@@ -1,0 +1,52 @@
+[package]
+name = "xray-vpn-test"
+version = "0.1.0"
+edition = "2024"
+authors = ["lain"]
+description = "VPN profile benchmark tool for VLESS, Hysteria2, and XHTTP nodes"
+license = "MIT"
+
+[[bin]]
+name = "xray-vpn-test"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "hincyray"
+path = "src/bin/hincyray.rs"
+
+[features]
+default = ["desktop"]
+# Desktop GUI build (`xray-vpn-test` binary). The `hincyray` router
+# daemon can be built with `--no-default-features --bin hincyray` to
+# avoid pulling in eframe/egui/arboard for Entware/OpenWrt.
+desktop = ["dep:arboard", "dep:eframe", "dep:egui_extras"]
+
+[dependencies]
+arboard = { version = "3.6", optional = true }
+base64 = "0.22"
+eframe = { version = "0.33", default-features = true, optional = true }
+egui_extras = { version = "0.33", optional = true }
+percent-encoding = "2.3"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "socks"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.24"
+url = "2.5"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = "z"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "warn"
+panic_in_result_fn = "warn"
+dbg_macro = "warn"
+todo = "warn"
+wildcard_dependencies = "warn"
+clone_on_copy = "warn"
