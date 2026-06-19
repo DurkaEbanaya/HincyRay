@@ -6,7 +6,7 @@
 
 Build a lightweight VPN/proxy client for Keenetic Homebrew routers, starting with Keenetic Giga KN-1012, using the current XrayVpnTest project as the parser, benchmark, and diagnostics foundation.
 
-The desktop application is the diagnostics surface. The shipped router product is `hincyray` v0.1: a router-installed daemon with a web panel that accepts Happ/TutNet-style subscriptions and direct configs, lets the user choose a server manually, and exposes a local SOCKS listener through Xray. Automatic server selection, policy routing, and Hysteria2 are post-MVP.
+The desktop application is the diagnostics surface. The shipped router product is `hincyray` v0.1: a router-installed daemon with a web panel that accepts Happ/TutNet-style subscriptions and direct configs, lets the user choose a server manually, and exposes a local SOCKS listener through Xray. The v0.1.1 add-on in `scripts/` adds an opt-in WiFi VPN segment via TPROXY for `192.168.2.0/24` (manual setup, main network untouched). Automatic server selection, per-device/per-domain policy routing, and Hysteria2 remain post-MVP.
 
 ## Target Device
 
@@ -78,10 +78,11 @@ Implemented:
 - The daemon can be built without the desktop feature: `cargo build --release --no-default-features --bin hincyray` skips `eframe`/`egui_extras`/`arboard` so the Entware/OpenWrt artifact stays small and free of GUI dependencies. Shared modules (`profiles`, `scoring`, `xray_config`, `tester`, `hincyray`) remain available; `app`/`theme`/`run()` are gated behind the `desktop` feature.
 - Xray config generation reuses `xray_config::build_xray_config` (VLESS only; Hysteria2 returns a 400 with a clear message).
 - Tests for xray_config (VLESS XHTTP Reality fields, Hysteria2 rejection, Unknown protocol rejection, TCP Reality), storage round-trip with defaults, import/dedup, active-profile activation and config write, edge-case HTTP responses.
+- v0.1.1 opt-in WiFi VPN segment via TPROXY: `scripts/wifi-segment-setup.sh`, `scripts/xray-tproxy-inbound.sh`, `scripts/tproxy-setup.sh`, `scripts/tproxy-rollback.sh`. Creates `HincyRay-VPN` SSID on `192.168.2.0/24`, patches the generated Xray config with a `dokodemo-door` TPROXY inbound on port `10810`, and installs `iptables` mangle TPROXY rules + a policy-routing table that steer only `192.168.2.0/24` through Xray. The main `192.168.1.0/24` network is untouched. Manual setup only; the daemon stays SOCKS-only by default. Validated on KN-1012: a phone on `HincyRay-VPN` got the proxy exit IP and YouTube worked, while `192.168.1.0/24` kept its direct IP.
 
 Not yet implemented (post-MVP, tracked below):
 
-- Router-side policy routing (`iptables` / `ip rule` / `nftables` / Keenetic hooks).
+- Router-side policy routing installed/managed by the daemon itself. The v0.1.1 WiFi VPN segment ships an opt-in, script-driven TPROXY path for `192.168.2.0/24`, but per-device / per-domain rules and daemon-managed install/rollback are still pending.
 - Automatic server selection using `scoring::quality_score` and recent metrics.
 - Health checks with automatic failover.
 - Full web UI (only an endpoint-listing index page is shipped).
@@ -91,7 +92,7 @@ Not yet implemented (post-MVP, tracked below):
 ## Post-MVP Scope
 
 - Automatic server selector using quality score, recent failures, and preferred country/provider.
-- Policy routing for selected clients, SSIDs, domains, or IP ranges.
+- Policy routing for selected clients, SSIDs, domains, or IP ranges (v0.1.1 delivers an opt-in per-subnet WiFi segment via `scripts/`; per-client/per-domain rules and daemon-managed install/rollback remain).
 - Health checks with automatic failover.
 - Export/import full router-client configuration.
 - Optional Mihomo backend for advanced rule-based routing if Xray routing is insufficient.

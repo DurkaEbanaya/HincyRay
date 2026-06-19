@@ -310,6 +310,86 @@ curl -sS https://api.ipify.org
 
 If the workstation IP is unchanged and the router-local SOCKS curl shows the proxy exit IP, v0.1 is working as designed.
 
+## WiFi VPN segment setup (v0.1.1, opt-in)
+
+v0.1.1 adds an **opt-in** path to route a separate WiFi segment through Xray via TPROXY. The daemon stays SOCKS-only by default; the WiFi VPN segment is set up by four shell scripts under `scripts/`. Nothing is installed automatically.
+
+Copy the scripts to the router once:
+
+```bash
+scp -r scripts root@<router-ip>:/opt/etc/hincyray/scripts
+ssh root@<router-ip> 'chmod +x /opt/etc/hincyray/scripts/*.sh'
+```
+
+Pre-flight: the daemon must already be running with an active VLESS profile and a started Xray core (Steps 4&ndash;7 above), and `jq` must be installed on the router (the Xray config patch script needs it):
+
+```bash
+ssh root@<router-ip> 'opkg update && opkg install jq'
+```
+
+Then run, in order, on the router:
+
+```bash
+# 1. Create the HincyRay-VPN WiFi segment on 192.168.2.0/24 (2.4 + 5 GHz).
+#    Override defaults with HINCYRAY_WIFI_PASSWORD / HINCYRAY_WIFI_SSID /
+#    HINCYRAY_WIFI_SUBNET / HINCYRAY_WIFI_GATEWAY if needed.
+ssh root@<router-ip> 'sh /opt/etc/hincyray/scripts/wifi-segment-setup.sh'
+
+# 2. Patch the generated Xray config with a dokodemo-door TPROXY inbound
+#    on 0.0.0.0:10810, then restart the core so Xray picks it up.
+ssh root@<router-ip> 'sh /opt/etc/hincyray/scripts/xray-tproxy-inbound.sh'
+curl -sS -X POST http://<router-ip>:8088/api/core/restart
+
+# 3. Install iptables mangle TPROXY rules + policy routing for
+#    192.168.2.0/24 only. 192.168.1.0/24 is not touched.
+ssh root@<router-ip> 'sh /opt/etc/hincyray/scripts/tproxy-setup.sh'
+```
+
+Test:
+
+1. Connect a phone to the `HincyRay-VPN` SSID (default password `HincyRayVPN2026`; override it in production via `HINCYRAY_WIFI_PASSWORD`).
+2. On the phone, open `https://2ip.io/` or `https://api.ipify.org`. The IP shown should be the **proxy exit IP**, not your home IP. YouTube and other blocked services should work.
+3. From a device on the main `192.168.1.0/24` network, confirm the IP is unchanged and the default route is intact:
+
+   ```bash
+   curl -sS https://api.ipify.org
+   ```
+
+4. On the router, verify the rules:
+
+   ```bash
+   ssh root@<router-ip> '
+     iptables -t mangle -S HINCYRAY
+     ip rule show | grep 0x111
+   '
+   ```
+
+Rollback (no reboot needed):
+
+```bash
+# Removes iptables rules, the HINCYRAY chain, and the policy-routing table.
+# After this, 192.168.2.0/24 routes direct again.
+ssh root@<router-ip> 'sh /opt/etc/hincyray/scripts/tproxy-rollback.sh'
+
+# Optional: take the HincyRay-VPN SSID down entirely.
+ssh root@<router-ip> '
+  ndmc -c "interface WifiMaster0/AccessPoint1 down"
+  ndmc -c "interface WifiMaster1/AccessPoint1 down"
+'
+```
+
+Save the WiFi segment to flash (the `iptables` rules are **not** persisted by this; re-run `tproxy-setup.sh` after every reboot):
+
+```bash
+ssh root@<router-ip> 'ndmc -c "system configuration save"'
+```
+
+Notes:
+
+- Only `192.168.2.0/24` is steered through Xray. `192.168.1.0/24` (Home) keeps the main uplink.
+- The Xray config patch (`xray-tproxy-inbound.sh`) is idempotent and skips if a `dokodemo-door` inbound already exists. Re-selecting the active profile through the HincyRay API regenerates `xray-client.json` **without** the TPROXY inbound, so after a profile switch you must re-run the patch and then `POST /api/core/restart` before TPROXY routing works again.
+- Keenetic ships the `xt_TPROXY` / `xt_socket` kernel modules built-in; no `modprobe` is needed on KN-1012.
+
 ## Logs and state
 
 - Daemon log: `/opt/var/log/hincyray/hincyray.log` (whatever the init script redirects to).
@@ -363,13 +443,15 @@ ssh root@<router-ip> '
 '
 ```
 
-## What v0.1 deliberately does not do
+## What v0.1 deliberately does not do (by default)
 
-- No `iptables` / `ip rule` / `nftables` rules.
-- No Keenetic routing hooks or service mesh.
-- No transparent proxy or system-wide policy routing.
+- No `iptables` / `ip rule` / `nftables` rules installed by the daemon itself.
+- No Keenetic routing hooks or service mesh installed by the daemon.
+- No transparent proxy or system-wide policy routing installed by the daemon.
 - No automatic server selection or failover.
 - No Hysteria2 backend.
 - No changes to your workstation IP or default route.
+
+The **v0.1.1 opt-in WiFi VPN segment** is the only exception: the four `scripts/` add `iptables` mangle TPROXY rules + a policy-routing table that steer `192.168.2.0/24` through Xray. They are run manually, only affect that subnet, and are not saved to flash unless you run `ndmc -c "system configuration save"`. See [WiFi VPN segment setup (v0.1.1, opt-in)](#wifi-vpn-segment-setup-v011-opt-in) above.
 
 These are tracked as post-MVP in [`docs/keenetic-client-roadmap.md`](keenetic-client-roadmap.md). See [`docs/hincyray-v0.1-status.md`](hincyray-v0.1-status.md) for the precise implemented/not-implemented list.

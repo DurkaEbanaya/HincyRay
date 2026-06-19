@@ -1,6 +1,6 @@
 # HincyRay v0.1
 
-HincyRay is a lightweight VPN/proxy client for Keenetic Homebrew routers. v0.1 ships a router daemon (`hincyray`) that reuses the parser, Xray config generator, and quality scoring originally developed for the `XrayVpnTest` desktop tool, and exposes an embedded web panel on the router LAN.
+HincyRay is a lightweight VPN/proxy client for Keenetic Homebrew routers. v0.1 ships a router daemon (`hincyray`) that reuses the parser, Xray config generator, and quality scoring originally developed for the `XrayVpnTest` desktop tool, and exposes an embedded web panel on the router LAN. The **v0.1.1 add-on** in `scripts/` introduces an opt-in WiFi VPN segment that routes a separate `HincyRay-VPN` SSID on `192.168.2.0/24` through Xray via TPROXY, leaving the main `192.168.1.0/24` network untouched.
 
 The desktop app `xray-vpn-test` is still built from this crate behind the `desktop` feature, but its role is now diagnostics and benchmarking only &mdash; it is not the shipped product. See [`docs/hincyray-v0.1-status.md`](docs/hincyray-v0.1-status.md) for the version status and [`docs/keenetic-client-roadmap.md`](docs/keenetic-client-roadmap.md) for the longer plan.
 
@@ -13,20 +13,21 @@ The desktop app `xray-vpn-test` is still built from this crate behind the `deskt
 - Parses Happ/TutNet Xray-style JSON that carries DNS-over-HTTPS URLs by falling back to Xray `outbounds` parsing when no direct profiles are found, so embedded DNS URLs are not mistaken for subscriptions.
 - Generates Xray client configs for VLESS Reality/TLS and VLESS XHTTP/Satellite via the shared `xray_config` module.
 - Persists state, profiles, active profile, and generated Xray config under `/opt/etc/hincyray/` on Entware.
+- **Opt-in WiFi VPN segment via TPROXY (v0.1.1 add-on)**: shell scripts under `scripts/` create a separate `HincyRay-VPN` SSID on `192.168.2.0/24`, patch the generated Xray config with a `dokodemo-door` TPROXY inbound on port `10810`, and install `iptables` mangle TPROXY rules that steer **only** `192.168.2.0/24` through Xray. The main `192.168.1.0/24` network is untouched. Nothing is installed automatically by the daemon.
 - Desktop `xray-vpn-test` remains available as the macOS diagnostics surface (feature `desktop`) for benchmarking nodes through `sing-box` and `xray`.
 
-## Safe SOCKS-only MVP
+## Safe SOCKS-only MVP (default)
 
 v0.1 is intentionally narrow to avoid breaking the workstation that manages the router:
 
 - The daemon only starts Xray with a local SOCKS listener on the router at `127.0.0.1:10808`.
-- It does **not** install `iptables` / `ip rule` / `nftables` rules, Keenetic routing hooks, or any system-wide policy routing.
+- It does **not** install `iptables` / `ip rule` / `nftables` rules, Keenetic routing hooks, or any system-wide policy routing. (The v0.1.1 WiFi VPN segment is **opt-in and manual**: you must run `scripts/` yourself; see [WiFi VPN segment (v0.1.1, opt-in)](#wifi-vpn-segment-v011-opt-in) below.)
 - It does **not** change your main workstation IP or default route. Validation is done by curling through the router-local SOCKS proxy from the router itself.
-- It does **not** autostart policy routing or transparent proxying. Those are post-MVP and tracked in the roadmap.
+- It does **not** autostart policy routing or transparent proxying by default. The opt-in WiFi segment is the only shipped routing path; per-device/per-domain rules are post-MVP.
 
 ## Current limitations
 
-- **No automatic routing.** Only the router-local SOCKS endpoint is exposed. There is no transparent proxy, no per-device/SSID/domain steering, and no automatic failover yet.
+- **No automatic routing installed by the daemon.** By default only the router-local SOCKS endpoint is exposed. The v0.1.1 WiFi VPN segment is opt-in and script-driven (TPROXY for `192.168.2.0/24` only); per-device/per-domain steering and automatic failover are still post-MVP.
 - **Hysteria2 is not supported by the Xray backend.** Selecting a Hysteria2 profile returns a clear 400 error from `/api/active-profile`. A future sing-box or Mihomo backend is planned.
 - **Router internet may require manual artifact copy.** The Entware router is often isolated or has restricted direct downloads. The Xray binary, HincyRay binary, and `geoip.dat`/`geosite.dat` assets may need to be fetched on a workstation and copied via `scp`. See [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md).
 - **Automatic server selection is not wired up.** The shared `scoring::quality_score` exists, but the daemon does not yet run benchmarks or pick the best profile.
@@ -142,6 +143,17 @@ curl -sS -X POST http://127.0.0.1:8088/api/core/start
 # Validate through router-local SOCKS (does NOT change client routes)
 curl -sS --socks5-hostname 127.0.0.1:10808 https://api.ipify.org
 ```
+
+## WiFi VPN segment (v0.1.1, opt-in)
+
+The four shell scripts in `scripts/` add an opt-in path to route a separate WiFi segment through Xray:
+
+- `scripts/wifi-segment-setup.sh` &mdash; creates the `HincyRay-VPN` SSID on `192.168.2.0/24` via Keenetic `ndmc` (2.4 GHz + 5 GHz, DHCP pool).
+- `scripts/xray-tproxy-inbound.sh` &mdash; patches the generated Xray config with a `dokodemo-door` TPROXY inbound on `0.0.0.0:10810` (needs `jq`).
+- `scripts/tproxy-setup.sh` &mdash; installs `iptables` mangle TPROXY rules + a policy-routing table for `192.168.2.0/24` only.
+- `scripts/tproxy-rollback.sh` &mdash; removes the above; `192.168.2.0/24` then routes direct again.
+
+Only `192.168.2.0/24` is steered through Xray; `192.168.1.0/24` keeps the main uplink. Nothing is installed automatically, and changes are not saved to flash unless you run `ndmc -c "system configuration save"`. The `iptables` rules are not persisted, so re-run `tproxy-setup.sh` after every reboot. The step-by-step runbook (run, test, rollback, save) is in [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md).
 
 ## Documentation
 
