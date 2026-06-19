@@ -16,19 +16,29 @@ use std::{
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex, MutexGuard},
-    thread,
-    time::Duration,
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::profiles::{Profile, load_subscription_detailed, parse_input};
+use crate::benchmark::{
+    BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL, SharedJob,
+    run_bench,
+};
+use crate::profiles::{
+    Profile, SubscriptionSource, load_subscription_detailed_via_proxy, parse_input,
+};
 use crate::xray_config::build_xray_config;
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_HISTORY_SAMPLES: usize = 1000;
 
 /// Entry point for the `hincyray` binary. Binds the listener and serves
 /// requests on the calling thread; spawn background threads per
@@ -81,6 +91,59 @@ pub struct Daemon {
 struct DaemonInner {
     state: HincyrayState,
     core: CoreManager,
+    bench: BenchRuntime,
+}
+
+/// Holds the live benchmark job (if any), its cancel flag, and the
+/// worker thread handle. The active Xray `CoreManager` is intentionally
+/// separate: benchmarks spin up their own temporary Xray children and
+/// must never touch the running core.
+struct BenchRuntime {
+    job: Option<SharedJob>,
+    cancel: Option<Arc<AtomicBool>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl BenchRuntime {
+    fn new() -> Self {
+        Self {
+            job: None,
+            cancel: None,
+            handle: None,
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.job
+            .as_ref()
+            .map(|job| {
+                job.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .running
+            })
+            .unwrap_or(false)
+    }
+
+    fn request_cancel(&self) {
+        if let Some(flag) = self.cancel.as_ref() {
+            flag.store(true, Ordering::Relaxed);
+            if let Some(job) = self.job.as_ref() {
+                let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
+                state.cancel_requested = true;
+            }
+        }
+    }
+
+    fn snapshot(&self) -> BenchJob {
+        self.job
+            .as_ref()
+            .map(|job| {
+                job.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Persisted HincyRay state.
@@ -104,6 +167,17 @@ pub struct HincyrayState {
     pub metrics_history: Vec<MetricSample>,
     #[serde(default)]
     pub routing_rules: Vec<RoutingRule>,
+    /// v0.2: saved subscription sources so `/api/subscriptions/refresh`
+    /// can re-fetch them without re-entering URLs.
+    #[serde(default)]
+    pub subscriptions: Vec<StoredSubscription>,
+    /// v0.2: favorite profile share-link strings. Stored by raw link so
+    /// favorites survive profile renumbering across imports.
+    #[serde(default)]
+    pub favorites: Vec<String>,
+    /// v0.2: per-profile benchmark statistics keyed by raw share link.
+    #[serde(default)]
+    pub stats: Vec<ProfileStats>,
 }
 
 impl Default for HincyrayState {
@@ -118,6 +192,9 @@ impl Default for HincyrayState {
             xray_path: default_xray_path(),
             metrics_history: Vec::new(),
             routing_rules: Vec::new(),
+            subscriptions: Vec::new(),
+            favorites: Vec::new(),
+            stats: Vec::new(),
         }
     }
 }
@@ -130,6 +207,43 @@ pub struct MetricSample {
     pub passed: bool,
     pub latency_ms: u32,
     pub download_mbps: f32,
+}
+
+/// v0.2: persisted subscription source plus its last refresh metadata.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StoredSubscription {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_loaded_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub profile_count: usize,
+}
+
+/// v0.2: per-profile benchmark statistics keyed by raw share link so
+/// stats survive profile renumbering across imports/refreshes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProfileStats {
+    pub profile_raw: String,
+    #[serde(default)]
+    pub last_latency_ms: u32,
+    #[serde(default)]
+    pub last_jitter_ms: u32,
+    #[serde(default)]
+    pub last_download_mbps: f32,
+    #[serde(default)]
+    pub last_loss_percent: f32,
+    #[serde(default)]
+    pub last_score: u32,
+    #[serde(default)]
+    pub success_count: u32,
+    #[serde(default)]
+    pub failure_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_checked_unix: u64,
 }
 
 /// Placeholder for future policy-routing rules (e.g. per-SSID / per-device
@@ -165,6 +279,7 @@ impl Daemon {
             inner: Arc::new(Mutex::new(DaemonInner {
                 state,
                 core: CoreManager::new(),
+                bench: BenchRuntime::new(),
             })),
             state_path,
             xray_config_path,
@@ -300,6 +415,77 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
+/// Cached SOCKS fallback info for the running core. Captured under a
+/// short lock and then used by `load_subscription_for_daemon` outside
+/// the mutex so network I/O does not block the API.
+struct DaemonProxyInfo {
+    socks_url: String,
+    core_running: bool,
+}
+
+/// Result of `load_subscription_for_daemon`: either a successful
+/// `SubscriptionLoadReport` (regardless of whether direct or proxy
+/// path was used), or the direct error paired with an optional proxy
+/// fallback error. The `direct` error is always present on failure;
+/// `proxy` is `Some` only when a proxy attempt was actually made and
+/// also failed, so callers can build a single combined error string.
+enum SubscriptionLoadOutcome {
+    Ok(crate::profiles::SubscriptionLoadReport),
+    Failed {
+        direct: String,
+        proxy: Option<String>,
+    },
+}
+
+impl SubscriptionLoadOutcome {
+    fn format_error(direct: &str, proxy: Option<&str>) -> String {
+        match proxy {
+            Some(proxy_err) => format!("{direct}; via proxy: {proxy_err}"),
+            None => direct.to_owned(),
+        }
+    }
+}
+
+fn proxy_info_for_daemon(inner: &mut DaemonInner) -> DaemonProxyInfo {
+    let core_running = inner.core.is_running();
+    let socks_url = format!(
+        "socks5h://{}:{}",
+        inner.state.listen_host, inner.state.socks_port
+    );
+    DaemonProxyInfo {
+        socks_url,
+        core_running,
+    }
+}
+
+/// Try direct fetch first; on failure, fall back to the local Xray
+/// SOCKS inbound (`socks5h://127.0.0.1:<socks_port>`) iff the active
+/// core is running. Network I/O happens here, so the caller must NOT
+/// hold the daemon mutex.
+fn load_subscription_for_daemon(
+    source: &SubscriptionSource,
+    proxy_info: &DaemonProxyInfo,
+) -> SubscriptionLoadOutcome {
+    match load_subscription_detailed_via_proxy(source, None) {
+        Ok(report) => SubscriptionLoadOutcome::Ok(report),
+        Err(direct_err) => {
+            if !proxy_info.core_running {
+                return SubscriptionLoadOutcome::Failed {
+                    direct: direct_err,
+                    proxy: None,
+                };
+            }
+            match load_subscription_detailed_via_proxy(source, Some(&proxy_info.socks_url)) {
+                Ok(report) => SubscriptionLoadOutcome::Ok(report),
+                Err(proxy_err) => SubscriptionLoadOutcome::Failed {
+                    direct: direct_err,
+                    proxy: Some(proxy_err),
+                },
+            }
+        }
+    }
+}
+
 fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
 
@@ -416,6 +602,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
                         "address": profile.address,
                         "port": profile.port,
                         "active": active_id == Some(profile.id),
+                        "group": profile.group,
                     })
                 })
                 .collect();
@@ -431,6 +618,17 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/core/start") => handle_core_start(daemon),
         ("POST", "/api/core/stop") => handle_core_stop(daemon),
         ("POST", "/api/core/restart") => handle_core_restart(daemon),
+        ("GET", "/api/bench/status") => handle_bench_status(daemon),
+        ("POST", "/api/bench/start") => handle_bench_start(body, daemon),
+        ("POST", "/api/bench/stop") => handle_bench_stop(daemon),
+        ("GET", "/api/stats") => handle_stats(daemon),
+        ("POST", "/api/favorites/toggle") => handle_favorites_toggle(body, daemon),
+        ("GET", "/api/favorites") => handle_favorites_list(daemon),
+        ("POST", "/api/subscriptions/refresh") => handle_subscriptions_refresh(daemon),
+        ("POST", "/api/subscriptions/refresh-one") => {
+            handle_subscriptions_refresh_one(body, daemon)
+        }
+        ("GET", "/api/subscriptions") => handle_subscriptions_list(daemon),
         _ => (
             404,
             "application/json",
@@ -440,15 +638,77 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
 }
 
 fn handle_import(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
-    let parsed = parse_input(body);
+    // Accept two import body shapes (backward compatible):
+    //   * JSON object `{"text": "...", "group": "Tutnet online"}` —
+    //     `group` is optional. Empty/whitespace string is treated as
+    //     `None`. Used by the web panel's optional "Group name" field.
+    //   * Raw text (any other body) — old path; group stays `None`.
+    let (import_text, group_param): (String, Option<String>) =
+        match serde_json::from_str::<Value>(body) {
+            Ok(value) if value.get("text").and_then(Value::as_str).is_some() => {
+                let text = value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let group = value
+                    .get("group")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
+                (text, group)
+            }
+            _ => (body.to_owned(), None),
+        };
+
+    let parsed = parse_input(&import_text);
     let mut incoming = parsed.profiles;
+    // Tag direct profiles with the user-supplied group name (if any).
+    for profile in &mut incoming {
+        if profile.group.is_none() {
+            profile.group = group_param.clone();
+        }
+    }
     let mut errors: Vec<String> = Vec::new();
+    // Stored per-source outcome so we can update `subscriptions` meta
+    // after merging profiles. `Ok` carries only the count since the
+    // profiles themselves are moved into `incoming`.
+    enum StoredOutcome {
+        Ok { count: usize },
+        Failed { error: String },
+    }
+    let mut loaded_subs: Vec<(SubscriptionSource, StoredOutcome)> = Vec::new();
+
+    // Grab proxy fallback info under a short lock; network I/O below
+    // runs without holding the mutex so the API stays responsive.
+    let proxy_info = {
+        let mut inner = lock(&daemon.inner);
+        proxy_info_for_daemon(&mut inner)
+    };
 
     for source in &parsed.subscriptions {
-        match load_subscription_detailed(source) {
-            Ok(report) => incoming.extend(report.profiles),
-            Err(error) => errors.push(error),
-        }
+        let outcome = load_subscription_for_daemon(source, &proxy_info);
+        let stored = match outcome {
+            SubscriptionLoadOutcome::Ok(report) => {
+                let count = report.profiles.len();
+                // Tag subscription-loaded profiles with the source URL so
+                // the UI can group them per subscription.
+                let mut sub_profiles = report.profiles;
+                for profile in &mut sub_profiles {
+                    if profile.group.is_none() {
+                        profile.group = Some(source.url.clone());
+                    }
+                }
+                incoming.extend(sub_profiles);
+                StoredOutcome::Ok { count }
+            }
+            SubscriptionLoadOutcome::Failed { direct, proxy } => {
+                let error = SubscriptionLoadOutcome::format_error(&direct, proxy.as_deref());
+                errors.push(error.clone());
+                StoredOutcome::Failed { error }
+            }
+        };
+        loaded_subs.push((source.clone(), stored));
     }
 
     let mut inner = lock(&daemon.inner);
@@ -463,10 +723,59 @@ fn handle_import(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
         if seen.insert(profile.raw.clone()) {
             profile.id = inner.state.profiles.len();
             inner.state.profiles.push(profile);
+        } else if profile.group.is_some() {
+            // Dedup: keep the existing profile but, if it has no group
+            // yet, adopt the new one so a later import with a group
+            // name still tags previously-seen direct profiles.
+            let raw = profile.raw.clone();
+            if let Some(existing) = inner
+                .state
+                .profiles
+                .iter_mut()
+                .find(|p| p.raw == raw && p.group.is_none())
+            {
+                existing.group = profile.group.take();
+            }
         }
     }
     let count_after = inner.state.profiles.len();
     let added = count_after.saturating_sub(count_before);
+
+    // v0.2: persist any subscription URLs from the import so they can be
+    // refreshed later via /api/subscriptions/refresh. Merge by URL.
+    let now = unix_now();
+    for (source, outcome) in &loaded_subs {
+        let stored = inner
+            .state
+            .subscriptions
+            .iter_mut()
+            .find(|existing| existing.url == source.url);
+        let entry = if let Some(stored) = stored {
+            stored
+        } else {
+            inner.state.subscriptions.push(StoredSubscription {
+                url: source.url.clone(),
+                last_loaded_unix: None,
+                last_error: None,
+                profile_count: 0,
+            });
+            inner
+                .state
+                .subscriptions
+                .last_mut()
+                .expect("just pushed a subscription entry")
+        };
+        match outcome {
+            StoredOutcome::Ok { count } => {
+                entry.last_loaded_unix = Some(now);
+                entry.last_error = None;
+                entry.profile_count = *count;
+            }
+            StoredOutcome::Failed { error } => {
+                entry.last_error = Some(error.clone());
+            }
+        }
+    }
 
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         errors.push(format!("persist: {error}"));
@@ -478,6 +787,7 @@ fn handle_import(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
         "subscriptions": parsed.subscriptions.len(),
         "candidate_count": parsed.candidates,
         "unsupported_placeholders": parsed.unsupported_placeholders,
+        "group": group_param,
         "errors": errors,
     });
     (200, "application/json", response.to_string())
@@ -631,6 +941,628 @@ fn handle_core_restart(daemon: &Daemon) -> (u16, &'static str, String) {
     }
 }
 
+fn handle_bench_status(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let job = inner.bench.snapshot();
+    let method = job.method.map(|m| m.as_str().to_owned());
+    let summary = bench_summary(&job);
+    let response = json!({
+        "running": job.running,
+        "method": method,
+        "total": job.total,
+        "completed": job.completed,
+        "current_profile_id": job.current_profile_id,
+        "current_profile_name": job.current_profile_name,
+        "last_updated": job.last_updated,
+        "cancel_requested": job.cancel_requested,
+        "results": job.results,
+        "summary": summary,
+    });
+    (200, "application/json", response.to_string())
+}
+
+fn bench_summary(job: &BenchJob) -> Value {
+    let total = job.results.len();
+    let passed = job.results.iter().filter(|r| r.success).count();
+    let failed = total.saturating_sub(passed);
+    let avg_latency = if passed == 0 {
+        0.0
+    } else {
+        let sum: u64 = job
+            .results
+            .iter()
+            .filter(|r| r.success)
+            .map(|r| r.latency_ms as u64)
+            .sum();
+        sum as f32 / passed as f32
+    };
+    json!({
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "avg_latency_ms": avg_latency,
+    })
+}
+
+fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let method_str = value.get("method").and_then(Value::as_str).unwrap_or("tcp");
+    let Some(method) = BenchMethod::parse_method(method_str) else {
+        return (
+            400,
+            "application/json",
+            json!({
+                "error": "unknown method",
+                "supported": ["tcp", "head", "get"],
+            })
+            .to_string(),
+        );
+    };
+    let probe_url = value
+        .get("probe_url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_PROBE_URL)
+        .to_owned();
+    let download_url = value
+        .get("download_url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_DOWNLOAD_URL)
+        .to_owned();
+
+    // Decide which profiles to benchmark. Either an explicit `profile_ids`
+    // array (single ping if length 1) or all imported profiles.
+    let requested_ids: Option<Vec<usize>> =
+        value
+            .get("profile_ids")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as usize))
+                    .collect()
+            });
+
+    let (profiles, xray_path) = {
+        let inner = lock(&daemon.inner);
+        if inner.bench.is_running() {
+            return (
+                409,
+                "application/json",
+                json!({"error": "benchmark already running; call /api/bench/stop first"})
+                    .to_string(),
+            );
+        }
+        let profiles: Vec<Profile> = match requested_ids {
+            Some(ids) if !ids.is_empty() => inner
+                .state
+                .profiles
+                .iter()
+                .filter(|p| ids.contains(&p.id))
+                .cloned()
+                .collect(),
+            _ => inner.state.profiles.clone(),
+        };
+        (profiles, inner.state.xray_path.clone())
+    };
+
+    if profiles.is_empty() {
+        return (
+            400,
+            "application/json",
+            json!({"error": "no profiles to benchmark; import first"}).to_string(),
+        );
+    }
+
+    let job = Arc::new(Mutex::new(BenchJob::default()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let daemon_for_callback = daemon.clone();
+    let on_result = Box::new(move |result: BenchResult| {
+        apply_bench_result(&daemon_for_callback, result);
+    });
+
+    let handle = run_bench(
+        profiles,
+        method,
+        probe_url,
+        download_url,
+        xray_path,
+        Arc::clone(&job),
+        Arc::clone(&cancel),
+        on_result,
+    );
+
+    {
+        let mut inner = lock(&daemon.inner);
+        // Drop a previously finished handle, if any.
+        if let Some(prev) = inner.bench.handle.take() {
+            let _ = prev.join();
+        }
+        inner.bench.job = Some(job);
+        inner.bench.cancel = Some(cancel);
+        inner.bench.handle = Some(handle);
+    }
+
+    let inner = lock(&daemon.inner);
+    let snapshot = inner.bench.snapshot();
+    let response = json!({
+        "started": true,
+        "method": method.as_str(),
+        "total": snapshot.total,
+        "running": snapshot.running,
+    });
+    (200, "application/json", response.to_string())
+}
+
+fn handle_bench_stop(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let running = inner.bench.is_running();
+    if running {
+        inner.bench.request_cancel();
+    }
+    (
+        200,
+        "application/json",
+        json!({
+            "stopped": running,
+            "cancel_requested": running,
+        })
+        .to_string(),
+    )
+}
+
+/// Apply a single benchmark result to persisted state: update the
+/// per-profile `ProfileStats`, push a `MetricSample` (capped at
+/// `MAX_HISTORY_SAMPLES`), and persist. Called from the benchmark
+/// worker thread via the `on_result` callback.
+fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
+    let mut inner = lock(&daemon.inner);
+    let now = result.timestamp;
+
+    // Find or insert the stats entry by index to avoid aliased mutable
+    // borrows of `inner.state.stats` while we also touch
+    // `inner.state.metrics_history` below.
+    let stats_idx = match inner
+        .state
+        .stats
+        .iter()
+        .position(|s| s.profile_raw == result.profile_raw)
+    {
+        Some(idx) => idx,
+        None => {
+            inner.state.stats.push(ProfileStats {
+                profile_raw: result.profile_raw.clone(),
+                ..Default::default()
+            });
+            inner.state.stats.len() - 1
+        }
+    };
+
+    {
+        let stats_entry = &mut inner.state.stats[stats_idx];
+        if result.success {
+            stats_entry.last_latency_ms = result.latency_ms;
+            stats_entry.last_jitter_ms = result.jitter_ms;
+            stats_entry.last_download_mbps = result.download_mbps;
+            stats_entry.last_loss_percent = result.loss_percent;
+            stats_entry.last_score = result.score;
+            stats_entry.last_error = None;
+            stats_entry.success_count = stats_entry.success_count.saturating_add(1);
+        } else {
+            stats_entry.failure_count = stats_entry.failure_count.saturating_add(1);
+            stats_entry.last_error = result.error.clone();
+        }
+        stats_entry.last_checked_unix = now;
+    }
+
+    inner.state.metrics_history.push(MetricSample {
+        timestamp: now,
+        profile_id: result.profile_id,
+        score: result.score,
+        passed: result.success,
+        latency_ms: result.latency_ms,
+        download_mbps: result.download_mbps,
+    });
+    if inner.state.metrics_history.len() > MAX_HISTORY_SAMPLES {
+        let excess = inner.state.metrics_history.len() - MAX_HISTORY_SAMPLES;
+        inner.state.metrics_history.drain(0..excess);
+    }
+
+    let _ = persist_state(&daemon.state_path, &inner.state);
+}
+
+fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let active_id = inner.state.active_profile_id;
+    let favorites = &inner.state.favorites;
+    let stats = &inner.state.stats;
+    let profiles = &inner.state.profiles;
+
+    let mut entries: Vec<Value> = profiles
+        .iter()
+        .map(|profile| {
+            let stat = stats.iter().find(|s| s.profile_raw == profile.raw);
+            let favorite = favorites.iter().any(|raw| raw == &profile.raw);
+            json!({
+                "profile_id": profile.id,
+                "name": profile.name,
+                "protocol": profile.protocol.to_string(),
+                "transport": profile.transport(),
+                "address": profile.address,
+                "port": profile.port,
+                "active": active_id == Some(profile.id),
+                "favorite": favorite,
+                "group": profile.group,
+                "last_latency_ms": stat.map(|s| s.last_latency_ms).unwrap_or(0),
+                "last_jitter_ms": stat.map(|s| s.last_jitter_ms).unwrap_or(0),
+                "last_download_mbps": stat.map(|s| s.last_download_mbps).unwrap_or(0.0),
+                "last_loss_percent": stat.map(|s| s.last_loss_percent).unwrap_or(0.0),
+                "score": stat.map(|s| s.last_score).unwrap_or(0),
+                "success_count": stat.map(|s| s.success_count).unwrap_or(0),
+                "failure_count": stat.map(|s| s.failure_count).unwrap_or(0),
+                "last_error": stat.and_then(|s| s.last_error.clone()),
+                "last_checked": stat.map(|s| s.last_checked_unix).unwrap_or(0),
+            })
+        })
+        .collect();
+    // Sort by score descending so the rating table is meaningful by default.
+    entries.sort_by(|a, b| {
+        let sa = a.get("score").and_then(Value::as_u64).unwrap_or(0);
+        let sb = b.get("score").and_then(Value::as_u64).unwrap_or(0);
+        sb.cmp(&sa)
+    });
+
+    let response = json!({
+        "stats": entries,
+        "favorites_count": favorites.len(),
+        "profiles_count": profiles.len(),
+    });
+    (200, "application/json", response.to_string())
+}
+
+fn handle_favorites_toggle(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(id) = value
+        .get("profile_id")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+    else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing profile_id"}).to_string(),
+        );
+    };
+
+    let mut inner = lock(&daemon.inner);
+    let Some(profile) = inner.state.profiles.iter().find(|p| p.id == id).cloned() else {
+        return (
+            404,
+            "application/json",
+            json!({"error": "profile not found", "profile_id": id}).to_string(),
+        );
+    };
+
+    let raw = profile.raw.clone();
+    let already = inner
+        .state
+        .favorites
+        .iter()
+        .position(|existing| existing == &raw);
+    let now_favorite = if let Some(idx) = already {
+        inner.state.favorites.remove(idx);
+        false
+    } else {
+        inner.state.favorites.push(raw.clone());
+        true
+    };
+
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+
+    let response = json!({
+        "profile_id": id,
+        "profile_name": profile.name,
+        "favorite": now_favorite,
+    });
+    (200, "application/json", response.to_string())
+}
+
+fn handle_favorites_list(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let favorites = &inner.state.favorites;
+    let entries: Vec<Value> = inner
+        .state
+        .profiles
+        .iter()
+        .filter(|p| favorites.iter().any(|raw| raw == &p.raw))
+        .map(|p| {
+            json!({
+                "profile_id": p.id,
+                "name": p.name,
+                "protocol": p.protocol.to_string(),
+                "address": p.address,
+                "port": p.port,
+            })
+        })
+        .collect();
+    (
+        200,
+        "application/json",
+        json!({"favorites": entries, "count": entries.len()}).to_string(),
+    )
+}
+
+fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) {
+    // Read saved subscription sources plus the SOCKS fallback info
+    // under a single short lock; network I/O happens below without
+    // holding the mutex so the API stays responsive.
+    let (subs, proxy_info) = {
+        let mut inner = lock(&daemon.inner);
+        let subs: Vec<SubscriptionSource> = inner
+            .state
+            .subscriptions
+            .iter()
+            .map(|stored| SubscriptionSource {
+                url: stored.url.clone(),
+            })
+            .collect();
+        let proxy_info = proxy_info_for_daemon(&mut inner);
+        (subs, proxy_info)
+    };
+
+    if subs.is_empty() {
+        return (
+            200,
+            "application/json",
+            json!({
+                "refreshed": 0,
+                "added": 0,
+                "errors": Vec::<String>::new(),
+                "note": "no saved subscriptions; import a subscription URL first"
+            })
+            .to_string(),
+        );
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut added_total = 0usize;
+    let mut refreshed = 0usize;
+    let now = unix_now();
+
+    for source in &subs {
+        let outcome = load_subscription_for_daemon(source, &proxy_info);
+        let mut inner = lock(&daemon.inner);
+        let stored = inner
+            .state
+            .subscriptions
+            .iter_mut()
+            .find(|s| s.url == source.url);
+        match outcome {
+            SubscriptionLoadOutcome::Ok(report) => {
+                let count = report.profiles.len();
+                if let Some(stored) = stored {
+                    stored.last_loaded_unix = Some(now);
+                    stored.last_error = None;
+                    stored.profile_count = count;
+                }
+                let count_before = inner.state.profiles.len();
+                let mut seen: HashSet<String> =
+                    inner.state.profiles.iter().map(|p| p.raw.clone()).collect();
+                let mut sub_profiles = report.profiles;
+                // Tag subscription-loaded profiles with the source URL
+                // so they keep their group across refreshes.
+                for profile in &mut sub_profiles {
+                    if profile.group.is_none() {
+                        profile.group = Some(source.url.clone());
+                    }
+                }
+                for mut profile in sub_profiles {
+                    if seen.insert(profile.raw.clone()) {
+                        profile.id = inner.state.profiles.len();
+                        inner.state.profiles.push(profile);
+                    } else if profile.group.is_some() {
+                        let raw = profile.raw.clone();
+                        if let Some(existing) = inner
+                            .state
+                            .profiles
+                            .iter_mut()
+                            .find(|p| p.raw == raw && p.group.is_none())
+                        {
+                            existing.group = profile.group.take();
+                        }
+                    }
+                }
+                let added = inner.state.profiles.len().saturating_sub(count_before);
+                added_total += added;
+                refreshed += 1;
+            }
+            SubscriptionLoadOutcome::Failed { direct, proxy } => {
+                let error = SubscriptionLoadOutcome::format_error(&direct, proxy.as_deref());
+                if let Some(stored) = stored {
+                    stored.last_error = Some(error.clone());
+                }
+                errors.push(error);
+            }
+        }
+        let _ = persist_state(&daemon.state_path, &inner.state);
+    }
+
+    let response = json!({
+        "refreshed": refreshed,
+        "added": added_total,
+        "errors": errors,
+    });
+    (200, "application/json", response.to_string())
+}
+
+/// Refresh a single saved subscription by URL. Body: `{"url": "..."}`.
+/// Used by the per-group "Refresh" button in the web panel so the
+/// user can re-fetch one subscription without re-running all of them.
+/// Behaviour mirrors `handle_subscriptions_refresh` for the matched
+/// source; unknown URLs return 404.
+fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(url) = value.get("url").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing url"}).to_string(),
+        );
+    };
+    let url = url.trim();
+    if url.is_empty() {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing url"}).to_string(),
+        );
+    }
+
+    // Confirm the URL is a known saved subscription before any network
+    // I/O, so we never fetch an arbitrary URL supplied by the client.
+    let (proxy_info, exists) = {
+        let mut inner = lock(&daemon.inner);
+        let exists = inner.state.subscriptions.iter().any(|s| s.url == url);
+        (proxy_info_for_daemon(&mut inner), exists)
+    };
+    if !exists {
+        return (
+            404,
+            "application/json",
+            json!({"error": "subscription not found", "url": url}).to_string(),
+        );
+    }
+
+    let source = SubscriptionSource {
+        url: url.to_owned(),
+    };
+    let outcome = load_subscription_for_daemon(&source, &proxy_info);
+    let now = unix_now();
+
+    let mut inner = lock(&daemon.inner);
+    let stored = inner
+        .state
+        .subscriptions
+        .iter_mut()
+        .find(|s| s.url == source.url);
+    match outcome {
+        SubscriptionLoadOutcome::Ok(report) => {
+            let count = report.profiles.len();
+            if let Some(stored) = stored {
+                stored.last_loaded_unix = Some(now);
+                stored.last_error = None;
+                stored.profile_count = count;
+            }
+            let mut seen: HashSet<String> =
+                inner.state.profiles.iter().map(|p| p.raw.clone()).collect();
+            let mut sub_profiles = report.profiles;
+            for profile in &mut sub_profiles {
+                if profile.group.is_none() {
+                    profile.group = Some(source.url.clone());
+                }
+            }
+            let mut added = 0usize;
+            for mut profile in sub_profiles {
+                if seen.insert(profile.raw.clone()) {
+                    profile.id = inner.state.profiles.len();
+                    inner.state.profiles.push(profile);
+                    added += 1;
+                } else if profile.group.is_some() {
+                    let raw = profile.raw.clone();
+                    if let Some(existing) = inner
+                        .state
+                        .profiles
+                        .iter_mut()
+                        .find(|p| p.raw == raw && p.group.is_none())
+                    {
+                        existing.group = profile.group.take();
+                    }
+                }
+            }
+            let _ = persist_state(&daemon.state_path, &inner.state);
+            let response = json!({
+                "url": source.url,
+                "refreshed": 1,
+                "added": added,
+                "profile_count": count,
+                "errors": Vec::<String>::new(),
+            });
+            (200, "application/json", response.to_string())
+        }
+        SubscriptionLoadOutcome::Failed { direct, proxy } => {
+            let error = SubscriptionLoadOutcome::format_error(&direct, proxy.as_deref());
+            if let Some(stored) = stored {
+                stored.last_error = Some(error.clone());
+            }
+            let _ = persist_state(&daemon.state_path, &inner.state);
+            (
+                200,
+                "application/json",
+                json!({
+                    "url": source.url,
+                    "refreshed": 0,
+                    "added": 0,
+                    "errors": [error],
+                })
+                .to_string(),
+            )
+        }
+    }
+}
+
+fn handle_subscriptions_list(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let entries: Vec<Value> = inner
+        .state
+        .subscriptions
+        .iter()
+        .map(|s| {
+            json!({
+                "url": s.url,
+                "profile_count": s.profile_count,
+                "last_loaded_unix": s.last_loaded_unix,
+                "last_error": s.last_error,
+            })
+        })
+        .collect();
+    (
+        200,
+        "application/json",
+        json!({"subscriptions": entries, "count": entries.len()}).to_string(),
+    )
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn write_response(
     stream: &mut TcpStream,
     status: u16,
@@ -656,6 +1588,7 @@ fn status_text(code: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        409 => "Conflict",
         500 => "Internal Server Error",
         _ => "OK",
     }
@@ -670,9 +1603,10 @@ fn index_html() -> &'static str {
 <title>HincyRay</title>
 <style>
 :root{color-scheme:light dark}
-body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;max-width:1100px;margin:1.4em auto;padding:0 .8em;color:#1f2328;background:#f6f8fa}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;max-width:1180px;margin:1.4em auto;padding:0 .8em;color:#1f2328;background:#f6f8fa}
 h1{margin:0 0 .15em;font-size:1.6em}
 h2{margin:1.3em 0 .4em;font-size:1.05em;border-bottom:1px solid #d0d7de;padding-bottom:.25em}
+h2 .toggle{font-size:.78em;font-weight:normal;color:#1f6feb;cursor:pointer;margin-left:.5em}
 .subtle{color:#57606a;font-size:.88em}
 code{background:#eaeef2;padding:.12em .35em;border-radius:4px;font-size:.88em}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.6em;margin:.7em 0}
@@ -682,26 +1616,48 @@ code{background:#eaeef2;padding:.12em .35em;border-radius:4px;font-size:.88em}
 .badge{display:inline-block;padding:.12em .5em;border-radius:12px;font-size:.78em;font-weight:600}
 .badge.ok{background:#dafbe1;color:#1a7f37}
 .badge.stop{background:#ffebe9;color:#cf222e}
+.badge.run{background:#ddf4ff;color:#0969da}
 button{font:inherit;padding:.34em .8em;border:1px solid #1f2328;background:#f6f8fa;border-radius:5px;cursor:pointer}
 button:hover{background:#eaeef2}
 button.primary{background:#1f6feb;color:#fff;border-color:#1f6feb}
 button.primary:hover{background:#218bff}
+button.danger{background:#cf222e;color:#fff;border-color:#cf222e}
+button.danger:hover{background:#a40e26}
+button.star{background:transparent;border:none;font-size:1em;color:#d0d7de;cursor:pointer;padding:0 .2em}
+button.star.on{color:#d4a72c}
 .row{display:flex;gap:.5em;flex-wrap:wrap;align-items:center}
-textarea{width:100%;min-height:108px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85em;padding:.5em;border:1px solid #d0d7de;border-radius:6px;box-sizing:border-box}
+textarea,input[type=text],select{font:inherit;padding:.32em .55em;border:1px solid #d0d7de;border-radius:5px;box-sizing:border-box}
+textarea{width:100%;min-height:108px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85em}
+input[type=text]{width:100%}
+.field{display:flex;flex-direction:column;gap:.18em;margin:.25em 0}
+.field label{font-size:.78em;color:#57606a;text-transform:uppercase;letter-spacing:.04em}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.6em}
 table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d0d7de;border-radius:6px;overflow:hidden}
 th,td{padding:.4em .6em;text-align:left;border-bottom:1px solid #eaeef2;font-size:.9em;vertical-align:middle}
 th{background:#eaeef2;font-weight:600}
 tr:last-child td{border-bottom:none}
 tr.active{background:#fff8c5}
+tr.fav td:first-child{border-left:3px solid #d4a72c}
 .msg{margin:.6em 0;padding:.55em .75em;border-radius:6px;font-size:.9em;display:none}
 .msg.err{background:#ffebe9;border:1px solid #ff8182;color:#82071e;display:block}
 .msg.ok{background:#dafbe1;border:1px solid #4ac26b;color:#1a7f37;display:block}
+progress{width:100%;height:6px;border-radius:3px;overflow:hidden}
+.collapsible{display:none}
+.collapsible.open{display:block}
 pre{background:#1f2328;color:#e6edf3;padding:.7em;border-radius:6px;overflow:auto;max-height:420px;font-size:.82em}
+.star.on::after{content:"\2605"}
+.star:not(.on)::after{content:"\2606"}
+tr.group-header td{background:#eaeef2;font-weight:600;cursor:pointer;user-select:none}
+tr.group-header .caret{display:inline-block;width:1em;text-align:center}
+tr.group-header .grp-name{margin-left:.35em}
+tr.group-header .grp-count{color:#57606a;font-weight:normal;font-size:.82em;margin-left:.45em}
+tr.group-header .grp-refresh{margin-left:.7em;font-weight:normal}
+tr.group-row.collapsed{display:none}
 </style>
 </head>
 <body>
 <h1>HincyRay daemon</h1>
-<p class="subtle">Lightweight Keenetic VPN/proxy panel &middot; MVP. Talks to the local JSON API over fetch.</p>
+<p class="subtle">Lightweight Keenetic VPN/proxy panel &middot; v0.2 &middot; ping, stats, favorites, subscription refresh. Talks to the local JSON API over fetch.</p>
 
 <div id="msg" class="msg" role="status" aria-live="polite"></div>
 
@@ -722,19 +1678,83 @@ pre{background:#1f2328;color:#e6edf3;padding:.7em;border-radius:6px;overflow:aut
   <button id="btn-restart">Restart core</button>
 </div>
 
+<h2>Benchmark / ping</h2>
+<p class="subtle">TCP probes <code>address:port</code> directly (no Xray). HEAD/GET spin up a temporary Xray SOCKS per VLESS profile, run curl, then tear it down &mdash; the active core is never touched. Hysteria2 is unsupported by the Xray benchmark; use TCP for it.</p>
+<div class="grid2">
+  <div class="field">
+    <label for="bench-method">Method</label>
+    <select id="bench-method">
+      <option value="tcp">TCP (address:port, no Xray)</option>
+      <option value="head">HEAD via temp Xray SOCKS</option>
+      <option value="get">GET via temp Xray SOCKS (+ short download)</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="probe-url">Probe URL</label>
+    <input type="text" id="probe-url" value="https://www.gstatic.com/generate_204">
+  </div>
+  <div class="field">
+    <label for="download-url">Download URL (GET only)</label>
+    <input type="text" id="download-url" value="https://proof.ovh.net/files/100Mb.dat">
+  </div>
+  <div class="field" style="justify-content:flex-end">
+    <button class="primary" id="btn-bench-all">Ping all</button>
+  </div>
+</div>
+<div class="row" style="margin-top:.3em">
+  <progress id="bench-progress" value="0" max="1"></progress>
+  <span class="subtle" id="bench-progress-text">&mdash;</span>
+</div>
+
 <h2>Import</h2>
-<p class="subtle">Paste a subscription URL, direct share links (<code>vless://</code>, <code>hysteria2://</code>), or an Xray JSON config; one per line or mixed.</p>
+<p class="subtle">Paste a subscription URL, direct share links (<code>vless://</code>, <code>hysteria2://</code>), or an Xray JSON config; one per line or mixed. Subscription URLs are saved for later refresh. Optional group name tags direct profiles so they appear under that group in the table below.</p>
 <textarea id="import-text" placeholder="https://example.com/sub&#10;vless://...&#10;{ &quot;outbounds&quot;: [...] }"></textarea>
-<div class="row" style="margin-top:.4em">
-  <button class="primary" id="btn-import">Import</button>
-  <span class="subtle" id="import-status"></span>
+<div class="grid2" style="margin-top:.4em">
+  <div class="field">
+    <label for="import-group">Group name (optional)</label>
+    <input type="text" id="import-group" placeholder="e.g. Tutnet online">
+  </div>
+  <div class="field" style="justify-content:flex-end">
+    <button class="primary" id="btn-import">Import</button>
+    <span class="subtle" id="import-status"></span>
+  </div>
+</div>
+
+<h2>Subscriptions <span id="subs-toggle" class="toggle">show</span></h2>
+<div id="subs-panel" class="collapsible">
+  <div class="row">
+    <button id="btn-subs-refresh">Refresh all subscriptions</button>
+    <span class="subtle" id="subs-status"></span>
+  </div>
+  <table style="margin-top:.4em">
+    <thead><tr><th>URL</th><th>Profiles</th><th>Last loaded</th><th>Last error</th></tr></thead>
+    <tbody id="subs-body"><tr><td colspan="4" class="subtle">No saved subscriptions.</td></tr></tbody>
+  </table>
 </div>
 
 <h2>Profiles</h2>
+<div class="row" style="margin:.3em 0">
+  <span class="subtle">Sort by:</span>
+  <select id="profile-sort">
+    <option value="default">Import order</option>
+    <option value="rating" selected>Rating (desc)</option>
+    <option value="latency">Latency (asc)</option>
+    <option value="name">Name (A-Z)</option>
+  </select>
+  <span class="subtle">Click a group header to collapse/expand it.</span>
+</div>
 <table>
-  <thead><tr><th>Active</th><th>ID</th><th>Name</th><th>Protocol</th><th>Transport</th><th>Address:port</th><th></th></tr></thead>
-  <tbody id="profiles-body"><tr><td colspan="7" class="subtle">No profiles yet.</td></tr></tbody>
+  <thead><tr><th>Fav</th><th>ID</th><th>Name</th><th>Protocol</th><th>Transport</th><th>Latency (ms)</th><th>Jitter (ms)</th><th>Speed (Mbps)</th><th>Fail</th><th>Score</th><th></th></tr></thead>
+  <tbody id="profiles-body"><tr><td colspan="11" class="subtle">No profiles yet.</td></tr></tbody>
 </table>
+
+<h2>Favorites <span id="fav-toggle" class="toggle">show</span></h2>
+<div id="fav-panel" class="collapsible">
+  <table>
+    <thead><tr><th>ID</th><th>Name</th><th>Protocol</th><th>Address:port</th><th></th></tr></thead>
+    <tbody id="fav-body"><tr><td colspan="5" class="subtle">No favorites yet.</td></tr></tbody>
+  </table>
+</div>
 
 <h2>Generated Xray config</h2>
 <div class="row">
@@ -744,12 +1764,15 @@ pre{background:#1f2328;color:#e6edf3;padding:.7em;border-radius:6px;overflow:aut
 <pre id="xray-config">&mdash;</pre>
 
 <hr class="subtle">
-<p class="subtle">HincyRay daemon &middot; API: <code>/api/health</code>, <code>/api/status</code>, <code>/api/profiles</code>, <code>/api/xray/config</code>, <code>/api/core/*</code>.</p>
+<p class="subtle">HincyRay daemon &middot; API: <code>/api/health</code>, <code>/api/status</code>, <code>/api/profiles</code>, <code>/api/bench/*</code>, <code>/api/stats</code>, <code>/api/favorites/*</code>, <code>/api/subscriptions/refresh</code>, <code>/api/subscriptions/refresh-one</code>, <code>/api/xray/config</code>, <code>/api/core/*</code>.</p>
 
 <script>
 (function(){
 "use strict";
 var msgEl = document.getElementById("msg");
+var benchPollHandle = null;
+var lastStats = [];
+
 function setMsg(text, kind){
   if(!text){ msgEl.className = "msg"; msgEl.textContent = ""; return; }
   msgEl.className = "msg " + (kind || "err");
@@ -790,6 +1813,12 @@ function esc(s){
     .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
 }
 
+function fmtTime(unix){
+  if(!unix){ return "&mdash;"; }
+  var d = new Date(unix * 1000);
+  return esc(d.toLocaleString());
+}
+
 function renderStatus(s){
   var running = s.core_status === "running";
   var coreEl = document.getElementById("card-core");
@@ -803,26 +1832,175 @@ function renderStatus(s){
   document.getElementById("card-xray-path").textContent = s.xray_config_path;
 }
 
-function renderProfiles(profiles){
+function groupLabel(group){
+  // `null`/`undefined` group is shown as "Direct".
+  return (group == null || group === "") ? "Direct" : String(group);
+}
+
+function groupStorageKey(group){
+  // Per-group collapse state in localStorage. Key is namespaced and
+  // contains the group label so URL groups and named groups do not clash.
+  return "hincyray-collapsed-" + groupLabel(group);
+}
+
+function isGroupCollapsed(group){
+  try { return localStorage.getItem(groupStorageKey(group)) === "1"; }
+  catch(e){ return false; }
+}
+
+function setGroupCollapsed(group, collapsed){
+  try { localStorage.setItem(groupStorageKey(group), collapsed ? "1" : "0"); }
+  catch(e){ /* private mode etc — ignore */ }
+}
+
+function isUrlGroup(group){
+  if(!group){ return false; }
+  var g = String(group);
+  return g.indexOf("http://") === 0 || g.indexOf("https://") === 0;
+}
+
+function renderProfiles(profiles, stats){
   var tbody = document.getElementById("profiles-body");
   if(!profiles || !profiles.length){
-    tbody.innerHTML = '<tr><td colspan="7" class="subtle">No profiles yet. Import above.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" class="subtle">No profiles yet. Import above.</td></tr>';
     return;
   }
-  var rows = profiles.map(function(p){
-    var addr = esc(p.address) + ":" + (p.port == null ? "?" : p.port);
-    var activeMark = p.active ? '<span class="badge ok">active</span>' : '';
-    return '<tr class="' + (p.active ? "active" : "") + '">'
-      + '<td>' + activeMark + '</td>'
-      + '<td>' + p.id + '</td>'
-      + '<td>' + esc(p.name) + '</td>'
-      + '<td>' + esc(p.protocol) + '</td>'
-      + '<td>' + esc(p.transport) + '</td>'
-      + '<td>' + addr + '</td>'
-      + '<td><button class="select-btn" data-id="' + p.id + '">Select</button></td>'
-      + '</tr>';
+  var sortKey = document.getElementById("profile-sort").value;
+  var enriched = profiles.map(function(p){
+    var st = (stats || []).find(function(s){ return s.profile_id === p.id; }) || {};
+    return {
+      p: p,
+      score: st.score || 0,
+      latency: st.last_latency_ms || 0,
+      jitter: st.last_jitter_ms || 0,
+      speed: st.last_download_mbps || 0,
+      fail: st.failure_count || 0,
+      name: p.name || ""
+    };
   });
-  tbody.innerHTML = rows.join("");
+  // Sorting applies INSIDE each group, not across groups.
+  function sortGroup(items){
+    if(sortKey === "rating"){
+      items.sort(function(a,b){
+        var d = b.score - a.score;
+        if(d !== 0){ return d; }
+        return a.p.id - b.p.id;
+      });
+    }
+    else if(sortKey === "default"){
+      items.sort(function(a,b){ return a.p.id - b.p.id; });
+    }
+    else if(sortKey === "latency"){
+      items.sort(function(a,b){
+        var la = a.latency || 1e9, lb = b.latency || 1e9;
+        return la - lb;
+      });
+    }
+    else if(sortKey === "name"){ items.sort(function(a,b){ return a.name.localeCompare(b.name); });
+    }
+    return items;
+  }
+
+  // Group order: named/URL groups in first-appearance order, "Direct"
+  // (None) last.
+  var groupOrder = [];
+  var groups = {};
+  enriched.forEach(function(e){
+    var g = e.p.group;
+    if(g === undefined || g === null || g === "") { g = null; }
+    if(!groups.hasOwnProperty(g === null ? "__direct__" : g)){
+      groups[g === null ? "__direct__" : g] = [];
+      if(g === null){ /* Direct is appended last explicitly */ }
+      else { groupOrder.push(g); }
+    }
+    groups[g === null ? "__direct__" : g].push(e);
+  });
+  if(groups.hasOwnProperty("__direct__")){ groupOrder.push(null); }
+
+  var html = [];
+  groupOrder.forEach(function(g){
+    var items = sortGroup(groups[g === null ? "__direct__" : g].slice());
+    var label = groupLabel(g);
+    var collapsed = isGroupCollapsed(g);
+    var caret = collapsed ? "&#9654;" : "&#9660;";
+    var refreshBtn = isUrlGroup(g)
+      ? '<button class="grp-refresh" data-refresh-url="' + esc(g) + '">Refresh</button>'
+      : '';
+    html.push(
+      '<tr class="group-header" data-group-key="' + esc(g === null ? "" : g) + '">'
+      + '<td colspan="11">'
+      + '<span class="caret">' + caret + '</span>'
+      + '<span class="grp-name">' + esc(label) + '</span>'
+      + '<span class="grp-count">' + items.length + ' profile' + (items.length === 1 ? "" : "s") + '</span>'
+      + refreshBtn
+      + '</td></tr>'
+    );
+    items.forEach(function(e){
+      var p = e.p;
+      var favClass = p.favorite ? " fav" : "";
+      var starClass = p.favorite ? "star on" : "star";
+      var rowClass = (p.active ? "active" : "") + favClass + " group-row" + (collapsed ? " collapsed" : "");
+      html.push(
+        '<tr class="' + rowClass.trim() + '" data-group-row="' + esc(g === null ? "" : g) + '">'
+        + '<td><button class="' + starClass + '" data-fav="' + p.id + '" title="Toggle favorite"></button></td>'
+        + '<td>' + p.id + '</td>'
+        + '<td>' + esc(p.name) + '</td>'
+        + '<td>' + esc(p.protocol) + '</td>'
+        + '<td>' + esc(p.transport) + '</td>'
+        + '<td>' + (e.latency || 0) + '</td>'
+        + '<td>' + (e.jitter || 0) + '</td>'
+        + '<td>' + (e.speed ? e.speed.toFixed(1) : "0.0") + '</td>'
+        + '<td>' + (e.fail || 0) + '</td>'
+        + '<td><strong>' + (e.score || 0) + '</strong></td>'
+        + '<td class="row">'
+          + '<button class="ping-btn" data-id="' + p.id + '">Ping</button>'
+          + '<button class="select-btn" data-id="' + p.id + '">Select</button>'
+        + '</td>'
+        + '</tr>'
+      );
+    });
+  });
+  tbody.innerHTML = html.join("");
+
+  // Group header click: toggle collapse of the following rows in the
+  // same group, persist to localStorage, and update the caret.
+  Array.prototype.forEach.call(tbody.querySelectorAll("tr.group-header"), function(hdr){
+    hdr.addEventListener("click", function(ev){
+      // Ignore clicks on the per-group Refresh button (it has its own
+      // handler that should not also toggle the group).
+      if(ev.target && ev.target.classList && ev.target.classList.contains("grp-refresh")){ return; }
+      var key = hdr.getAttribute("data-group-key") || "";
+      var g = key === "" ? null : key;
+      var nowCollapsed = !isGroupCollapsed(g);
+      setGroupCollapsed(g, nowCollapsed);
+      var caretEl = hdr.querySelector(".caret");
+      if(caretEl){ caretEl.innerHTML = nowCollapsed ? "&#9654;" : "&#9660;"; }
+      Array.prototype.forEach.call(
+        tbody.querySelectorAll('tr.group-row[data-group-row="' + (g === null ? "" : esc(g)) + '"]'),
+        function(row){
+          if(nowCollapsed){ row.classList.add("collapsed"); }
+          else { row.classList.remove("collapsed"); }
+        }
+      );
+    });
+  });
+
+  Array.prototype.forEach.call(tbody.querySelectorAll(".grp-refresh"), function(btn){
+    btn.addEventListener("click", function(ev){
+      ev.stopPropagation();
+      var url = btn.getAttribute("data-refresh-url");
+      if(!url){ return; }
+      api("POST", "/api/subscriptions/refresh-one", JSON.stringify({url: url})).then(function(data){
+        if(data.errors && data.errors.length){
+          setMsg("Refresh failed: " + data.errors.join("; "), "err");
+        } else {
+          showOk("Subscription refreshed: +" + (data.added || 0) + " new profile(s).");
+        }
+        return refreshAll();
+      }).catch(function(err){ setMsg("Refresh failed: " + err.message); });
+    });
+  });
+
   Array.prototype.forEach.call(tbody.querySelectorAll(".select-btn"), function(btn){
     btn.addEventListener("click", function(){
       var id = btn.getAttribute("data-id");
@@ -834,15 +2012,176 @@ function renderProfiles(profiles){
         .catch(function(err){ setMsg("Select failed: " + err.message); });
     });
   });
+  Array.prototype.forEach.call(tbody.querySelectorAll(".ping-btn"), function(btn){
+    btn.addEventListener("click", function(){
+      var id = Number(btn.getAttribute("data-id"));
+      startBench([id]);
+    });
+  });
+  Array.prototype.forEach.call(tbody.querySelectorAll("[data-fav]"), function(btn){
+    btn.addEventListener("click", function(){
+      var id = Number(btn.getAttribute("data-fav"));
+      api("POST", "/api/favorites/toggle", JSON.stringify({profile_id: id}))
+        .then(function(){ return refreshAll(); })
+        .catch(function(err){ setMsg("Favorite toggle failed: " + err.message); });
+    });
+  });
+}
+
+function renderFavorites(profiles){
+  var tbody = document.getElementById("fav-body");
+  if(!profiles || !profiles.length){
+    tbody.innerHTML = '<tr><td colspan="5" class="subtle">No favorites yet.</td></tr>';
+    return;
+  }
+  var rows = profiles.map(function(p){
+    var addr = esc(p.address) + ":" + (p.port == null ? "?" : p.port);
+    return '<tr>'
+      + '<td>' + p.profile_id + '</td>'
+      + '<td>' + esc(p.name) + '</td>'
+      + '<td>' + esc(p.protocol) + '</td>'
+      + '<td>' + addr + '</td>'
+      + '<td><button class="select-btn" data-id="' + p.profile_id + '">Select</button></td>'
+      + '</tr>';
+  });
+  tbody.innerHTML = rows.join("");
+  Array.prototype.forEach.call(tbody.querySelectorAll(".select-btn"), function(btn){
+    btn.addEventListener("click", function(){
+      var id = btn.getAttribute("data-id");
+      api("POST", "/api/active-profile", JSON.stringify({profile_id: Number(id)}))
+        .then(function(){ showOk("Profile " + id + " selected."); return refreshAll(); })
+        .catch(function(err){ setMsg("Select failed: " + err.message); });
+    });
+  });
+}
+
+function renderSubscriptions(subs){
+  var tbody = document.getElementById("subs-body");
+  if(!subs || !subs.length){
+    tbody.innerHTML = '<tr><td colspan="4" class="subtle">No saved subscriptions. Import a subscription URL to save it here.</td></tr>';
+    return;
+  }
+  var rows = subs.map(function(s){
+    var err = s.last_error ? esc(s.last_error).slice(0, 80) : "&mdash;";
+    return '<tr>'
+      + '<td><code>' + esc(s.url) + '</code></td>'
+      + '<td>' + (s.profile_count || 0) + '</td>'
+      + '<td>' + fmtTime(s.last_loaded_unix) + '</td>'
+      + '<td>' + err + '</td>'
+      + '</tr>';
+  });
+  tbody.innerHTML = rows.join("");
+}
+
+function renderBenchStatus(b){
+  var progress = document.getElementById("bench-progress");
+  var text = document.getElementById("bench-progress-text");
+  var btnAll = document.getElementById("btn-bench-all");
+  if(b.running){
+    var pct = b.total > 0 ? b.completed / b.total : 0;
+    progress.max = b.total || 1;
+    progress.value = b.completed;
+    var cur = b.current_profile_name ? ("current: " + esc(b.current_profile_name)) : "";
+    text.innerHTML = (b.method || "") + " " + b.completed + "/" + b.total
+      + (b.cancel_requested ? " (stopping)" : "")
+      + (cur ? " &middot; " + cur : "");
+    btnAll.textContent = "Stop ping";
+    btnAll.classList.remove("primary");
+    btnAll.classList.add("danger");
+  } else {
+    progress.value = 0;
+    progress.max = 1;
+    if(b.total > 0 && b.completed >= b.total){
+      var sum = b.summary || {};
+      text.innerHTML = "last run: " + (b.method || "")
+        + " " + sum.passed + "/" + sum.total + " ok"
+        + (sum.failed ? ", " + sum.failed + " failed" : "");
+    } else {
+      text.textContent = "—";
+    }
+    btnAll.textContent = "Ping all";
+    btnAll.classList.add("primary");
+    btnAll.classList.remove("danger");
+  }
 }
 
 function refreshAll(){
-  return Promise.all([ api("GET","/api/status"), api("GET","/api/profiles") ])
-    .then(function(results){
-      renderStatus(results[0]);
-      renderProfiles(results[1].profiles || []);
-    })
-    .catch(function(err){ setMsg("Refresh failed: " + err.message); });
+  var promises = [
+    api("GET","/api/status"),
+    api("GET","/api/profiles"),
+    api("GET","/api/stats"),
+    api("GET","/api/favorites"),
+    api("GET","/api/bench/status"),
+    api("GET","/api/subscriptions")
+  ];
+  return Promise.all(promises).then(function(results){
+    renderStatus(results[0]);
+    var stats = results[2].stats || [];
+    lastStats = stats;
+    var profiles = (results[1].profiles || []).map(function(p){
+      var st = stats.find(function(s){ return s.profile_id === p.id; });
+      p.favorite = st ? st.favorite : false;
+      return p;
+    });
+    renderProfiles(profiles, stats);
+    renderFavorites(results[3].favorites || []);
+    renderBenchStatus(results[4]);
+    renderSubscriptions(results[5].subscriptions || []);
+    maybePollBench(results[4]);
+  }).catch(function(err){ setMsg("Refresh failed: " + err.message); });
+}
+
+function loadSubscriptions(){
+  return api("GET", "/api/subscriptions").then(function(data){
+    renderSubscriptions(data.subscriptions || []);
+  }).catch(function(){ /* leave panel as-is */ });
+}
+
+function maybePollBench(b){
+  if(b && b.running){
+    if(benchPollHandle){ return; }
+    benchPollHandle = setInterval(function(){
+      api("GET","/api/bench/status").then(function(status){
+        renderBenchStatus(status);
+        if(!status.running){
+          stopBenchPoll();
+          refreshAll();
+        }
+      }).catch(function(){ /* keep polling, transient */ });
+    }, 1500);
+  } else {
+    stopBenchPoll();
+  }
+}
+
+function stopBenchPoll(){
+  if(benchPollHandle){ clearInterval(benchPollHandle); benchPollHandle = null; }
+}
+
+function startBench(profileIds){
+  var method = document.getElementById("bench-method").value;
+  var probeUrl = document.getElementById("probe-url").value.trim();
+  var downloadUrl = document.getElementById("download-url").value.trim();
+  var body = JSON.stringify({
+    method: method,
+    probe_url: probeUrl,
+    download_url: downloadUrl,
+    profile_ids: profileIds
+  });
+  api("POST", "/api/bench/start", body).then(function(data){
+    showOk("Benchmark started: " + (data.method || method) + ", " + (data.total || 0) + " profile(s).");
+    return refreshAll();
+  }).catch(function(err){
+    setMsg("Benchmark start failed: " + err.message);
+    return refreshAll();
+  });
+}
+
+function stopBench(){
+  api("POST", "/api/bench/stop").then(function(){
+    showOk("Stop requested. In-flight profile will finish first.");
+    return refreshAll();
+  }).catch(function(err){ setMsg("Stop failed: " + err.message); });
 }
 
 function coreAction(path, label){
@@ -852,17 +2191,54 @@ function coreAction(path, label){
   }).catch(function(err){ setMsg(label + " failed: " + err.message); });
 }
 
+function toggleCollapsible(toggleId, panelId){
+  var t = document.getElementById(toggleId);
+  var p = document.getElementById(panelId);
+  if(!t || !p){ return; }
+  if(p.classList.contains("open")){
+    p.classList.remove("open");
+    t.textContent = "show";
+  } else {
+    p.classList.add("open");
+    t.textContent = "hide";
+  }
+}
+
 document.getElementById("btn-refresh").addEventListener("click", function(){ clearMsg(); refreshAll(); });
 document.getElementById("btn-start").addEventListener("click", function(){ coreAction("/api/core/start", "Start core"); });
 document.getElementById("btn-stop").addEventListener("click", function(){ coreAction("/api/core/stop", "Stop core"); });
 document.getElementById("btn-restart").addEventListener("click", function(){ coreAction("/api/core/restart", "Restart core"); });
 
+document.getElementById("btn-bench-all").addEventListener("click", function(){
+  // Toggle action depends on current state.
+  api("GET", "/api/bench/status").then(function(b){
+    if(b.running){ stopBench(); }
+    else { startBench([]); }
+  }).catch(function(err){ setMsg("Status check failed: " + err.message); });
+});
+
+document.getElementById("profile-sort").addEventListener("change", function(){
+  // Re-render with the latest profiles/stats without a network round trip.
+  api("GET", "/api/profiles").then(function(profilesResp){
+    var profiles = (profilesResp.profiles || []).map(function(p){
+      var st = lastStats.find(function(s){ return s.profile_id === p.id; });
+      p.favorite = st ? st.favorite : false;
+      return p;
+    });
+    renderProfiles(profiles, lastStats);
+  }).catch(function(){ /* ignore */ });
+});
+
 document.getElementById("btn-import").addEventListener("click", function(){
   var text = document.getElementById("import-text").value.trim();
   if(!text){ setMsg("Paste something first."); return; }
+  var group = (document.getElementById("import-group").value || "").trim();
+  // Always send the JSON shape now: {text, group}. The handler on the
+  // daemon side still accepts raw text for backward compatibility.
+  var body = JSON.stringify({text: text, group: group ? group : null});
   var status = document.getElementById("import-status");
   status.textContent = "Importing…";
-  api("POST", "/api/profiles/import", text).then(function(data){
+  api("POST", "/api/profiles/import", body).then(function(data){
     status.textContent = "";
     var parts = ["added " + data.added, "total " + data.profile_count];
     if(data.errors && data.errors.length){
@@ -871,6 +2247,7 @@ document.getElementById("btn-import").addEventListener("click", function(){
       showOk("Imported: " + parts.join(", "));
     }
     document.getElementById("import-text").value = "";
+    document.getElementById("import-group").value = "";
     return refreshAll();
   }).catch(function(err){
     status.textContent = "";
@@ -878,10 +2255,34 @@ document.getElementById("btn-import").addEventListener("click", function(){
   });
 });
 
+document.getElementById("btn-subs-refresh").addEventListener("click", function(){
+  var status = document.getElementById("subs-status");
+  status.textContent = "Refreshing…";
+  api("POST", "/api/subscriptions/refresh").then(function(data){
+    status.textContent = "refreshed " + data.refreshed + ", added " + data.added;
+    if(data.errors && data.errors.length){
+      setMsg("Subscription refresh had errors: " + data.errors.join("; "), "err");
+    } else {
+      showOk("Subscriptions refreshed: +" + data.added + " profile(s).");
+    }
+    return refreshAll();
+  }).catch(function(err){
+    status.textContent = "";
+    setMsg("Refresh failed: " + err.message);
+  });
+});
+
 document.getElementById("btn-load-config").addEventListener("click", function(){
   api("GET", "/api/xray/config").then(function(data){
     document.getElementById("xray-config").textContent = JSON.stringify(data, null, 2);
   }).catch(function(err){ setMsg("Load config failed: " + err.message); });
+});
+
+document.getElementById("subs-toggle").addEventListener("click", function(){
+  toggleCollapsible("subs-toggle", "subs-panel");
+});
+document.getElementById("fav-toggle").addEventListener("click", function(){
+  toggleCollapsible("fav-toggle", "fav-panel");
 });
 
 refreshAll();
@@ -905,6 +2306,30 @@ mod tests {
     }
 
     #[test]
+    fn proxy_info_for_daemon_uses_state_socks_port() {
+        let (_dir, daemon) = test_daemon();
+        let mut inner = lock(&daemon.inner);
+        let proxy_info = proxy_info_for_daemon(&mut inner);
+        // Default state has the core stopped, so no fallback should be
+        // attempted by load_subscription_for_daemon. The SOCKS URL is
+        // built from listen_host + socks_port.
+        assert!(!proxy_info.core_running);
+        assert_eq!(proxy_info.socks_url, "socks5h://127.0.0.1:10808");
+    }
+
+    #[test]
+    fn format_error_combines_direct_and_proxy_messages() {
+        let direct = "https://provider.example/sub/x: connection refused";
+        let proxy = "socks5h://127.0.0.1:10808: connect error";
+        let combined = SubscriptionLoadOutcome::format_error(direct, Some(proxy));
+        assert!(combined.contains(direct));
+        assert!(combined.contains("via proxy"));
+        assert!(combined.contains(proxy));
+        let direct_only = SubscriptionLoadOutcome::format_error(direct, None);
+        assert_eq!(direct_only, direct);
+    }
+
+    #[test]
     fn state_round_trips_through_json_with_defaults() {
         let dir = TempDir::new().expect("temp dir");
         let state_path = dir.path().join("nested/state.json");
@@ -917,6 +2342,7 @@ mod tests {
             port: Some(443),
             raw: "vless://11111111-1111-1111-1111-111111111111@example.com:443#demo".to_owned(),
             selected: true,
+            group: None,
         });
         state.active_profile_id = Some(0);
 
@@ -1092,6 +2518,181 @@ mod tests {
     }
 
     #[test]
+    fn import_with_group_name_tags_profiles() {
+        // JSON body `{"text": ..., "group": "Tutnet online"}` must tag
+        // every directly-parsed profile with that group name. The
+        // import response echoes the group back for the UI.
+        let (_dir, daemon) = test_daemon();
+        let body = r#"{"text":"vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo","group":"Tutnet online"}"#;
+        let (status, _, response_text) = handle_import(body, &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&response_text).expect("parse response");
+        assert_eq!(response["profile_count"], 1);
+        assert_eq!(response["added"], 1);
+        assert_eq!(response["group"], "Tutnet online");
+
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 1);
+        assert_eq!(
+            inner.state.profiles[0].group.as_deref(),
+            Some("Tutnet online")
+        );
+    }
+
+    #[test]
+    fn import_raw_text_without_group_leaves_none() {
+        // Backward-compatible raw-text body (no JSON, no group) must
+        // leave the new `group` field as `None`.
+        let (_dir, daemon) = test_daemon();
+        let body = "vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo";
+        let (status, _, response_text) = handle_import(body, &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&response_text).expect("parse response");
+        assert_eq!(response["profile_count"], 1);
+        assert!(
+            response["group"].is_null(),
+            "group should be null in response"
+        );
+
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 1);
+        assert!(inner.state.profiles[0].group.is_none());
+    }
+
+    #[test]
+    fn profiles_endpoint_includes_group() {
+        // `/api/profiles` exposes `group` per profile (null when None)
+        // so the UI can build collapsible groups without /api/stats.
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            r#"{"text":"vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo","group":"Tutnet online"}"#,
+            &daemon,
+        );
+        let (_, _, body) = dispatch("GET", "/api/profiles", "", &daemon);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        let profiles = response["profiles"].as_array().expect("profiles array");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0]["group"], "Tutnet online");
+    }
+
+    #[test]
+    fn profiles_endpoint_group_is_null_for_ungrouped_direct_import() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo",
+            &daemon,
+        );
+        let (_, _, body) = dispatch("GET", "/api/profiles", "", &daemon);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        let profiles = response["profiles"].as_array().expect("profiles array");
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles[0]["group"].is_null());
+    }
+
+    #[test]
+    fn import_json_without_group_field_leaves_none() {
+        // JSON body that omits the group field is the same as raw text
+        // from a group perspective: group stays None.
+        let (_dir, daemon) = test_daemon();
+        let body =
+            r#"{"text":"vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo"}"#;
+        let (status, _, _) = handle_import(body, &daemon);
+        assert_eq!(status, 200);
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 1);
+        assert!(inner.state.profiles[0].group.is_none());
+    }
+
+    #[test]
+    fn import_does_not_overwrite_existing_group_on_dedup() {
+        // Re-importing the same raw link with a different group name
+        // must NOT overwrite the existing profile's group (otherwise a
+        // later import could silently change a profile's group).
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            r#"{"text":"vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo","group":"First"}"#,
+            &daemon,
+        );
+        handle_import(
+            r#"{"text":"vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo","group":"Second"}"#,
+            &daemon,
+        );
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 1);
+        assert_eq!(inner.state.profiles[0].group.as_deref(), Some("First"));
+    }
+
+    #[test]
+    fn import_fills_group_for_previously_ungrouped_profile() {
+        // First import without a group, then again with one: the new
+        // group should be adopted because the existing profile had no
+        // group yet (the safe upgrade path documented in handle_import).
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo",
+            &daemon,
+        );
+        handle_import(
+            r#"{"text":"vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo","group":"Late"}"#,
+            &daemon,
+        );
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 1);
+        assert_eq!(inner.state.profiles[0].group.as_deref(), Some("Late"));
+    }
+
+    #[test]
+    fn stats_endpoint_includes_group() {
+        // /api/stats must also expose `group` so the UI can group the
+        // unified table from stats alone if needed.
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            r#"{"text":"vless://11111111-1111-1111-1111-111111111111@example.com:443#Demo","group":"Tutnet online"}"#,
+            &daemon,
+        );
+        let (status, _, body) = dispatch("GET", "/api/stats", "", &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        let stats = response["stats"].as_array().expect("stats array");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0]["group"], "Tutnet online");
+    }
+
+    #[test]
+    fn subscriptions_refresh_one_rejects_unknown_url() {
+        // Refreshing an unsaved URL must 404 without any network I/O.
+        let (_dir, daemon) = test_daemon();
+        let (status, _, _) = dispatch(
+            "POST",
+            "/api/subscriptions/refresh-one",
+            r#"{"url":"https://provider.example/sub/never-saved"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn subscriptions_refresh_one_rejects_missing_url() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) =
+            dispatch("POST", "/api/subscriptions/refresh-one", r#"{}"#, &daemon);
+        assert_eq!(status, 400);
+        assert!(body.contains("missing url"));
+    }
+
+    #[test]
+    fn subscriptions_refresh_one_rejects_invalid_json() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, _) = dispatch(
+            "POST",
+            "/api/subscriptions/refresh-one",
+            "not json",
+            &daemon,
+        );
+        assert_eq!(status, 400);
+    }
+
+    #[test]
     fn root_endpoint_returns_html() {
         let (_dir, daemon) = test_daemon();
         let (status, content_type, body) = dispatch("GET", "/", "", &daemon);
@@ -1106,5 +2707,309 @@ mod tests {
         let (status, _, body) = dispatch("POST", "/api/core/stop", "", &daemon);
         assert_eq!(status, 200);
         assert!(body.contains("\"core_status\":\"stopped\""));
+    }
+
+    #[test]
+    fn legacy_state_json_without_v02_fields_loads_with_defaults() {
+        // Pre-v0.2 state file: no subscriptions, favorites, stats, or
+        // profile `group` keys. serde defaults must fill them in so
+        // existing state.json on routers upgrades cleanly, and the new
+        // `group` field deserialises to `None`.
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let legacy = r#"{
+            "profiles": [
+                {
+                    "id": 0,
+                    "name": "demo",
+                    "protocol": "Vless",
+                    "address": "example.com",
+                    "port": 443,
+                    "raw": "vless://11111111-1111-1111-1111-111111111111@example.com:443#demo",
+                    "selected": true
+                }
+            ],
+            "active_profile_id": 0,
+            "auto_select": false,
+            "listen_host": "127.0.0.1",
+            "socks_port": 10808,
+            "http_port": 10809,
+            "xray_path": "xray",
+            "metrics_history": [],
+            "routing_rules": []
+        }"#;
+        fs::write(&state_path, legacy).expect("write legacy state");
+        let loaded = load_state(&state_path);
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.active_profile_id, Some(0));
+        assert!(
+            loaded.profiles[0].group.is_none(),
+            "group must default to None"
+        );
+        assert!(loaded.subscriptions.is_empty());
+        assert!(loaded.favorites.is_empty());
+        assert!(loaded.stats.is_empty());
+    }
+
+    #[test]
+    fn bench_status_defaults_to_not_running() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("GET", "/api/bench/status", "", &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(response["running"], false);
+        assert_eq!(response["total"], 0);
+        assert_eq!(response["completed"], 0);
+        assert_eq!(response["cancel_requested"], false);
+    }
+
+    #[test]
+    fn bench_start_rejects_unknown_method() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) =
+            dispatch("POST", "/api/bench/start", r#"{"method":"quic"}"#, &daemon);
+        assert_eq!(status, 400);
+        assert!(body.contains("unknown method"));
+    }
+
+    #[test]
+    fn bench_start_rejects_empty_profile_set() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) =
+            dispatch("POST", "/api/bench/start", r#"{"method":"tcp"}"#, &daemon);
+        assert_eq!(status, 400);
+        assert!(body.contains("no profiles to benchmark"));
+    }
+
+    #[test]
+    fn bench_start_returns_409_when_already_running() {
+        let (_dir, daemon) = test_daemon();
+        // Simulate a running job without actually spawning the worker.
+        let job: SharedJob = Arc::new(Mutex::new(BenchJob {
+            running: true,
+            ..Default::default()
+        }));
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.bench.job = Some(Arc::clone(&job));
+            inner.bench.cancel = Some(Arc::new(AtomicBool::new(false)));
+        }
+        // Import a profile so the empty-profile guard does not fire.
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
+            &daemon,
+        );
+        let (status, _, body) =
+            dispatch("POST", "/api/bench/start", r#"{"method":"tcp"}"#, &daemon);
+        assert_eq!(status, 409);
+        assert!(body.contains("already running"));
+    }
+
+    #[test]
+    fn bench_stop_when_idle_reports_not_running() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("POST", "/api/bench/stop", "", &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(response["stopped"], false);
+    }
+
+    #[test]
+    fn stats_endpoint_lists_imported_profile_with_zeroes() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
+            &daemon,
+        );
+        let (status, _, body) = dispatch("GET", "/api/stats", "", &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        let stats = response["stats"].as_array().expect("stats array");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0]["name"], "Demo");
+        assert_eq!(stats[0]["score"], 0);
+        assert_eq!(stats[0]["favorite"], false);
+        assert_eq!(stats[0]["active"], false);
+    }
+
+    #[test]
+    fn favorites_toggle_adds_then_removes_by_id() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
+            &daemon,
+        );
+
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/favorites/toggle",
+            r#"{"profile_id":0}"#,
+            &daemon,
+        );
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(response["favorite"], true);
+
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.favorites.len(), 1);
+        drop(inner);
+
+        // Toggle again removes it.
+        let (_, _, body) = dispatch(
+            "POST",
+            "/api/favorites/toggle",
+            r#"{"profile_id":0}"#,
+            &daemon,
+        );
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(response["favorite"], false);
+
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.favorites.is_empty());
+    }
+
+    #[test]
+    fn favorites_toggle_returns_404_for_missing_profile() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, _) = dispatch(
+            "POST",
+            "/api/favorites/toggle",
+            r#"{"profile_id":99}"#,
+            &daemon,
+        );
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn favorites_toggle_rejects_missing_field() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, _) = dispatch("POST", "/api/favorites/toggle", r#"{}"#, &daemon);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn favorites_list_endpoint_returns_imported_favorites() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
+            &daemon,
+        );
+        dispatch(
+            "POST",
+            "/api/favorites/toggle",
+            r#"{"profile_id":0}"#,
+            &daemon,
+        );
+        let (status, _, body) = dispatch("GET", "/api/favorites", "", &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        let favorites = response["favorites"].as_array().expect("favorites array");
+        assert_eq!(favorites.len(), 1);
+        assert_eq!(favorites[0]["name"], "Demo");
+    }
+
+    #[test]
+    fn subscriptions_refresh_with_no_sources_returns_note() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("POST", "/api/subscriptions/refresh", "", &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(response["refreshed"], 0);
+        assert!(response["note"].as_str().is_some());
+    }
+
+    #[test]
+    fn apply_bench_result_updates_stats_and_history() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
+            &daemon,
+        );
+        let raw = lock(&daemon.inner).state.profiles[0].raw.clone();
+
+        let success = BenchResult {
+            profile_id: 0,
+            profile_name: "Demo".to_owned(),
+            profile_raw: raw.clone(),
+            method: "tcp".to_owned(),
+            latency_ms: 80,
+            jitter_ms: 4,
+            download_mbps: 0.0,
+            loss_percent: 0.0,
+            score: 70,
+            success: true,
+            error: None,
+            timestamp: 1_700_000_000,
+        };
+        apply_bench_result(&daemon, success);
+
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.stats.len(), 1);
+        let stat = &inner.state.stats[0];
+        assert_eq!(stat.profile_raw, raw);
+        assert_eq!(stat.last_latency_ms, 80);
+        assert_eq!(stat.last_score, 70);
+        assert_eq!(stat.success_count, 1);
+        assert_eq!(stat.failure_count, 0);
+        assert_eq!(inner.state.metrics_history.len(), 1);
+        drop(inner);
+
+        // A failure outcome increments failure_count and stores last_error.
+        let failure = BenchResult {
+            profile_id: 0,
+            profile_name: "Demo".to_owned(),
+            profile_raw: raw,
+            method: "tcp".to_owned(),
+            latency_ms: 0,
+            jitter_ms: 0,
+            download_mbps: 0.0,
+            loss_percent: 100.0,
+            score: 0,
+            success: false,
+            error: Some("tcp connect failed".to_owned()),
+            timestamp: 1_700_000_001,
+        };
+        apply_bench_result(&daemon, failure);
+        let inner = lock(&daemon.inner);
+        let stat = &inner.state.stats[0];
+        assert_eq!(stat.success_count, 1);
+        assert_eq!(stat.failure_count, 1);
+        assert_eq!(stat.last_error.as_deref(), Some("tcp connect failed"));
+        assert_eq!(inner.state.metrics_history.len(), 2);
+    }
+
+    #[test]
+    fn apply_bench_result_caps_history_at_max() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
+            &daemon,
+        );
+        let raw = lock(&daemon.inner).state.profiles[0].raw.clone();
+        for i in 0..(MAX_HISTORY_SAMPLES + 5) {
+            apply_bench_result(
+                &daemon,
+                BenchResult {
+                    profile_id: 0,
+                    profile_name: "Demo".to_owned(),
+                    profile_raw: raw.clone(),
+                    method: "tcp".to_owned(),
+                    latency_ms: 10 + i as u32,
+                    jitter_ms: 0,
+                    download_mbps: 0.0,
+                    loss_percent: 0.0,
+                    score: 50,
+                    success: true,
+                    error: None,
+                    timestamp: 1_700_000_000 + i as u64,
+                },
+            );
+        }
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.metrics_history.len(), MAX_HISTORY_SAMPLES);
+        // The oldest samples should have been dropped; the first kept
+        // sample's latency must be greater than the very first sample's.
+        let first_kept = &inner.state.metrics_history[0];
+        assert!(first_kept.latency_ms > 10);
     }
 }

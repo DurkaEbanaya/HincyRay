@@ -56,6 +56,14 @@ pub struct Profile {
     pub port: Option<u16>,
     pub raw: String,
     pub selected: bool,
+    /// Optional subscription/group label. `None` (absent in older
+    /// state files, populated via `serde(default)`) is shown as the
+    /// "Direct" group in the daemon web panel. Profiles loaded from a
+    /// subscription URL are tagged with that URL so the UI can group
+    /// them; profiles pasted directly are tagged with the user-supplied
+    /// group name (if any) on import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,11 +133,23 @@ pub fn load_subscription(source: &SubscriptionSource) -> Result<Vec<Profile>, St
 pub fn load_subscription_detailed(
     source: &SubscriptionSource,
 ) -> Result<SubscriptionLoadReport, String> {
-    let mut response = fetch_subscription(source, SubscriptionRequestMode::SingBox)?;
+    load_subscription_detailed_via_proxy(source, None)
+}
+
+/// Fetch and parse a subscription, optionally through a proxy URL
+/// (e.g. `socks5h://127.0.0.1:10808`). Used by the HincyRay daemon to
+/// fall back to the local Xray SOCKS inbound on isolated routers when
+/// direct fetch fails. `proxy = None` is the desktop path and must
+/// behave exactly like `load_subscription_detailed`.
+pub fn load_subscription_detailed_via_proxy(
+    source: &SubscriptionSource,
+    proxy: Option<&str>,
+) -> Result<SubscriptionLoadReport, String> {
+    let mut response = fetch_subscription(source, SubscriptionRequestMode::SingBox, proxy)?;
     let (mut decoded, mut parsed) = parse_subscription_response(&response);
 
     if should_retry_as_happ(&parsed) {
-        response = fetch_subscription(source, SubscriptionRequestMode::HappAndroid)?;
+        response = fetch_subscription(source, SubscriptionRequestMode::HappAndroid, proxy)?;
         (decoded, parsed) = parse_subscription_response(&response);
     }
 
@@ -149,14 +169,20 @@ enum SubscriptionRequestMode {
 fn fetch_subscription(
     source: &SubscriptionSource,
     mode: SubscriptionRequestMode,
+    proxy: Option<&str>,
 ) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(match mode {
-            SubscriptionRequestMode::SingBox => subscription_user_agent(),
-            SubscriptionRequestMode::HappAndroid => happ_user_agent(),
-        })
-        .build()
-        .map_err(|error| error.to_string())?;
+    let mut builder = reqwest::blocking::Client::builder().user_agent(match mode {
+        SubscriptionRequestMode::SingBox => subscription_user_agent(),
+        SubscriptionRequestMode::HappAndroid => happ_user_agent(),
+    });
+    if let Some(proxy_url) = proxy {
+        // `Proxy::all` validates the URL before any network I/O, so a
+        // malformed proxy surfaces here without touching the network.
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .map_err(|error| format!("{}: proxy {proxy_url}: {error}", source.url))?;
+        builder = builder.proxy(proxy);
+    }
+    let client = builder.build().map_err(|error| error.to_string())?;
     let mut request = client.get(&source.url);
 
     if matches!(mode, SubscriptionRequestMode::HappAndroid) {
@@ -299,6 +325,7 @@ fn parse_profile_candidate(candidate: &str) -> Option<Profile> {
         port,
         raw: candidate.to_owned(),
         selected: true,
+        group: None,
     })
 }
 
@@ -447,7 +474,7 @@ fn percent_decode_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_input;
+    use super::{SubscriptionSource, load_subscription_detailed_via_proxy, parse_input};
 
     #[test]
     fn parses_subscription_urls_from_rtf_text() {
@@ -616,5 +643,22 @@ https://provider.example/sub/token-b}"#;
         assert!(output.profiles[0].raw.contains("type=xhttp"));
         assert!(output.profiles[0].raw.contains("path=%2Fcheck%2Dupdate"));
         assert!(output.profiles[0].raw.contains("mode=auto"));
+    }
+
+    #[test]
+    fn load_via_proxy_rejects_malformed_proxy_url_without_network() {
+        // `reqwest::Proxy::all` validates the URL up front, so a clearly
+        // malformed proxy string surfaces as an error mentioning "proxy"
+        // before any TCP connection is attempted. This pins the
+        // direct-vs-proxy split behaviour the daemon relies on.
+        let source = SubscriptionSource {
+            url: "https://provider.example/sub/none".to_owned(),
+        };
+        let error = load_subscription_detailed_via_proxy(&source, Some("not a valid url"))
+            .expect_err("malformed proxy should error");
+        assert!(
+            error.contains("proxy"),
+            "error should mention proxy marker: {error}"
+        );
     }
 }

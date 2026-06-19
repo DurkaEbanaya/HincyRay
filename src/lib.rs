@@ -1,5 +1,6 @@
 // Shared modules: available in every build, including the lightweight
 // `hincyray` router daemon built with `--no-default-features`.
+pub mod benchmark;
 pub mod hincyray;
 pub mod profiles;
 pub mod scoring;

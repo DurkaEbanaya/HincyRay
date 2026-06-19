@@ -1,5 +1,7 @@
 # HincyRay v0.1 status
 
+> **v0.2 update**: as of crate version `0.2.0`, the daemon also ships background ping/benchmark (`/api/bench/*`), per-profile stats and ratings (`/api/stats`), favorites (`/api/favorites/*`), and subscription refresh (`/api/subscriptions/*`). The v0.1 baseline described below is unchanged; see the [README](../README.md) for the v0.2 API table and the web panel's benchmark/stats/favorites/subscriptions controls.
+
 Version: **0.1.0** (crate version in `Cargo.toml`). The **v0.1.1 add-on** shipped in `scripts/` introduces an opt-in WiFi VPN segment via TPROXY; the crate version is not bumped yet, so the daemon still reports `0.1.0` on `/api/health`.
 
 This document records what is implemented, what was validated on real hardware, what is intentionally not implemented, and the next milestones. It is the authoritative v0.1 status snapshot; the long-form plan lives in [`keenetic-client-roadmap.md`](keenetic-client-roadmap.md).
