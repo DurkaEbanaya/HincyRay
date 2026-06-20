@@ -12,11 +12,142 @@ use url::Url;
 
 use crate::profiles::{Profile, Protocol};
 
+pub const WIFI_TPROXY_INBOUND_TAG: &str = "wifi-tproxy";
+pub const DIRECT_OUTBOUND_TAG: &str = "direct";
+pub const ACTIVE_OUTBOUND_TAG: &str = "active";
+pub const BLOCK_OUTBOUND_TAG: &str = "block";
+
+/// A daemon-level Xray routing rule after HincyRay has resolved UI targets
+/// (active/fixed/direct) into concrete outbound tags.
+#[derive(Clone, Debug)]
+pub struct XrayRouteRule {
+    pub domains: Vec<String>,
+    pub ips: Vec<String>,
+    pub outbound_tag: String,
+    pub block_quic: bool,
+}
+
+/// Build an Xray config for router mode: normal SOCKS inbound plus an
+/// optional WiFi-only TPROXY inbound whose traffic is split by routing rules.
+pub fn build_xray_router_config(
+    active_profile: &Profile,
+    extra_profiles: &[(&Profile, String)],
+    route_rules: &[XrayRouteRule],
+    listen_host: &str,
+    socks_port: u16,
+    tproxy_port: Option<u16>,
+    active_block_quic: bool,
+) -> Result<Value, String> {
+    let mut inbounds = vec![json!({
+        "tag": "socks-in",
+        "listen": listen_host,
+        "port": socks_port,
+        "protocol": "socks",
+        "settings": { "udp": true }
+    })];
+
+    if let Some(port) = tproxy_port {
+        inbounds.push(json!({
+            "tag": WIFI_TPROXY_INBOUND_TAG,
+            "listen": "0.0.0.0",
+            "port": port,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "network": "tcp,udp",
+                "followRedirect": true
+            },
+            "streamSettings": {
+                "sockopt": { "tproxy": "tproxy" }
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"],
+                "routeOnly": true
+            }
+        }));
+    }
+
+    let mut outbounds = vec![
+        build_profile_outbound(active_profile, ACTIVE_OUTBOUND_TAG)?,
+        json!({
+            "tag": DIRECT_OUTBOUND_TAG,
+            "protocol": "freedom",
+            "settings": { "domainStrategy": "AsIs" }
+        }),
+        json!({
+            "tag": BLOCK_OUTBOUND_TAG,
+            "protocol": "blackhole",
+            "settings": {}
+        }),
+    ];
+
+    for (profile, tag) in extra_profiles {
+        outbounds.push(build_profile_outbound(profile, tag)?);
+    }
+
+    let mut rules = Vec::new();
+    for rule in route_rules {
+        if rule.block_quic {
+            rules.push(json!({
+                "type": "field",
+                "inboundTag": [WIFI_TPROXY_INBOUND_TAG],
+                "network": "udp",
+                "port": "443",
+                "outboundTag": BLOCK_OUTBOUND_TAG,
+            }));
+        }
+
+        let mut route = json!({
+            "type": "field",
+            "inboundTag": [WIFI_TPROXY_INBOUND_TAG],
+            "outboundTag": rule.outbound_tag,
+        });
+        if !rule.domains.is_empty() {
+            route["domain"] = json!(rule.domains);
+        }
+        if !rule.ips.is_empty() {
+            route["ip"] = json!(rule.ips);
+        }
+        if route.get("domain").is_some() || route.get("ip").is_some() {
+            rules.push(route);
+        }
+    }
+
+    // Only WiFi TPROXY gets split rules. Anything else, including SOCKS
+    // clients, keeps the traditional active-profile behaviour.
+    if tproxy_port.is_some() {
+        if active_block_quic {
+            rules.push(json!({
+                "type": "field",
+                "inboundTag": [WIFI_TPROXY_INBOUND_TAG],
+                "network": "udp",
+                "port": "443",
+                "outboundTag": BLOCK_OUTBOUND_TAG,
+            }));
+        }
+        rules.push(json!({
+            "type": "field",
+            "inboundTag": [WIFI_TPROXY_INBOUND_TAG],
+            "outboundTag": ACTIVE_OUTBOUND_TAG,
+        }));
+    }
+
+    Ok(json!({
+        "log": { "loglevel": "warning" },
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": rules
+        }
+    }))
+}
+
 /// Build an Xray client config that exposes a SOCKS5 endpoint on
 /// `listen_host:port` and routes traffic through the given profile.
 pub fn build_xray_config(profile: &Profile, listen_host: &str, port: u16) -> Result<Value, String> {
     let outbound = match &profile.protocol {
-        Protocol::Vless => build_vless_outbound(profile)?,
+        Protocol::Vless => build_profile_outbound(profile, "proxy")?,
         Protocol::Hysteria2 => {
             return Err(
                 "Xray не поддерживает Hysteria2; используйте sing-box или mihomo".to_owned(),
@@ -39,7 +170,17 @@ pub fn build_xray_config(profile: &Profile, listen_host: &str, port: u16) -> Res
     }))
 }
 
-fn build_vless_outbound(profile: &Profile) -> Result<Value, String> {
+fn build_profile_outbound(profile: &Profile, tag: &str) -> Result<Value, String> {
+    match &profile.protocol {
+        Protocol::Vless => build_vless_outbound(profile, tag),
+        Protocol::Hysteria2 => {
+            Err("Xray не поддерживает Hysteria2; используйте sing-box или mihomo".to_owned())
+        }
+        Protocol::Unknown(scheme) => Err(format!("Xray не поддерживает протокол {scheme}")),
+    }
+}
+
+fn build_vless_outbound(profile: &Profile, tag: &str) -> Result<Value, String> {
     let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
     let uuid = url.username();
     if uuid.is_empty() {
@@ -66,7 +207,7 @@ fn build_vless_outbound(profile: &Profile) -> Result<Value, String> {
         "streamSettings": build_stream_settings(&url)
     });
 
-    outbound["tag"] = json!("proxy");
+    outbound["tag"] = json!(tag);
     Ok(outbound)
 }
 

@@ -1,12 +1,12 @@
 # Keenetic VPN Client Roadmap
 
-> v0.1 is shipped as the `hincyray` router daemon. See [`hincyray-v0.1-status.md`](hincyray-v0.1-status.md) for the implemented / validated / not-implemented snapshot, and [`hincyray-entware-install.md`](hincyray-entware-install.md) for the install runbook. The desktop `xray-vpn-test` is the diagnostics surface behind the `desktop` feature.
+> v0.3 is shipped as the `hincyray` router daemon. See [`hincyray-v0.1-status.md`](hincyray-v0.1-status.md) for the implemented / validated / not-implemented snapshot, and [`hincyray-entware-install.md`](hincyray-entware-install.md) for the install runbook. The desktop `xray-vpn-test` is the diagnostics surface behind the `desktop` feature.
 
 ## Goal
 
 Build a lightweight VPN/proxy client for Keenetic Homebrew routers, starting with Keenetic Giga KN-1012, using the current XrayVpnTest project as the parser, benchmark, and diagnostics foundation.
 
-The desktop application is the diagnostics surface. The shipped router product is `hincyray` v0.1: a router-installed daemon with a web panel that accepts Happ/TutNet-style subscriptions and direct configs, lets the user choose a server manually, and exposes a local SOCKS listener through Xray. The v0.1.1 add-on in `scripts/` adds an opt-in WiFi VPN segment via TPROXY for `192.168.2.0/24` (manual setup, main network untouched). Automatic server selection, per-device/per-domain policy routing, and Hysteria2 remain post-MVP.
+The desktop application is the diagnostics surface. The shipped router product is `hincyray` v0.3: a router-installed daemon with a web panel that accepts Happ/TutNet-style subscriptions and direct configs, lets the user choose a server manually, exposes a local SOCKS listener through Xray, and optionally routes a separate WiFi segment through Xray with per-domain / per-IP / per-service split rules. The v0.1.1 add-on in `scripts/` adds an opt-in WiFi VPN segment via TPROXY for `192.168.2.0/24`; v0.3 adds the split-routing engine and daemon-managed TPROXY controls. Automatic server selection, per-device/per-SSID policy routing, and Hysteria2 remain post-MVP.
 
 ## Target Device
 
@@ -72,8 +72,8 @@ Implemented:
 - Bind default `0.0.0.0:8088`, override via `HINCYRAY_LISTEN`.
 - State path auto-detection: `HINCYRAY_STATE` env → `/opt/etc/hincyray/state.json` (Entware) → `/etc/hincyray/state.json` (OpenWrt) → `$HOME/.config/hincyray/state.json` → `./hincyray-state.json`. Atomic save via temp file + rename.
 - Xray config path: `HINCYRAY_XRAY_CONFIG` env → `xray-client.json` next to state.
-- JSON state: profiles, active_profile_id, auto_select, listen_host (default `127.0.0.1`), socks_port (default `10808`), http_port (default `10809`, reserved for later), xray_path (default `xray`), metrics_history placeholder, routing_rules placeholder.
-- HTTP API: `GET /`, `GET /api/health`, `GET /api/status`, `GET /api/profiles`, `POST /api/profiles/import`, `POST /api/active-profile`, `GET /api/xray/config`, `POST /api/core/start|stop|restart`.
+- JSON state: profiles (including `block_quic` per server), active_profile_id, auto_select, listen_host (default `127.0.0.1`), socks_port (default `10808`), http_port (default `10809`, reserved for later), xray_path (default `xray`), metrics_history, routing_rules, split_routing settings.
+- HTTP API: `GET /`, `GET /api/health`, `GET /api/status`, `GET /api/profiles`, `POST /api/profiles/import`, `POST /api/profiles/block-quic`, `POST /api/active-profile`, `GET /api/xray/config`, `POST /api/core/start|stop|restart`, `GET|POST /api/bench/*`, `GET /api/stats`, `POST /api/favorites/toggle`, `GET /api/favorites`, `GET|POST /api/subscriptions/*`, `GET /api/routing`, `POST /api/routing/settings`, `POST /api/routing/rules`, `POST /api/routing/catalog/refresh`, `POST /api/routing/apply`, `GET /api/routing/tproxy-status`, `POST /api/routing/tproxy-install`, `POST /api/routing/tproxy-rollback`.
 - `CoreManager` with one in-memory `Child`, status detection via `try_wait`, idempotent stop. Xray is spawned with `stdout`/`stderr` set to `Stdio::null()` so the long-lived child cannot block on a buffered pipe that nothing reads.
 - The daemon can be built without the desktop feature: `cargo build --release --no-default-features --bin hincyray` skips `eframe`/`egui_extras`/`arboard` so the Entware/OpenWrt artifact stays small and free of GUI dependencies. Shared modules (`profiles`, `scoring`, `xray_config`, `tester`, `hincyray`) remain available; `app`/`theme`/`run()` are gated behind the `desktop` feature.
 - Xray config generation reuses `xray_config::build_xray_config` (VLESS only; Hysteria2 returns a 400 with a clear message).
@@ -82,7 +82,7 @@ Implemented:
 
 Not yet implemented (post-MVP, tracked below):
 
-- Router-side policy routing installed/managed by the daemon itself. The v0.1.1 WiFi VPN segment ships an opt-in, script-driven TPROXY path for `192.168.2.0/24`, but per-device / per-domain rules and daemon-managed install/rollback are still pending.
+- Router-side policy routing installed/managed by the daemon itself. The v0.1.1 WiFi VPN segment ships an opt-in, script-driven TPROXY path for `192.168.2.0/24`; v0.3 added per-domain / per-IP / per-service split rules and daemon-managed TPROXY install/rollback, but per-device / per-SSID rules and `iptables` persistence across reboots are still pending.
 - Automatic server selection using `scoring::quality_score` and recent metrics.
 - Health checks with automatic failover.
 - Full web UI (only an endpoint-listing index page is shipped).
@@ -92,7 +92,7 @@ Not yet implemented (post-MVP, tracked below):
 ## Post-MVP Scope
 
 - Automatic server selector using quality score, recent failures, and preferred country/provider.
-- Policy routing for selected clients, SSIDs, domains, or IP ranges (v0.1.1 delivers an opt-in per-subnet WiFi segment via `scripts/`; per-client/per-domain rules and daemon-managed install/rollback remain).
+- Policy routing for selected clients, SSIDs, domains, or IP ranges (v0.1.1 delivers an opt-in per-subnet WiFi segment via `scripts/`; v0.3 delivers per-domain/per-IP/per-service rules and daemon-managed TPROXY install/rollback; per-client/per-SSID rules and `iptables` persistence remain).
 - Health checks with automatic failover.
 - Export/import full router-client configuration.
 - Optional Mihomo backend for advanced rule-based routing if Xray routing is insufficient.

@@ -56,6 +56,12 @@ pub struct Profile {
     pub port: Option<u16>,
     pub raw: String,
     pub selected: bool,
+    /// Per-profile QUIC/UDP 443 block flag. When the profile is the
+    /// active server or a fixed target in a WiFi split-routing rule,
+    /// HincyRay emits an Xray routing rule that drops UDP port 443 for
+    /// matched WiFi traffic, forcing services to fall back to TCP.
+    #[serde(default)]
+    pub block_quic: bool,
     /// Optional subscription/group label. `None` (absent in older
     /// state files, populated via `serde(default)`) is shown as the
     /// "Direct" group in the daemon web panel. Profiles loaded from a
@@ -325,6 +331,7 @@ fn parse_profile_candidate(candidate: &str) -> Option<Profile> {
         port,
         raw: candidate.to_owned(),
         selected: true,
+        block_quic: false,
         group: None,
     })
 }

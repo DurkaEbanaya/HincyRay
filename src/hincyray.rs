@@ -35,6 +35,9 @@ use crate::profiles::{
     Profile, SubscriptionSource, load_subscription_detailed_via_proxy, parse_input,
 };
 use crate::xray_config::build_xray_config;
+use crate::xray_config::{
+    ACTIVE_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, XrayRouteRule, build_xray_router_config,
+};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -167,6 +170,8 @@ pub struct HincyrayState {
     pub metrics_history: Vec<MetricSample>,
     #[serde(default)]
     pub routing_rules: Vec<RoutingRule>,
+    #[serde(default)]
+    pub split_routing: SplitRoutingSettings,
     /// v0.2: saved subscription sources so `/api/subscriptions/refresh`
     /// can re-fetch them without re-entering URLs.
     #[serde(default)]
@@ -192,6 +197,7 @@ impl Default for HincyrayState {
             xray_path: default_xray_path(),
             metrics_history: Vec::new(),
             routing_rules: Vec::new(),
+            split_routing: SplitRoutingSettings::default(),
             subscriptions: Vec::new(),
             favorites: Vec::new(),
             stats: Vec::new(),
@@ -246,15 +252,74 @@ pub struct ProfileStats {
     pub last_checked_unix: u64,
 }
 
-/// Placeholder for future policy-routing rules (e.g. per-SSID / per-device
-/// traffic steering). Stored now so future migrations do not need to
-/// restructure the state file.
+/// WiFi split-routing controls. Rules are scoped to the TPROXY WiFi inbound;
+/// SOCKS clients keep using the active profile.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SplitRoutingSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auto_switch: bool,
+    #[serde(default)]
+    pub block_quic_global: bool,
+    #[serde(default = "default_rule_source")]
+    pub rule_source: String,
+    #[serde(default = "default_vpn_subnet")]
+    pub vpn_subnet: String,
+    #[serde(default = "default_tproxy_port")]
+    pub tproxy_port: u16,
+}
+
+impl Default for SplitRoutingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_switch: false,
+            block_quic_global: false,
+            rule_source: default_rule_source(),
+            vpn_subnet: default_vpn_subnet(),
+            tproxy_port: default_tproxy_port(),
+        }
+    }
+}
+
+fn default_rule_source() -> String {
+    "metacubex-lite".to_owned()
+}
+
+fn default_vpn_subnet() -> String {
+    "192.168.2.0/24".to_owned()
+}
+
+fn default_tproxy_port() -> u16 {
+    10810
+}
+
+/// Policy-routing rule. `kind`/`pattern`/`target` existed as a v0.1
+/// placeholder, so they remain strings for safe state migration. New UI uses
+/// `domains`/`ips`/`services`; `target` is one of: `direct`, `active`,
+/// `best`, or `profile:<id>`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RoutingRule {
+    #[serde(default)]
+    pub enabled: bool,
     pub name: String,
+    #[serde(default)]
     pub kind: String,
+    #[serde(default)]
     pub pattern: String,
+    #[serde(default = "default_routing_target")]
     pub target: String,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub ips: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<String>,
+}
+
+fn default_routing_target() -> String {
+    "active".to_owned()
 }
 
 fn default_listen_host() -> String {
@@ -409,6 +474,108 @@ fn write_xray_config(path: &Path, config: &Value) -> Result<(), String> {
     }
     let text = serde_json::to_string_pretty(config).map_err(|error| error.to_string())?;
     fs::write(path, text).map_err(|error| error.to_string())
+}
+
+fn build_daemon_xray_config(state: &HincyrayState) -> Result<Value, String> {
+    let Some(active_id) = state.active_profile_id else {
+        return Err("no active profile".to_owned());
+    };
+    let Some(active_profile) = state
+        .profiles
+        .iter()
+        .find(|profile| profile.id == active_id)
+    else {
+        return Err("active profile missing".to_owned());
+    };
+
+    if !state.split_routing.enabled {
+        return build_xray_config(active_profile, &state.listen_host, state.socks_port);
+    }
+
+    let mut extra_profiles: Vec<(&Profile, String)> = Vec::new();
+    let mut routes = Vec::new();
+    for rule in state.routing_rules.iter().filter(|rule| rule.enabled) {
+        let mut domains = normalize_route_items(&rule.domains);
+        let mut ips = normalize_route_items(&rule.ips);
+        for service in &rule.services {
+            let service = service.trim().trim_start_matches("geosite:");
+            if !service.is_empty() {
+                domains.push(format!("geosite:{service}"));
+            }
+        }
+        if domains.is_empty() && ips.is_empty() && !rule.pattern.trim().is_empty() {
+            match rule.kind.as_str() {
+                "ip" | "geoip" => ips.push(rule.pattern.trim().to_owned()),
+                _ => domains.push(rule.pattern.trim().to_owned()),
+            }
+        }
+        if domains.is_empty() && ips.is_empty() {
+            continue;
+        }
+
+        let outbound_tag = match rule.target.as_str() {
+            "direct" => DIRECT_OUTBOUND_TAG.to_owned(),
+            "active" | "best" | "" => ACTIVE_OUTBOUND_TAG.to_owned(),
+            target if target.starts_with("profile:") => {
+                let id = target.trim_start_matches("profile:").parse::<usize>().ok();
+                if let Some(id) = id {
+                    if id == active_id {
+                        ACTIVE_OUTBOUND_TAG.to_owned()
+                    } else if let Some(profile) = state.profiles.iter().find(|p| p.id == id) {
+                        let tag = format!("profile-{id}");
+                        if !extra_profiles.iter().any(|(_, existing)| existing == &tag) {
+                            extra_profiles.push((profile, tag.clone()));
+                        }
+                        tag
+                    } else {
+                        ACTIVE_OUTBOUND_TAG.to_owned()
+                    }
+                } else {
+                    ACTIVE_OUTBOUND_TAG.to_owned()
+                }
+            }
+            _ => ACTIVE_OUTBOUND_TAG.to_owned(),
+        };
+
+        let profile_for_quic = match rule.target.as_str() {
+            "active" | "best" | "" => Some(active_profile),
+            target if target.starts_with("profile:") => {
+                let id = target.trim_start_matches("profile:").parse::<usize>().ok();
+                id.and_then(|id| state.profiles.iter().find(|p| p.id == id))
+            }
+            _ => None,
+        };
+        let profile_quic = profile_for_quic
+            .map(|profile| profile.block_quic)
+            .unwrap_or(false);
+
+        routes.push(XrayRouteRule {
+            domains,
+            ips,
+            outbound_tag,
+            block_quic: state.split_routing.block_quic_global || profile_quic,
+        });
+    }
+
+    let active_block_quic = state.split_routing.block_quic_global || active_profile.block_quic;
+    build_xray_router_config(
+        active_profile,
+        &extra_profiles,
+        &routes,
+        &state.listen_host,
+        state.socks_port,
+        Some(state.split_routing.tproxy_port),
+        active_block_quic,
+    )
+}
+
+fn normalize_route_items(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -583,6 +750,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
                 "state_path": daemon.state_path.to_string_lossy(),
                 "xray_path": inner.state.xray_path,
                 "core_status": inner.core.status(),
+                "split_routing": inner.state.split_routing,
             });
             (200, "application/json", response.to_string())
         }
@@ -603,6 +771,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
                         "port": profile.port,
                         "active": active_id == Some(profile.id),
                         "group": profile.group,
+                        "block_quic": profile.block_quic,
                     })
                 })
                 .collect();
@@ -613,6 +782,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
             )
         }
         ("POST", "/api/profiles/import") => handle_import(body, daemon),
+        ("POST", "/api/profiles/block-quic") => handle_profile_block_quic(body, daemon),
         ("POST", "/api/active-profile") => handle_set_active(body, daemon),
         ("GET", "/api/xray/config") => handle_get_xray_config(daemon),
         ("POST", "/api/core/start") => handle_core_start(daemon),
@@ -629,6 +799,14 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
             handle_subscriptions_refresh_one(body, daemon)
         }
         ("GET", "/api/subscriptions") => handle_subscriptions_list(daemon),
+        ("GET", "/api/routing") => handle_routing_get(daemon),
+        ("POST", "/api/routing/settings") => handle_routing_settings(body, daemon),
+        ("POST", "/api/routing/rules") => handle_routing_rules(body, daemon),
+        ("POST", "/api/routing/catalog/refresh") => handle_routing_catalog_refresh(body, daemon),
+        ("POST", "/api/routing/apply") => handle_routing_apply(daemon),
+        ("GET", "/api/routing/tproxy-status") => handle_tproxy_status(daemon),
+        ("POST", "/api/routing/tproxy-install") => handle_tproxy_script("tproxy-setup.sh"),
+        ("POST", "/api/routing/tproxy-rollback") => handle_tproxy_script("tproxy-rollback.sh"),
         _ => (
             404,
             "application/json",
@@ -829,9 +1007,8 @@ fn handle_set_active(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
         );
     };
 
-    let listen_host = inner.state.listen_host.clone();
-    let socks_port = inner.state.socks_port;
-    let config = match build_xray_config(&profile, &listen_host, socks_port) {
+    inner.state.active_profile_id = Some(id);
+    let config = match build_daemon_xray_config(&inner.state) {
         Ok(config) => config,
         Err(error) => {
             return (
@@ -850,7 +1027,6 @@ fn handle_set_active(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
         );
     }
 
-    inner.state.active_profile_id = Some(id);
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         return (
             500,
@@ -869,34 +1045,12 @@ fn handle_set_active(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
 
 fn handle_get_xray_config(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
-    let Some(id) = inner.state.active_profile_id else {
-        return (
-            400,
-            "application/json",
-            json!({"error": "no active profile"}).to_string(),
-        );
-    };
-    let Some(profile) = inner
-        .state
-        .profiles
-        .iter()
-        .find(|profile| profile.id == id)
-        .cloned()
-    else {
-        return (
-            404,
-            "application/json",
-            json!({"error": "active profile missing"}).to_string(),
-        );
-    };
-    let listen_host = inner.state.listen_host.clone();
-    let socks_port = inner.state.socks_port;
-    match build_xray_config(&profile, &listen_host, socks_port) {
+    match build_daemon_xray_config(&inner.state) {
         Ok(config) => (200, "application/json", config.to_string()),
         Err(error) => (
             400,
             "application/json",
-            json!({"error": error, "profile_id": id}).to_string(),
+            json!({"error": error, "profile_id": inner.state.active_profile_id}).to_string(),
         ),
     }
 }
@@ -1224,6 +1378,56 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
         "profiles_count": profiles.len(),
     });
     (200, "application/json", response.to_string())
+}
+
+fn handle_profile_block_quic(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(id) = value
+        .get("profile_id")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+    else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing profile_id"}).to_string(),
+        );
+    };
+    let Some(block) = value.get("block_quic").and_then(Value::as_bool) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing block_quic"}).to_string(),
+        );
+    };
+
+    let mut inner = lock(&daemon.inner);
+    let Some(profile) = inner.state.profiles.iter_mut().find(|p| p.id == id) else {
+        return (
+            404,
+            "application/json",
+            json!({"error": "profile not found", "profile_id": id}).to_string(),
+        );
+    };
+    profile.block_quic = block;
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+    (
+        200,
+        "application/json",
+        json!({"profile_id": id, "block_quic": block}).to_string(),
+    )
 }
 
 fn handle_favorites_toggle(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
@@ -1556,6 +1760,318 @@ fn handle_subscriptions_list(daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
+fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let response = json!({
+        "settings": inner.state.split_routing,
+        "rules": inner.state.routing_rules,
+        "catalog": popular_service_catalog(),
+        "sources": rule_sources(),
+    });
+    (200, "application/json", response.to_string())
+}
+
+fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let mut inner = lock(&daemon.inner);
+    if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
+        inner.state.split_routing.enabled = v;
+    }
+    if let Some(v) = value.get("auto_switch").and_then(Value::as_bool) {
+        inner.state.split_routing.auto_switch = v;
+    }
+    if let Some(v) = value.get("block_quic_global").and_then(Value::as_bool) {
+        inner.state.split_routing.block_quic_global = v;
+    }
+    if let Some(v) = value.get("rule_source").and_then(Value::as_str) {
+        inner.state.split_routing.rule_source = v.trim().to_owned();
+    }
+    if let Some(v) = value
+        .get("vpn_subnet")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    {
+        inner.state.split_routing.vpn_subnet = v.trim().to_owned();
+    }
+    if let Some(v) = value.get("tproxy_port").and_then(Value::as_u64) {
+        inner.state.split_routing.tproxy_port = v as u16;
+    }
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+    (
+        200,
+        "application/json",
+        json!({"settings": inner.state.split_routing}).to_string(),
+    )
+}
+
+fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let rules_value = value.get("rules").cloned().unwrap_or(value);
+    let Ok(mut rules) = serde_json::from_value::<Vec<RoutingRule>>(rules_value) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "expected rules array"}).to_string(),
+        );
+    };
+    for rule in &mut rules {
+        rule.name = rule.name.trim().to_owned();
+        rule.kind = rule.kind.trim().to_owned();
+        rule.pattern = rule.pattern.trim().to_owned();
+        rule.target = rule.target.trim().to_owned();
+        if rule.target.is_empty() {
+            rule.target = default_routing_target();
+        }
+        rule.domains = normalize_route_items(&rule.domains);
+        rule.ips = normalize_route_items(&rule.ips);
+        rule.services = normalize_route_items(&rule.services);
+    }
+    let mut inner = lock(&daemon.inner);
+    inner.state.routing_rules = rules;
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+    (
+        200,
+        "application/json",
+        json!({"rules": inner.state.routing_rules}).to_string(),
+    )
+}
+
+fn handle_routing_catalog_refresh(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let source = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("source")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(default_rule_source);
+    let proxy_info = {
+        let mut inner = lock(&daemon.inner);
+        proxy_info_for_daemon(&mut inner)
+    };
+    let proxy = proxy_info
+        .core_running
+        .then_some(proxy_info.socks_url.as_str());
+    match fetch_service_catalog(&source, proxy) {
+        Ok(catalog) => (
+            200,
+            "application/json",
+            json!({"source": source, "catalog": catalog}).to_string(),
+        ),
+        Err(error) => (
+            500,
+            "application/json",
+            json!({"error": error, "fallback": popular_service_catalog()}).to_string(),
+        ),
+    }
+}
+
+fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
+    let mut inner = lock(&daemon.inner);
+    let config = match build_daemon_xray_config(&inner.state) {
+        Ok(config) => config,
+        Err(error) => return (400, "application/json", json!({"error": error}).to_string()),
+    };
+    if let Err(error) = write_xray_config(&daemon.xray_config_path, &config) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("write xray config: {error}")}).to_string(),
+        );
+    }
+    let was_running = inner.core.is_running();
+    let xray_path = inner.state.xray_path.clone();
+    let config_path = daemon.xray_config_path.clone();
+    let core_status = if was_running {
+        match inner.core.restart(&xray_path, &config_path) {
+            Ok(()) => inner.core.status().to_owned(),
+            Err(error) => return (500, "application/json", json!({"error": error}).to_string()),
+        }
+    } else {
+        inner.core.status().to_owned()
+    };
+    (
+        200,
+        "application/json",
+        json!({"applied": true, "core_status": core_status}).to_string(),
+    )
+}
+
+fn handle_tproxy_status(_daemon: &Daemon) -> (u16, &'static str, String) {
+    let chain = shell_status("iptables -t mangle -S HINCYRAY >/dev/null 2>&1");
+    let rule = shell_status("ip rule show 2>/dev/null | grep -q 'fwmark 0x111' ");
+    let port = shell_status("netstat -ltnp 2>/dev/null | grep -q ':10810' ");
+    (
+        200,
+        "application/json",
+        json!({"chain": chain, "ip_rule": rule, "tproxy_port": port}).to_string(),
+    )
+}
+
+fn handle_tproxy_script(script_name: &str) -> (u16, &'static str, String) {
+    let script = format!("/opt/etc/hincyray/scripts/{script_name}");
+    if !Path::new(&script).is_file() {
+        return (
+            404,
+            "application/json",
+            json!({"error": "script not found", "script": script}).to_string(),
+        );
+    }
+    match Command::new("sh").arg(&script).output() {
+        Ok(output) => {
+            let ok = output.status.success();
+            let status = if ok { 200 } else { 500 };
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            (
+                status,
+                "application/json",
+                json!({"ok": ok, "stdout": stdout, "stderr": stderr}).to_string(),
+            )
+        }
+        Err(error) => (
+            500,
+            "application/json",
+            json!({"error": error.to_string()}).to_string(),
+        ),
+    }
+}
+
+fn shell_status(command: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn rule_sources() -> Vec<Value> {
+    vec![
+        json!({"id":"metacubex-lite","name":"MetaCubeX Lite","kind":"xray-dat","recommended":true}),
+        json!({"id":"metacubex-full","name":"MetaCubeX Full","kind":"xray-dat"}),
+        json!({"id":"loyalsoldier","name":"Loyalsoldier v2ray-rules-dat","kind":"xray-dat"}),
+        json!({"id":"v2fly-dlc","name":"v2fly/domain-list-community","kind":"geosite-catalog"}),
+        json!({"id":"blackmatrix7","name":"blackmatrix7 ios_rule_script","kind":"service-catalog"}),
+        json!({"id":"custom","name":"Custom URLs","kind":"manual"}),
+    ]
+}
+
+fn popular_service_catalog() -> Vec<Value> {
+    let services = [
+        (
+            "youtube",
+            "YouTube",
+            ["youtube", "googlevideo", "ytimg"].as_slice(),
+        ),
+        (
+            "instagram",
+            "Instagram",
+            ["instagram", "facebook", "fbcdn"].as_slice(),
+        ),
+        ("telegram", "Telegram", ["telegram"].as_slice()),
+        ("discord", "Discord", ["discord"].as_slice()),
+        ("tiktok", "TikTok", ["tiktok"].as_slice()),
+        ("netflix", "Netflix", ["netflix"].as_slice()),
+        ("twitch", "Twitch", ["twitch"].as_slice()),
+        ("spotify", "Spotify", ["spotify"].as_slice()),
+        ("steam", "Steam", ["steam"].as_slice()),
+        ("google", "Google", ["google"].as_slice()),
+        ("apple", "Apple", ["apple"].as_slice()),
+        ("microsoft", "Microsoft", ["microsoft"].as_slice()),
+        ("openai", "OpenAI", ["openai"].as_slice()),
+        ("cloudflare", "Cloudflare", ["cloudflare"].as_slice()),
+        ("ru", "Russia / RU", ["ru"].as_slice()),
+    ];
+    services
+        .into_iter()
+        .map(|(id, name, geosite)| json!({"id": id, "name": name, "geosite": geosite}))
+        .collect()
+}
+
+fn fetch_service_catalog(source: &str, proxy: Option<&str>) -> Result<Vec<Value>, String> {
+    match source {
+        "v2fly-dlc" => fetch_github_names(
+            "https://api.github.com/repos/v2fly/domain-list-community/contents/data?ref=master",
+            proxy,
+        ),
+        "blackmatrix7" => fetch_github_names(
+            "https://api.github.com/repos/blackmatrix7/ios_rule_script/contents/rule/Clash?ref=master",
+            proxy,
+        ),
+        // Dat releases are assets, not a category index. Keep a curated
+        // catalog while using the selected project for geosite/geoip files.
+        "metacubex-lite" | "metacubex-full" | "loyalsoldier" | "custom" => {
+            Ok(popular_service_catalog())
+        }
+        other => Err(format!("unknown rule source: {other}")),
+    }
+}
+
+fn fetch_github_names(url: &str, proxy: Option<&str>) -> Result<Vec<Value>, String> {
+    let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(20));
+    if let Some(proxy) = proxy {
+        let proxy = reqwest::Proxy::all(proxy).map_err(|error| error.to_string())?;
+        builder = builder.proxy(proxy);
+    }
+    let client = builder.build().map_err(|error| error.to_string())?;
+    let response = client
+        .get(url)
+        .header("User-Agent", "HincyRay")
+        .send()
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("GitHub returned HTTP {}", response.status()));
+    }
+    let text = response.text().map_err(|error| error.to_string())?;
+    let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    let Some(items) = value.as_array() else {
+        return Err("GitHub response is not an array".to_owned());
+    };
+    let mut names: Vec<String> = items
+        .iter()
+        .filter_map(|item| item.get("name").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    names.sort_by_key(|name| name.to_ascii_lowercase());
+    names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    Ok(names
+        .into_iter()
+        .take(800)
+        .map(|name| {
+            let id = name.to_ascii_lowercase();
+            json!({"id": id, "name": name, "geosite": [id]})
+        })
+        .collect())
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1625,6 +2141,8 @@ button.danger{background:#cf222e;color:#fff;border-color:#cf222e}
 button.danger:hover{background:#a40e26}
 button.star{background:transparent;border:none;font-size:1em;color:#d0d7de;cursor:pointer;padding:0 .2em}
 button.star.on{color:#d4a72c}
+button.quic{background:transparent;border:none;font-size:.78em;color:#d0d7de;cursor:pointer;padding:.15em .35em;border-radius:999px;white-space:nowrap}
+button.quic.on{background:#ffebe9;color:#cf222e;font-weight:600}
 .row{display:flex;gap:.5em;flex-wrap:wrap;align-items:center}
 textarea,input[type=text],select{font:inherit;padding:.32em .55em;border:1px solid #d0d7de;border-radius:5px;box-sizing:border-box}
 textarea{width:100%;min-height:108px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85em}
@@ -1653,11 +2171,14 @@ tr.group-header .grp-name{margin-left:.35em}
 tr.group-header .grp-count{color:#57606a;font-weight:normal;font-size:.82em;margin-left:.45em}
 tr.group-header .grp-refresh{margin-left:.7em;font-weight:normal}
 tr.group-row.collapsed{display:none}
+.chips{display:flex;flex-wrap:wrap;gap:.35em;margin:.35em 0;max-height:170px;overflow:auto;background:#fff;border:1px solid #d0d7de;border-radius:6px;padding:.45em}
+.chip{display:inline-flex;gap:.25em;align-items:center;border:1px solid #d0d7de;border-radius:999px;padding:.18em .55em;background:#f6f8fa;font-size:.86em}
+.mini{font-size:.78em;padding:.18em .5em}
 </style>
 </head>
 <body>
 <h1>HincyRay daemon</h1>
-<p class="subtle">Lightweight Keenetic VPN/proxy panel &middot; v0.2 &middot; ping, stats, favorites, subscription refresh. Talks to the local JSON API over fetch.</p>
+<p class="subtle">Lightweight Keenetic VPN/proxy panel &middot; v0.3 &middot; ping, stats, favorites, subscription refresh, WiFi traffic split. Talks to the local JSON API over fetch.</p>
 
 <div id="msg" class="msg" role="status" aria-live="polite"></div>
 
@@ -1732,6 +2253,39 @@ tr.group-row.collapsed{display:none}
   </table>
 </div>
 
+<h2>WiFi Traffic Split <span id="routing-toggle" class="toggle">show</span></h2>
+<div id="routing-panel" class="collapsible">
+  <p class="subtle">Rules apply only to the <code>HincyRay-VPN</code> WiFi/TPROXY inbound. SOCKS clients keep using the active server. First matching rule wins; unmatched WiFi traffic falls back to the active server.</p>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="route-enabled"> Enable WiFi split routing</label>
+    <label class="chip"><input type="checkbox" id="route-auto-switch"> Auto switch servers</label>
+    <label class="chip"><input type="checkbox" id="route-block-quic"> Block QUIC / UDP 443 globally</label>
+    <div class="field"><label for="route-source">Rule source project</label><select id="route-source"></select></div>
+  </div>
+  <div class="row" style="margin:.45em 0">
+    <button id="btn-routing-save">Save settings</button>
+    <button id="btn-catalog-refresh">Refresh service catalog</button>
+    <button class="primary" id="btn-routing-apply">Apply Xray config</button>
+    <button id="btn-tproxy-status">TPROXY status</button>
+    <button id="btn-tproxy-install">Install/repair TPROXY</button>
+    <button class="danger" id="btn-tproxy-rollback">Rollback TPROXY</button>
+    <span class="subtle" id="routing-status"></span>
+  </div>
+  <h3 style="font-size:.95em;margin:.8em 0 .35em">Add rule</h3>
+  <div class="grid2">
+    <div class="field"><label for="rule-name">Rule name</label><input type="text" id="rule-name" placeholder="YouTube via server A"></div>
+    <div class="field"><label for="rule-target">Target</label><select id="rule-target"></select></div>
+  </div>
+  <div class="field"><label for="rule-domains">Manual domains / geosite (one per line)</label><textarea id="rule-domains" placeholder="geosite:youtube&#10;domain:youtube.com&#10;domain:googlevideo.com"></textarea></div>
+  <div class="field"><label for="rule-ips">Manual IP / CIDR / geoip (one per line)</label><textarea id="rule-ips" placeholder="geoip:ru&#10;8.8.8.8&#10;142.250.0.0/15"></textarea></div>
+  <div class="field"><label>Popular services</label><div id="service-catalog" class="chips"></div></div>
+  <div class="row" style="margin:.45em 0"><button id="btn-rule-add">Add rule</button><button id="btn-rule-save">Save rules</button></div>
+  <table>
+    <thead><tr><th>On</th><th>Name</th><th>Match</th><th>Target</th><th></th></tr></thead>
+    <tbody id="routing-rules-body"><tr><td colspan="5" class="subtle">No routing rules.</td></tr></tbody>
+  </table>
+</div>
+
 <h2>Profiles</h2>
 <div class="row" style="margin:.3em 0">
   <span class="subtle">Sort by:</span>
@@ -1744,8 +2298,8 @@ tr.group-row.collapsed{display:none}
   <span class="subtle">Click a group header to collapse/expand it.</span>
 </div>
 <table>
-  <thead><tr><th>Fav</th><th>ID</th><th>Name</th><th>Protocol</th><th>Transport</th><th>Latency (ms)</th><th>Jitter (ms)</th><th>Speed (Mbps)</th><th>Fail</th><th>Score</th><th></th></tr></thead>
-  <tbody id="profiles-body"><tr><td colspan="11" class="subtle">No profiles yet.</td></tr></tbody>
+  <thead><tr><th>Fav</th><th>QUIC</th><th>ID</th><th>Name</th><th>Protocol</th><th>Transport</th><th>Latency (ms)</th><th>Jitter (ms)</th><th>Speed (Mbps)</th><th>Fail</th><th>Score</th><th></th></tr></thead>
+  <tbody id="profiles-body"><tr><td colspan="12" class="subtle">No profiles yet.</td></tr></tbody>
 </table>
 
 <h2>Favorites <span id="fav-toggle" class="toggle">show</span></h2>
@@ -1772,6 +2326,8 @@ tr.group-row.collapsed{display:none}
 var msgEl = document.getElementById("msg");
 var benchPollHandle = null;
 var lastStats = [];
+var routingState = { settings: {}, rules: [], catalog: [], sources: [] };
+var lastProfiles = [];
 
 function setMsg(text, kind){
   if(!text){ msgEl.className = "msg"; msgEl.textContent = ""; return; }
@@ -1939,10 +2495,13 @@ function renderProfiles(profiles, stats){
       var p = e.p;
       var favClass = p.favorite ? " fav" : "";
       var starClass = p.favorite ? "star on" : "star";
+      var quicClass = p.block_quic ? "quic on" : "quic";
+      var quicTitle = p.block_quic ? "QUIC / UDP 443 blocked for this server" : "Block QUIC / UDP 443 for this server";
       var rowClass = (p.active ? "active" : "") + favClass + " group-row" + (collapsed ? " collapsed" : "");
       html.push(
         '<tr class="' + rowClass.trim() + '" data-group-row="' + esc(g === null ? "" : g) + '">'
         + '<td><button class="' + starClass + '" data-fav="' + p.id + '" title="Toggle favorite"></button></td>'
+        + '<td><button class="' + quicClass + '" data-quic="' + p.id + '" title="' + quicTitle + '">&#8856; QUIC</button></td>'
         + '<td>' + p.id + '</td>'
         + '<td>' + esc(p.name) + '</td>'
         + '<td>' + esc(p.protocol) + '</td>'
@@ -2026,6 +2585,16 @@ function renderProfiles(profiles, stats){
         .catch(function(err){ setMsg("Favorite toggle failed: " + err.message); });
     });
   });
+  Array.prototype.forEach.call(tbody.querySelectorAll("[data-quic]"), function(btn){
+    btn.addEventListener("click", function(ev){
+      ev.stopPropagation();
+      var id = Number(btn.getAttribute("data-quic"));
+      var current = btn.classList.contains("on");
+      api("POST", "/api/profiles/block-quic", JSON.stringify({profile_id: id, block_quic: !current}))
+        .then(function(){ return refreshAll(); })
+        .catch(function(err){ setMsg("QUIC toggle failed: " + err.message); });
+    });
+  });
 }
 
 function renderFavorites(profiles){
@@ -2073,6 +2642,89 @@ function renderSubscriptions(subs){
   tbody.innerHTML = rows.join("");
 }
 
+function linesFrom(id){
+  return (document.getElementById(id).value || "").split(/\r?\n/).map(function(s){ return s.trim(); }).filter(Boolean);
+}
+
+function renderRouting(data, profiles){
+  routingState = data || routingState;
+  var settings = routingState.settings || {};
+  document.getElementById("route-enabled").checked = !!settings.enabled;
+  document.getElementById("route-auto-switch").checked = !!settings.auto_switch;
+  document.getElementById("route-block-quic").checked = !!settings.block_quic_global;
+
+  var source = document.getElementById("route-source");
+  source.innerHTML = (routingState.sources || []).map(function(s){
+    return '<option value="' + esc(s.id) + '"' + (s.id === settings.rule_source ? ' selected' : '') + '>' + esc(s.name) + '</option>';
+  }).join("");
+
+  var target = document.getElementById("rule-target");
+  var opts = ['<option value="active">Active server</option>','<option value="direct">Direct</option>','<option value="best">Best server (auto)</option>'];
+  (profiles || []).forEach(function(p){ opts.push('<option value="profile:' + p.id + '">#' + p.id + ' ' + esc(p.name) + '</option>'); });
+  target.innerHTML = opts.join("");
+
+  var catalog = document.getElementById("service-catalog");
+  catalog.innerHTML = (routingState.catalog || []).map(function(s){
+    var geosite = (s.geosite || []).join(",");
+    return '<label class="chip"><input type="checkbox" data-service="' + esc(s.id) + '" data-geosite="' + esc(geosite) + '"> ' + esc(s.name) + '</label>';
+  }).join("");
+
+  renderRoutingRules();
+}
+
+function routingMatchSummary(rule){
+  var parts = [];
+  if(rule.services && rule.services.length){ parts.push("services: " + rule.services.join(", ")); }
+  if(rule.domains && rule.domains.length){ parts.push("domains: " + rule.domains.slice(0,4).join(", ") + (rule.domains.length > 4 ? "…" : "")); }
+  if(rule.ips && rule.ips.length){ parts.push("ip: " + rule.ips.slice(0,4).join(", ") + (rule.ips.length > 4 ? "…" : "")); }
+  return parts.join("; ") || "—";
+}
+
+function renderRoutingRules(){
+  var tbody = document.getElementById("routing-rules-body");
+  var rules = routingState.rules || [];
+  if(!rules.length){ tbody.innerHTML = '<tr><td colspan="6" class="subtle">No routing rules.</td></tr>'; return; }
+  tbody.innerHTML = rules.map(function(r, idx){
+    return '<tr>'
+      + '<td><input type="checkbox" data-rule-on="' + idx + '"' + (r.enabled ? ' checked' : '') + '></td>'
+      + '<td>' + esc(r.name || ("Rule " + (idx + 1))) + '</td>'
+      + '<td>' + esc(routingMatchSummary(r)) + '</td>'
+      + '<td><code>' + esc(r.target || "active") + '</code></td>'
+      + '<td><button class="mini" data-rule-up="' + idx + '">↑</button> <button class="mini" data-rule-down="' + idx + '">↓</button> <button class="mini danger" data-rule-del="' + idx + '">Delete</button></td>'
+      + '</tr>';
+  }).join("");
+  Array.prototype.forEach.call(tbody.querySelectorAll("[data-rule-on]"), function(el){ el.addEventListener("change", function(){ routingState.rules[Number(el.getAttribute("data-rule-on"))].enabled = el.checked; }); });
+  Array.prototype.forEach.call(tbody.querySelectorAll("[data-rule-del]"), function(el){ el.addEventListener("click", function(){ routingState.rules.splice(Number(el.getAttribute("data-rule-del")),1); renderRoutingRules(); }); });
+  Array.prototype.forEach.call(tbody.querySelectorAll("[data-rule-up]"), function(el){ el.addEventListener("click", function(){ var i=Number(el.getAttribute("data-rule-up")); if(i>0){ var r=routingState.rules.splice(i,1)[0]; routingState.rules.splice(i-1,0,r); renderRoutingRules(); } }); });
+  Array.prototype.forEach.call(tbody.querySelectorAll("[data-rule-down]"), function(el){ el.addEventListener("click", function(){ var i=Number(el.getAttribute("data-rule-down")); if(i<routingState.rules.length-1){ var r=routingState.rules.splice(i,1)[0]; routingState.rules.splice(i+1,0,r); renderRoutingRules(); } }); });
+}
+
+function addRoutingRule(){
+  var services = [];
+  var domains = linesFrom("rule-domains");
+  Array.prototype.forEach.call(document.querySelectorAll("#service-catalog input:checked"), function(el){
+    services.push(el.getAttribute("data-service"));
+    (el.getAttribute("data-geosite") || "").split(",").forEach(function(g){ if(g){ domains.push("geosite:" + g); } });
+    el.checked = false;
+  });
+  var rule = {
+    enabled: true,
+    name: (document.getElementById("rule-name").value || "").trim() || "Routing rule",
+    kind: "custom",
+    pattern: "",
+    target: document.getElementById("rule-target").value,
+    domains: domains,
+    ips: linesFrom("rule-ips"),
+    services: services
+  };
+  routingState.rules = routingState.rules || [];
+  routingState.rules.push(rule);
+  document.getElementById("rule-name").value = "";
+  document.getElementById("rule-domains").value = "";
+  document.getElementById("rule-ips").value = "";
+  renderRoutingRules();
+}
+
 function renderBenchStatus(b){
   var progress = document.getElementById("bench-progress");
   var text = document.getElementById("bench-progress-text");
@@ -2112,7 +2764,8 @@ function refreshAll(){
     api("GET","/api/stats"),
     api("GET","/api/favorites"),
     api("GET","/api/bench/status"),
-    api("GET","/api/subscriptions")
+    api("GET","/api/subscriptions"),
+    api("GET","/api/routing")
   ];
   return Promise.all(promises).then(function(results){
     renderStatus(results[0]);
@@ -2123,10 +2776,12 @@ function refreshAll(){
       p.favorite = st ? st.favorite : false;
       return p;
     });
+    lastProfiles = profiles;
     renderProfiles(profiles, stats);
     renderFavorites(results[3].favorites || []);
     renderBenchStatus(results[4]);
     renderSubscriptions(results[5].subscriptions || []);
+    renderRouting(results[6], profiles);
     maybePollBench(results[4]);
   }).catch(function(err){ setMsg("Refresh failed: " + err.message); });
 }
@@ -2278,11 +2933,76 @@ document.getElementById("btn-load-config").addEventListener("click", function(){
   }).catch(function(err){ setMsg("Load config failed: " + err.message); });
 });
 
+document.getElementById("btn-routing-save").addEventListener("click", function(){
+  var body = JSON.stringify({
+    enabled: document.getElementById("route-enabled").checked,
+    auto_switch: document.getElementById("route-auto-switch").checked,
+    block_quic_global: document.getElementById("route-block-quic").checked,
+    rule_source: document.getElementById("route-source").value
+  });
+  api("POST", "/api/routing/settings", body).then(function(data){
+    routingState.settings = data.settings || routingState.settings;
+    showOk("Routing settings saved.");
+    return refreshAll();
+  }).catch(function(err){ setMsg("Routing settings failed: " + err.message); });
+});
+
+document.getElementById("btn-rule-add").addEventListener("click", addRoutingRule);
+document.getElementById("btn-catalog-refresh").addEventListener("click", function(){
+  var source = document.getElementById("route-source").value;
+  document.getElementById("routing-status").textContent = "Refreshing catalog…";
+  api("POST", "/api/routing/catalog/refresh", JSON.stringify({source: source})).then(function(data){
+    routingState.catalog = data.catalog || routingState.catalog || [];
+    document.getElementById("routing-status").textContent = "catalog: " + routingState.catalog.length + " item(s)";
+    renderRouting(routingState, lastProfiles);
+  }).catch(function(err){
+    document.getElementById("routing-status").textContent = "";
+    setMsg("Catalog refresh failed: " + err.message);
+  });
+});
+document.getElementById("btn-rule-save").addEventListener("click", function(){
+  api("POST", "/api/routing/rules", JSON.stringify({rules: routingState.rules || []})).then(function(data){
+    routingState.rules = data.rules || [];
+    showOk("Routing rules saved.");
+    renderRoutingRules();
+  }).catch(function(err){ setMsg("Save rules failed: " + err.message); });
+});
+document.getElementById("btn-routing-apply").addEventListener("click", function(){
+  api("POST", "/api/routing/settings", JSON.stringify({
+    enabled: document.getElementById("route-enabled").checked,
+    auto_switch: document.getElementById("route-auto-switch").checked,
+    block_quic_global: document.getElementById("route-block-quic").checked,
+    rule_source: document.getElementById("route-source").value
+  })).then(function(){
+    return api("POST", "/api/routing/rules", JSON.stringify({rules: routingState.rules || []}));
+  }).then(function(){
+    return api("POST", "/api/routing/apply");
+  }).then(function(data){
+    showOk("Routing applied. Core: " + (data.core_status || "ok"));
+    return refreshAll();
+  }).catch(function(err){ setMsg("Apply routing failed: " + err.message); });
+});
+
+document.getElementById("btn-tproxy-status").addEventListener("click", function(){
+  api("GET", "/api/routing/tproxy-status").then(function(data){
+    document.getElementById("routing-status").textContent = "chain=" + data.chain + ", rule=" + data.ip_rule + ", port=" + data.tproxy_port;
+  }).catch(function(err){ setMsg("TPROXY status failed: " + err.message); });
+});
+document.getElementById("btn-tproxy-install").addEventListener("click", function(){
+  api("POST", "/api/routing/tproxy-install").then(function(){ showOk("TPROXY installed/repaired."); }).catch(function(err){ setMsg("TPROXY install failed: " + err.message); });
+});
+document.getElementById("btn-tproxy-rollback").addEventListener("click", function(){
+  api("POST", "/api/routing/tproxy-rollback").then(function(){ showOk("TPROXY rollback done."); }).catch(function(err){ setMsg("TPROXY rollback failed: " + err.message); });
+});
+
 document.getElementById("subs-toggle").addEventListener("click", function(){
   toggleCollapsible("subs-toggle", "subs-panel");
 });
 document.getElementById("fav-toggle").addEventListener("click", function(){
   toggleCollapsible("fav-toggle", "fav-panel");
+});
+document.getElementById("routing-toggle").addEventListener("click", function(){
+  toggleCollapsible("routing-toggle", "routing-panel");
 });
 
 refreshAll();
@@ -2342,6 +3062,7 @@ mod tests {
             port: Some(443),
             raw: "vless://11111111-1111-1111-1111-111111111111@example.com:443#demo".to_owned(),
             selected: true,
+            block_quic: false,
             group: None,
         });
         state.active_profile_id = Some(0);
@@ -2422,6 +3143,162 @@ mod tests {
         assert_eq!(config["inbounds"][0]["protocol"], "socks");
         assert_eq!(config["outbounds"][0]["protocol"], "vless");
         assert_eq!(config["outbounds"][0]["streamSettings"]["network"], "xhttp");
+    }
+
+    #[test]
+    fn split_routing_config_is_wifi_only_and_falls_back_to_active() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active\n\
+             vless://22222222-2222-2222-2222-222222222222@example.org:443?security=tls#YouTube",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "RU direct".to_owned(),
+                target: "direct".to_owned(),
+                domains: vec!["geosite:ru".to_owned()],
+                ips: vec!["geoip:ru".to_owned()],
+                ..Default::default()
+            });
+            inner.state.profiles[0].block_quic = true;
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "YouTube".to_owned(),
+                target: "profile:1".to_owned(),
+                services: vec!["youtube".to_owned()],
+                ..Default::default()
+            });
+        }
+
+        let (status, _, body) = handle_get_xray_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_json::from_str(&body).expect("parse config");
+        assert!(
+            config["inbounds"]
+                .as_array()
+                .expect("inbounds array")
+                .iter()
+                .any(|inbound| {
+                    inbound["tag"] == "wifi-tproxy" && inbound["protocol"] == "dokodemo-door"
+                })
+        );
+        assert!(
+            config["outbounds"]
+                .as_array()
+                .expect("outbounds array")
+                .iter()
+                .any(|outbound| {
+                    outbound["tag"] == "profile-1" && outbound["protocol"] == "vless"
+                })
+        );
+        let rules = config["routing"]["rules"]
+            .as_array()
+            .expect("routing rules");
+        assert!(rules.iter().any(|rule| {
+            rule["outboundTag"] == "direct"
+                && rule["domain"]
+                    .as_array()
+                    .is_some_and(|d| d.contains(&json!("geosite:ru")))
+                && rule["ip"]
+                    .as_array()
+                    .is_some_and(|d| d.contains(&json!("geoip:ru")))
+        }));
+        assert!(rules.iter().any(|rule| rule["outboundTag"] == "block"
+            && rule["network"] == "udp"
+            && rule["port"] == "443"));
+        assert_eq!(
+            rules.last().expect("fallback rule")["outboundTag"],
+            "active"
+        );
+    }
+
+    #[test]
+    fn routing_api_saves_settings_and_rules() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, _) = handle_routing_settings(
+            r#"{"enabled":true,"auto_switch":true,"block_quic_global":true,"rule_source":"blackmatrix7"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 200);
+        let body = r#"{"rules":[{"enabled":true,"name":"Instagram","target":"active","domains":["domain:instagram.com"],"ips":["1.2.3.0/24"],"services":["instagram"]}]}"#;
+        let (status, _, response) = handle_routing_rules(body, &daemon);
+        assert_eq!(status, 200);
+        assert!(response.contains("Instagram"));
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.split_routing.enabled);
+        assert!(inner.state.split_routing.auto_switch);
+        assert!(inner.state.split_routing.block_quic_global);
+        assert_eq!(inner.state.split_routing.rule_source, "blackmatrix7");
+        assert_eq!(inner.state.routing_rules.len(), 1);
+        assert_eq!(inner.state.routing_rules[0].services, vec!["instagram"]);
+    }
+
+    #[test]
+    fn profile_block_quic_toggle_persists_and_affects_config() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active\n\
+             vless://22222222-2222-2222-2222-222222222222@example.org:443?security=tls#YouTube",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "YouTube".to_owned(),
+                target: "profile:1".to_owned(),
+                services: vec!["youtube".to_owned()],
+                ..Default::default()
+            });
+        }
+
+        // Toggle block_quic on the fixed target profile (id=1).
+        let (status, _, _) =
+            handle_profile_block_quic(r#"{"profile_id":1,"block_quic":true}"#, &daemon);
+        assert_eq!(status, 200);
+
+        let (status, _, body) = handle_get_xray_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_json::from_str(&body).expect("parse config");
+        let rules = config["routing"]["rules"]
+            .as_array()
+            .expect("routing rules");
+        let mut block_count = 0usize;
+        let mut youtube_block_seen = false;
+        for (i, rule) in rules.iter().enumerate() {
+            if rule["outboundTag"] == "block" && rule["network"] == "udp" && rule["port"] == "443" {
+                block_count += 1;
+                // The block should appear immediately before a YouTube rule if it
+                // belongs to the fixed profile target.
+                if i + 1 < rules.len() && rules[i + 1]["outboundTag"] == "profile-1" {
+                    youtube_block_seen = true;
+                }
+            }
+        }
+        assert!(block_count > 0, "expected at least one QUIC block rule");
+        assert!(
+            youtube_block_seen,
+            "expected QUIC block before fixed-profile YouTube rule"
+        );
+    }
+
+    #[test]
+    fn routing_catalog_refresh_returns_curated_for_dat_sources() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) =
+            handle_routing_catalog_refresh(r#"{"source":"metacubex-lite"}"#, &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse catalog response");
+        let catalog = response["catalog"].as_array().expect("catalog array");
+        assert!(catalog.iter().any(|item| item["id"] == "youtube"));
+        assert!(catalog.iter().any(|item| item["id"] == "instagram"));
     }
 
     #[test]

@@ -590,6 +590,7 @@ mod tests {
             port: Some(443),
             raw: "hysteria2://secret@example.com:443?sni=example.com#Hy2".to_owned(),
             selected: false,
+            block_quic: false,
             group: None,
         };
         let result = benchmark_profile(
@@ -614,6 +615,7 @@ mod tests {
             port: Some(1),
             raw: "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:1#dead".to_owned(),
             selected: false,
+            block_quic: false,
             group: None,
         };
         let result = benchmark_profile(
