@@ -1,6 +1,6 @@
-# HincyRay v0.3
+# HincyRay v0.4
 
-HincyRay is a lightweight VPN/proxy client for Keenetic Homebrew routers. v0.3 ships a router daemon (`hincyray`) that reuses the parser, Xray config generator, and quality scoring originally developed for the `XrayVpnTest` desktop tool, and exposes an embedded web panel on the router LAN. v0.3 adds WiFi-only traffic split (per-domain/per-IP/per-service routing), a per-server QUIC/UDP 443 toggle, and a live service catalog refresh from community rule projects. Earlier versions added the v0.1.1 opt-in WiFi VPN segment (`scripts/`) and v0.2 benchmark/stats/favorites/subscription refresh.
+HincyRay is a lightweight VPN/proxy client for Keenetic Homebrew routers. v0.4 ships a router daemon (`hincyray`) that reuses the parser, Xray config generator, and quality scoring originally developed for the `XrayVpnTest` desktop tool, and exposes an embedded web panel on the router LAN. v0.4 replaces the TPROXY-based WiFi VPN routing with tun2socks (TUN device + iproute2 policy routing), eliminating iptables mangle chain dependency and surviving Keenetic ndm reloads with zero downtime. v0.3 added WiFi-only traffic split (per-domain/per-IP/per-service routing), a per-server QUIC/UDP 443 toggle, and a live service catalog refresh. Earlier versions added the v0.1.1 opt-in WiFi VPN segment and v0.2 benchmark/stats/favorites/subscription refresh.
 
 The desktop app `xray-vpn-test` is still built from this crate behind the `desktop` feature, but its role is now diagnostics and benchmarking only &mdash; it is not the shipped product. See [`docs/hincyray-v0.1-status.md`](docs/hincyray-v0.1-status.md) for the version status and [`docs/keenetic-client-roadmap.md`](docs/keenetic-client-roadmap.md) for the longer plan.
 
@@ -17,11 +17,12 @@ The desktop app `xray-vpn-test` is still built from this crate behind the `deskt
 - **v0.2 stats and ratings**: `GET /api/stats` returns per-profile latest latency/jitter/speed/success/fail/score/last error/last checked, sorted by score descending. Uses the shared `scoring::quality_score` formula. Stats survive daemon restarts and are capped at the latest 1000 history samples.
 - **v0.2 favorites**: `POST /api/favorites/toggle` with `{ "profile_id": N }` toggles a favorite by raw share link (stable across renumbering). `GET /api/favorites` lists them.
 - **v0.2 subscription refresh**: `POST /api/subscriptions/refresh` re-fetches every saved subscription source, merges new profiles by raw link, and updates per-source `last_loaded`/`last_error`/`profile_count`. Failed refreshes do not delete existing profiles. `GET /api/subscriptions` lists saved sources.
-- **Opt-in WiFi VPN segment via TPROXY (v0.1.1 add-on)**: shell scripts under `scripts/` create a separate `HincyRay-VPN` SSID on `192.168.2.0/24`, patch the generated Xray config with a `dokodemo-door` TPROXY inbound on port `10810`, and install `iptables` mangle TPROXY rules that steer **only** `192.168.2.0/24` through Xray. The main `192.168.1.0/24` network is untouched.
-- **v0.3 WiFi traffic split**: in the web panel, define routing rules scoped to the `HincyRay-VPN` TPROXY inbound. Rules can match `geosite:*` categories, custom domains, IP/CIDR, or `geoip:*` and target `direct`, the active server, the best server, or a fixed profile. SOCKS clients are unaffected.
+- **v0.4 TUN-based WiFi VPN routing via tun2socks**: `tun2socks` creates a TUN device (`tun0`) and forwards WiFi VPN traffic (192.168.2.0/24) to Xray's second SOCKS inbound (127.0.0.1:10810) via iproute2 policy routing. iptables mangle MARK + fwmark rule is used for source-based routing (source-based ip rule alone does not work for forwarded traffic on Keenetic). FORWARD ACCEPT rules allow br1↔tun0 forwarding. A 10-second watchdog reinstalls any iptables rules wiped by ndm. No TPROXY, no dokodemo-door, no mangle redirect — just a MARK + TUN + SOCKS chain.
+- **Opt-in WiFi VPN segment**: `scripts/wifi-segment-setup.sh` creates a separate `HincyRay-VPN` SSID on `192.168.2.0/24` via Keenetic `ndmc`. The daemon handles all routing internally via tun2socks and iproute2; no manual iptables scripts needed.
+- **v0.3 WiFi traffic split**: in the web panel, define routing rules scoped to the tun2socks SOCKS inbound. Rules can match `geosite:*` categories, custom domains, IP/CIDR, or `geoip:*` and target `direct`, the active server, the best server, or a fixed profile. SOCKS clients are unaffected.
 - **v0.3 service catalog**: choose a rule source project (`MetaCubeX`, `Loyalsoldier`, `v2fly/domain-list-community`, `blackmatrix7/ios_rule_script`) and click **Refresh service catalog** to pull live category lists from GitHub; the panel turns them into checkboxes. Catalog refresh uses the same direct-then-local-SOCKS fallback as subscription refresh, so it works on isolated routers.
 - **v0.3 per-server QUIC toggle**: each profile row has a `⊘ QUIC` button. When enabled for a server, HincyRay adds a `block UDP 443` rule before any WiFi traffic that would exit through that server (active fallback or fixed target), forcing services like YouTube to fall back to TCP.
-- **v0.3 TPROXY controls**: the web panel shows live TPROXY status and offers **Install/repair** and **Rollback** buttons that run the existing `scripts/tproxy-setup.sh` / `tproxy-rollback.sh` from the router, so the WiFi segment can be restored after a Keenetic reboot without SSH.
+- **v0.4 TUN controls**: the web panel shows live TUN status (tun2socks process, TUN interface, mangle MARK chain, FORWARD rules, ip rule, SOCKS port, Xray core) and offers **Start** and **Stop** buttons for the tun2socks process.
 - Desktop `xray-vpn-test` remains available as the macOS diagnostics surface (feature `desktop`) for benchmarking nodes through `sing-box` and `xray`.
 
 ## Safe SOCKS-only MVP (default)
@@ -35,7 +36,7 @@ v0.1 is intentionally narrow to avoid breaking the workstation that manages the 
 
 ## Current limitations
 
-- **No automatic routing installed by the daemon by default.** The v0.1.1 WiFi VPN segment is opt-in and script-driven (TPROXY for `192.168.2.0/24` only); automatic failover and auto-select are still post-MVP. The v0.3 split-routing engine only applies to the TPROXY WiFi segment, not to the main `192.168.1.0/24` network or SOCKS clients.
+- **No automatic routing installed by the daemon by default.** The v0.4 WiFi VPN segment uses tun2socks (TUN + iproute2 + mangle MARK) for `192.168.2.0/24` only; automatic failover and auto-select are still post-MVP. The v0.3 split-routing engine only applies to the tun2socks WiFi segment, not to the main `192.168.1.0/24` network or SOCKS clients.
 - **Hysteria2 is not supported by the Xray backend.** Selecting a Hysteria2 profile returns a clear 400 error from `/api/active-profile`. Hysteria2 is also rejected by the HEAD/GET benchmark with `unsupported by xray benchmark`; use the TCP method to probe `address:port` for Hysteria2 nodes. A future sing-box or Mihomo backend is planned.
 - **Router internet may require manual artifact copy.** The Entware router is often isolated or has restricted direct downloads. The Xray binary, HincyRay binary, and `geoip.dat`/`geosite.dat` assets may need to be fetched on a workstation and copied via `scp`. See [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md).
 - **Benchmark HEAD/GET requires `curl` in PATH.** Entware ships curl; if it is missing, HEAD/GET methods return a clear `curl spawn` error. The TCP method does not need curl.
@@ -49,7 +50,7 @@ Requirements:
 - Rust 2024 toolchain.
 - For the desktop diagnostics build: macOS SDK / Xcode command line tools, plus `sing-box` and `xray` in `PATH` for runtime checks.
 
-### Router daemon (HincyRay v0.3)
+### Router daemon (HincyRay v0.4)
 
 Build only the `hincyray` binary with desktop features disabled so `eframe`, `egui_extras`, and `arboard` are not pulled in. This is the build that ships to Keenetic Entware:
 
@@ -146,9 +147,9 @@ Environment overrides:
 | `POST` | `/api/routing/rules` | Body: `{ "rules": [...] }`. Save WiFi-only routing rules (domains/IPs/services/target). |
 | `POST` | `/api/routing/catalog/refresh` | Body: `{ "source": "v2fly-dlc"|"blackmatrix7"|... }`. Pull live service category list from the selected GitHub project (direct or via local SOCKS fallback). |
 | `POST` | `/api/routing/apply` | Regenerate Xray config with the current rules and restart the core if running. |
-| `GET` | `/api/routing/tproxy-status` | Returns `{ chain, ip_rule, tproxy_port }`. |
-| `POST` | `/api/routing/tproxy-install` | Run `scripts/tproxy-setup.sh` on the router. |
-| `POST` | `/api/routing/tproxy-rollback` | Run `scripts/tproxy-rollback.sh` on the router. |
+| `GET` | `/api/routing/tun-status` | Returns `{ enabled, tun_running, core_running, iface_exists, rule_exists, mangle_exists, forward_exists, socks_listening, tun_device, tun_socks_port }`. |
+| `POST` | `/api/routing/tun-start` | Start the tun2socks process and install iproute2 + iptables rules. |
+| `POST` | `/api/routing/tun-stop` | Stop tun2socks and remove all routing rules. |
 
 Request bodies are limited to 1 MiB. No async runtime or web framework is used; the daemon runs on `std::net::TcpListener` with one thread per connection. The benchmark worker is a separate `std::thread`; the active Xray `CoreManager` child is never touched by benchmarks.
 
@@ -199,16 +200,19 @@ curl -sS -X POST http://127.0.0.1:8088/api/profiles/block-quic \
   -H 'Content-Type: application/json' --data '{"profile_id":0,"block_quic":true}'
 ```
 
-## WiFi VPN segment (v0.1.1, opt-in)
+## WiFi VPN segment (v0.4, tun2socks)
 
-The four shell scripts in `scripts/` add an opt-in path to route a separate WiFi segment through Xray:
+v0.4 routes a separate WiFi segment through Xray using tun2socks — no TPROXY, no dokodemo-door, no mangle redirect:
 
 - `scripts/wifi-segment-setup.sh` &mdash; creates the `HincyRay-VPN` SSID on `192.168.2.0/24` via Keenetic `ndmc` (2.4 GHz + 5 GHz, DHCP pool).
-- `scripts/xray-tproxy-inbound.sh` &mdash; patches the generated Xray config with a `dokodemo-door` TPROXY inbound on `0.0.0.0:10810` (needs `jq`).
-- `scripts/tproxy-setup.sh` &mdash; installs `iptables` mangle TPROXY rules + a policy-routing table for `192.168.2.0/24` only.
-- `scripts/tproxy-rollback.sh` &mdash; removes the above; `192.168.2.0/24` then routes direct again.
+- The daemon handles all routing internally via `TunManager`:
+  1. `tun2socks` creates a TUN device (`tun0`) and forwards traffic to Xray's second SOCKS inbound (`127.0.0.1:10810`).
+  2. iptables mangle MARK chain (`HINCYRAY_TUN`) marks packets from `192.168.2.0/24` with fwmark `0x111`.
+  3. iproute2 `ip rule fwmark 0x111 lookup 111` + `ip route default dev tun0 table 111` routes marked packets through the TUN.
+  4. iptables FORWARD ACCEPT rules allow br1↔tun0 forwarding (ndm default FORWARD policy is DROP).
+  5. A 10-second watchdog checks all components and reinstalls any iptables rules wiped by ndm.
 
-Only `192.168.2.0/24` is steered through Xray; `192.168.1.0/24` keeps the main uplink. Nothing is installed automatically, and changes are not saved to flash unless you run `ndmc -c "system configuration save"`. The `iptables` rules are not persisted, so re-run `tproxy-setup.sh` after every reboot. The step-by-step runbook (run, test, rollback, save) is in [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md).
+Only `192.168.2.0/24` is steered through Xray; `192.168.1.0/24` keeps the main uplink. The TUN interface and iproute2 rules survive ndm reloads; only iptables chains need watchdog reinstallation. Tested: `kill -HUP ndm` &mdash; zero downtime, VPN stays up.
 
 ## Documentation
 
@@ -218,10 +222,11 @@ Only `192.168.2.0/24` is steered through Xray; `192.168.1.0/24` keeps the main u
 
 ## Notes
 
-- VLESS XHTTP is not supported by `sing-box`, so the desktop diagnostics app tests XHTTP/Satellite profiles through `xray`. The router daemon uses `xray` exclusively for v0.3.
+- VLESS XHTTP is not supported by `sing-box`, so the desktop diagnostics app tests XHTTP/Satellite profiles through `xray`. The router daemon uses `xray` exclusively for v0.4.
 - The quality score is a pragmatic composite of short download speed, latency, jitter, and failures. It is shared between the desktop app and the daemon via `scoring::quality_score`. The v0.3 daemon uses it for `/api/stats` and the rating table.
 - v0.3 benchmark cleanup: temporary Xray children are wrapped in a `Drop` guard, so even on early return, cancel, or error the child is killed and reaped. The active core (held by `CoreManager`) is never touched by the benchmark worker.
-- Neither the daemon nor the desktop app modifies system VPN settings by default; checks and the router MVP run through a local SOCKS proxy. The v0.1.1 WiFi VPN segment remains opt-in and script-driven, but v0.3 can install/repair it from the web panel.
-- v0.3 split routing only applies to the TPROXY WiFi inbound (`192.168.2.0/24` by default). SOCKS clients always use the active profile.
+- Neither the daemon nor the desktop app modifies system VPN settings by default; checks and the router MVP run through a local SOCKS proxy. The v0.4 WiFi VPN segment uses tun2socks managed by the daemon's `TunManager`.
+- v0.4 split routing only applies to the tun2socks WiFi inbound (`192.168.2.0/24` by default). SOCKS clients always use the active profile.
+- v0.4 requires `tun2socks` binary at `/opt/sbin/tun2socks` (or path specified in `SplitRoutingSettings.tun2socks_path`). Download from [xjasonlyu/tun2socks releases](https://github.com/xjasonlyu/tun2socks/releases) — the `tun2socks-linux-arm64` build is a statically linked Go binary (~10 MB).
 - Subscription bodies and rule catalog bodies are tried as plain text and common base64 variants.
 - Do not put real subscription URLs or tokens into bug reports or docs; use the placeholder `https://provider.example/sub/<token>`.

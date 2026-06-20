@@ -1,12 +1,12 @@
 # Keenetic VPN Client Roadmap
 
-> v0.3 is shipped as the `hincyray` router daemon. See [`hincyray-v0.1-status.md`](hincyray-v0.1-status.md) for the implemented / validated / not-implemented snapshot, and [`hincyray-entware-install.md`](hincyray-entware-install.md) for the install runbook. The desktop `xray-vpn-test` is the diagnostics surface behind the `desktop` feature.
+> v0.4 is shipped as the `hincyray` router daemon. See [`hincyray-v0.1-status.md`](hincyray-v0.1-status.md) for the implemented / validated / not-implemented snapshot, and [`hincyray-entware-install.md`](hincyray-entware-install.md) for the install runbook. The desktop `xray-vpn-test` is the diagnostics surface behind the `desktop` feature.
 
 ## Goal
 
 Build a lightweight VPN/proxy client for Keenetic Homebrew routers, starting with Keenetic Giga KN-1012, using the current XrayVpnTest project as the parser, benchmark, and diagnostics foundation.
 
-The desktop application is the diagnostics surface. The shipped router product is `hincyray` v0.3: a router-installed daemon with a web panel that accepts Happ/TutNet-style subscriptions and direct configs, lets the user choose a server manually, exposes a local SOCKS listener through Xray, and optionally routes a separate WiFi segment through Xray with per-domain / per-IP / per-service split rules. The v0.1.1 add-on in `scripts/` adds an opt-in WiFi VPN segment via TPROXY for `192.168.2.0/24`; v0.3 adds the split-routing engine and daemon-managed TPROXY controls. Automatic server selection, per-device/per-SSID policy routing, and Hysteria2 remain post-MVP.
+The desktop application is the diagnostics surface. The shipped router product is `hincyray` v0.4: a router-installed daemon with a web panel that accepts Happ/TutNet-style subscriptions and direct configs, lets the user choose a server manually, exposes a local SOCKS listener through Xray, and optionally routes a separate WiFi segment through Xray with per-domain / per-IP / per-service split rules via tun2socks (TUN + iproute2). v0.4 replaced TPROXY with tun2socks for ndm resilience. Automatic server selection, per-device/per-SSID policy routing, and Hysteria2 remain post-MVP.
 
 ## Target Device
 
@@ -73,16 +73,16 @@ Implemented:
 - State path auto-detection: `HINCYRAY_STATE` env → `/opt/etc/hincyray/state.json` (Entware) → `/etc/hincyray/state.json` (OpenWrt) → `$HOME/.config/hincyray/state.json` → `./hincyray-state.json`. Atomic save via temp file + rename.
 - Xray config path: `HINCYRAY_XRAY_CONFIG` env → `xray-client.json` next to state.
 - JSON state: profiles (including `block_quic` per server), active_profile_id, auto_select, listen_host (default `127.0.0.1`), socks_port (default `10808`), http_port (default `10809`, reserved for later), xray_path (default `xray`), metrics_history, routing_rules, split_routing settings.
-- HTTP API: `GET /`, `GET /api/health`, `GET /api/status`, `GET /api/profiles`, `POST /api/profiles/import`, `POST /api/profiles/block-quic`, `POST /api/active-profile`, `GET /api/xray/config`, `POST /api/core/start|stop|restart`, `GET|POST /api/bench/*`, `GET /api/stats`, `POST /api/favorites/toggle`, `GET /api/favorites`, `GET|POST /api/subscriptions/*`, `GET /api/routing`, `POST /api/routing/settings`, `POST /api/routing/rules`, `POST /api/routing/catalog/refresh`, `POST /api/routing/apply`, `GET /api/routing/tproxy-status`, `POST /api/routing/tproxy-install`, `POST /api/routing/tproxy-rollback`.
+- HTTP API: `GET /`, `GET /api/health`, `GET /api/status`, `GET /api/profiles`, `POST /api/profiles/import`, `POST /api/profiles/block-quic`, `POST /api/active-profile`, `GET /api/xray/config`, `POST /api/core/start|stop|restart`, `GET|POST /api/bench/*`, `GET /api/stats`, `POST /api/favorites/toggle`, `GET /api/favorites`, `GET|POST /api/subscriptions/*`, `GET /api/routing`, `POST /api/routing/settings`, `POST /api/routing/rules`, `POST /api/routing/catalog/refresh`, `POST /api/routing/apply`, `GET /api/routing/tun-status`, `POST /api/routing/tun-start`, `POST /api/routing/tun-stop`.
 - `CoreManager` with one in-memory `Child`, status detection via `try_wait`, idempotent stop. Xray is spawned with `stdout`/`stderr` set to `Stdio::null()` so the long-lived child cannot block on a buffered pipe that nothing reads.
 - The daemon can be built without the desktop feature: `cargo build --release --no-default-features --bin hincyray` skips `eframe`/`egui_extras`/`arboard` so the Entware/OpenWrt artifact stays small and free of GUI dependencies. Shared modules (`profiles`, `scoring`, `xray_config`, `tester`, `hincyray`) remain available; `app`/`theme`/`run()` are gated behind the `desktop` feature.
 - Xray config generation reuses `xray_config::build_xray_config` (VLESS only; Hysteria2 returns a 400 with a clear message).
 - Tests for xray_config (VLESS XHTTP Reality fields, Hysteria2 rejection, Unknown protocol rejection, TCP Reality), storage round-trip with defaults, import/dedup, active-profile activation and config write, edge-case HTTP responses.
-- v0.1.1 opt-in WiFi VPN segment via TPROXY: `scripts/wifi-segment-setup.sh`, `scripts/xray-tproxy-inbound.sh`, `scripts/tproxy-setup.sh`, `scripts/tproxy-rollback.sh`. Creates `HincyRay-VPN` SSID on `192.168.2.0/24`, patches the generated Xray config with a `dokodemo-door` TPROXY inbound on port `10810`, and installs `iptables` mangle TPROXY rules + a policy-routing table that steer only `192.168.2.0/24` through Xray. The main `192.168.1.0/24` network is untouched. Manual setup only; the daemon stays SOCKS-only by default. Validated on KN-1012: a phone on `HincyRay-VPN` got the proxy exit IP and YouTube worked, while `192.168.1.0/24` kept its direct IP.
+- v0.4 WiFi VPN segment via tun2socks: `TunManager` creates a TUN device (`tun0`) via `tun2socks`, forwards WiFi VPN traffic from `192.168.2.0/24` to Xray's second SOCKS inbound (`127.0.0.1:10810`), and installs iproute2 policy routing (fwmark `0x111`, table `111`) + iptables mangle MARK chain + FORWARD ACCEPT rules. A 10-second watchdog reinstalls any iptables rules wiped by ndm. The main `192.168.1.0/24` network is untouched. Validated on KN-1012: a phone on `HincyRay-VPN` got the proxy exit IP, `kill -HUP ndm` caused zero downtime. TPROXY scripts (`tproxy-setup.sh`, `tproxy-rollback.sh`, `xray-tproxy-inbound.sh`) removed in v0.4.
 
 Not yet implemented (post-MVP, tracked below):
 
-- Router-side policy routing installed/managed by the daemon itself. The v0.1.1 WiFi VPN segment ships an opt-in, script-driven TPROXY path for `192.168.2.0/24`; v0.3 added per-domain / per-IP / per-service split rules and daemon-managed TPROXY install/rollback, but per-device / per-SSID rules and `iptables` persistence across reboots are still pending.
+- Router-side policy routing installed/managed by the daemon itself. v0.4 delivers tun2socks-based routing (TUN + iproute2 + mangle MARK) managed by `TunManager`; v0.3 added per-domain / per-IP / per-service split rules. Per-device / per-SSID rules remain pending.
 - Automatic server selection using `scoring::quality_score` and recent metrics.
 - Health checks with automatic failover.
 - Full web UI (only an endpoint-listing index page is shipped).
@@ -92,7 +92,7 @@ Not yet implemented (post-MVP, tracked below):
 ## Post-MVP Scope
 
 - Automatic server selector using quality score, recent failures, and preferred country/provider.
-- Policy routing for selected clients, SSIDs, domains, or IP ranges (v0.1.1 delivers an opt-in per-subnet WiFi segment via `scripts/`; v0.3 delivers per-domain/per-IP/per-service rules and daemon-managed TPROXY install/rollback; per-client/per-SSID rules and `iptables` persistence remain).
+- Policy routing for selected clients, SSIDs, domains, or IP ranges (v0.4 delivers tun2socks-based per-subnet WiFi routing managed by `TunManager`; v0.3 delivers per-domain/per-IP/per-service rules; per-client/per-SSID rules remain).
 - Health checks with automatic failover.
 - Export/import full router-client configuration.
 - Optional Mihomo backend for advanced rule-based routing if Xray routing is insufficient.

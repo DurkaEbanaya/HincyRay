@@ -53,18 +53,40 @@ pub fn run() -> Result<(), String> {
     let state = load_state(&state_path);
     let daemon = Daemon::new(state, state_path, xray_config_path);
 
-    // Regenerate Xray config from state on startup so the TPROXY inbound
-    // is included when split routing is enabled. This replaces the legacy
-    // xray-tproxy-inbound.sh patching approach.
+    // Regenerate Xray config from state on startup so the tun2socks
+    // SOCKS inbound is included when split routing is enabled.
     {
-        let inner = lock(&daemon.inner);
+        let mut inner = lock(&daemon.inner);
         if let Err(error) = regenerate_xray_config(&inner.state, &daemon.xray_config_path) {
             eprintln!("hincyray: startup config regeneration failed: {error}");
         }
+        let split = &inner.state.split_routing;
+        if split.enabled && Path::new(&split.tun2socks_path).exists() {
+            let tun2socks_path = split.tun2socks_path.clone();
+            let tun_device = split.tun_device.clone();
+            let tun_address = split.tun_address.clone();
+            let tun_mtu = split.tun_mtu;
+            let tun_socks_port = split.tun_socks_port;
+            let vpn_subnet = split.vpn_subnet.clone();
+            if let Err(error) = inner.tun.start(
+                &tun2socks_path,
+                &tun_device,
+                &tun_address,
+                tun_mtu,
+                tun_socks_port,
+                &vpn_subnet,
+            ) {
+                eprintln!("hincyray: tun2socks startup failed: {error}");
+            } else {
+                eprintln!(
+                    "hincyray: tun2socks started on {tun_device} -> 127.0.0.1:{tun_socks_port}"
+                );
+            }
+        }
     }
 
-    // Start TPROXY watchdog on router targets.
-    start_tproxy_watchdog(daemon.clone());
+    // Start watchdog on router targets.
+    start_watchdog(daemon.clone());
 
     let listener = TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;
     eprintln!("hincyray listening on {listen}");
@@ -107,6 +129,7 @@ pub struct Daemon {
 struct DaemonInner {
     state: HincyrayState,
     core: CoreManager,
+    tun: TunManager,
     bench: BenchRuntime,
 }
 
@@ -265,8 +288,8 @@ pub struct ProfileStats {
     pub last_checked_unix: u64,
 }
 
-/// WiFi split-routing controls. Rules are scoped to the TPROXY WiFi inbound;
-/// SOCKS clients keep using the active profile.
+/// WiFi split-routing controls. Rules are scoped to the tun2socks SOCKS
+/// inbound; direct SOCKS clients keep using the active profile.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SplitRoutingSettings {
     #[serde(default)]
@@ -279,8 +302,16 @@ pub struct SplitRoutingSettings {
     pub rule_source: String,
     #[serde(default = "default_vpn_subnet")]
     pub vpn_subnet: String,
-    #[serde(default = "default_tproxy_port")]
-    pub tproxy_port: u16,
+    #[serde(default = "default_tun_socks_port")]
+    pub tun_socks_port: u16,
+    #[serde(default = "default_tun_device")]
+    pub tun_device: String,
+    #[serde(default = "default_tun_address")]
+    pub tun_address: String,
+    #[serde(default = "default_tun2socks_path")]
+    pub tun2socks_path: String,
+    #[serde(default = "default_tun_mtu")]
+    pub tun_mtu: u16,
 }
 
 impl Default for SplitRoutingSettings {
@@ -291,7 +322,11 @@ impl Default for SplitRoutingSettings {
             block_quic_global: false,
             rule_source: default_rule_source(),
             vpn_subnet: default_vpn_subnet(),
-            tproxy_port: default_tproxy_port(),
+            tun_socks_port: default_tun_socks_port(),
+            tun_device: default_tun_device(),
+            tun_address: default_tun_address(),
+            tun2socks_path: default_tun2socks_path(),
+            tun_mtu: default_tun_mtu(),
         }
     }
 }
@@ -304,8 +339,24 @@ fn default_vpn_subnet() -> String {
     "192.168.2.0/24".to_owned()
 }
 
-fn default_tproxy_port() -> u16 {
+fn default_tun_socks_port() -> u16 {
     10810
+}
+
+fn default_tun_device() -> String {
+    "tun0".to_owned()
+}
+
+fn default_tun_address() -> String {
+    "172.19.0.1/30".to_owned()
+}
+
+fn default_tun2socks_path() -> String {
+    "/opt/sbin/tun2socks".to_owned()
+}
+
+fn default_tun_mtu() -> u16 {
+    1400
 }
 
 /// Policy-routing rule. `kind`/`pattern`/`target` existed as a v0.1
@@ -357,6 +408,7 @@ impl Daemon {
             inner: Arc::new(Mutex::new(DaemonInner {
                 state,
                 core: CoreManager::new(),
+                tun: TunManager::new(),
                 bench: BenchRuntime::new(),
             })),
             state_path,
@@ -439,6 +491,302 @@ impl CoreManager {
         self.stop()?;
         self.start(xray_path, config_path)
     }
+}
+
+/// tun2socks lifecycle manager. Creates a TUN device and forwards
+/// traffic from the VPN WiFi subnet to Xray's SOCKS inbound via
+/// iproute2 policy routing — no iptables needed.
+struct TunManager {
+    child: Option<Child>,
+}
+
+impl TunManager {
+    fn new() -> Self {
+        Self { child: None }
+    }
+
+    fn is_running(&mut self) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                self.child = None;
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn status(&mut self) -> &'static str {
+        if self.is_running() {
+            "running"
+        } else {
+            "stopped"
+        }
+    }
+
+    fn start(
+        &mut self,
+        tun2socks_path: &str,
+        tun_device: &str,
+        tun_address: &str,
+        tun_mtu: u16,
+        socks_port: u16,
+        vpn_subnet: &str,
+    ) -> Result<(), String> {
+        if self.is_running() {
+            return Ok(());
+        }
+        if !Path::new(tun2socks_path).exists() {
+            return Err(format!("tun2socks not found at {tun2socks_path}"));
+        }
+
+        // Kill any stale tun2socks process and remove old TUN device
+        // from a previous daemon run that wasn't cleaned up properly.
+        let _ = Command::new("killall").arg("tun2socks").status();
+        let ip_cmd = resolve_ip_cmd();
+        let _ = Command::new(&ip_cmd)
+            .args(["link", "del", tun_device])
+            .status();
+        thread::sleep(Duration::from_millis(500));
+
+        let device_url = format!("tun://{tun_device}");
+        let proxy_url = format!("socks5://127.0.0.1:{socks_port}");
+        let mtu_str = tun_mtu.to_string();
+
+        let child = Command::new(tun2socks_path)
+            .args(["-device", &device_url])
+            .args(["-proxy", &proxy_url])
+            .args(["-mtu", &mtu_str])
+            .args(["-loglevel", "info"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("tun2socks spawn: {error}"))?;
+        self.child = Some(child);
+
+        let sleep_dur = Duration::from_millis(1500);
+        thread::sleep(sleep_dur);
+
+        if !self.is_running() {
+            return Err("tun2socks exited immediately".to_owned());
+        }
+
+        let ip_cmd = resolve_ip_cmd();
+        let _ = Command::new(&ip_cmd)
+            .args(["addr", "add", tun_address, "dev", tun_device])
+            .status();
+        let _ = Command::new(&ip_cmd)
+            .args(["link", "set", tun_device, "up"])
+            .status();
+
+        let table = TUN_ROUTE_TABLE.to_string();
+        let mark = format!("0x{:x}", TUN_FWMARK);
+        // Use fwmark-based policy routing: mangle MARK + ip rule fwmark.
+        // Source-based ip rule (from 192.168.2.0/24) does NOT work for
+        // forwarded traffic on Keenetic because ndm's conntrack/NAT
+        // intercepts packets before the routing decision. MARK in
+        // mangle PREROUTING runs before conntrack and survives long
+        // enough for the fwmark ip rule to redirect to table 111.
+        let _ = Command::new("iptables")
+            .args(["-t", "mangle", "-N", "HINCYRAY_TUN"])
+            .status();
+        let _ = Command::new("iptables")
+            .args(["-t", "mangle", "-F", "HINCYRAY_TUN"])
+            .status();
+        let _ = Command::new("iptables")
+            .args([
+                "-t",
+                "mangle",
+                "-A",
+                "HINCYRAY_TUN",
+                "-d",
+                "192.168.0.0/16",
+                "-j",
+                "RETURN",
+            ])
+            .status();
+        let _ = Command::new("iptables")
+            .args([
+                "-t",
+                "mangle",
+                "-A",
+                "HINCYRAY_TUN",
+                "-d",
+                "224.0.0.0/4",
+                "-j",
+                "RETURN",
+            ])
+            .status();
+        let _ = Command::new("iptables")
+            .args([
+                "-t",
+                "mangle",
+                "-A",
+                "HINCYRAY_TUN",
+                "-j",
+                "MARK",
+                "--set-mark",
+                &mark,
+            ])
+            .status();
+        let _ = Command::new("iptables")
+            .args([
+                "-t",
+                "mangle",
+                "-D",
+                "PREROUTING",
+                "-s",
+                vpn_subnet,
+                "-j",
+                "HINCYRAY_TUN",
+            ])
+            .status();
+        let _ = Command::new("iptables")
+            .args([
+                "-t",
+                "mangle",
+                "-A",
+                "PREROUTING",
+                "-s",
+                vpn_subnet,
+                "-j",
+                "HINCYRAY_TUN",
+            ])
+            .status();
+
+        let _ = Command::new(&ip_cmd)
+            .args(["rule", "del", "from", vpn_subnet, "lookup", &table])
+            .status();
+        let _ = Command::new(&ip_cmd)
+            .args(["rule", "del", "fwmark", &mark, "lookup", &table])
+            .status();
+        let _ = Command::new(&ip_cmd)
+            .args(["rule", "add", "fwmark", &mark, "lookup", &table])
+            .status();
+        let _ = Command::new(&ip_cmd)
+            .args(["route", "flush", "table", &table])
+            .status();
+        let _ = Command::new(&ip_cmd)
+            .args([
+                "route", "add", "default", "dev", tun_device, "table", &table,
+            ])
+            .status();
+
+        let bridge = resolve_vpn_bridge(vpn_subnet);
+        install_forward_rules(&bridge, tun_device);
+
+        Ok(())
+    }
+
+    fn stop(&mut self, tun_device: &str, vpn_subnet: &str) -> Result<(), String> {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+
+        let bridge = resolve_vpn_bridge(vpn_subnet);
+        remove_forward_rules(&bridge, tun_device);
+
+        let mark = format!("0x{:x}", TUN_FWMARK);
+        let _ = Command::new("iptables")
+            .args([
+                "-t",
+                "mangle",
+                "-D",
+                "PREROUTING",
+                "-s",
+                vpn_subnet,
+                "-j",
+                "HINCYRAY_TUN",
+            ])
+            .status();
+        let _ = Command::new("iptables")
+            .args(["-t", "mangle", "-F", "HINCYRAY_TUN"])
+            .status();
+        let _ = Command::new("iptables")
+            .args(["-t", "mangle", "-X", "HINCYRAY_TUN"])
+            .status();
+
+        let ip_cmd = resolve_ip_cmd();
+        let table = TUN_ROUTE_TABLE.to_string();
+        let _ = Command::new(&ip_cmd)
+            .args(["rule", "del", "fwmark", &mark, "lookup", &table])
+            .status();
+        let _ = Command::new(&ip_cmd)
+            .args([
+                "route", "del", "default", "dev", tun_device, "table", &table,
+            ])
+            .status();
+        let _ = Command::new(&ip_cmd)
+            .args(["link", "del", tun_device])
+            .status();
+
+        Ok(())
+    }
+}
+
+/// Allow br1↔tun0 forwarding in the iptables FORWARD chain. Keenetic's
+/// ndm sets a default DROP policy on FORWARD, so without these ACCEPT
+/// rules the kernel drops packets from the VPN WiFi bridge to the TUN
+/// device (and vice versa). Unlike the old TPROXY mangle chains, these
+/// are simple FORWARD ACCEPT rules that are trivial to verify and
+/// re-add.
+fn install_forward_rules(bridge: &str, tun_device: &str) {
+    let _ = Command::new("iptables")
+        .args([
+            "-D", "FORWARD", "-i", bridge, "-o", tun_device, "-j", "ACCEPT",
+        ])
+        .status();
+    let _ = Command::new("iptables")
+        .args([
+            "-I", "FORWARD", "1", "-i", bridge, "-o", tun_device, "-j", "ACCEPT",
+        ])
+        .status();
+    let _ = Command::new("iptables")
+        .args([
+            "-D", "FORWARD", "-i", tun_device, "-o", bridge, "-j", "ACCEPT",
+        ])
+        .status();
+    let _ = Command::new("iptables")
+        .args([
+            "-I", "FORWARD", "2", "-i", tun_device, "-o", bridge, "-j", "ACCEPT",
+        ])
+        .status();
+}
+
+fn remove_forward_rules(bridge: &str, tun_device: &str) {
+    let _ = Command::new("iptables")
+        .args([
+            "-D", "FORWARD", "-i", bridge, "-o", tun_device, "-j", "ACCEPT",
+        ])
+        .status();
+    let _ = Command::new("iptables")
+        .args([
+            "-D", "FORWARD", "-i", tun_device, "-o", bridge, "-j", "ACCEPT",
+        ])
+        .status();
+}
+
+/// Resolve the bridge interface name for the VPN subnet. On Keenetic,
+/// 192.168.2.0/24 is bridge br1; other subnets may use different names.
+fn resolve_vpn_bridge(_vpn_subnet: &str) -> String {
+    "br1".to_owned()
+}
+
+const TUN_ROUTE_TABLE: u32 = 111;
+const TUN_FWMARK: u32 = 0x111;
+
+fn resolve_ip_cmd() -> String {
+    for candidate in ["/opt/sbin/ip", "/sbin/ip", "/usr/sbin/ip", "ip"] {
+        if Path::new(candidate).exists() || candidate == "ip" {
+            return candidate.to_owned();
+        }
+    }
+    "ip".to_owned()
 }
 
 fn resolve_state_path() -> PathBuf {
@@ -577,7 +925,7 @@ fn build_daemon_xray_config(state: &HincyrayState) -> Result<Value, String> {
         &routes,
         &state.listen_host,
         state.socks_port,
-        Some(state.split_routing.tproxy_port),
+        Some(state.split_routing.tun_socks_port),
         active_block_quic,
     )
 }
@@ -817,9 +1165,9 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/routing/rules") => handle_routing_rules(body, daemon),
         ("POST", "/api/routing/catalog/refresh") => handle_routing_catalog_refresh(body, daemon),
         ("POST", "/api/routing/apply") => handle_routing_apply(daemon),
-        ("GET", "/api/routing/tproxy-status") => handle_tproxy_status(daemon),
-        ("POST", "/api/routing/tproxy-install") => handle_tproxy_script("tproxy-setup.sh"),
-        ("POST", "/api/routing/tproxy-rollback") => handle_tproxy_script("tproxy-rollback.sh"),
+        ("GET", "/api/routing/tun-status") => handle_tun_status(daemon),
+        ("POST", "/api/routing/tun-start") => handle_tun_start(daemon),
+        ("POST", "/api/routing/tun-stop") => handle_tun_stop(daemon),
         _ => (
             404,
             "application/json",
@@ -1823,8 +2171,32 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
     {
         inner.state.split_routing.vpn_subnet = v.trim().to_owned();
     }
-    if let Some(v) = value.get("tproxy_port").and_then(Value::as_u64) {
-        inner.state.split_routing.tproxy_port = v as u16;
+    if let Some(v) = value.get("tun_socks_port").and_then(Value::as_u64) {
+        inner.state.split_routing.tun_socks_port = v as u16;
+    }
+    if let Some(v) = value
+        .get("tun_device")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    {
+        inner.state.split_routing.tun_device = v.trim().to_owned();
+    }
+    if let Some(v) = value
+        .get("tun_address")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    {
+        inner.state.split_routing.tun_address = v.trim().to_owned();
+    }
+    if let Some(v) = value
+        .get("tun2socks_path")
+        .and_then(Value::as_str)
+        .filter(|v| !v.trim().is_empty())
+    {
+        inner.state.split_routing.tun2socks_path = v.trim().to_owned();
+    }
+    if let Some(v) = value.get("tun_mtu").and_then(Value::as_u64) {
+        inner.state.split_routing.tun_mtu = v as u16;
     }
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         return (
@@ -1931,6 +2303,7 @@ fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
     let was_running = inner.core.is_running();
     let xray_path = inner.state.xray_path.clone();
     let config_path = daemon.xray_config_path.clone();
+    let split = inner.state.split_routing.clone();
     let core_status = if was_running {
         match inner.core.restart(&xray_path, &config_path) {
             Ok(()) => inner.core.status().to_owned(),
@@ -1939,50 +2312,131 @@ fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
     } else {
         inner.core.status().to_owned()
     };
+
+    let tun_status = if split.enabled {
+        if !inner.tun.is_running() {
+            match inner.tun.start(
+                &split.tun2socks_path,
+                &split.tun_device,
+                &split.tun_address,
+                split.tun_mtu,
+                split.tun_socks_port,
+                &split.vpn_subnet,
+            ) {
+                Ok(()) => "running".to_owned(),
+                Err(error) => {
+                    return (
+                        500,
+                        "application/json",
+                        json!({"applied": true, "core_status": core_status, "tun_error": error})
+                            .to_string(),
+                    );
+                }
+            }
+        } else {
+            "running".to_owned()
+        }
+    } else {
+        let tun_device = split.tun_device.clone();
+        let vpn_subnet = split.vpn_subnet.clone();
+        let _ = inner.tun.stop(&tun_device, &vpn_subnet);
+        "stopped".to_owned()
+    };
+
     (
         200,
         "application/json",
-        json!({"applied": true, "core_status": core_status}).to_string(),
+        json!({"applied": true, "core_status": core_status, "tun_status": tun_status}).to_string(),
     )
 }
 
-fn handle_tproxy_status(_daemon: &Daemon) -> (u16, &'static str, String) {
-    let chain = shell_status("iptables -t mangle -S HINCYRAY >/dev/null 2>&1");
-    let rule = shell_status("ip rule show 2>/dev/null | grep -q 'fwmark 0x111' ");
-    let port = shell_status("netstat -ltnp 2>/dev/null | grep -q ':10810' ");
+fn handle_tun_status(daemon: &Daemon) -> (u16, &'static str, String) {
+    let mut inner = lock(&daemon.inner);
+    let tun_running = inner.tun.is_running();
+    let core_running = inner.core.is_running();
+    let tun_device = inner.state.split_routing.tun_device.clone();
+    let tun_socks_port = inner.state.split_routing.tun_socks_port;
+    let enabled = inner.state.split_routing.enabled;
+    drop(inner);
+
+    let ip_cmd = resolve_ip_cmd();
+    let iface_exists = Command::new(&ip_cmd)
+        .args(["link", "show", &tun_device])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    let rule_exists = Command::new(&ip_cmd)
+        .args(["rule", "show"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains("fwmark 0x111"))
+        .unwrap_or(false);
+
+    let mangle_exists = shell_status("iptables -t mangle -S HINCYRAY_TUN >/dev/null 2>&1");
+
+    let forward_exists = shell_status("iptables -S FORWARD 2>/dev/null | grep -q 'br1.*tun0'");
+
+    let socks_listening =
+        std::net::TcpStream::connect(format!("127.0.0.1:{tun_socks_port}")).is_ok();
+
     (
         200,
         "application/json",
-        json!({"chain": chain, "ip_rule": rule, "tproxy_port": port}).to_string(),
+        json!({
+            "enabled": enabled,
+            "tun_running": tun_running,
+            "core_running": core_running,
+            "iface_exists": iface_exists,
+            "rule_exists": rule_exists,
+            "mangle_exists": mangle_exists,
+            "forward_exists": forward_exists,
+            "socks_listening": socks_listening,
+            "tun_device": tun_device,
+            "tun_socks_port": tun_socks_port
+        })
+        .to_string(),
     )
 }
 
-fn handle_tproxy_script(script_name: &str) -> (u16, &'static str, String) {
-    let script = format!("/opt/etc/hincyray/scripts/{script_name}");
-    if !Path::new(&script).is_file() {
+fn handle_tun_start(daemon: &Daemon) -> (u16, &'static str, String) {
+    let mut inner = lock(&daemon.inner);
+    let split = inner.state.split_routing.clone();
+    if !split.enabled {
         return (
-            404,
+            400,
             "application/json",
-            json!({"error": "script not found", "script": script}).to_string(),
+            json!({"error": "split routing not enabled"}).to_string(),
         );
     }
-    match Command::new("sh").arg(&script).output() {
-        Ok(output) => {
-            let ok = output.status.success();
-            let status = if ok { 200 } else { 500 };
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            (
-                status,
-                "application/json",
-                json!({"ok": ok, "stdout": stdout, "stderr": stderr}).to_string(),
-            )
-        }
-        Err(error) => (
-            500,
+    let socks_port = inner.state.socks_port;
+    match inner.tun.start(
+        &split.tun2socks_path,
+        &split.tun_device,
+        &split.tun_address,
+        split.tun_mtu,
+        split.tun_socks_port,
+        &split.vpn_subnet,
+    ) {
+        Ok(()) => (
+            200,
             "application/json",
-            json!({"error": error.to_string()}).to_string(),
+            json!({"tun_status": inner.tun.status(), "socks_port": socks_port}).to_string(),
         ),
+        Err(error) => (500, "application/json", json!({"error": error}).to_string()),
+    }
+}
+
+fn handle_tun_stop(daemon: &Daemon) -> (u16, &'static str, String) {
+    let mut inner = lock(&daemon.inner);
+    let tun_device = inner.state.split_routing.tun_device.clone();
+    let vpn_subnet = inner.state.split_routing.vpn_subnet.clone();
+    match inner.tun.stop(&tun_device, &vpn_subnet) {
+        Ok(()) => (
+            200,
+            "application/json",
+            json!({"tun_status": inner.tun.status()}).to_string(),
+        ),
+        Err(error) => (500, "application/json", json!({"error": error}).to_string()),
     }
 }
 
@@ -1995,44 +2449,146 @@ fn shell_status(command: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Background thread that periodically checks whether the TPROXY iptables
-/// chain `HINCYRAY` still exists. Keenetic's `ndm` subsystem reloads the
-/// firewall on certain events (WAN reconnect, config changes) and wipes
-/// custom mangle chains. When that happens while split routing is enabled,
-/// WiFi VPN clients lose connectivity because traffic is steered toward
-/// port 10810 but the TPROXY redirect is gone.
-///
-/// The watchdog runs only on router targets (where `iptables` exists),
-/// checks every 30 seconds, and silently reinstalls the rules via
-/// `tproxy-setup.sh` when the chain is missing.
-fn start_tproxy_watchdog(daemon: Daemon) {
-    // Only run on systems that have iptables (router targets).
-    if !shell_status("command -v iptables >/dev/null 2>&1") {
+/// Background thread that periodically checks whether the tun2socks
+/// process is alive, the TUN interface exists, the Xray core is running,
+/// and the iptables mangle MARK chain + FORWARD ACCEPT rules are still
+/// present. iproute2 rules and TUN interfaces survive ndm reloads, but
+/// ndm wipes iptables chains on certain events. The watchdog runs every
+/// 10 seconds to minimise the downtime window.
+fn start_watchdog(daemon: Daemon) {
+    if !Path::new("/opt/sbin/tun2socks").exists()
+        && !shell_status("command -v tun2socks >/dev/null 2>&1")
+    {
         return;
     }
-    let script_path = "/opt/etc/hincyray/scripts/tproxy-setup.sh".to_owned();
     thread::spawn(move || {
         loop {
-            thread::sleep(Duration::from_secs(30));
+            thread::sleep(Duration::from_secs(10));
             let mut inner = lock(&daemon.inner);
             let enabled = inner.state.split_routing.enabled;
             let core_running = inner.core.is_running();
+            let tun_running = inner.tun.is_running();
+            let tun_device = inner.state.split_routing.tun_device.clone();
+            let vpn_subnet = inner.state.split_routing.vpn_subnet.clone();
             drop(inner);
 
             if !enabled {
                 continue;
             }
 
-            // Reinstall TPROXY iptables chain if ndm wiped it.
-            if !shell_status("iptables -t mangle -S HINCYRAY >/dev/null 2>&1") {
-                eprintln!("hincyray: TPROXY chain missing, reinstalling firewall rules...");
-                if Path::new(&script_path).is_file() {
-                    let _ = Command::new("sh").arg(&script_path).output();
-                    eprintln!("hincyray: TPROXY firewall rules reinstalled");
+            if !tun_running {
+                eprintln!("hincyray: tun2socks not running, restarting...");
+                let mut inner = lock(&daemon.inner);
+                let split = inner.state.split_routing.clone();
+                if let Err(error) = inner.tun.start(
+                    &split.tun2socks_path,
+                    &split.tun_device,
+                    &split.tun_address,
+                    split.tun_mtu,
+                    split.tun_socks_port,
+                    &split.vpn_subnet,
+                ) {
+                    eprintln!("hincyray: tun2socks restart failed: {error}");
+                } else {
+                    eprintln!("hincyray: tun2socks restarted");
                 }
+                continue;
             }
 
-            // Restart Xray core if it crashed.
+            // Check and reinstall iptables rules wiped by ndm.
+            let bridge = resolve_vpn_bridge(&vpn_subnet);
+            let mangle_ok = shell_status("iptables -t mangle -S HINCYRAY_TUN >/dev/null 2>&1");
+            let forward_ok = shell_status("iptables -S FORWARD 2>/dev/null | grep -q 'br1.*tun0'");
+
+            if !mangle_ok || !forward_ok {
+                eprintln!(
+                    "hincyray: iptables rules missing (mangle={}, fwd={}), reinstalling...",
+                    mangle_ok, forward_ok
+                );
+                let mark = format!("0x{:x}", TUN_FWMARK);
+                let table = TUN_ROUTE_TABLE.to_string();
+
+                if !mangle_ok {
+                    let _ = Command::new("iptables")
+                        .args(["-t", "mangle", "-N", "HINCYRAY_TUN"])
+                        .status();
+                    let _ = Command::new("iptables")
+                        .args(["-t", "mangle", "-F", "HINCYRAY_TUN"])
+                        .status();
+                    let _ = Command::new("iptables")
+                        .args([
+                            "-t",
+                            "mangle",
+                            "-A",
+                            "HINCYRAY_TUN",
+                            "-d",
+                            "192.168.0.0/16",
+                            "-j",
+                            "RETURN",
+                        ])
+                        .status();
+                    let _ = Command::new("iptables")
+                        .args([
+                            "-t",
+                            "mangle",
+                            "-A",
+                            "HINCYRAY_TUN",
+                            "-d",
+                            "224.0.0.0/4",
+                            "-j",
+                            "RETURN",
+                        ])
+                        .status();
+                    let _ = Command::new("iptables")
+                        .args([
+                            "-t",
+                            "mangle",
+                            "-A",
+                            "HINCYRAY_TUN",
+                            "-j",
+                            "MARK",
+                            "--set-mark",
+                            &mark,
+                        ])
+                        .status();
+                    let _ = Command::new("iptables")
+                        .args([
+                            "-t",
+                            "mangle",
+                            "-D",
+                            "PREROUTING",
+                            "-s",
+                            &vpn_subnet,
+                            "-j",
+                            "HINCYRAY_TUN",
+                        ])
+                        .status();
+                    let _ = Command::new("iptables")
+                        .args([
+                            "-t",
+                            "mangle",
+                            "-A",
+                            "PREROUTING",
+                            "-s",
+                            &vpn_subnet,
+                            "-j",
+                            "HINCYRAY_TUN",
+                        ])
+                        .status();
+
+                    let ip_cmd = resolve_ip_cmd();
+                    let _ = Command::new(&ip_cmd)
+                        .args(["rule", "del", "fwmark", &mark, "lookup", &table])
+                        .status();
+                    let _ = Command::new(&ip_cmd)
+                        .args(["rule", "add", "fwmark", &mark, "lookup", &table])
+                        .status();
+                }
+
+                install_forward_rules(&bridge, &tun_device);
+                eprintln!("hincyray: iptables rules reinstalled");
+            }
+
             if !core_running {
                 eprintln!("hincyray: core not running, restarting...");
                 let mut inner = lock(&daemon.inner);
@@ -2333,7 +2889,7 @@ tr.group-row.collapsed{display:none}
 
 <h2>WiFi Traffic Split <span id="routing-toggle" class="toggle">show</span></h2>
 <div id="routing-panel" class="collapsible">
-  <p class="subtle">Rules apply only to the <code>HincyRay-VPN</code> WiFi/TPROXY inbound. SOCKS clients keep using the active server. First matching rule wins; unmatched WiFi traffic falls back to the active server.</p>
+  <p class="subtle">Rules apply only to the <code>HincyRay-VPN</code> WiFi segment via tun2socks. Direct SOCKS clients keep using the active server. First matching rule wins; unmatched WiFi traffic falls back to the active server.</p>
   <div class="grid2">
     <label class="chip"><input type="checkbox" id="route-enabled"> Enable WiFi split routing</label>
     <label class="chip"><input type="checkbox" id="route-auto-switch"> Auto switch servers</label>
@@ -2344,9 +2900,9 @@ tr.group-row.collapsed{display:none}
     <button id="btn-routing-save">Save settings</button>
     <button id="btn-catalog-refresh">Refresh service catalog</button>
     <button class="primary" id="btn-routing-apply">Apply Xray config</button>
-    <button id="btn-tproxy-status">TPROXY status</button>
-    <button id="btn-tproxy-install">Install/repair TPROXY</button>
-    <button class="danger" id="btn-tproxy-rollback">Rollback TPROXY</button>
+    <button id="btn-tun-status">TUN status</button>
+    <button id="btn-tun-start">Start tun2socks</button>
+    <button class="danger" id="btn-tun-stop">Stop tun2socks</button>
     <span class="subtle" id="routing-status"></span>
   </div>
   <h3 style="font-size:.95em;margin:.8em 0 .35em">Add rule</h3>
@@ -3061,16 +3617,23 @@ document.getElementById("btn-routing-apply").addEventListener("click", function(
   }).catch(function(err){ setMsg("Apply routing failed: " + err.message); });
 });
 
-document.getElementById("btn-tproxy-status").addEventListener("click", function(){
-  api("GET", "/api/routing/tproxy-status").then(function(data){
-    document.getElementById("routing-status").textContent = "chain=" + data.chain + ", rule=" + data.ip_rule + ", port=" + data.tproxy_port;
-  }).catch(function(err){ setMsg("TPROXY status failed: " + err.message); });
+document.getElementById("btn-tun-status").addEventListener("click", function(){
+  api("GET", "/api/routing/tun-status").then(function(data){
+    document.getElementById("routing-status").textContent =
+    "tun=" + (data.tun_running ? "running" : "stopped") +
+    ", iface=" + (data.iface_exists ? "yes" : "no") +
+    ", mangle=" + (data.mangle_exists ? "yes" : "no") +
+    ", fwd=" + (data.forward_exists ? "yes" : "no") +
+    ", rule=" + (data.rule_exists ? "yes" : "no") +
+    ", socks=" + (data.socks_listening ? "yes" : "no") +
+    ", core=" + (data.core_running ? "running" : "stopped");
+  }).catch(function(err){ setMsg("TUN status failed: " + err.message); });
 });
-document.getElementById("btn-tproxy-install").addEventListener("click", function(){
-  api("POST", "/api/routing/tproxy-install").then(function(){ showOk("TPROXY installed/repaired."); }).catch(function(err){ setMsg("TPROXY install failed: " + err.message); });
+document.getElementById("btn-tun-start").addEventListener("click", function(){
+  api("POST", "/api/routing/tun-start").then(function(){ showOk("tun2socks started."); }).catch(function(err){ setMsg("tun2socks start failed: " + err.message); });
 });
-document.getElementById("btn-tproxy-rollback").addEventListener("click", function(){
-  api("POST", "/api/routing/tproxy-rollback").then(function(){ showOk("TPROXY rollback done."); }).catch(function(err){ setMsg("TPROXY rollback failed: " + err.message); });
+document.getElementById("btn-tun-stop").addEventListener("click", function(){
+  api("POST", "/api/routing/tun-stop").then(function(){ showOk("tun2socks stopped."); }).catch(function(err){ setMsg("tun2socks stop failed: " + err.message); });
 });
 
 document.getElementById("subs-toggle").addEventListener("click", function(){
@@ -3262,7 +3825,7 @@ mod tests {
                 .expect("inbounds array")
                 .iter()
                 .any(|inbound| {
-                    inbound["tag"] == "wifi-tproxy" && inbound["protocol"] == "dokodemo-door"
+                    inbound["tag"] == "tun-socks-in" && inbound["protocol"] == "socks"
                 })
         );
         assert!(

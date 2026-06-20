@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::profiles::{Profile, Protocol};
 
-pub const WIFI_TPROXY_INBOUND_TAG: &str = "wifi-tproxy";
+pub const WIFI_TUN_INBOUND_TAG: &str = "tun-socks-in";
 pub const DIRECT_OUTBOUND_TAG: &str = "direct";
 pub const ACTIVE_OUTBOUND_TAG: &str = "active";
 pub const BLOCK_OUTBOUND_TAG: &str = "block";
@@ -28,14 +28,16 @@ pub struct XrayRouteRule {
 }
 
 /// Build an Xray config for router mode: normal SOCKS inbound plus an
-/// optional WiFi-only TPROXY inbound whose traffic is split by routing rules.
+/// optional second SOCKS inbound for tun2socks whose traffic is split by
+/// routing rules. tun2socks creates a TUN device and forwards WiFi VPN
+/// traffic to this second SOCKS port; no iptables/TPROXY needed.
 pub fn build_xray_router_config(
     active_profile: &Profile,
     extra_profiles: &[(&Profile, String)],
     route_rules: &[XrayRouteRule],
     listen_host: &str,
     socks_port: u16,
-    tproxy_port: Option<u16>,
+    tun_socks_port: Option<u16>,
     active_block_quic: bool,
 ) -> Result<Value, String> {
     let mut inbounds = vec![json!({
@@ -46,19 +48,13 @@ pub fn build_xray_router_config(
         "settings": { "udp": true }
     })];
 
-    if let Some(port) = tproxy_port {
+    if let Some(port) = tun_socks_port {
         inbounds.push(json!({
-            "tag": WIFI_TPROXY_INBOUND_TAG,
-            "listen": "0.0.0.0",
+            "tag": WIFI_TUN_INBOUND_TAG,
+            "listen": "127.0.0.1",
             "port": port,
-            "protocol": "dokodemo-door",
-            "settings": {
-                "network": "tcp,udp",
-                "followRedirect": true
-            },
-            "streamSettings": {
-                "sockopt": { "tproxy": "tproxy" }
-            },
+            "protocol": "socks",
+            "settings": { "udp": true },
             "sniffing": {
                 "enabled": true,
                 "destOverride": ["http", "tls", "quic"],
@@ -90,7 +86,7 @@ pub fn build_xray_router_config(
         if rule.block_quic {
             rules.push(json!({
                 "type": "field",
-                "inboundTag": [WIFI_TPROXY_INBOUND_TAG],
+                "inboundTag": [WIFI_TUN_INBOUND_TAG],
                 "network": "udp",
                 "port": "443",
                 "outboundTag": BLOCK_OUTBOUND_TAG,
@@ -99,7 +95,7 @@ pub fn build_xray_router_config(
 
         let mut route = json!({
             "type": "field",
-            "inboundTag": [WIFI_TPROXY_INBOUND_TAG],
+            "inboundTag": [WIFI_TUN_INBOUND_TAG],
             "outboundTag": rule.outbound_tag,
         });
         if !rule.domains.is_empty() {
@@ -113,13 +109,14 @@ pub fn build_xray_router_config(
         }
     }
 
-    // Only WiFi TPROXY gets split rules. Anything else, including SOCKS
-    // clients, keeps the traditional active-profile behaviour.
-    if tproxy_port.is_some() {
+    // Only WiFi tun2socks inbound gets split rules. Anything else,
+    // including direct SOCKS clients, keeps the traditional
+    // active-profile behaviour.
+    if tun_socks_port.is_some() {
         if active_block_quic {
             rules.push(json!({
                 "type": "field",
-                "inboundTag": [WIFI_TPROXY_INBOUND_TAG],
+                "inboundTag": [WIFI_TUN_INBOUND_TAG],
                 "network": "udp",
                 "port": "443",
                 "outboundTag": BLOCK_OUTBOUND_TAG,
@@ -127,7 +124,7 @@ pub fn build_xray_router_config(
         }
         rules.push(json!({
             "type": "field",
-            "inboundTag": [WIFI_TPROXY_INBOUND_TAG],
+            "inboundTag": [WIFI_TUN_INBOUND_TAG],
             "outboundTag": ACTIVE_OUTBOUND_TAG,
         }));
     }
