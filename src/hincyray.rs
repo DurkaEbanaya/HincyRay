@@ -53,6 +53,19 @@ pub fn run() -> Result<(), String> {
     let state = load_state(&state_path);
     let daemon = Daemon::new(state, state_path, xray_config_path);
 
+    // Regenerate Xray config from state on startup so the TPROXY inbound
+    // is included when split routing is enabled. This replaces the legacy
+    // xray-tproxy-inbound.sh patching approach.
+    {
+        let inner = lock(&daemon.inner);
+        if let Err(error) = regenerate_xray_config(&inner.state, &daemon.xray_config_path) {
+            eprintln!("hincyray: startup config regeneration failed: {error}");
+        }
+    }
+
+    // Start TPROXY watchdog on router targets.
+    start_tproxy_watchdog(daemon.clone());
+
     let listener = TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;
     eprintln!("hincyray listening on {listen}");
     eprintln!("hincyray state: {}", daemon.state_path.to_string_lossy());
@@ -1055,10 +1068,18 @@ fn handle_get_xray_config(daemon: &Daemon) -> (u16, &'static str, String) {
     }
 }
 
+fn regenerate_xray_config(state: &HincyrayState, config_path: &Path) -> Result<(), String> {
+    let config = build_daemon_xray_config(state)?;
+    write_xray_config(config_path, &config)
+}
+
 fn handle_core_start(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
     let xray_path = inner.state.xray_path.clone();
     let config_path = daemon.xray_config_path.clone();
+    if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
+        eprintln!("hincyray: config regeneration on core start failed: {error}");
+    }
     match inner.core.start(&xray_path, &config_path) {
         Ok(()) => (
             200,
@@ -1085,6 +1106,9 @@ fn handle_core_restart(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
     let xray_path = inner.state.xray_path.clone();
     let config_path = daemon.xray_config_path.clone();
+    if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
+        eprintln!("hincyray: config regeneration on core restart failed: {error}");
+    }
     match inner.core.restart(&xray_path, &config_path) {
         Ok(()) => (
             200,
@@ -1969,6 +1993,60 @@ fn shell_status(command: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+/// Background thread that periodically checks whether the TPROXY iptables
+/// chain `HINCYRAY` still exists. Keenetic's `ndm` subsystem reloads the
+/// firewall on certain events (WAN reconnect, config changes) and wipes
+/// custom mangle chains. When that happens while split routing is enabled,
+/// WiFi VPN clients lose connectivity because traffic is steered toward
+/// port 10810 but the TPROXY redirect is gone.
+///
+/// The watchdog runs only on router targets (where `iptables` exists),
+/// checks every 30 seconds, and silently reinstalls the rules via
+/// `tproxy-setup.sh` when the chain is missing.
+fn start_tproxy_watchdog(daemon: Daemon) {
+    // Only run on systems that have iptables (router targets).
+    if !shell_status("command -v iptables >/dev/null 2>&1") {
+        return;
+    }
+    let script_path = "/opt/etc/hincyray/scripts/tproxy-setup.sh".to_owned();
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            let mut inner = lock(&daemon.inner);
+            let enabled = inner.state.split_routing.enabled;
+            let core_running = inner.core.is_running();
+            drop(inner);
+
+            if !enabled {
+                continue;
+            }
+
+            // Reinstall TPROXY iptables chain if ndm wiped it.
+            if !shell_status("iptables -t mangle -S HINCYRAY >/dev/null 2>&1") {
+                eprintln!("hincyray: TPROXY chain missing, reinstalling firewall rules...");
+                if Path::new(&script_path).is_file() {
+                    let _ = Command::new("sh").arg(&script_path).output();
+                    eprintln!("hincyray: TPROXY firewall rules reinstalled");
+                }
+            }
+
+            // Restart Xray core if it crashed.
+            if !core_running {
+                eprintln!("hincyray: core not running, restarting...");
+                let mut inner = lock(&daemon.inner);
+                let xray_path = inner.state.xray_path.clone();
+                let config_path = daemon.xray_config_path.clone();
+                if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
+                    eprintln!("hincyray: watchdog config regeneration failed: {error}");
+                }
+                if let Err(error) = inner.core.start(&xray_path, &config_path) {
+                    eprintln!("hincyray: watchdog core restart failed: {error}");
+                }
+            }
+        }
+    });
 }
 
 fn rule_sources() -> Vec<Value> {
