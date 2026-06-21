@@ -1377,6 +1377,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/routing/tun-stop") => handle_tun_stop(daemon),
         ("GET", "/api/dns") => handle_dns_get(daemon),
         ("POST", "/api/dns") => handle_dns_set(body, daemon),
+        ("GET", "/api/dns/leak-test") => handle_dns_leak_test(daemon),
         ("GET", "/api/hwid") => handle_hwid_get(daemon),
         ("POST", "/api/hwid") => handle_hwid_set(body, daemon),
         _ => (
@@ -2746,6 +2747,152 @@ fn handle_dns_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
+fn handle_dns_leak_test(daemon: &Daemon) -> (u16, &'static str, String) {
+    let mut inner = lock(&daemon.inner);
+    let core_running = inner.core.is_running();
+    let split_enabled = inner.state.split_routing.enabled;
+    let tun_socks_port = inner.state.split_routing.tun_socks_port;
+    drop(inner);
+
+    if !core_running {
+        return (
+            400,
+            "application/json",
+            json!({"error": "Xray core is not running"}).to_string(),
+        );
+    }
+
+    // Infrastructure checks: iptables rules + Xray DNS inbound.
+    let dns_redirect_ok =
+        shell_status("iptables -t nat -S PREROUTING 2>/dev/null | grep -q 'br1.*dport 53.*DNAT'");
+    let mangle_ok =
+        shell_status("iptables -t mangle -S PREROUTING 2>/dev/null | grep -q HINCYRAY_TUN");
+    let dns_in_listening = std::net::TcpStream::connect("127.0.0.1:1053").is_ok();
+
+    // Proxy exit IP + location via Cloudflare trace through SOCKS.
+    let trace_via_proxy = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "10",
+            "--socks5-hostname",
+            &format!("127.0.0.1:{tun_socks_port}"),
+            "https://1.1.1.1/cdn-cgi/trace",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    let proxy_exit_ip = trace_via_proxy
+        .lines()
+        .find(|l| l.starts_with("ip="))
+        .and_then(|l| l.split('=').nth(1))
+        .map(|s| s.to_owned())
+        .unwrap_or_default();
+
+    let proxy_loc = trace_via_proxy
+        .lines()
+        .find(|l| l.starts_with("loc="))
+        .and_then(|l| l.split('=').nth(1))
+        .map(|s| s.to_owned())
+        .unwrap_or_default();
+
+    // DNS via proxy: query DoH through the SOCKS proxy. The response
+    // for whoami.akamai.net is the IP of the resolver that queried the
+    // authoritative server. Through the proxy, this should be a
+    // resolver near the proxy exit — NOT the ISP's DNS.
+    let dns_via_proxy = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "10",
+            "--socks5-hostname",
+            &format!("127.0.0.1:{tun_socks_port}"),
+            "https://1.1.1.1/dns-query?name=whoami.akamai.net&type=A",
+            "-H",
+            "accept: application/dns-json",
+        ])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    // Parse DoH JSON: {"Status":0,"Answer":[{"data":"1.2.3.4"}]}
+    let dns_via_proxy_ip = serde_json::from_str::<Value>(&dns_via_proxy)
+        .ok()
+        .and_then(|v| {
+            v.get("Answer")
+                .and_then(|a| a.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|ans| ans.get("data"))
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_owned())
+        })
+        .unwrap_or_default();
+
+    // DNS direct: router's default resolver → ISP DNS proxy.
+    // whoami.akamai.net returns the ISP's DNS resolver IP.
+    let dns_direct = Command::new("sh")
+        .arg("-c")
+        .arg("nslookup whoami.akamai.net 2>/dev/null | grep -A1 'Name:' | grep 'Address' | awk '{print $NF}' | head -1")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+
+    // Leak detection logic:
+    // - If proxy is unreachable → can't test
+    // - If iptables rules or DNS inbound are missing → leak (VPN
+    //   clients' DNS bypasses the tunnel)
+    // - If dns_via_proxy IP == dns_direct IP → DNS is going to the
+    //   same resolver (ISP), indicating a leak
+    // - Otherwise → no leak
+    let proxy_ok = !proxy_exit_ip.is_empty();
+
+    let leaked = if !proxy_ok {
+        false // can't determine
+    } else if !dns_redirect_ok || !mangle_ok || !dns_in_listening {
+        true // infrastructure broken = DNS leak
+    } else if !dns_via_proxy_ip.is_empty() && !dns_direct.is_empty() {
+        // If both resolved, compare resolver IPs.
+        // Through proxy: should be a resolver near the proxy exit.
+        // Direct: should be the ISP's DNS resolver.
+        // If they're the same, DNS is leaking to ISP.
+        dns_via_proxy_ip == dns_direct
+    } else {
+        // Can't compare DNS IPs, but infrastructure is OK.
+        false
+    };
+
+    let status = if !proxy_ok {
+        "proxy_unreachable"
+    } else if !dns_in_listening {
+        "dns_inbound_down"
+    } else if !dns_redirect_ok || !mangle_ok {
+        "rules_missing"
+    } else if leaked {
+        "leak_detected"
+    } else {
+        "ok"
+    };
+
+    (
+        200,
+        "application/json",
+        json!({
+            "status": status,
+            "split_routing_enabled": split_enabled,
+            "dns_redirect_ok": dns_redirect_ok,
+            "mangle_ok": mangle_ok,
+            "dns_inbound_listening": dns_in_listening,
+            "proxy_exit_ip": proxy_exit_ip,
+            "proxy_location": proxy_loc,
+            "dns_via_proxy": dns_via_proxy_ip,
+            "dns_direct": dns_direct,
+            "leak_detected": leaked,
+        })
+        .to_string(),
+    )
+}
+
 fn handle_hwid_get(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
     (
@@ -3271,6 +3418,30 @@ tr.group-row.collapsed{display:none}
     <div class="field"><label for="dns-local">Local DNS servers (one per line, for direct domains)</label><textarea id="dns-local" placeholder="223.5.5.5&#10;223.6.6.6"></textarea></div>
   </div>
   <div class="row"><button id="btn-dns-save">Save DNS</button><span class="subtle" id="dns-status"></span></div>
+</div>
+
+<h2>DNS Leak Test <span id="leak-toggle" class="toggle">show</span></h2>
+<div id="leak-panel" class="collapsible">
+  <p class="subtle">Checks whether DNS queries from the VPN WiFi segment are routed through the proxy (no leak) or exposed to the ISP (leak). Click "Run test" to check.</p>
+  <div class="row" style="margin:.3em 0">
+    <button class="primary" id="btn-dns-leak-test">Run test</button>
+    <span class="subtle" id="leak-test-status"></span>
+  </div>
+  <div id="leak-test-results" style="display:none">
+    <table>
+      <tbody>
+        <tr><td class="subtle">Status</td><td id="leak-status"></td></tr>
+        <tr><td class="subtle">DNS redirect (iptables)</td><td id="leak-dns-redirect"></td></tr>
+        <tr><td class="subtle">Mangle MARK (iptables)</td><td id="leak-mangle"></td></tr>
+        <tr><td class="subtle">Xray DNS inbound (port 1053)</td><td id="leak-dns-inbound"></td></tr>
+        <tr><td class="subtle">Proxy exit IP</td><td id="leak-proxy-ip"></td></tr>
+        <tr><td class="subtle">Proxy location</td><td id="leak-proxy-loc"></td></tr>
+        <tr><td class="subtle">DNS via proxy (whoami.akamai.net)</td><td id="leak-dns-proxy"></td></tr>
+        <tr><td class="subtle">DNS direct (ISP resolver)</td><td id="leak-dns-direct"></td></tr>
+        <tr><td class="subtle">Leak detected?</td><td id="leak-detected"></td></tr>
+      </tbody>
+    </table>
+  </div>
 </div>
 
 <h2>WiFi Traffic Split <span id="routing-toggle" class="toggle">show</span></h2>
@@ -4072,6 +4243,48 @@ document.getElementById("btn-dns-save").addEventListener("click", function(){
     showOk("DNS settings saved.");
     document.getElementById("dns-status").textContent = "";
   }).catch(function(err){ setMsg("DNS save failed: " + err.message); });
+});
+
+document.getElementById("leak-toggle").addEventListener("click", function(){
+  toggleCollapsible("leak-toggle", "leak-panel");
+});
+document.getElementById("btn-dns-leak-test").addEventListener("click", function(){
+  var btn = document.getElementById("btn-dns-leak-test");
+  var status = document.getElementById("leak-test-status");
+  var results = document.getElementById("leak-test-results");
+  btn.disabled = true;
+  status.textContent = "Running test… (up to 20s)";
+  results.style.display = "none";
+  api("GET", "/api/dns/leak-test").then(function(d){
+    btn.disabled = false;
+    status.textContent = "";
+    results.style.display = "block";
+    function setCell(id, val, okClass){
+      var el = document.getElementById(id);
+      el.textContent = val;
+      el.style.color = okClass === true ? "#4caf50" : okClass === false ? "#f44336" : "";
+    }
+    var statusMap = {
+      "ok": "No leak detected",
+      "leak_detected": "LEAK DETECTED",
+      "proxy_unreachable": "Proxy unreachable",
+      "dns_inbound_down": "Xray DNS inbound not listening",
+      "rules_missing": "iptables rules missing"
+    };
+    setCell("leak-status", statusMap[d.status] || d.status, d.status === "ok");
+    setCell("leak-dns-redirect", d.dns_redirect_ok ? "OK" : "MISSING", d.dns_redirect_ok);
+    setCell("leak-mangle", d.mangle_ok ? "OK" : "MISSING", d.mangle_ok);
+    setCell("leak-dns-inbound", d.dns_inbound_listening ? "listening" : "not listening", d.dns_inbound_listening);
+    setCell("leak-proxy-ip", d.proxy_exit_ip || "—");
+    setCell("leak-proxy-loc", d.proxy_location || "—");
+    setCell("leak-dns-proxy", d.dns_via_proxy || "—");
+    setCell("leak-dns-direct", d.dns_direct || "—");
+    setCell("leak-detected", d.leak_detected ? "YES — DNS is leaking to ISP" : "NO — DNS goes through proxy", !d.leak_detected);
+  }).catch(function(err){
+    btn.disabled = false;
+    status.textContent = "";
+    setMsg("DNS leak test failed: " + err.message);
+  });
 });
 
 document.getElementById("btn-tun-status").addEventListener("click", function(){
