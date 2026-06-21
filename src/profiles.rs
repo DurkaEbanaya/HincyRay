@@ -3,12 +3,15 @@ use std::fmt;
 use base64::{Engine as _, engine::general_purpose};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use url::Url;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
     Vless,
+    VMess,
+    Trojan,
+    Shadowsocks,
     Hysteria2,
     Unknown(String),
 }
@@ -17,6 +20,9 @@ impl Protocol {
     fn from_scheme(scheme: &str) -> Self {
         match scheme.to_ascii_lowercase().as_str() {
             "vless" => Self::Vless,
+            "vmess" => Self::VMess,
+            "trojan" => Self::Trojan,
+            "ss" | "shadowsocks" => Self::Shadowsocks,
             "hysteria" | "hysteria2" | "hy2" => Self::Hysteria2,
             other => Self::Unknown(other.to_owned()),
         }
@@ -27,24 +33,125 @@ impl fmt::Display for Protocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Vless => f.write_str("VLESS"),
+            Self::VMess => f.write_str("VMess"),
+            Self::Trojan => f.write_str("Trojan"),
+            Self::Shadowsocks => f.write_str("Shadowsocks"),
             Self::Hysteria2 => f.write_str("Hysteria2"),
             Self::Unknown(value) => f.write_str(value),
         }
     }
 }
 
+/// Hardcoded device fingerprint for Happ subscription fetches.
+/// Values follow the HWID-HARDCODING.md pattern: a realistic 16-hex
+/// HWID, consistent OS/model pair, and matching User-Agent so the
+/// server's cross-check passes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HwidConfig {
+    #[serde(default = "default_hwid")]
+    pub hwid: String,
+    #[serde(default = "default_os_version")]
+    pub os_version: String,
+    #[serde(default = "default_device_model")]
+    pub device_model: String,
+    #[serde(default = "default_device_os")]
+    pub device_os: String,
+    #[serde(default = "default_app_version")]
+    pub app_version: String,
+    #[serde(default = "default_bundle_id")]
+    pub bundle_id: String,
+    #[serde(default = "default_api_version")]
+    pub api_version: String,
+}
+
+impl Default for HwidConfig {
+    fn default() -> Self {
+        Self {
+            hwid: default_hwid(),
+            os_version: default_os_version(),
+            device_model: default_device_model(),
+            device_os: default_device_os(),
+            app_version: default_app_version(),
+            bundle_id: default_bundle_id(),
+            api_version: default_api_version(),
+        }
+    }
+}
+
+impl HwidConfig {
+    /// Build the User-Agent string matching the real Happ app format:
+    /// `Happ/<version>/<platform>/<build_number>`.
+    pub fn user_agent(&self) -> String {
+        format!("Happ/{}/Android/17800511170441525643", self.app_version)
+    }
+}
+
+fn default_hwid() -> String {
+    "a3f7e10d5c9b2486".to_owned()
+}
+
+fn default_os_version() -> String {
+    "13".to_owned()
+}
+
+fn default_device_model() -> String {
+    "Poco X3 Pro".to_owned()
+}
+
+fn default_device_os() -> String {
+    "Android".to_owned()
+}
+
+fn default_app_version() -> String {
+    "3.22.1".to_owned()
+}
+
+fn default_bundle_id() -> String {
+    "su.happ.proxyutility".to_owned()
+}
+
+fn default_api_version() -> String {
+    "1.0".to_owned()
+}
+
 impl Profile {
     pub fn transport(&self) -> String {
-        Url::parse(&self.raw)
-            .ok()
-            .and_then(|url| {
-                url.query_pairs()
-                    .find(|(name, _)| name == "type")
-                    .map(|(_, value)| value.into_owned())
-            })
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "tcp".to_owned())
+        if matches!(self.protocol, Protocol::VMess) {
+            vmess_transport(&self.raw).unwrap_or_else(|| "tcp".to_owned())
+        } else {
+            Url::parse(&self.raw)
+                .ok()
+                .and_then(|url| {
+                    url.query_pairs()
+                        .find(|(name, _)| name == "type")
+                        .map(|(_, value)| value.into_owned())
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "tcp".to_owned())
+        }
     }
+}
+
+/// Extract the transport network type from a `vmess://` base64-JSON link.
+fn vmess_transport(raw: &str) -> Option<String> {
+    let json = decode_vmess_json(raw)?;
+    json.get("net")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+/// Decode the base64 JSON payload from a `vmess://` link.
+pub(crate) fn decode_vmess_json(raw: &str) -> Option<Value> {
+    let b64 = raw.strip_prefix("vmess://")?.trim();
+    // Strip fragment (#...) if present — some clients append a name.
+    let b64 = b64.split('#').next()?.trim();
+    let bytes = general_purpose::STANDARD
+        .decode(b64)
+        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(b64))
+        .or_else(|_| general_purpose::URL_SAFE.decode(b64))
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(b64))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,11 +258,23 @@ pub fn load_subscription_detailed_via_proxy(
     source: &SubscriptionSource,
     proxy: Option<&str>,
 ) -> Result<SubscriptionLoadReport, String> {
-    let mut response = fetch_subscription(source, SubscriptionRequestMode::SingBox, proxy)?;
+    load_subscription_detailed_via_proxy_with_hwid(source, proxy, &HwidConfig::default())
+}
+
+/// Like `load_subscription_detailed_via_proxy` but with a custom HWID
+/// fingerprint for the Happ Android fallback fetch. The daemon uses this
+/// to pass user-configured HWID settings; the desktop app uses the
+/// default via `load_subscription_detailed_via_proxy`.
+pub fn load_subscription_detailed_via_proxy_with_hwid(
+    source: &SubscriptionSource,
+    proxy: Option<&str>,
+    hwid: &HwidConfig,
+) -> Result<SubscriptionLoadReport, String> {
+    let mut response = fetch_subscription(source, SubscriptionRequestMode::SingBox, proxy, hwid)?;
     let (mut decoded, mut parsed) = parse_subscription_response(&response);
 
     if should_retry_as_happ(&parsed) {
-        response = fetch_subscription(source, SubscriptionRequestMode::HappAndroid, proxy)?;
+        response = fetch_subscription(source, SubscriptionRequestMode::HappAndroid, proxy, hwid)?;
         (decoded, parsed) = parse_subscription_response(&response);
     }
 
@@ -176,11 +295,13 @@ fn fetch_subscription(
     source: &SubscriptionSource,
     mode: SubscriptionRequestMode,
     proxy: Option<&str>,
+    hwid: &HwidConfig,
 ) -> Result<String, String> {
-    let mut builder = reqwest::blocking::Client::builder().user_agent(match mode {
-        SubscriptionRequestMode::SingBox => subscription_user_agent(),
-        SubscriptionRequestMode::HappAndroid => happ_user_agent(),
-    });
+    let user_agent = match mode {
+        SubscriptionRequestMode::SingBox => subscription_user_agent().to_owned(),
+        SubscriptionRequestMode::HappAndroid => hwid.user_agent(),
+    };
+    let mut builder = reqwest::blocking::Client::builder().user_agent(user_agent);
     if let Some(proxy_url) = proxy {
         // `Proxy::all` validates the URL before any network I/O, so a
         // malformed proxy surfaces here without touching the network.
@@ -193,12 +314,13 @@ fn fetch_subscription(
 
     if matches!(mode, SubscriptionRequestMode::HappAndroid) {
         request = request
-            .header("X-HWID", "0000000000000000")
-            .header("X-Ver-OS", "15")
-            .header("X-Bundle-ID", "su.happ.proxyutility")
-            .header("X-Device-model", "GM1911")
-            .header("X-Device-OS", "Android")
-            .header("X-API-Version", "1.0");
+            .header("X-HWID", &hwid.hwid)
+            .header("X-Ver-OS", &hwid.os_version)
+            .header("X-Bundle-ID", &hwid.bundle_id)
+            .header("X-Device-model", &hwid.device_model)
+            .header("X-Device-OS", &hwid.device_os)
+            .header("X-App-Version", &hwid.app_version)
+            .header("X-API-Version", &hwid.api_version);
     }
 
     request
@@ -236,10 +358,6 @@ fn should_retry_as_happ(parsed: &ParseOutput) -> bool {
 
 fn subscription_user_agent() -> &'static str {
     "sing-box/1.13.13"
-}
-
-fn happ_user_agent() -> &'static str {
-    "Happ/3.22.1"
 }
 
 fn decode_subscription_body(body: &str) -> String {
@@ -315,6 +433,20 @@ fn parse_profile_candidate(candidate: &str) -> Option<Profile> {
         return None;
     }
 
+    // VMess uses a base64-JSON payload, not a standard URL with
+    // userinfo/host. Decode the JSON to extract fields.
+    if matches!(protocol, Protocol::VMess) {
+        return parse_vmess_candidate(candidate);
+    }
+
+    // Shadowsocks legacy format: ss://base64(method:password@host:port)#name
+    // The base64 payload includes host and port, so there's no `@`
+    // separator in the URL. We detect this by checking if the URL has
+    // no userinfo (username is empty).
+    if matches!(protocol, Protocol::Shadowsocks) && url.username().is_empty() {
+        return parse_shadowsocks_legacy_candidate(candidate);
+    }
+
     let address = url.host_str()?.to_owned();
     let port = url.port();
     let name = url
@@ -330,6 +462,74 @@ fn parse_profile_candidate(candidate: &str) -> Option<Profile> {
         address,
         port,
         raw: candidate.to_owned(),
+        selected: true,
+        block_quic: false,
+        group: None,
+    })
+}
+
+/// Parse a `vmess://base64(json)` link into a Profile.
+fn parse_vmess_candidate(raw: &str) -> Option<Profile> {
+    let json = decode_vmess_json(raw)?;
+    let address = json.get("add").and_then(Value::as_str)?.to_owned();
+    let port = json
+        .get("port")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .map(|p| p as u16);
+    let name = json
+        .get("ps")
+        .and_then(Value::as_str)
+        .unwrap_or(&address)
+        .to_owned();
+
+    Some(Profile {
+        id: 0,
+        name,
+        protocol: Protocol::VMess,
+        address,
+        port,
+        raw: raw.to_owned(),
+        selected: true,
+        block_quic: false,
+        group: None,
+    })
+}
+
+/// Parse the legacy Shadowsocks format `ss://base64(method:password@host:port)#name`.
+fn parse_shadowsocks_legacy_candidate(raw: &str) -> Option<Profile> {
+    let b64_part = raw
+        .strip_prefix("ss://")
+        .and_then(|rest| rest.split('#').next())?
+        .trim();
+
+    let decoded = general_purpose::STANDARD
+        .decode(b64_part)
+        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(b64_part))
+        .or_else(|_| general_purpose::URL_SAFE.decode(b64_part))
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(b64_part))
+        .ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+
+    // Format: method:password@host:port
+    let (_userinfo, hostport) = text.rsplit_once('@')?;
+    let (host, port_str) = hostport.rsplit_once(':')?;
+    let port = port_str.parse::<u16>().ok()?;
+
+    let name = Url::parse(raw)
+        .ok()
+        .and_then(|url| url.fragment().map(percent_decode_name))
+        .unwrap_or_else(|| format!("{host}:{port}"));
+
+    Some(Profile {
+        id: 0,
+        name,
+        protocol: Protocol::Shadowsocks,
+        address: host.to_owned(),
+        port: Some(port),
+        raw: raw.to_owned(),
         selected: true,
         block_quic: false,
         group: None,
@@ -359,8 +559,15 @@ fn parse_json_profiles(input: &str) -> Vec<Profile> {
         };
 
         for outbound in outbounds {
-            if outbound.get("protocol").and_then(Value::as_str) == Some("vless")
-                && let Some(raw) = xray_vless_to_share_link(outbound, remarks)
+            let protocol = outbound.get("protocol").and_then(Value::as_str);
+            let raw = match protocol {
+                Some("vless") => xray_vless_to_share_link(outbound, remarks),
+                Some("vmess") => xray_vmess_to_share_link(outbound, remarks),
+                Some("trojan") => xray_trojan_to_share_link(outbound, remarks),
+                Some("shadowsocks") => xray_shadowsocks_to_share_link(outbound, remarks),
+                _ => None,
+            };
+            if let Some(raw) = raw
                 && let Some(profile) = parse_profile_candidate(&raw)
             {
                 profiles.push(profile);
@@ -458,6 +665,177 @@ fn xray_vless_to_share_link(outbound: &Value, remarks: &str) -> Option<String> {
     ))
 }
 
+/// Convert an Xray VMess outbound JSON to a `vmess://base64(json)` share link.
+fn xray_vmess_to_share_link(outbound: &Value, remarks: &str) -> Option<String> {
+    let vnext = outbound
+        .get("settings")?
+        .get("vnext")?
+        .as_array()?
+        .first()?;
+    let address = vnext.get("address")?.as_str()?;
+    let port = vnext.get("port")?.as_u64()?;
+    let user = vnext.get("users")?.as_array()?.first()?;
+    let uuid = user.get("id")?.as_str()?;
+    let alter_id = user.get("alterId").and_then(Value::as_u64).unwrap_or(0);
+    let security = user
+        .get("security")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+
+    let stream = outbound.get("streamSettings");
+    let network = stream
+        .and_then(|v| v.get("network"))
+        .and_then(Value::as_str)
+        .unwrap_or("tcp");
+    let tls = stream
+        .and_then(|v| v.get("security"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let mut vmess_json = json!({
+        "v": "2",
+        "ps": remarks,
+        "add": address,
+        "port": port.to_string(),
+        "id": uuid,
+        "aid": alter_id.to_string(),
+        "scy": security,
+        "net": network,
+        "tls": if tls == "tls" { "tls" } else { "" },
+        "type": "none",
+    });
+
+    if let Some(sni) = stream
+        .and_then(|v| v.get("tlsSettings"))
+        .and_then(|v| v.get("serverName"))
+        .and_then(Value::as_str)
+    {
+        vmess_json["sni"] = json!(sni);
+    }
+    if let Some(fp) = stream
+        .and_then(|v| v.get("tlsSettings"))
+        .and_then(|v| v.get("fingerprint"))
+        .and_then(Value::as_str)
+    {
+        vmess_json["fp"] = json!(fp);
+    }
+    if let Some(path) = stream
+        .and_then(|v| v.get("wsSettings"))
+        .and_then(|v| v.get("path"))
+        .and_then(Value::as_str)
+    {
+        vmess_json["path"] = json!(path);
+    }
+    if let Some(host) = stream
+        .and_then(|v| v.get("wsSettings"))
+        .and_then(|v| v.get("headers"))
+        .and_then(|v| v.get("Host"))
+        .and_then(Value::as_str)
+    {
+        vmess_json["host"] = json!(host);
+    }
+    if let Some(service_name) = stream
+        .and_then(|v| v.get("grpcSettings"))
+        .and_then(|v| v.get("serviceName"))
+        .and_then(Value::as_str)
+    {
+        vmess_json["path"] = json!(service_name);
+    }
+
+    let encoded =
+        general_purpose::STANDARD.encode(serde_json::to_string(&vmess_json).ok()?.as_bytes());
+    Some(format!("vmess://{encoded}"))
+}
+
+/// Convert an Xray Trojan outbound JSON to a `trojan://` share link.
+fn xray_trojan_to_share_link(outbound: &Value, remarks: &str) -> Option<String> {
+    let server = outbound
+        .get("settings")?
+        .get("servers")?
+        .as_array()?
+        .first()?;
+    let address = server.get("address")?.as_str()?;
+    let port = server.get("port")?.as_u64()?;
+    let password = server.get("password")?.as_str()?;
+
+    let stream = outbound.get("streamSettings");
+    let network = stream
+        .and_then(|v| v.get("network"))
+        .and_then(Value::as_str)
+        .unwrap_or("tcp");
+    let security = stream
+        .and_then(|v| v.get("security"))
+        .and_then(Value::as_str)
+        .unwrap_or("tls");
+
+    let mut params = vec![
+        ("type", network.to_owned()),
+        ("security", security.to_owned()),
+    ];
+
+    if let Some(tls_settings) = stream
+        .and_then(|v| v.get("tlsSettings"))
+        .and_then(Value::as_object)
+    {
+        push_json_string_param(&mut params, tls_settings, "serverName", "sni");
+        push_json_string_param(&mut params, tls_settings, "fingerprint", "fp");
+    }
+
+    if let Some(ws) = stream
+        .and_then(|v| v.get("wsSettings"))
+        .and_then(Value::as_object)
+    {
+        push_json_string_param(&mut params, ws, "path", "path");
+        if let Some(host) = ws
+            .get("headers")
+            .and_then(|v| v.get("Host"))
+            .and_then(Value::as_str)
+        {
+            params.push(("host", host.to_owned()));
+        }
+    }
+
+    if let Some(grpc) = stream
+        .and_then(|v| v.get("grpcSettings"))
+        .and_then(Value::as_object)
+    {
+        push_json_string_param(&mut params, grpc, "serviceName", "serviceName");
+    }
+
+    let query = params
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", encode_url_component(&value)))
+        .collect::<Vec<_>>()
+        .join("&");
+
+    Some(format!(
+        "trojan://{}@{address}:{port}?{query}#{}",
+        encode_url_component(password),
+        encode_url_component(remarks)
+    ))
+}
+
+/// Convert an Xray Shadowsocks outbound JSON to an `ss://` share link.
+fn xray_shadowsocks_to_share_link(outbound: &Value, remarks: &str) -> Option<String> {
+    let server = outbound
+        .get("settings")?
+        .get("servers")?
+        .as_array()?
+        .first()?;
+    let address = server.get("address")?.as_str()?;
+    let port = server.get("port")?.as_u64()?;
+    let method = server.get("method")?.as_str()?;
+    let password = server.get("password")?.as_str()?;
+
+    let credentials = format!("{method}:{password}");
+    let encoded = general_purpose::STANDARD.encode(credentials.as_bytes());
+
+    Some(format!(
+        "ss://{encoded}@{address}:{port}#{}",
+        encode_url_component(remarks)
+    ))
+}
+
 fn push_json_string_param(
     params: &mut Vec<(&'static str, String)>,
     object: &serde_json::Map<String, Value>,
@@ -482,6 +860,7 @@ fn percent_decode_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{SubscriptionSource, load_subscription_detailed_via_proxy, parse_input};
+    use base64::Engine as _;
 
     #[test]
     fn parses_subscription_urls_from_rtf_text() {
@@ -667,5 +1046,159 @@ https://provider.example/sub/token-b}"#;
             error.contains("proxy"),
             "error should mention proxy marker: {error}"
         );
+    }
+
+    #[test]
+    fn hwid_config_defaults_match_hardcoded_fingerprint() {
+        use super::HwidConfig;
+        let config = HwidConfig::default();
+        assert_eq!(config.hwid, "a3f7e10d5c9b2486");
+        assert_eq!(config.os_version, "13");
+        assert_eq!(config.device_model, "Poco X3 Pro");
+        assert_eq!(config.device_os, "Android");
+        assert_eq!(config.app_version, "3.22.1");
+        assert_eq!(config.bundle_id, "su.happ.proxyutility");
+        assert_eq!(config.api_version, "1.0");
+    }
+
+    #[test]
+    fn hwid_user_agent_matches_happ_format() {
+        use super::HwidConfig;
+        let config = HwidConfig::default();
+        let ua = config.user_agent();
+        assert!(ua.starts_with("Happ/3.22.1/Android/"));
+        assert!(ua.contains("1780051117044152"));
+    }
+
+    #[test]
+    fn parses_vmess_share_link() {
+        let vmess_json = r#"{"v":"2","ps":"VMess Test","add":"example.com","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"ws","type":"none","host":"example.com","path":"/ws","tls":"tls"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(vmess_json.as_bytes());
+        let link = format!("vmess://{encoded}");
+        let output = parse_input(&link);
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].name, "VMess Test");
+        assert_eq!(output.profiles[0].address, "example.com");
+        assert_eq!(output.profiles[0].port, Some(443));
+        assert_eq!(output.profiles[0].transport(), "ws");
+    }
+
+    #[test]
+    fn parses_trojan_share_link() {
+        let output = parse_input(
+            "trojan://secretpass@example.com:443?security=tls&sni=www.example.com&type=tcp#Trojan_Test",
+        );
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].name, "Trojan_Test");
+        assert_eq!(output.profiles[0].address, "example.com");
+        assert_eq!(output.profiles[0].port, Some(443));
+    }
+
+    #[test]
+    fn parses_shadowsocks_new_format() {
+        let credentials =
+            base64::engine::general_purpose::STANDARD.encode(b"aes-256-gcm:secretpass");
+        let link = format!("ss://{credentials}@example.com:8388#SS_Test");
+        let output = parse_input(&link);
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].name, "SS_Test");
+        assert_eq!(output.profiles[0].address, "example.com");
+        assert_eq!(output.profiles[0].port, Some(8388));
+    }
+
+    #[test]
+    fn parses_shadowsocks_legacy_format() {
+        let payload = base64::engine::general_purpose::STANDARD
+            .encode(b"aes-256-gcm:secretpass@example.com:8388");
+        let link = format!("ss://{payload}#SS_Legacy");
+        let output = parse_input(&link);
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].address, "example.com");
+        assert_eq!(output.profiles[0].port, Some(8388));
+    }
+
+    #[test]
+    fn parses_xray_json_vmess_outbound() {
+        let output = parse_input(
+            r#"[{
+                "remarks": "VMess JSON",
+                "outbounds": [{
+                    "protocol": "vmess",
+                    "tag": "proxy",
+                    "settings": {
+                        "vnext": [{
+                            "address": "example.com",
+                            "port": 443,
+                            "users": [{
+                                "id": "11111111-1111-1111-1111-111111111111",
+                                "alterId": 0
+                            }]
+                        }]
+                    },
+                    "streamSettings": {
+                        "network": "ws",
+                        "security": "tls",
+                        "wsSettings": { "path": "/ws" },
+                        "tlsSettings": { "serverName": "example.com" }
+                    }
+                }]
+            }]"#,
+        );
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].name, "VMess JSON");
+        assert!(output.profiles[0].raw.starts_with("vmess://"));
+    }
+
+    #[test]
+    fn parses_xray_json_trojan_outbound() {
+        let output = parse_input(
+            r#"[{
+                "remarks": "Trojan JSON",
+                "outbounds": [{
+                    "protocol": "trojan",
+                    "tag": "proxy",
+                    "settings": {
+                        "servers": [{
+                            "address": "example.com",
+                            "port": 443,
+                            "password": "secretpass"
+                        }]
+                    },
+                    "streamSettings": {
+                        "network": "tcp",
+                        "security": "tls",
+                        "tlsSettings": { "serverName": "www.example.com" }
+                    }
+                }]
+            }]"#,
+        );
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].name, "Trojan JSON");
+        assert!(output.profiles[0].raw.starts_with("trojan://"));
+        assert!(output.profiles[0].raw.contains("secretpass"));
+    }
+
+    #[test]
+    fn parses_xray_json_shadowsocks_outbound() {
+        let output = parse_input(
+            r#"[{
+                "remarks": "SS JSON",
+                "outbounds": [{
+                    "protocol": "shadowsocks",
+                    "tag": "proxy",
+                    "settings": {
+                        "servers": [{
+                            "address": "example.com",
+                            "port": 8388,
+                            "method": "aes-256-gcm",
+                            "password": "secretpass"
+                        }]
+                    }
+                }]
+            }]"#,
+        );
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].name, "SS JSON");
+        assert!(output.profiles[0].raw.starts_with("ss://"));
     }
 }

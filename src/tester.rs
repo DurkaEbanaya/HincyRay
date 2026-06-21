@@ -452,6 +452,9 @@ fn tail_chars(value: &str, limit: usize) -> String {
 fn build_sing_box_config(profile: &Profile, port: u16) -> Result<Value, String> {
     let outbound = match profile.protocol {
         Protocol::Vless => build_vless_outbound(profile)?,
+        Protocol::VMess => build_vmess_outbound(profile)?,
+        Protocol::Trojan => build_trojan_outbound(profile)?,
+        Protocol::Shadowsocks => build_shadowsocks_outbound(profile)?,
         Protocol::Hysteria2 => build_hysteria2_outbound(profile)?,
         Protocol::Unknown(_) => return Err("неподдерживаемый протокол".to_owned()),
     };
@@ -537,6 +540,133 @@ fn build_hysteria2_outbound(profile: &Profile) -> Result<Value, String> {
     }
 
     Ok(outbound)
+}
+
+fn build_vmess_outbound(profile: &Profile) -> Result<Value, String> {
+    let json = crate::profiles::decode_vmess_json(&profile.raw)
+        .ok_or_else(|| "VMess: не удалось декодировать base64 JSON".to_owned())?;
+
+    let address = json
+        .get("add")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "VMess: нет адреса".to_owned())?;
+    let port = json
+        .get("port")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(443) as u16;
+    let uuid = json
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "VMess: нет UUID".to_owned())?;
+    let alter_id = json
+        .get("aid")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0) as u32;
+    let security = json.get("scy").and_then(Value::as_str).unwrap_or("auto");
+
+    let mut outbound = json!({
+        "type": "vmess",
+        "tag": "proxy",
+        "server": address,
+        "server_port": port,
+        "uuid": uuid,
+        "alter_id": alter_id,
+        "security": security
+    });
+
+    let network = json.get("net").and_then(Value::as_str).unwrap_or("tcp");
+    if network != "tcp" {
+        let mut transport = json!({ "type": network });
+        if network == "ws" {
+            if let Some(path) = json.get("path").and_then(Value::as_str) {
+                transport["path"] = json!(path);
+            }
+            if let Some(host) = json.get("host").and_then(Value::as_str) {
+                transport["headers"] = json!({ "Host": host });
+            }
+        } else if network == "grpc"
+            && let Some(service_name) = json
+                .get("path")
+                .and_then(Value::as_str)
+                .or_else(|| json.get("serviceName").and_then(Value::as_str))
+        {
+            transport["service_name"] = json!(service_name);
+        }
+        outbound["transport"] = transport;
+    }
+
+    let tls = json.get("tls").and_then(Value::as_str);
+    if tls == Some("tls") {
+        let url = Url::parse(&profile.raw).ok();
+        let mut tls_val = json!({ "enabled": true });
+        if let Some(sni) = json.get("sni").and_then(Value::as_str) {
+            tls_val["server_name"] = json!(sni);
+        } else if let Some(host) = json.get("host").and_then(Value::as_str) {
+            tls_val["server_name"] = json!(host);
+        }
+        if let Some(fp) = json.get("fp").and_then(Value::as_str) {
+            tls_val["utls"] = json!({ "enabled": true, "fingerprint": fp });
+        }
+        if let Some(url) = url
+            && let Some(insecure) = query_value(&url, "allowInsecure").as_deref()
+            && matches!(insecure, "1" | "true")
+        {
+            tls_val["insecure"] = json!(true);
+        }
+        if let Some(alpn) = json.get("alpn").and_then(Value::as_str) {
+            tls_val["alpn"] = json!(alpn.split(',').collect::<Vec<_>>());
+        }
+        outbound["tls"] = tls_val;
+    }
+
+    Ok(outbound)
+}
+
+fn build_trojan_outbound(profile: &Profile) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let password = percent_decode(url.username());
+    if password.is_empty() {
+        return Err("Trojan ссылка без пароля".to_owned());
+    }
+
+    let mut outbound = json!({
+        "type": "trojan",
+        "tag": "proxy",
+        "server": profile.address,
+        "server_port": profile.port.unwrap_or(443),
+        "password": password
+    });
+
+    let security = query_value(&url, "security");
+    if security.as_deref().is_some_and(|v| v != "none") {
+        outbound["tls"] = build_tls(&url, security.as_deref() == Some("reality"), true);
+    }
+
+    let network = query_value(&url, "type").unwrap_or_else(|| "tcp".to_owned());
+    if network != "tcp" {
+        outbound["transport"] = build_transport(&url, &network);
+    }
+
+    Ok(outbound)
+}
+
+fn build_shadowsocks_outbound(profile: &Profile) -> Result<Value, String> {
+    let (method, password) = crate::xray_config::extract_ss_credentials(&profile.raw)?;
+
+    Ok(json!({
+        "type": "shadowsocks",
+        "tag": "proxy",
+        "server": profile.address,
+        "server_port": profile.port.unwrap_or(8388),
+        "method": method,
+        "password": password
+    }))
 }
 
 fn build_tls(url: &Url, reality: bool, utls_enabled: bool) -> Value {

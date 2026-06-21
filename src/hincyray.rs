@@ -32,11 +32,13 @@ use crate::benchmark::{
     run_bench,
 };
 use crate::profiles::{
-    Profile, SubscriptionSource, load_subscription_detailed_via_proxy, parse_input,
+    HwidConfig, Profile, SubscriptionSource, load_subscription_detailed_via_proxy_with_hwid,
+    parse_input,
 };
 use crate::xray_config::build_xray_config;
 use crate::xray_config::{
-    ACTIVE_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, XrayRouteRule, build_xray_router_config,
+    ACTIVE_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DnsSettings, PortMode, RouterExtra, XrayRouteRule,
+    build_xray_router_config,
 };
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
@@ -219,6 +221,12 @@ pub struct HincyrayState {
     /// v0.2: per-profile benchmark statistics keyed by raw share link.
     #[serde(default)]
     pub stats: Vec<ProfileStats>,
+    /// v0.5: DNS anti-leak settings for the router Xray config.
+    #[serde(default)]
+    pub dns_settings: DnsSettings,
+    /// v0.5: Hardcoded HWID fingerprint for Happ subscription fetches.
+    #[serde(default)]
+    pub hwid_config: HwidConfig,
 }
 
 impl Default for HincyrayState {
@@ -237,6 +245,8 @@ impl Default for HincyrayState {
             subscriptions: Vec::new(),
             favorites: Vec::new(),
             stats: Vec::new(),
+            dns_settings: DnsSettings::default(),
+            hwid_config: HwidConfig::default(),
         }
     }
 }
@@ -312,6 +322,19 @@ pub struct SplitRoutingSettings {
     pub tun2socks_path: String,
     #[serde(default = "default_tun_mtu")]
     pub tun_mtu: u16,
+    /// v0.5: Port-based routing mode for WiFi VPN traffic.
+    #[serde(default)]
+    pub port_mode: PortMode,
+    /// v0.5: Ports to proxy when `port_mode` is `AllowList`.
+    #[serde(default)]
+    pub proxy_ports: Vec<String>,
+    /// v0.5: Ports to bypass (direct) when `port_mode` is `DenyList`.
+    #[serde(default)]
+    pub bypass_ports: Vec<String>,
+    /// v0.5: Path to GeoIP/GeoSite .dat files for Xray. Sets the
+    /// `XRAY_LOCATION_ASSET` env var when starting the core.
+    #[serde(default = "default_geo_asset_path")]
+    pub geo_asset_path: String,
 }
 
 impl Default for SplitRoutingSettings {
@@ -327,6 +350,10 @@ impl Default for SplitRoutingSettings {
             tun_address: default_tun_address(),
             tun2socks_path: default_tun2socks_path(),
             tun_mtu: default_tun_mtu(),
+            port_mode: PortMode::default(),
+            proxy_ports: Vec::new(),
+            bypass_ports: Vec::new(),
+            geo_asset_path: default_geo_asset_path(),
         }
     }
 }
@@ -359,6 +386,14 @@ fn default_tun_mtu() -> u16 {
     1400
 }
 
+fn default_geo_asset_path() -> String {
+    if Path::new("/opt/etc/hincyray").is_dir() {
+        "/opt/etc/hincyray".to_owned()
+    } else {
+        String::new()
+    }
+}
+
 /// Policy-routing rule. `kind`/`pattern`/`target` existed as a v0.1
 /// placeholder, so they remain strings for safe state migration. New UI uses
 /// `domains`/`ips`/`services`; `target` is one of: `direct`, `active`,
@@ -380,6 +415,12 @@ pub struct RoutingRule {
     pub ips: Vec<String>,
     #[serde(default)]
     pub services: Vec<String>,
+    /// v0.5: Port specifications for port-based routing (e.g. "80", "443", "1000-2000").
+    #[serde(default)]
+    pub ports: Vec<String>,
+    /// v0.5: Network type filter: "tcp", "udp", or empty for both.
+    #[serde(default)]
+    pub network: String,
 }
 
 fn default_routing_target() -> String {
@@ -450,7 +491,12 @@ impl CoreManager {
         }
     }
 
-    fn start(&mut self, xray_path: &str, config_path: &Path) -> Result<(), String> {
+    fn start(
+        &mut self,
+        xray_path: &str,
+        config_path: &Path,
+        geo_asset_path: Option<&str>,
+    ) -> Result<(), String> {
         if self.is_running() {
             return Ok(());
         }
@@ -460,18 +506,18 @@ impl CoreManager {
                 config_path.display()
             ));
         }
-        let child = Command::new(xray_path)
-            .arg("run")
+        let mut cmd = Command::new(xray_path);
+        cmd.arg("run")
             .arg("-format")
             .arg("json")
             .arg("-c")
             .arg(config_path)
             .stdout(Stdio::null())
-            // Long-lived daemon child: do not pipe stderr without a
-            // reader, or the OS buffer fills and xray blocks. For the
-            // MVP we discard stderr; route to a file later if a
-            // diagnostics surface is needed.
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(path) = geo_asset_path.filter(|p| !p.is_empty()) {
+            cmd.env("XRAY_LOCATION_ASSET", path);
+        }
+        let child = cmd
             .spawn()
             .map_err(|error| format!("xray spawn: {error}"))?;
         self.child = Some(child);
@@ -487,9 +533,14 @@ impl CoreManager {
         Ok(())
     }
 
-    fn restart(&mut self, xray_path: &str, config_path: &Path) -> Result<(), String> {
+    fn restart(
+        &mut self,
+        xray_path: &str,
+        config_path: &Path,
+        geo_asset_path: Option<&str>,
+    ) -> Result<(), String> {
         self.stop()?;
-        self.start(xray_path, config_path)
+        self.start(xray_path, config_path, geo_asset_path)
     }
 }
 
@@ -870,7 +921,13 @@ fn build_daemon_xray_config(state: &HincyrayState) -> Result<Value, String> {
                 _ => domains.push(rule.pattern.trim().to_owned()),
             }
         }
-        if domains.is_empty() && ips.is_empty() {
+        let ports = normalize_route_items(&rule.ports);
+        let network = if rule.network.trim().is_empty() {
+            None
+        } else {
+            Some(rule.network.trim().to_owned())
+        };
+        if domains.is_empty() && ips.is_empty() && ports.is_empty() && network.is_none() {
             continue;
         }
 
@@ -915,10 +972,23 @@ fn build_daemon_xray_config(state: &HincyrayState) -> Result<Value, String> {
             ips,
             outbound_tag,
             block_quic: state.split_routing.block_quic_global || profile_quic,
+            ports,
+            network,
         });
     }
 
     let active_block_quic = state.split_routing.block_quic_global || active_profile.block_quic;
+    let extra = RouterExtra {
+        dns: Some(state.dns_settings.clone()),
+        port_mode: state.split_routing.port_mode.clone(),
+        proxy_ports: normalize_route_items(&state.split_routing.proxy_ports),
+        bypass_ports: normalize_route_items(&state.split_routing.bypass_ports),
+        geo_asset_path: if state.split_routing.geo_asset_path.is_empty() {
+            None
+        } else {
+            Some(state.split_routing.geo_asset_path.clone())
+        },
+    };
     build_xray_router_config(
         active_profile,
         &extra_profiles,
@@ -927,6 +997,7 @@ fn build_daemon_xray_config(state: &HincyrayState) -> Result<Value, String> {
         state.socks_port,
         Some(state.split_routing.tun_socks_port),
         active_block_quic,
+        &extra,
     )
 }
 
@@ -993,8 +1064,9 @@ fn proxy_info_for_daemon(inner: &mut DaemonInner) -> DaemonProxyInfo {
 fn load_subscription_for_daemon(
     source: &SubscriptionSource,
     proxy_info: &DaemonProxyInfo,
+    hwid: &HwidConfig,
 ) -> SubscriptionLoadOutcome {
-    match load_subscription_detailed_via_proxy(source, None) {
+    match load_subscription_detailed_via_proxy_with_hwid(source, None, hwid) {
         Ok(report) => SubscriptionLoadOutcome::Ok(report),
         Err(direct_err) => {
             if !proxy_info.core_running {
@@ -1003,7 +1075,11 @@ fn load_subscription_for_daemon(
                     proxy: None,
                 };
             }
-            match load_subscription_detailed_via_proxy(source, Some(&proxy_info.socks_url)) {
+            match load_subscription_detailed_via_proxy_with_hwid(
+                source,
+                Some(&proxy_info.socks_url),
+                hwid,
+            ) {
                 Ok(report) => SubscriptionLoadOutcome::Ok(report),
                 Err(proxy_err) => SubscriptionLoadOutcome::Failed {
                     direct: direct_err,
@@ -1112,6 +1188,8 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
                 "xray_path": inner.state.xray_path,
                 "core_status": inner.core.status(),
                 "split_routing": inner.state.split_routing,
+                "dns_enabled": inner.state.dns_settings.enabled,
+                "hwid": inner.state.hwid_config.hwid,
             });
             (200, "application/json", response.to_string())
         }
@@ -1168,6 +1246,10 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/routing/tun-status") => handle_tun_status(daemon),
         ("POST", "/api/routing/tun-start") => handle_tun_start(daemon),
         ("POST", "/api/routing/tun-stop") => handle_tun_stop(daemon),
+        ("GET", "/api/dns") => handle_dns_get(daemon),
+        ("POST", "/api/dns") => handle_dns_set(body, daemon),
+        ("GET", "/api/hwid") => handle_hwid_get(daemon),
+        ("POST", "/api/hwid") => handle_hwid_set(body, daemon),
         _ => (
             404,
             "application/json",
@@ -1220,13 +1302,14 @@ fn handle_import(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
 
     // Grab proxy fallback info under a short lock; network I/O below
     // runs without holding the mutex so the API stays responsive.
-    let proxy_info = {
+    let (proxy_info, hwid) = {
         let mut inner = lock(&daemon.inner);
-        proxy_info_for_daemon(&mut inner)
+        let hwid = inner.state.hwid_config.clone();
+        (proxy_info_for_daemon(&mut inner), hwid)
     };
 
     for source in &parsed.subscriptions {
-        let outcome = load_subscription_for_daemon(source, &proxy_info);
+        let outcome = load_subscription_for_daemon(source, &proxy_info, &hwid);
         let stored = match outcome {
             SubscriptionLoadOutcome::Ok(report) => {
                 let count = report.profiles.len();
@@ -1425,10 +1508,11 @@ fn handle_core_start(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
     let xray_path = inner.state.xray_path.clone();
     let config_path = daemon.xray_config_path.clone();
+    let geo_asset = inner.state.split_routing.geo_asset_path.clone();
     if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
         eprintln!("hincyray: config regeneration on core start failed: {error}");
     }
-    match inner.core.start(&xray_path, &config_path) {
+    match inner.core.start(&xray_path, &config_path, Some(&geo_asset)) {
         Ok(()) => (
             200,
             "application/json",
@@ -1454,10 +1538,14 @@ fn handle_core_restart(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
     let xray_path = inner.state.xray_path.clone();
     let config_path = daemon.xray_config_path.clone();
+    let geo_asset = inner.state.split_routing.geo_asset_path.clone();
     if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
         eprintln!("hincyray: config regeneration on core restart failed: {error}");
     }
-    match inner.core.restart(&xray_path, &config_path) {
+    match inner
+        .core
+        .restart(&xray_path, &config_path, Some(&geo_asset))
+    {
         Ok(()) => (
             200,
             "application/json",
@@ -1890,7 +1978,7 @@ fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) 
     // Read saved subscription sources plus the SOCKS fallback info
     // under a single short lock; network I/O happens below without
     // holding the mutex so the API stays responsive.
-    let (subs, proxy_info) = {
+    let (subs, proxy_info, hwid) = {
         let mut inner = lock(&daemon.inner);
         let subs: Vec<SubscriptionSource> = inner
             .state
@@ -1901,7 +1989,8 @@ fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) 
             })
             .collect();
         let proxy_info = proxy_info_for_daemon(&mut inner);
-        (subs, proxy_info)
+        let hwid = inner.state.hwid_config.clone();
+        (subs, proxy_info, hwid)
     };
 
     if subs.is_empty() {
@@ -1924,7 +2013,7 @@ fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) 
     let now = unix_now();
 
     for source in &subs {
-        let outcome = load_subscription_for_daemon(source, &proxy_info);
+        let outcome = load_subscription_for_daemon(source, &proxy_info, &hwid);
         let mut inner = lock(&daemon.inner);
         let stored = inner
             .state
@@ -2020,10 +2109,11 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
 
     // Confirm the URL is a known saved subscription before any network
     // I/O, so we never fetch an arbitrary URL supplied by the client.
-    let (proxy_info, exists) = {
+    let (proxy_info, exists, hwid) = {
         let mut inner = lock(&daemon.inner);
         let exists = inner.state.subscriptions.iter().any(|s| s.url == url);
-        (proxy_info_for_daemon(&mut inner), exists)
+        let hwid = inner.state.hwid_config.clone();
+        (proxy_info_for_daemon(&mut inner), exists, hwid)
     };
     if !exists {
         return (
@@ -2036,7 +2126,7 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
     let source = SubscriptionSource {
         url: url.to_owned(),
     };
-    let outcome = load_subscription_for_daemon(&source, &proxy_info);
+    let outcome = load_subscription_for_daemon(&source, &proxy_info, &hwid);
     let now = unix_now();
 
     let mut inner = lock(&daemon.inner);
@@ -2198,6 +2288,30 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
     if let Some(v) = value.get("tun_mtu").and_then(Value::as_u64) {
         inner.state.split_routing.tun_mtu = v as u16;
     }
+    if let Some(v) = value.get("port_mode").and_then(Value::as_str) {
+        inner.state.split_routing.port_mode = match v {
+            "allow_list" => PortMode::AllowList,
+            "deny_list" => PortMode::DenyList,
+            _ => PortMode::All,
+        };
+    }
+    if let Some(v) = value.get("proxy_ports").and_then(Value::as_array) {
+        inner.state.split_routing.proxy_ports = v
+            .iter()
+            .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Some(v) = value.get("bypass_ports").and_then(Value::as_array) {
+        inner.state.split_routing.bypass_ports = v
+            .iter()
+            .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Some(v) = value.get("geo_asset_path").and_then(Value::as_str) {
+        inner.state.split_routing.geo_asset_path = v.trim().to_owned();
+    }
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         return (
             500,
@@ -2239,6 +2353,8 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         rule.domains = normalize_route_items(&rule.domains);
         rule.ips = normalize_route_items(&rule.ips);
         rule.services = normalize_route_items(&rule.services);
+        rule.ports = normalize_route_items(&rule.ports);
+        rule.network = rule.network.trim().to_owned();
     }
     let mut inner = lock(&daemon.inner);
     inner.state.routing_rules = rules;
@@ -2304,8 +2420,12 @@ fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
     let xray_path = inner.state.xray_path.clone();
     let config_path = daemon.xray_config_path.clone();
     let split = inner.state.split_routing.clone();
+    let geo_asset = split.geo_asset_path.clone();
     let core_status = if was_running {
-        match inner.core.restart(&xray_path, &config_path) {
+        match inner
+            .core
+            .restart(&xray_path, &config_path, Some(&geo_asset))
+        {
             Ok(()) => inner.core.status().to_owned(),
             Err(error) => return (500, "application/json", json!({"error": error}).to_string()),
         }
@@ -2438,6 +2558,105 @@ fn handle_tun_stop(daemon: &Daemon) -> (u16, &'static str, String) {
         ),
         Err(error) => (500, "application/json", json!({"error": error}).to_string()),
     }
+}
+
+fn handle_dns_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    (
+        200,
+        "application/json",
+        json!({"dns": inner.state.dns_settings}).to_string(),
+    )
+}
+
+fn handle_dns_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let mut inner = lock(&daemon.inner);
+    if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
+        inner.state.dns_settings.enabled = v;
+    }
+    if let Some(v) = value.get("remote_servers").and_then(Value::as_array) {
+        inner.state.dns_settings.remote_servers = v
+            .iter()
+            .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Some(v) = value.get("local_servers").and_then(Value::as_array) {
+        inner.state.dns_settings.local_servers = v
+            .iter()
+            .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Some(v) = value.get("query_strategy").and_then(Value::as_str) {
+        inner.state.dns_settings.query_strategy = v.trim().to_owned();
+    }
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+    (
+        200,
+        "application/json",
+        json!({"dns": inner.state.dns_settings}).to_string(),
+    )
+}
+
+fn handle_hwid_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    (
+        200,
+        "application/json",
+        json!({"hwid": inner.state.hwid_config}).to_string(),
+    )
+}
+
+fn handle_hwid_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let mut inner = lock(&daemon.inner);
+    if let Some(v) = value.get("hwid").and_then(Value::as_str) {
+        inner.state.hwid_config.hwid = v.trim().to_owned();
+    }
+    if let Some(v) = value.get("os_version").and_then(Value::as_str) {
+        inner.state.hwid_config.os_version = v.trim().to_owned();
+    }
+    if let Some(v) = value.get("device_model").and_then(Value::as_str) {
+        inner.state.hwid_config.device_model = v.trim().to_owned();
+    }
+    if let Some(v) = value.get("device_os").and_then(Value::as_str) {
+        inner.state.hwid_config.device_os = v.trim().to_owned();
+    }
+    if let Some(v) = value.get("app_version").and_then(Value::as_str) {
+        inner.state.hwid_config.app_version = v.trim().to_owned();
+    }
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+    (
+        200,
+        "application/json",
+        json!({"hwid": inner.state.hwid_config}).to_string(),
+    )
 }
 
 fn shell_status(command: &str) -> bool {
@@ -2594,10 +2813,11 @@ fn start_watchdog(daemon: Daemon) {
                 let mut inner = lock(&daemon.inner);
                 let xray_path = inner.state.xray_path.clone();
                 let config_path = daemon.xray_config_path.clone();
+                let geo_asset = inner.state.split_routing.geo_asset_path.clone();
                 if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
                     eprintln!("hincyray: watchdog config regeneration failed: {error}");
                 }
-                if let Err(error) = inner.core.start(&xray_path, &config_path) {
+                if let Err(error) = inner.core.start(&xray_path, &config_path, Some(&geo_asset)) {
                     eprintln!("hincyray: watchdog core restart failed: {error}");
                 }
             }
@@ -2812,7 +3032,7 @@ tr.group-row.collapsed{display:none}
 </head>
 <body>
 <h1>HincyRay daemon</h1>
-<p class="subtle">Lightweight Keenetic VPN/proxy panel &middot; v0.3 &middot; ping, stats, favorites, subscription refresh, WiFi traffic split. Talks to the local JSON API over fetch.</p>
+<p class="subtle">Lightweight Keenetic VPN/proxy panel &middot; v0.5 &middot; ping, stats, favorites, subscription refresh, WiFi traffic split, port routing, DNS anti-leak, HWID fingerprint, VMess/Trojan/Shadowsocks. Talks to the local JSON API over fetch.</p>
 
 <div id="msg" class="msg" role="status" aria-live="polite"></div>
 
@@ -2887,6 +3107,33 @@ tr.group-row.collapsed{display:none}
   </table>
 </div>
 
+<h2>HWID Fingerprint <span id="hwid-toggle" class="toggle">show</span></h2>
+<div id="hwid-panel" class="collapsible">
+  <p class="subtle">Hardcoded device fingerprint for Happ subscription fetches. Replaces the real device ID with a fixed, consistent identity so the server's cross-check passes. All fields must be mutually consistent (model/OS/HWID).</p>
+  <div class="grid2">
+    <div class="field"><label for="hwid-value">HWID (16 hex chars)</label><input type="text" id="hwid-value" placeholder="a3f7e10d5c9b2486"></div>
+    <div class="field"><label for="hwid-os">OS version</label><input type="text" id="hwid-os" placeholder="13"></div>
+    <div class="field"><label for="hwid-model">Device model</label><input type="text" id="hwid-model" placeholder="Poco X3 Pro"></div>
+    <div class="field"><label for="hwid-device-os">Device OS</label><input type="text" id="hwid-device-os" placeholder="Android"></div>
+    <div class="field"><label for="hwid-app-ver">App version</label><input type="text" id="hwid-app-ver" placeholder="3.22.1"></div>
+  </div>
+  <div class="row"><button id="btn-hwid-save">Save HWID</button><span class="subtle" id="hwid-status"></span></div>
+</div>
+
+<h2>DNS Anti-Leak <span id="dns-toggle" class="toggle">show</span></h2>
+<div id="dns-panel" class="collapsible">
+  <p class="subtle">When enabled, Xray uses configured DNS servers instead of the system resolver, preventing DNS leaks. Remote DNS queries go through the proxy; local DNS handles direct domains (e.g. CN).</p>
+  <div class="row" style="margin:.3em 0">
+    <label class="chip"><input type="checkbox" id="dns-enabled"> Enable DNS anti-leak</label>
+    <div class="field"><label for="dns-strategy">Query strategy</label><select id="dns-strategy"><option value="UseIPv4">UseIPv4</option><option value="UseIPv6">UseIPv6</option><option value="UseIP">UseIP (v4+v6)</option></select></div>
+  </div>
+  <div class="grid2">
+    <div class="field"><label for="dns-remote">Remote DNS servers (one per line)</label><textarea id="dns-remote" placeholder="https://1.1.1.1/dns-query&#10;8.8.8.8"></textarea></div>
+    <div class="field"><label for="dns-local">Local DNS servers (one per line, for direct domains)</label><textarea id="dns-local" placeholder="223.5.5.5&#10;223.6.6.6"></textarea></div>
+  </div>
+  <div class="row"><button id="btn-dns-save">Save DNS</button><span class="subtle" id="dns-status"></span></div>
+</div>
+
 <h2>WiFi Traffic Split <span id="routing-toggle" class="toggle">show</span></h2>
 <div id="routing-panel" class="collapsible">
   <p class="subtle">Rules apply only to the <code>HincyRay-VPN</code> WiFi segment via tun2socks. Direct SOCKS clients keep using the active server. First matching rule wins; unmatched WiFi traffic falls back to the active server.</p>
@@ -2895,6 +3142,12 @@ tr.group-row.collapsed{display:none}
     <label class="chip"><input type="checkbox" id="route-auto-switch"> Auto switch servers</label>
     <label class="chip"><input type="checkbox" id="route-block-quic"> Block QUIC / UDP 443 globally</label>
     <div class="field"><label for="route-source">Rule source project</label><select id="route-source"></select></div>
+    <div class="field"><label for="route-port-mode">Port routing mode</label><select id="route-port-mode"><option value="all">All ports (proxy everything)</option><option value="allow_list">Allow-list (only proxy listed ports)</option><option value="deny_list">Deny-list (proxy all except listed)</option></select></div>
+    <div class="field"><label for="route-geo-path">GeoIP/GeoSite asset path</label><input type="text" id="route-geo-path" placeholder="/opt/etc/hincyray"></div>
+  </div>
+  <div class="grid2" id="port-lists-section" style="display:none">
+    <div class="field"><label for="route-proxy-ports">Proxy ports (allow-list mode, comma-separated)</label><input type="text" id="route-proxy-ports" placeholder="80,443,8080"></div>
+    <div class="field"><label for="route-bypass-ports">Bypass ports (deny-list mode, comma-separated)</label><input type="text" id="route-bypass-ports" placeholder="25,53,110,143"></div>
   </div>
   <div class="row" style="margin:.45em 0">
     <button id="btn-routing-save">Save settings</button>
@@ -2909,6 +3162,8 @@ tr.group-row.collapsed{display:none}
   <div class="grid2">
     <div class="field"><label for="rule-name">Rule name</label><input type="text" id="rule-name" placeholder="YouTube via server A"></div>
     <div class="field"><label for="rule-target">Target</label><select id="rule-target"></select></div>
+    <div class="field"><label for="rule-ports">Ports (comma-separated, e.g. 80,443,1000-2000)</label><input type="text" id="rule-ports" placeholder="80,443"></div>
+    <div class="field"><label for="rule-network">Network</label><select id="rule-network"><option value="">Any (TCP+UDP)</option><option value="tcp">TCP only</option><option value="udp">UDP only</option></select></div>
   </div>
   <div class="field"><label for="rule-domains">Manual domains / geosite (one per line)</label><textarea id="rule-domains" placeholder="geosite:youtube&#10;domain:youtube.com&#10;domain:googlevideo.com"></textarea></div>
   <div class="field"><label for="rule-ips">Manual IP / CIDR / geoip (one per line)</label><textarea id="rule-ips" placeholder="geoip:ru&#10;8.8.8.8&#10;142.250.0.0/15"></textarea></div>
@@ -2952,7 +3207,7 @@ tr.group-row.collapsed{display:none}
 <pre id="xray-config">&mdash;</pre>
 
 <hr class="subtle">
-<p class="subtle">HincyRay daemon &middot; API: <code>/api/health</code>, <code>/api/status</code>, <code>/api/profiles</code>, <code>/api/bench/*</code>, <code>/api/stats</code>, <code>/api/favorites/*</code>, <code>/api/subscriptions/refresh</code>, <code>/api/subscriptions/refresh-one</code>, <code>/api/xray/config</code>, <code>/api/core/*</code>.</p>
+<p class="subtle">HincyRay daemon &middot; API: <code>/api/health</code>, <code>/api/status</code>, <code>/api/profiles</code>, <code>/api/bench/*</code>, <code>/api/stats</code>, <code>/api/favorites/*</code>, <code>/api/subscriptions/*</code>, <code>/api/xray/config</code>, <code>/api/core/*</code>, <code>/api/routing/*</code>, <code>/api/dns</code>, <code>/api/hwid</code>.</p>
 
 <script>
 (function(){
@@ -3292,6 +3547,16 @@ function renderRouting(data, profiles){
     return '<option value="' + esc(s.id) + '"' + (s.id === settings.rule_source ? ' selected' : '') + '>' + esc(s.name) + '</option>';
   }).join("");
 
+  var portMode = document.getElementById("route-port-mode");
+  if(portMode){ portMode.value = settings.port_mode || "all"; }
+  var geoPath = document.getElementById("route-geo-path");
+  if(geoPath){ geoPath.value = settings.geo_asset_path || ""; }
+  var proxyPorts = document.getElementById("route-proxy-ports");
+  if(proxyPorts){ proxyPorts.value = (settings.proxy_ports || []).join(","); }
+  var bypassPorts = document.getElementById("route-bypass-ports");
+  if(bypassPorts){ bypassPorts.value = (settings.bypass_ports || []).join(","); }
+  updatePortListsVisibility();
+
   var target = document.getElementById("rule-target");
   var opts = ['<option value="active">Active server</option>','<option value="direct">Direct</option>','<option value="best">Best server (auto)</option>'];
   (profiles || []).forEach(function(p){ opts.push('<option value="profile:' + p.id + '">#' + p.id + ' ' + esc(p.name) + '</option>'); });
@@ -3306,11 +3571,21 @@ function renderRouting(data, profiles){
   renderRoutingRules();
 }
 
+function updatePortListsVisibility(){
+  var mode = document.getElementById("route-port-mode");
+  var section = document.getElementById("port-lists-section");
+  if(!mode || !section){ return; }
+  var v = mode.value;
+  section.style.display = (v === "allow_list" || v === "deny_list") ? "grid" : "none";
+}
+
 function routingMatchSummary(rule){
   var parts = [];
   if(rule.services && rule.services.length){ parts.push("services: " + rule.services.join(", ")); }
   if(rule.domains && rule.domains.length){ parts.push("domains: " + rule.domains.slice(0,4).join(", ") + (rule.domains.length > 4 ? "…" : "")); }
   if(rule.ips && rule.ips.length){ parts.push("ip: " + rule.ips.slice(0,4).join(", ") + (rule.ips.length > 4 ? "…" : "")); }
+  if(rule.ports && rule.ports.length){ parts.push("ports: " + rule.ports.join(",")); }
+  if(rule.network){ parts.push("net: " + rule.network); }
   return parts.join("; ") || "—";
 }
 
@@ -3341,6 +3616,9 @@ function addRoutingRule(){
     (el.getAttribute("data-geosite") || "").split(",").forEach(function(g){ if(g){ domains.push("geosite:" + g); } });
     el.checked = false;
   });
+  var portsRaw = (document.getElementById("rule-ports").value || "").trim();
+  var ports = portsRaw ? portsRaw.split(",").map(function(s){ return s.trim(); }).filter(Boolean) : [];
+  var networkVal = (document.getElementById("rule-network").value || "").trim();
   var rule = {
     enabled: true,
     name: (document.getElementById("rule-name").value || "").trim() || "Routing rule",
@@ -3349,13 +3627,17 @@ function addRoutingRule(){
     target: document.getElementById("rule-target").value,
     domains: domains,
     ips: linesFrom("rule-ips"),
-    services: services
+    services: services,
+    ports: ports,
+    network: networkVal
   };
   routingState.rules = routingState.rules || [];
   routingState.rules.push(rule);
   document.getElementById("rule-name").value = "";
   document.getElementById("rule-domains").value = "";
   document.getElementById("rule-ips").value = "";
+  document.getElementById("rule-ports").value = "";
+  document.getElementById("rule-network").value = "";
   renderRoutingRules();
 }
 
@@ -3567,14 +3849,24 @@ document.getElementById("btn-load-config").addEventListener("click", function(){
   }).catch(function(err){ setMsg("Load config failed: " + err.message); });
 });
 
-document.getElementById("btn-routing-save").addEventListener("click", function(){
-  var body = JSON.stringify({
+function routingSettingsBody(){
+  var portMode = document.getElementById("route-port-mode");
+  var proxyPorts = (document.getElementById("route-proxy-ports").value || "").split(",").map(function(s){return s.trim();}).filter(Boolean);
+  var bypassPorts = (document.getElementById("route-bypass-ports").value || "").split(",").map(function(s){return s.trim();}).filter(Boolean);
+  return JSON.stringify({
     enabled: document.getElementById("route-enabled").checked,
     auto_switch: document.getElementById("route-auto-switch").checked,
     block_quic_global: document.getElementById("route-block-quic").checked,
-    rule_source: document.getElementById("route-source").value
+    rule_source: document.getElementById("route-source").value,
+    port_mode: portMode ? portMode.value : "all",
+    proxy_ports: proxyPorts,
+    bypass_ports: bypassPorts,
+    geo_asset_path: (document.getElementById("route-geo-path").value || "").trim()
   });
-  api("POST", "/api/routing/settings", body).then(function(data){
+}
+
+document.getElementById("btn-routing-save").addEventListener("click", function(){
+  api("POST", "/api/routing/settings", routingSettingsBody()).then(function(data){
     routingState.settings = data.settings || routingState.settings;
     showOk("Routing settings saved.");
     return refreshAll();
@@ -3602,12 +3894,7 @@ document.getElementById("btn-rule-save").addEventListener("click", function(){
   }).catch(function(err){ setMsg("Save rules failed: " + err.message); });
 });
 document.getElementById("btn-routing-apply").addEventListener("click", function(){
-  api("POST", "/api/routing/settings", JSON.stringify({
-    enabled: document.getElementById("route-enabled").checked,
-    auto_switch: document.getElementById("route-auto-switch").checked,
-    block_quic_global: document.getElementById("route-block-quic").checked,
-    rule_source: document.getElementById("route-source").value
-  })).then(function(){
+  api("POST", "/api/routing/settings", routingSettingsBody()).then(function(){
     return api("POST", "/api/routing/rules", JSON.stringify({rules: routingState.rules || []}));
   }).then(function(){
     return api("POST", "/api/routing/apply");
@@ -3615,6 +3902,37 @@ document.getElementById("btn-routing-apply").addEventListener("click", function(
     showOk("Routing applied. Core: " + (data.core_status || "ok"));
     return refreshAll();
   }).catch(function(err){ setMsg("Apply routing failed: " + err.message); });
+});
+
+document.getElementById("route-port-mode").addEventListener("change", updatePortListsVisibility);
+
+document.getElementById("btn-hwid-save").addEventListener("click", function(){
+  var body = JSON.stringify({
+    hwid: (document.getElementById("hwid-value").value || "").trim(),
+    os_version: (document.getElementById("hwid-os").value || "").trim(),
+    device_model: (document.getElementById("hwid-model").value || "").trim(),
+    device_os: (document.getElementById("hwid-device-os").value || "").trim(),
+    app_version: (document.getElementById("hwid-app-ver").value || "").trim()
+  });
+  api("POST", "/api/hwid", body).then(function(data){
+    showOk("HWID saved.");
+    document.getElementById("hwid-status").textContent = "";
+  }).catch(function(err){ setMsg("HWID save failed: " + err.message); });
+});
+
+document.getElementById("btn-dns-save").addEventListener("click", function(){
+  var remote = (document.getElementById("dns-remote").value || "").split(/\r?\n/).map(function(s){return s.trim();}).filter(Boolean);
+  var local = (document.getElementById("dns-local").value || "").split(/\r?\n/).map(function(s){return s.trim();}).filter(Boolean);
+  var body = JSON.stringify({
+    enabled: document.getElementById("dns-enabled").checked,
+    remote_servers: remote,
+    local_servers: local,
+    query_strategy: document.getElementById("dns-strategy").value
+  });
+  api("POST", "/api/dns", body).then(function(data){
+    showOk("DNS settings saved.");
+    document.getElementById("dns-status").textContent = "";
+  }).catch(function(err){ setMsg("DNS save failed: " + err.message); });
 });
 
 document.getElementById("btn-tun-status").addEventListener("click", function(){
@@ -3642,9 +3960,33 @@ document.getElementById("subs-toggle").addEventListener("click", function(){
 document.getElementById("fav-toggle").addEventListener("click", function(){
   toggleCollapsible("fav-toggle", "fav-panel");
 });
+document.getElementById("hwid-toggle").addEventListener("click", function(){
+  toggleCollapsible("hwid-toggle", "hwid-panel");
+});
+document.getElementById("dns-toggle").addEventListener("click", function(){
+  toggleCollapsible("dns-toggle", "dns-panel");
+});
 document.getElementById("routing-toggle").addEventListener("click", function(){
   toggleCollapsible("routing-toggle", "routing-panel");
 });
+
+// Load HWID and DNS settings on page load.
+api("GET","/api/hwid").then(function(data){
+  var h = data.hwid || {};
+  document.getElementById("hwid-value").value = h.hwid || "";
+  document.getElementById("hwid-os").value = h.os_version || "";
+  document.getElementById("hwid-model").value = h.device_model || "";
+  document.getElementById("hwid-device-os").value = h.device_os || "";
+  document.getElementById("hwid-app-ver").value = h.app_version || "";
+}).catch(function(){ /* ignore */ });
+api("GET","/api/dns").then(function(data){
+  var d = data.dns || {};
+  document.getElementById("dns-enabled").checked = !!d.enabled;
+  document.getElementById("dns-remote").value = (d.remote_servers || []).join("\n");
+  document.getElementById("dns-local").value = (d.local_servers || []).join("\n");
+  var strat = document.getElementById("dns-strategy");
+  if(strat && d.query_strategy){ strat.value = d.query_strategy; }
+}).catch(function(){ /* ignore */ });
 
 refreshAll();
 })();
@@ -4529,5 +4871,111 @@ mod tests {
         // sample's latency must be greater than the very first sample's.
         let first_kept = &inner.state.metrics_history[0];
         assert!(first_kept.latency_ms > 10);
+    }
+
+    #[test]
+    fn dns_api_get_returns_defaults() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("GET", "/api/dns", "", &daemon);
+        assert_eq!(status, 200);
+        assert!(body.contains("\"enabled\":false"));
+    }
+
+    #[test]
+    fn dns_api_set_persists_enabled_and_servers() {
+        let (_dir, daemon) = test_daemon();
+        let body = r#"{"enabled":true,"remote_servers":["https://1.1.1.1/dns-query","8.8.8.8"],"local_servers":["223.5.5.5"],"query_strategy":"UseIPv4"}"#;
+        let (status, _, response) = dispatch("POST", "/api/dns", body, &daemon);
+        assert_eq!(status, 200);
+        assert!(response.contains("\"enabled\":true"));
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.dns_settings.enabled);
+        assert_eq!(inner.state.dns_settings.remote_servers.len(), 2);
+        assert_eq!(inner.state.dns_settings.local_servers.len(), 1);
+    }
+
+    #[test]
+    fn hwid_api_get_returns_defaults() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("GET", "/api/hwid", "", &daemon);
+        assert_eq!(status, 200);
+        assert!(body.contains("a3f7e10d5c9b2486"));
+        assert!(body.contains("Poco X3 Pro"));
+    }
+
+    #[test]
+    fn hwid_api_set_persists_custom_values() {
+        let (_dir, daemon) = test_daemon();
+        let body = r#"{"hwid":"abcdef0123456789","os_version":"14","device_model":"Pixel 7","device_os":"Android"}"#;
+        let (status, _, response) = dispatch("POST", "/api/hwid", body, &daemon);
+        assert_eq!(status, 200);
+        assert!(response.contains("abcdef0123456789"));
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.hwid_config.hwid, "abcdef0123456789");
+        assert_eq!(inner.state.hwid_config.device_model, "Pixel 7");
+    }
+
+    #[test]
+    fn routing_settings_with_port_mode_persists() {
+        let (_dir, daemon) = test_daemon();
+        let body = r#"{"port_mode":"allow_list","proxy_ports":["80","443"],"geo_asset_path":"/opt/etc/hincyray"}"#;
+        let (status, _, _) = handle_routing_settings(body, &daemon);
+        assert_eq!(status, 200);
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.split_routing.port_mode, PortMode::AllowList);
+        assert_eq!(inner.state.split_routing.proxy_ports, vec!["80", "443"]);
+        assert_eq!(
+            inner.state.split_routing.geo_asset_path,
+            "/opt/etc/hincyray"
+        );
+    }
+
+    #[test]
+    fn routing_rule_with_ports_and_network_generates_xray_rule() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "Gaming UDP".to_owned(),
+                target: "direct".to_owned(),
+                ports: vec!["27000-27050".to_owned()],
+                network: "udp".to_owned(),
+                ..Default::default()
+            });
+        }
+        let (status, _, body) = handle_get_xray_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_json::from_str(&body).expect("parse config");
+        let rules = config["routing"]["rules"].as_array().expect("rules");
+        assert!(rules.iter().any(|r| {
+            r["outboundTag"] == "direct" && r.get("port").is_some() && r.get("network").is_some()
+        }));
+    }
+
+    #[test]
+    fn split_routing_config_with_dns_enabled_includes_dns_section() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.dns_settings.enabled = true;
+            inner.state.dns_settings.remote_servers = vec!["https://1.1.1.1/dns-query".to_owned()];
+        }
+        let (status, _, body) = handle_get_xray_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_json::from_str(&body).expect("parse config");
+        assert!(config.get("dns").is_some());
     }
 }
