@@ -728,6 +728,7 @@ impl TunManager {
 
         let bridge = resolve_vpn_bridge(vpn_subnet);
         install_forward_rules(&bridge, tun_device);
+        install_dns_redirect(&bridge);
 
         Ok(())
     }
@@ -740,6 +741,7 @@ impl TunManager {
         self.child = None;
 
         let bridge = resolve_vpn_bridge(vpn_subnet);
+        remove_dns_redirect(&bridge);
         remove_forward_rules(&bridge, tun_device);
 
         let mark = format!("0x{:x}", TUN_FWMARK);
@@ -822,6 +824,132 @@ fn remove_forward_rules(bridge: &str, tun_device: &str) {
         .status();
 }
 
+/// Redirect DNS queries from the VPN WiFi bridge to the local Xray
+/// dokodemo DNS inbound (127.0.0.1:1053). This prevents DNS leaks by
+/// ensuring VPN clients' DNS queries go through the Xray proxy instead
+/// of to Keenetic's built-in DNS proxy (_NDM_HOTSPOT_DNSREDIR → port
+/// 41100 → ISP DNS). The DNAT must be inserted at position 1 in nat
+/// PREROUTING, before Keenetic's _NDM_DNAT and _NDM_DNS_REDIRECT chains.
+/// Xray forwards the queries to 1.1.1.1:53 through the active VLESS
+/// outbound, avoiding UDP-over-SOCKS5 issues with tun2socks.
+fn install_dns_redirect(bridge: &str) {
+    let dst: &str = TUN_DNS_REDIRECT;
+    let _ = Command::new("iptables")
+        .args([
+            "-t",
+            "nat",
+            "-D",
+            "PREROUTING",
+            "-i",
+            bridge,
+            "-p",
+            "udp",
+            "--dport",
+            "53",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            dst,
+        ])
+        .status();
+    let _ = Command::new("iptables")
+        .args([
+            "-t",
+            "nat",
+            "-I",
+            "PREROUTING",
+            "1",
+            "-i",
+            bridge,
+            "-p",
+            "udp",
+            "--dport",
+            "53",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            dst,
+        ])
+        .status();
+    let _ = Command::new("iptables")
+        .args([
+            "-t",
+            "nat",
+            "-D",
+            "PREROUTING",
+            "-i",
+            bridge,
+            "-p",
+            "tcp",
+            "--dport",
+            "53",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            dst,
+        ])
+        .status();
+    let _ = Command::new("iptables")
+        .args([
+            "-t",
+            "nat",
+            "-I",
+            "PREROUTING",
+            "2",
+            "-i",
+            bridge,
+            "-p",
+            "tcp",
+            "--dport",
+            "53",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            dst,
+        ])
+        .status();
+}
+
+fn remove_dns_redirect(bridge: &str) {
+    let dst: &str = TUN_DNS_REDIRECT;
+    let _ = Command::new("iptables")
+        .args([
+            "-t",
+            "nat",
+            "-D",
+            "PREROUTING",
+            "-i",
+            bridge,
+            "-p",
+            "udp",
+            "--dport",
+            "53",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            dst,
+        ])
+        .status();
+    let _ = Command::new("iptables")
+        .args([
+            "-t",
+            "nat",
+            "-D",
+            "PREROUTING",
+            "-i",
+            bridge,
+            "-p",
+            "tcp",
+            "--dport",
+            "53",
+            "-j",
+            "DNAT",
+            "--to-destination",
+            dst,
+        ])
+        .status();
+}
+
 /// Resolve the bridge interface name for the VPN subnet. On Keenetic,
 /// 192.168.2.0/24 is bridge br1; other subnets may use different names.
 fn resolve_vpn_bridge(_vpn_subnet: &str) -> String {
@@ -830,6 +958,7 @@ fn resolve_vpn_bridge(_vpn_subnet: &str) -> String {
 
 const TUN_ROUTE_TABLE: u32 = 111;
 const TUN_FWMARK: u32 = 0x111;
+const TUN_DNS_REDIRECT: &str = "127.0.0.1:1053";
 
 fn resolve_ip_cmd() -> String {
     for candidate in ["/opt/sbin/ip", "/sbin/ip", "/usr/sbin/ip", "ip"] {
@@ -2497,6 +2626,9 @@ fn handle_tun_status(daemon: &Daemon) -> (u16, &'static str, String) {
 
     let forward_exists = shell_status("iptables -S FORWARD 2>/dev/null | grep -q 'br1.*tun0'");
 
+    let dns_redirect_exists =
+        shell_status("iptables -t nat -S PREROUTING 2>/dev/null | grep -q 'br1.*dport 53.*DNAT'");
+
     let socks_listening =
         std::net::TcpStream::connect(format!("127.0.0.1:{tun_socks_port}")).is_ok();
 
@@ -2511,6 +2643,7 @@ fn handle_tun_status(daemon: &Daemon) -> (u16, &'static str, String) {
             "rule_exists": rule_exists,
             "mangle_exists": mangle_exists,
             "forward_exists": forward_exists,
+            "dns_redirect_exists": dns_redirect_exists,
             "socks_listening": socks_listening,
             "tun_device": tun_device,
             "tun_socks_port": tun_socks_port
@@ -2720,11 +2853,14 @@ fn start_watchdog(daemon: Daemon) {
             let mangle_ok =
                 shell_status("iptables -t mangle -S PREROUTING 2>/dev/null | grep -q HINCYRAY_TUN");
             let forward_ok = shell_status("iptables -S FORWARD 2>/dev/null | grep -q 'br1.*tun0'");
+            let dns_ok = shell_status(
+                "iptables -t nat -S PREROUTING 2>/dev/null | grep -q 'br1.*dport 53.*DNAT'",
+            );
 
-            if !mangle_ok || !forward_ok {
+            if !mangle_ok || !forward_ok || !dns_ok {
                 eprintln!(
-                    "hincyray: iptables rules missing (mangle={}, fwd={}), reinstalling...",
-                    mangle_ok, forward_ok
+                    "hincyray: iptables rules missing (mangle={}, fwd={}, dns={}), reinstalling...",
+                    mangle_ok, forward_ok, dns_ok,
                 );
                 let mark = format!("0x{:x}", TUN_FWMARK);
                 let table = TUN_ROUTE_TABLE.to_string();
@@ -2807,6 +2943,7 @@ fn start_watchdog(daemon: Daemon) {
                 }
 
                 install_forward_rules(&bridge, &tun_device);
+                install_dns_redirect(&bridge);
                 eprintln!("hincyray: iptables rules reinstalled");
             }
 

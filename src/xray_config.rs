@@ -15,6 +15,8 @@ use url::Url;
 use crate::profiles::{Profile, Protocol, decode_vmess_json};
 
 pub const WIFI_TUN_INBOUND_TAG: &str = "tun-socks-in";
+pub const DNS_INBOUND_TAG: &str = "dns-in";
+pub const DNS_INBOUND_PORT: u16 = 1053;
 pub const DIRECT_OUTBOUND_TAG: &str = "direct";
 pub const ACTIVE_OUTBOUND_TAG: &str = "active";
 pub const BLOCK_OUTBOUND_TAG: &str = "block";
@@ -130,6 +132,23 @@ pub fn build_xray_router_config(
                 "routeOnly": true
             }
         }));
+        // Dokodemo DNS inbound for the VPN WiFi segment.  DNS queries
+        // from br1 are DNAT'd to 127.0.0.1:1053 (see install_dns_redirect
+        // in hincyray.rs).  Xray receives them here and forwards to
+        // 1.1.1.1:53 through the active VLESS outbound.  This avoids
+        // UDP-over-SOCKS5 issues with tun2socks: DNS goes directly to
+        // Xray (local routing), then out through the proxy as TCP.
+        inbounds.push(json!({
+            "tag": DNS_INBOUND_TAG,
+            "listen": "127.0.0.1",
+            "port": DNS_INBOUND_PORT,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "address": "1.1.1.1",
+                "port": 53,
+                "network": "tcp,udp"
+            }
+        }));
     }
 
     let mut outbounds = vec![
@@ -157,6 +176,14 @@ pub fn build_xray_router_config(
     }
 
     let mut rules = Vec::new();
+    // DNS queries from the dokodemo inbound go through the active proxy.
+    if tun_socks_port.is_some() {
+        rules.push(json!({
+            "type": "field",
+            "inboundTag": [DNS_INBOUND_TAG],
+            "outboundTag": ACTIVE_OUTBOUND_TAG,
+        }));
+    }
     for rule in route_rules {
         if rule.block_quic {
             rules.push(json!({
