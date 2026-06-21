@@ -2492,7 +2492,8 @@ fn handle_tun_status(daemon: &Daemon) -> (u16, &'static str, String) {
         .map(|output| String::from_utf8_lossy(&output.stdout).contains("fwmark 0x111"))
         .unwrap_or(false);
 
-    let mangle_exists = shell_status("iptables -t mangle -S HINCYRAY_TUN >/dev/null 2>&1");
+    let mangle_exists =
+        shell_status("iptables -t mangle -S PREROUTING 2>/dev/null | grep -q HINCYRAY_TUN");
 
     let forward_exists = shell_status("iptables -S FORWARD 2>/dev/null | grep -q 'br1.*tun0'");
 
@@ -2716,7 +2717,8 @@ fn start_watchdog(daemon: Daemon) {
 
             // Check and reinstall iptables rules wiped by ndm.
             let bridge = resolve_vpn_bridge(&vpn_subnet);
-            let mangle_ok = shell_status("iptables -t mangle -S HINCYRAY_TUN >/dev/null 2>&1");
+            let mangle_ok =
+                shell_status("iptables -t mangle -S PREROUTING 2>/dev/null | grep -q HINCYRAY_TUN");
             let forward_ok = shell_status("iptables -S FORWARD 2>/dev/null | grep -q 'br1.*tun0'");
 
             if !mangle_ok || !forward_ok {
