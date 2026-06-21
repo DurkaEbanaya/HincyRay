@@ -3319,18 +3319,6 @@ fn handle_system(daemon: &Daemon) -> (u16, &'static str, String) {
         None
     })();
 
-    // ── /sys/devices/system/cpu: frequency ──
-    let cpu_freq_mhz: Option<u64> = (|| {
-        let text = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq").ok()?;
-        let khz: u64 = text.trim().parse().ok()?;
-        Some(khz / 1000)
-    })();
-    let cpu_freq_max_mhz: Option<u64> = (|| {
-        let text = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq").ok()?;
-        let khz: u64 = text.trim().parse().ok()?;
-        Some(khz / 1000)
-    })();
-
     // ── /proc/meminfo: memory ──
     let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let mut mem_total_kb: u64 = 0;
@@ -3412,8 +3400,6 @@ fn handle_system(daemon: &Daemon) -> (u16, &'static str, String) {
                 "usage_pct": (cpu_usage * 10.0).round() / 10.0,
                 "usage_per_core": cpu_usage_per_core.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>(),
                 "temp_c": cpu_temp.map(|t| (t * 10.0).round() / 10.0),
-                "freq_mhz": cpu_freq_mhz,
-                "freq_max_mhz": cpu_freq_max_mhz,
             },
             "memory": {
                 "total_kb": mem_total_kb,
@@ -4215,7 +4201,6 @@ tr.group-row.collapsed{display:none}
     <div class="card"><div class="label">Cores</div><div class="value" id="sys-cpu-cores">&mdash;</div></div>
     <div class="card"><div class="label">CPU usage</div><div class="value" id="sys-cpu-usage">&mdash;</div><div class="bar-wrap"><div class="bar-fill cpu" id="sys-cpu-bar" style="width:0%"></div></div></div>
     <div class="card"><div class="label">Temperature</div><div class="value" id="sys-cpu-temp">&mdash;</div><div class="bar-wrap"><div class="bar-fill" id="sys-temp-bar" style="width:0%"></div></div></div>
-    <div class="card"><div class="label">Frequency</div><div class="value" id="sys-cpu-freq">&mdash;</div></div>
     <div class="card"><div class="label">RAM usage</div><div class="value" id="sys-mem-usage">&mdash;</div><div class="bar-wrap"><div class="bar-fill mem" id="sys-mem-bar" style="width:0%"></div></div></div>
     <div class="card"><div class="label">RAM total</div><div class="value" id="sys-mem-total">&mdash;</div></div>
     <div class="card"><div class="label">Load average</div><div class="value" id="sys-load">&mdash;</div></div>
@@ -5274,20 +5259,6 @@ function renderSystem(s){
     var tempBar = document.getElementById("sys-temp-bar");
     if(tempBar){
       tempBar.style.width = Math.min(100, (cpu.temp_c / 100) * 100) + "%";
-    }
-  }
-
-  // Frequency
-  var freqEl = document.getElementById("sys-cpu-freq");
-  if(freqEl){
-    if(cpu.freq_mhz){
-      var freqText = cpu.freq_mhz + " MHz";
-      if(cpu.freq_max_mhz && cpu.freq_max_mhz !== cpu.freq_mhz){
-        freqText += " / " + cpu.freq_max_mhz + " MHz max";
-      }
-      freqEl.textContent = freqText;
-    } else {
-      freqEl.textContent = "n/a (no cpufreq)";
     }
   }
 
