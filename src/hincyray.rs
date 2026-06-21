@@ -45,10 +45,34 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_SAMPLES: usize = 1000;
 
+/// Global shutdown flag set by the SIGTERM/SIGINT handler.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_signal(_sig: i32) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+fn register_signal_handlers() {
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+    }
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    // SAFETY: `signal` is a standard C library function that registers
+    // a handler function pointer. The handler only writes to an atomic
+    // bool, which is async-signal-safe.
+    unsafe {
+        signal(SIGINT, handle_signal);
+        signal(SIGTERM, handle_signal);
+    }
+}
+
 /// Entry point for the `hincyray` binary. Binds the listener and serves
 /// requests on the calling thread; spawn background threads per
 /// connection to avoid one slow client blocking the API.
 pub fn run() -> Result<(), String> {
+    register_signal_handlers();
+
     let listen = std::env::var("HINCYRAY_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_owned());
     let state_path = resolve_state_path();
     let xray_config_path = resolve_xray_config_path(&state_path);
@@ -91,6 +115,9 @@ pub fn run() -> Result<(), String> {
     start_watchdog(daemon.clone());
 
     let listener = TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("set_nonblocking: {error}"))?;
     eprintln!("hincyray listening on {listen}");
     eprintln!("hincyray state: {}", daemon.state_path.to_string_lossy());
     eprintln!(
@@ -98,24 +125,43 @@ pub fn run() -> Result<(), String> {
         daemon.xray_config_path.to_string_lossy()
     );
 
-    for incoming in listener.incoming() {
-        let stream = match incoming {
-            Ok(stream) => stream,
+    loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            eprintln!("hincyray: shutdown signal received, cleaning up...");
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+                let daemon = daemon.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_connection(stream, &daemon) {
+                        eprintln!("hincyray handler: {error}");
+                    }
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(200));
+            }
             Err(error) => {
                 eprintln!("hincyray accept: {error}");
-                continue;
+                thread::sleep(Duration::from_millis(200));
             }
-        };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
-        let daemon = daemon.clone();
-        thread::spawn(move || {
-            if let Err(error) = handle_connection(stream, &daemon) {
-                eprintln!("hincyray handler: {error}");
-            }
-        });
+        }
     }
 
+    // Graceful shutdown: stop child processes and clean up kernel state.
+    eprintln!("hincyray: shutting down...");
+    {
+        let mut inner = lock(&daemon.inner);
+        let _ = inner.core.stop();
+        let tun_device = inner.state.split_routing.tun_device.clone();
+        let vpn_subnet = inner.state.split_routing.vpn_subnet.clone();
+        let _ = inner.tun.stop(&tun_device, &vpn_subnet);
+        let _ = persist_state(&daemon.state_path, &inner.state);
+        eprintln!("hincyray: state persisted, children stopped, iptables cleaned");
+    }
     Ok(())
 }
 
@@ -133,6 +179,10 @@ struct DaemonInner {
     core: CoreManager,
     tun: TunManager,
     bench: BenchRuntime,
+    /// v0.6: consecutive health-check failures for the active profile.
+    /// Reset to 0 on success. When it reaches the threshold (3), the
+    /// watchdog triggers a failover to the next-best profile.
+    failover_fail_count: u32,
 }
 
 /// Holds the live benchmark job (if any), its cancel flag, and the
@@ -227,6 +277,15 @@ pub struct HincyrayState {
     /// v0.5: Hardcoded HWID fingerprint for Happ subscription fetches.
     #[serde(default)]
     pub hwid_config: HwidConfig,
+    /// v0.6: Auto-benchmark interval in hours (0 = disabled). When > 0,
+    /// the watchdog triggers a TCP benchmark on all profiles every N
+    /// hours. If `auto_select` is true, switches to the best-scoring
+    /// profile after the benchmark completes.
+    #[serde(default)]
+    pub auto_bench_interval_hours: u32,
+    /// v0.6: Unix timestamp of the last auto-triggered benchmark.
+    #[serde(default)]
+    pub last_auto_bench_unix: u64,
 }
 
 impl Default for HincyrayState {
@@ -247,6 +306,8 @@ impl Default for HincyrayState {
             stats: Vec::new(),
             dns_settings: DnsSettings::default(),
             hwid_config: HwidConfig::default(),
+            auto_bench_interval_hours: 0,
+            last_auto_bench_unix: 0,
         }
     }
 }
@@ -451,6 +512,7 @@ impl Daemon {
                 core: CoreManager::new(),
                 tun: TunManager::new(),
                 bench: BenchRuntime::new(),
+                failover_fail_count: 0,
             })),
             state_path,
             xray_config_path,
@@ -506,6 +568,7 @@ impl CoreManager {
                 config_path.display()
             ));
         }
+        let stderr = open_log_file("xray.log").unwrap_or(Stdio::null());
         let mut cmd = Command::new(xray_path);
         cmd.arg("run")
             .arg("-format")
@@ -513,7 +576,7 @@ impl CoreManager {
             .arg("-c")
             .arg(config_path)
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(stderr);
         if let Some(path) = geo_asset_path.filter(|p| !p.is_empty()) {
             cmd.env("XRAY_LOCATION_ASSET", path);
         }
@@ -606,6 +669,7 @@ impl TunManager {
         let device_url = format!("tun://{tun_device}");
         let proxy_url = format!("socks5://127.0.0.1:{socks_port}");
         let mtu_str = tun_mtu.to_string();
+        let stderr = open_log_file("tun2socks.log").unwrap_or(Stdio::null());
 
         let child = Command::new(tun2socks_path)
             .args(["-device", &device_url])
@@ -613,7 +677,7 @@ impl TunManager {
             .args(["-mtu", &mtu_str])
             .args(["-loglevel", "info"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .map_err(|error| format!("tun2socks spawn: {error}"))?;
         self.child = Some(child);
@@ -950,9 +1014,31 @@ fn remove_dns_redirect(bridge: &str) {
         .status();
 }
 
-/// Resolve the bridge interface name for the VPN subnet. On Keenetic,
-/// 192.168.2.0/24 is bridge br1; other subnets may use different names.
-fn resolve_vpn_bridge(_vpn_subnet: &str) -> String {
+/// Resolve the bridge interface name for the VPN subnet by querying
+/// `ip -o addr show`. Falls back to `br1` if the command fails or no
+/// match is found (Keenetic default for 192.168.2.0/24).
+fn resolve_vpn_bridge(vpn_subnet: &str) -> String {
+    let prefix = vpn_subnet
+        .rsplit_once('.')
+        .map(|(base, _)| base)
+        .unwrap_or(vpn_subnet);
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("ip -o addr show 2>/dev/null")
+        .output();
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            // e.g. "17: br1    inet 192.168.2.1/24 ..."
+            if line.contains(prefix)
+                && line.contains("inet ")
+                && let Some(iface) = line.split_whitespace().nth(1)
+                && (iface.starts_with("br") || iface.starts_with("wlan"))
+            {
+                return iface.to_owned();
+            }
+        }
+    }
     "br1".to_owned()
 }
 
@@ -967,6 +1053,39 @@ fn resolve_ip_cmd() -> String {
         }
     }
     "ip".to_owned()
+}
+
+/// Resolve the log directory for daemon and child process logs.
+fn resolve_log_dir() -> PathBuf {
+    if Path::new("/opt/var/log").is_dir() {
+        return PathBuf::from("/opt/var/log/hincyray");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/share/hincyray/logs");
+    }
+    PathBuf::from("./hincyray-logs")
+}
+
+/// Open a log file in the daemon log directory, truncating if the
+/// existing file exceeds 1 MB to prevent unbounded growth on the
+/// router's limited flash/tmpfs. Returns a `Stdio` for passing to
+/// `Command::stderr()`.
+fn open_log_file(name: &str) -> Result<Stdio, String> {
+    let dir = resolve_log_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let path = dir.join(name);
+    // Truncate if file is too large (> 1 MB).
+    if let Ok(meta) = fs::metadata(&path)
+        && meta.len() > 1_048_576
+    {
+        let _ = fs::write(&path, b"");
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    Ok(Stdio::from(file))
 }
 
 fn resolve_state_path() -> PathBuf {
@@ -993,10 +1112,23 @@ fn resolve_xray_config_path(state_path: &Path) -> PathBuf {
 }
 
 fn load_state(state_path: &Path) -> HincyrayState {
-    fs::read_to_string(state_path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    let Ok(text) = fs::read_to_string(state_path) else {
+        return HincyrayState::default();
+    };
+    match serde_json::from_str(&text) {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!(
+                "hincyray: state file {} is corrupted ({}), backing up and starting fresh",
+                state_path.display(),
+                error
+            );
+            let backup = state_path.with_extension("json.corrupt");
+            let _ = fs::write(&backup, &text);
+            eprintln!("hincyray: corrupted state saved to {}", backup.display());
+            HincyrayState::default()
+        }
+    }
 }
 
 fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String> {
@@ -1309,6 +1441,10 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
                 "active_profile_name": active.map(|p| p.name.clone()),
                 "profile_count": inner.state.profiles.len(),
                 "auto_select": inner.state.auto_select,
+                "auto_bench_interval_hours": inner.state.auto_bench_interval_hours,
+                "last_auto_bench_unix": inner.state.last_auto_bench_unix,
+                "auto_switch": inner.state.split_routing.auto_switch,
+                "failover_fail_count": inner.failover_fail_count,
                 "listen_host": inner.state.listen_host,
                 "socks_port": inner.state.socks_port,
                 "http_port": inner.state.http_port,
@@ -1378,6 +1514,9 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/dns") => handle_dns_get(daemon),
         ("POST", "/api/dns") => handle_dns_set(body, daemon),
         ("GET", "/api/dns/leak-test") => handle_dns_leak_test(daemon),
+        ("GET", "/api/logs") => handle_logs(daemon),
+        ("GET", "/api/auto-settings") => handle_auto_settings_get(daemon),
+        ("POST", "/api/auto-settings") => handle_auto_settings_set(body, daemon),
         ("GET", "/api/hwid") => handle_hwid_get(daemon),
         ("POST", "/api/hwid") => handle_hwid_set(body, daemon),
         _ => (
@@ -2607,8 +2746,10 @@ fn handle_tun_status(daemon: &Daemon) -> (u16, &'static str, String) {
     let tun_device = inner.state.split_routing.tun_device.clone();
     let tun_socks_port = inner.state.split_routing.tun_socks_port;
     let enabled = inner.state.split_routing.enabled;
+    let vpn_subnet = inner.state.split_routing.vpn_subnet.clone();
     drop(inner);
 
+    let bridge = resolve_vpn_bridge(&vpn_subnet);
     let ip_cmd = resolve_ip_cmd();
     let iface_exists = Command::new(&ip_cmd)
         .args(["link", "show", &tun_device])
@@ -2625,10 +2766,13 @@ fn handle_tun_status(daemon: &Daemon) -> (u16, &'static str, String) {
     let mangle_exists =
         shell_status("iptables -t mangle -S PREROUTING 2>/dev/null | grep -q HINCYRAY_TUN");
 
-    let forward_exists = shell_status("iptables -S FORWARD 2>/dev/null | grep -q 'br1.*tun0'");
+    let forward_exists = shell_status(&format!(
+        "iptables -S FORWARD 2>/dev/null | grep -q '{bridge}.*{tun_device}'"
+    ));
 
-    let dns_redirect_exists =
-        shell_status("iptables -t nat -S PREROUTING 2>/dev/null | grep -q 'br1.*dport 53.*DNAT'");
+    let dns_redirect_exists = shell_status(&format!(
+        "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '{bridge}.*dport 53.*DNAT'"
+    ));
 
     let socks_listening =
         std::net::TcpStream::connect(format!("127.0.0.1:{tun_socks_port}")).is_ok();
@@ -2752,6 +2896,7 @@ fn handle_dns_leak_test(daemon: &Daemon) -> (u16, &'static str, String) {
     let core_running = inner.core.is_running();
     let split_enabled = inner.state.split_routing.enabled;
     let tun_socks_port = inner.state.split_routing.tun_socks_port;
+    let vpn_subnet = inner.state.split_routing.vpn_subnet.clone();
     drop(inner);
 
     if !core_running {
@@ -2762,9 +2907,12 @@ fn handle_dns_leak_test(daemon: &Daemon) -> (u16, &'static str, String) {
         );
     }
 
+    let bridge = resolve_vpn_bridge(&vpn_subnet);
+
     // Infrastructure checks: iptables rules + Xray DNS inbound.
-    let dns_redirect_ok =
-        shell_status("iptables -t nat -S PREROUTING 2>/dev/null | grep -q 'br1.*dport 53.*DNAT'");
+    let dns_redirect_ok = shell_status(&format!(
+        "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '{bridge}.*dport 53.*DNAT'"
+    ));
     let mangle_ok =
         shell_status("iptables -t mangle -S PREROUTING 2>/dev/null | grep -q HINCYRAY_TUN");
     let dns_in_listening = std::net::TcpStream::connect("127.0.0.1:1053").is_ok();
@@ -2893,6 +3041,87 @@ fn handle_dns_leak_test(daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
+/// Return current auto-select / auto-benchmark / failover settings.
+fn handle_auto_settings_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    (
+        200,
+        "application/json",
+        json!({
+            "auto_select": inner.state.auto_select,
+            "auto_bench_interval_hours": inner.state.auto_bench_interval_hours,
+            "last_auto_bench_unix": inner.state.last_auto_bench_unix,
+            "auto_switch": inner.state.split_routing.auto_switch,
+            "failover_fail_count": inner.failover_fail_count,
+        })
+        .to_string(),
+    )
+}
+
+/// Update auto-select / auto-benchmark / failover settings.
+fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let mut inner = lock(&daemon.inner);
+    if let Some(v) = value.get("auto_select").and_then(Value::as_bool) {
+        inner.state.auto_select = v;
+    }
+    if let Some(v) = value
+        .get("auto_bench_interval_hours")
+        .and_then(Value::as_u64)
+    {
+        inner.state.auto_bench_interval_hours = v as u32;
+    }
+    if let Some(v) = value.get("auto_switch").and_then(Value::as_bool) {
+        inner.state.split_routing.auto_switch = v;
+    }
+    let _ = persist_state(&daemon.state_path, &inner.state);
+    (
+        200,
+        "application/json",
+        json!({
+            "auto_select": inner.state.auto_select,
+            "auto_bench_interval_hours": inner.state.auto_bench_interval_hours,
+            "auto_switch": inner.state.split_routing.auto_switch,
+        })
+        .to_string(),
+    )
+}
+
+/// Return the last N lines of the Xray and tun2socks log files so the
+/// user can diagnose start failures from the web panel without SSH.
+fn handle_logs(_daemon: &Daemon) -> (u16, &'static str, String) {
+    let dir = resolve_log_dir();
+    let xray_log = dir.join("xray.log");
+    let tun_log = dir.join("tun2socks.log");
+
+    let read_tail = |path: &Path| -> String {
+        let Ok(text) = fs::read_to_string(path) else {
+            return String::new();
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(200);
+        lines[start..].join("\n")
+    };
+
+    (
+        200,
+        "application/json",
+        json!({
+            "xray": read_tail(&xray_log),
+            "tun2socks": read_tail(&tun_log),
+            "xray_log_path": xray_log.to_string_lossy(),
+            "tun2socks_log_path": tun_log.to_string_lossy(),
+        })
+        .to_string(),
+    )
+}
+
 fn handle_hwid_get(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
     (
@@ -2949,164 +3178,375 @@ fn shell_status(command: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Background thread that periodically checks whether the tun2socks
-/// process is alive, the TUN interface exists, the Xray core is running,
-/// and the iptables mangle MARK chain + FORWARD ACCEPT rules are still
-/// present. iproute2 rules and TUN interfaces survive ndm reloads, but
-/// ndm wipes iptables chains on certain events. The watchdog runs every
-/// 10 seconds to minimise the downtime window.
-fn start_watchdog(daemon: Daemon) {
-    if !Path::new("/opt/sbin/tun2socks").exists()
-        && !shell_status("command -v tun2socks >/dev/null 2>&1")
-    {
+/// Quick SOCKS health check: try a tiny HTTP request through the
+/// proxy with a 5-second timeout. Returns true if the tunnel is
+/// forwarding traffic.
+fn socks_health_check(socks_port: u16) -> bool {
+    Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "5",
+            "--socks5-hostname",
+            &format!("127.0.0.1:{socks_port}"),
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "https://1.1.1.1/cdn-cgi/trace",
+        ])
+        .output()
+        .map(|o| {
+            let code = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+            o.status.success() && code.starts_with('2')
+        })
+        .unwrap_or(false)
+}
+
+/// Find the profile with the highest `last_score` from `ProfileStats`
+/// that is not the `exclude` profile and has at least one success.
+/// Returns the profile id, or None if no candidate exists.
+fn find_best_profile_by_score(state: &HincyrayState, exclude: Option<usize>) -> Option<usize> {
+    let mut best: Option<(usize, u32)> = None;
+    for profile in &state.profiles {
+        if Some(profile.id) == exclude {
+            continue;
+        }
+        let Some(stat) = state.stats.iter().find(|s| s.profile_raw == profile.raw) else {
+            continue;
+        };
+        if stat.success_count == 0 || stat.last_score == 0 {
+            continue;
+        }
+        if best
+            .map(|(_, score)| stat.last_score > score)
+            .unwrap_or(true)
+        {
+            best = Some((profile.id, stat.last_score));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+/// Start a TCP benchmark on all profiles from the watchdog. This is
+/// the same mechanism as `handle_bench_start` but uses the TCP method
+/// (lightweight, no temp Xray processes) and covers all profiles.
+fn start_auto_benchmark(daemon: &Daemon) {
+    let (profiles, xray_path) = {
+        let inner = lock(&daemon.inner);
+        if inner.bench.is_running() {
+            return;
+        }
+        (inner.state.profiles.clone(), inner.state.xray_path.clone())
+    };
+    if profiles.is_empty() {
         return;
     }
+    let job = Arc::new(Mutex::new(BenchJob::default()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let daemon_for_callback = daemon.clone();
+    let on_result = Box::new(move |result: BenchResult| {
+        apply_bench_result(&daemon_for_callback, result);
+    });
+    let handle = run_bench(
+        profiles,
+        BenchMethod::Tcp,
+        DEFAULT_PROBE_URL.to_owned(),
+        DEFAULT_DOWNLOAD_URL.to_owned(),
+        xray_path,
+        Arc::clone(&job),
+        Arc::clone(&cancel),
+        on_result,
+    );
+    let mut inner = lock(&daemon.inner);
+    if let Some(prev) = inner.bench.handle.take() {
+        let _ = prev.join();
+    }
+    inner.bench.job = Some(job);
+    inner.bench.cancel = Some(cancel);
+    inner.bench.handle = Some(handle);
+}
+
+/// Switch the active profile, regenerate Xray config, and restart the
+/// core. Caller must hold the lock.
+fn switch_active_profile(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon, profile_id: usize) {
+    inner.state.active_profile_id = Some(profile_id);
+    let config_path = daemon.xray_config_path.clone();
+    if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
+        eprintln!("hincyray: config regeneration failed: {error}");
+    }
+    let xray = inner.state.xray_path.clone();
+    let geo = inner.state.split_routing.geo_asset_path.clone();
+    if let Err(error) = inner.core.restart(&xray, &config_path, Some(&geo)) {
+        eprintln!("hincyray: core restart failed: {error}");
+    }
+    let _ = persist_state(&daemon.state_path, &inner.state);
+}
+
+/// Background watchdog thread. Runs every 10 seconds and handles:
+///
+/// 1. **Core monitoring (always)** — if the Xray core has crashed,
+///    regenerate config and restart it with exponential backoff.
+/// 2. **TUN/iptables monitoring (split routing only)** — restart
+///    tun2socks if dead, reinstall iptables rules wiped by ndm.
+/// 3. **Health check + failover (auto_switch)** — probe the SOCKS
+///    tunnel with a short curl request. After 3 consecutive failures,
+///    switch to the next-best profile by benchmark score.
+/// 4. **Auto-benchmark (auto_bench_interval_hours > 0)** — trigger a
+///    TCP benchmark on all profiles on a schedule.
+/// 5. **Auto-select (auto_select)** — when a benchmark finishes,
+///    switch to the highest-scoring profile.
+fn start_watchdog(daemon: Daemon) {
     thread::spawn(move || {
+        let mut bench_was_running = false;
+        let mut restart_backoff_secs: u64 = 0;
+
         loop {
             thread::sleep(Duration::from_secs(10));
-            let mut inner = lock(&daemon.inner);
-            let enabled = inner.state.split_routing.enabled;
-            let core_running = inner.core.is_running();
-            let tun_running = inner.tun.is_running();
-            let tun_device = inner.state.split_routing.tun_device.clone();
-            let vpn_subnet = inner.state.split_routing.vpn_subnet.clone();
-            drop(inner);
 
-            if !enabled {
-                continue;
-            }
-
-            if !tun_running {
-                eprintln!("hincyray: tun2socks not running, restarting...");
+            // --- Read state snapshot (short lock) ---
+            let (
+                core_running,
+                split_enabled,
+                tun_running,
+                tun_device,
+                vpn_subnet,
+                socks_port,
+                xray_path,
+                geo_asset,
+                auto_switch,
+                auto_select,
+                auto_bench_hours,
+                last_auto_bench,
+                bench_running,
+                active_profile_id,
+            ) = {
                 let mut inner = lock(&daemon.inner);
-                let split = inner.state.split_routing.clone();
-                if let Err(error) = inner.tun.start(
-                    &split.tun2socks_path,
-                    &split.tun_device,
-                    &split.tun_address,
-                    split.tun_mtu,
-                    split.tun_socks_port,
-                    &split.vpn_subnet,
-                ) {
-                    eprintln!("hincyray: tun2socks restart failed: {error}");
-                } else {
-                    eprintln!("hincyray: tun2socks restarted");
-                }
-                continue;
-            }
+                (
+                    inner.core.is_running(),
+                    inner.state.split_routing.enabled,
+                    inner.tun.is_running(),
+                    inner.state.split_routing.tun_device.clone(),
+                    inner.state.split_routing.vpn_subnet.clone(),
+                    inner.state.socks_port,
+                    inner.state.xray_path.clone(),
+                    inner.state.split_routing.geo_asset_path.clone(),
+                    inner.state.split_routing.auto_switch,
+                    inner.state.auto_select,
+                    inner.state.auto_bench_interval_hours,
+                    inner.state.last_auto_bench_unix,
+                    inner.bench.is_running(),
+                    inner.state.active_profile_id,
+                )
+            };
 
-            // Check and reinstall iptables rules wiped by ndm.
-            let bridge = resolve_vpn_bridge(&vpn_subnet);
-            let mangle_ok =
-                shell_status("iptables -t mangle -S PREROUTING 2>/dev/null | grep -q HINCYRAY_TUN");
-            let forward_ok = shell_status("iptables -S FORWARD 2>/dev/null | grep -q 'br1.*tun0'");
-            let dns_ok = shell_status(
-                "iptables -t nat -S PREROUTING 2>/dev/null | grep -q 'br1.*dport 53.*DNAT'",
-            );
-
-            if !mangle_ok || !forward_ok || !dns_ok {
-                eprintln!(
-                    "hincyray: iptables rules missing (mangle={}, fwd={}, dns={}), reinstalling...",
-                    mangle_ok, forward_ok, dns_ok,
-                );
-                let mark = format!("0x{:x}", TUN_FWMARK);
-                let table = TUN_ROUTE_TABLE.to_string();
-
-                if !mangle_ok {
-                    let _ = Command::new("iptables")
-                        .args(["-t", "mangle", "-N", "HINCYRAY_TUN"])
-                        .status();
-                    let _ = Command::new("iptables")
-                        .args(["-t", "mangle", "-F", "HINCYRAY_TUN"])
-                        .status();
-                    let _ = Command::new("iptables")
-                        .args([
-                            "-t",
-                            "mangle",
-                            "-A",
-                            "HINCYRAY_TUN",
-                            "-d",
-                            "192.168.0.0/16",
-                            "-j",
-                            "RETURN",
-                        ])
-                        .status();
-                    let _ = Command::new("iptables")
-                        .args([
-                            "-t",
-                            "mangle",
-                            "-A",
-                            "HINCYRAY_TUN",
-                            "-d",
-                            "224.0.0.0/4",
-                            "-j",
-                            "RETURN",
-                        ])
-                        .status();
-                    let _ = Command::new("iptables")
-                        .args([
-                            "-t",
-                            "mangle",
-                            "-A",
-                            "HINCYRAY_TUN",
-                            "-j",
-                            "MARK",
-                            "--set-mark",
-                            &mark,
-                        ])
-                        .status();
-                    let _ = Command::new("iptables")
-                        .args([
-                            "-t",
-                            "mangle",
-                            "-D",
-                            "PREROUTING",
-                            "-s",
-                            &vpn_subnet,
-                            "-j",
-                            "HINCYRAY_TUN",
-                        ])
-                        .status();
-                    let _ = Command::new("iptables")
-                        .args([
-                            "-t",
-                            "mangle",
-                            "-A",
-                            "PREROUTING",
-                            "-s",
-                            &vpn_subnet,
-                            "-j",
-                            "HINCYRAY_TUN",
-                        ])
-                        .status();
-
-                    let ip_cmd = resolve_ip_cmd();
-                    let _ = Command::new(&ip_cmd)
-                        .args(["rule", "del", "fwmark", &mark, "lookup", &table])
-                        .status();
-                    let _ = Command::new(&ip_cmd)
-                        .args(["rule", "add", "fwmark", &mark, "lookup", &table])
-                        .status();
-                }
-
-                install_forward_rules(&bridge, &tun_device);
-                install_dns_redirect(&bridge);
-                eprintln!("hincyray: iptables rules reinstalled");
-            }
-
+            // --- Phase 1: Core restart (always) ---
             if !core_running {
-                eprintln!("hincyray: core not running, restarting...");
-                let mut inner = lock(&daemon.inner);
-                let xray_path = inner.state.xray_path.clone();
-                let config_path = daemon.xray_config_path.clone();
-                let geo_asset = inner.state.split_routing.geo_asset_path.clone();
-                if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
-                    eprintln!("hincyray: watchdog config regeneration failed: {error}");
-                }
-                if let Err(error) = inner.core.start(&xray_path, &config_path, Some(&geo_asset)) {
-                    eprintln!("hincyray: watchdog core restart failed: {error}");
+                if restart_backoff_secs > 0 {
+                    eprintln!(
+                        "hincyray: core restart backoff ({}s remaining)",
+                        restart_backoff_secs
+                    );
+                    restart_backoff_secs = restart_backoff_secs.saturating_sub(10);
+                    // Still process auto-switch / bench state below.
+                } else {
+                    eprintln!("hincyray: core not running, restarting...");
+                    let mut inner = lock(&daemon.inner);
+                    let config_path = daemon.xray_config_path.clone();
+                    if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
+                        eprintln!("hincyray: watchdog config regeneration failed: {error}");
+                    }
+                    if let Err(error) = inner.core.start(&xray_path, &config_path, Some(&geo_asset))
+                    {
+                        eprintln!("hincyray: watchdog core restart failed: {error}");
+                        // Exponential backoff: 10 → 20 → 40 → 80 → 160 → 300 max.
+                        restart_backoff_secs = restart_backoff_secs.clamp(10, 150) * 2;
+                    } else {
+                        restart_backoff_secs = 0;
+                        eprintln!("hincyray: core restarted by watchdog");
+                    }
+                    continue;
                 }
             }
+
+            // --- Phase 2: TUN + iptables (split routing only) ---
+            if split_enabled {
+                if !tun_running {
+                    eprintln!("hincyray: tun2socks not running, restarting...");
+                    let mut inner = lock(&daemon.inner);
+                    let split = inner.state.split_routing.clone();
+                    if let Err(error) = inner.tun.start(
+                        &split.tun2socks_path,
+                        &split.tun_device,
+                        &split.tun_address,
+                        split.tun_mtu,
+                        split.tun_socks_port,
+                        &split.vpn_subnet,
+                    ) {
+                        eprintln!("hincyray: tun2socks restart failed: {error}");
+                    } else {
+                        eprintln!("hincyray: tun2socks restarted");
+                    }
+                } else {
+                    // Check and reinstall iptables rules wiped by ndm.
+                    let bridge = resolve_vpn_bridge(&vpn_subnet);
+                    let mangle_ok = shell_status(
+                        "iptables -t mangle -S PREROUTING 2>/dev/null | grep -q HINCYRAY_TUN",
+                    );
+                    let forward_ok = shell_status(&format!(
+                        "iptables -S FORWARD 2>/dev/null | grep -q '{bridge}.*{tun_device}'",
+                    ));
+                    let dns_ok = shell_status(&format!(
+                        "iptables -t nat -S PREROUTING 2>/dev/null | grep -q '{bridge}.*dport 53.*DNAT'",
+                    ));
+
+                    if !mangle_ok || !forward_ok || !dns_ok {
+                        eprintln!(
+                            "hincyray: iptables rules missing (mangle={}, fwd={}, dns={}), reinstalling...",
+                            mangle_ok, forward_ok, dns_ok,
+                        );
+                        let mark = format!("0x{:x}", TUN_FWMARK);
+                        let table = TUN_ROUTE_TABLE.to_string();
+
+                        if !mangle_ok {
+                            let _ = Command::new("iptables")
+                                .args(["-t", "mangle", "-N", "HINCYRAY_TUN"])
+                                .status();
+                            let _ = Command::new("iptables")
+                                .args(["-t", "mangle", "-F", "HINCYRAY_TUN"])
+                                .status();
+                            let _ = Command::new("iptables")
+                                .args([
+                                    "-t",
+                                    "mangle",
+                                    "-A",
+                                    "HINCYRAY_TUN",
+                                    "-d",
+                                    "192.168.0.0/16",
+                                    "-j",
+                                    "RETURN",
+                                ])
+                                .status();
+                            let _ = Command::new("iptables")
+                                .args([
+                                    "-t",
+                                    "mangle",
+                                    "-A",
+                                    "HINCYRAY_TUN",
+                                    "-d",
+                                    "224.0.0.0/4",
+                                    "-j",
+                                    "RETURN",
+                                ])
+                                .status();
+                            let _ = Command::new("iptables")
+                                .args([
+                                    "-t",
+                                    "mangle",
+                                    "-A",
+                                    "HINCYRAY_TUN",
+                                    "-j",
+                                    "MARK",
+                                    "--set-mark",
+                                    &mark,
+                                ])
+                                .status();
+                            let _ = Command::new("iptables")
+                                .args([
+                                    "-t",
+                                    "mangle",
+                                    "-D",
+                                    "PREROUTING",
+                                    "-s",
+                                    &vpn_subnet,
+                                    "-j",
+                                    "HINCYRAY_TUN",
+                                ])
+                                .status();
+                            let _ = Command::new("iptables")
+                                .args([
+                                    "-t",
+                                    "mangle",
+                                    "-A",
+                                    "PREROUTING",
+                                    "-s",
+                                    &vpn_subnet,
+                                    "-j",
+                                    "HINCYRAY_TUN",
+                                ])
+                                .status();
+
+                            let ip_cmd = resolve_ip_cmd();
+                            let _ = Command::new(&ip_cmd)
+                                .args(["rule", "del", "fwmark", &mark, "lookup", &table])
+                                .status();
+                            let _ = Command::new(&ip_cmd)
+                                .args(["rule", "add", "fwmark", &mark, "lookup", &table])
+                                .status();
+                        }
+
+                        install_forward_rules(&bridge, &tun_device);
+                        install_dns_redirect(&bridge);
+                        eprintln!("hincyray: iptables rules reinstalled");
+                    }
+                }
+            }
+
+            // --- Phase 3: Health check + failover (auto_switch) ---
+            if auto_switch && !bench_running && core_running {
+                let healthy = socks_health_check(socks_port);
+                let mut inner = lock(&daemon.inner);
+                if healthy {
+                    if inner.failover_fail_count > 0 {
+                        eprintln!("hincyray: health check recovered");
+                    }
+                    inner.failover_fail_count = 0;
+                } else {
+                    inner.failover_fail_count += 1;
+                    const FAILOVER_THRESHOLD: u32 = 3;
+                    eprintln!(
+                        "hincyray: health check failed ({}/{})",
+                        inner.failover_fail_count, FAILOVER_THRESHOLD
+                    );
+                    if inner.failover_fail_count >= FAILOVER_THRESHOLD {
+                        if let Some(next_id) =
+                            find_best_profile_by_score(&inner.state, active_profile_id)
+                        {
+                            eprintln!("hincyray: failover to profile {next_id}");
+                            switch_active_profile(&mut inner, &daemon, next_id);
+                        } else {
+                            eprintln!("hincyray: no alternative profile for failover");
+                        }
+                        inner.failover_fail_count = 0;
+                    }
+                }
+            }
+
+            // --- Phase 4: Auto-benchmark ---
+            if auto_bench_hours > 0 && !bench_running {
+                let now = unix_now();
+                let interval_secs = u64::from(auto_bench_hours) * 3600;
+                if now.saturating_sub(last_auto_bench) >= interval_secs {
+                    eprintln!("hincyray: auto-benchmark triggered");
+                    start_auto_benchmark(&daemon);
+                    let mut inner = lock(&daemon.inner);
+                    inner.state.last_auto_bench_unix = now;
+                    let _ = persist_state(&daemon.state_path, &inner.state);
+                }
+            }
+
+            // --- Phase 5: Auto-select after benchmark ---
+            if bench_was_running && !bench_running && auto_select {
+                eprintln!("hincyray: benchmark finished, auto-selecting best profile");
+                let mut inner = lock(&daemon.inner);
+                if let Some(best_id) = find_best_profile_by_score(&inner.state, None)
+                    && Some(best_id) != inner.state.active_profile_id
+                {
+                    eprintln!("hincyray: auto-switching to profile {best_id}");
+                    switch_active_profile(&mut inner, &daemon, best_id);
+                }
+            }
+            bench_was_running = bench_running;
         }
     });
 }
@@ -3302,6 +3742,7 @@ tr.fav td:first-child{border-left:3px solid #d4a72c}
 progress{width:100%;height:6px;border-radius:3px;overflow:hidden}
 .collapsible{display:none}
 .collapsible.open{display:block}
+.log-box{background:#1a1a2e;color:#c0c0c0;padding:.5em;max-height:300px;overflow:auto;font-size:12px;white-space:pre-wrap;border-radius:4px}
 pre{background:#1f2328;color:#e6edf3;padding:.7em;border-radius:6px;overflow:auto;max-height:420px;font-size:.82em}
 .star.on::after{content:"\2605"}
 .star:not(.on)::after{content:"\2606"}
@@ -3442,6 +3883,31 @@ tr.group-row.collapsed{display:none}
       </tbody>
     </table>
   </div>
+</div>
+
+<h2>Auto Settings <span id="auto-toggle" class="toggle">show</span></h2>
+<div id="auto-panel" class="collapsible">
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="auto-select-chk"> Auto-select best profile after benchmark</label>
+    <label class="chip"><input type="checkbox" id="auto-switch-chk"> Auto-switch (failover) on health check failure</label>
+    <div class="field"><label for="auto-bench-hours">Auto-benchmark interval (hours, 0 = disabled)</label><input type="number" id="auto-bench-hours" min="0" max="168" value="0"></div>
+  </div>
+  <div class="row" style="margin:.45em 0">
+    <button id="btn-auto-save">Save auto settings</button>
+    <span class="subtle">Failover failures: <span id="auto-failover-count">0</span>/3</span>
+    <span class="subtle" id="auto-last-bench"></span>
+  </div>
+</div>
+
+<h2>Logs <span id="logs-toggle" class="toggle">show</span></h2>
+<div id="logs-panel" class="collapsible">
+  <div class="row" style="margin:.45em 0">
+    <button id="btn-logs-refresh">Refresh logs</button>
+  </div>
+  <h3 class="subtle">Xray</h3>
+  <pre id="xray-log" class="log-box"></pre>
+  <h3 class="subtle">tun2socks</h3>
+  <pre id="tun-log" class="log-box"></pre>
 </div>
 
 <h2>WiFi Traffic Split <span id="routing-toggle" class="toggle">show</span></h2>
@@ -4339,6 +4805,61 @@ api("GET","/api/dns").then(function(data){
   var strat = document.getElementById("dns-strategy");
   if(strat && d.query_strategy){ strat.value = d.query_strategy; }
 }).catch(function(){ /* ignore */ });
+
+// Auto-settings: load, save, and display.
+function loadAutoSettings(){
+  api("GET", "/api/auto-settings").then(function(data){
+    document.getElementById("auto-select-chk").checked = !!data.auto_select;
+    document.getElementById("auto-switch-chk").checked = !!data.auto_switch;
+    document.getElementById("auto-bench-hours").value = data.auto_bench_interval_hours || 0;
+    document.getElementById("auto-failover-count").textContent = data.failover_fail_count || 0;
+    if(data.last_auto_bench_unix){
+      var ago = Math.round((Date.now()/1000 - data.last_auto_bench_unix) / 3600);
+      document.getElementById("auto-last-bench").textContent = "Last auto-bench: " + ago + "h ago";
+    }
+  }).catch(function(){ /* ignore */ });
+}
+
+document.getElementById("btn-auto-save").addEventListener("click", function(){
+  var body = JSON.stringify({
+    auto_select: document.getElementById("auto-select-chk").checked,
+    auto_switch: document.getElementById("auto-switch-chk").checked,
+    auto_bench_interval_hours: Number(document.getElementById("auto-bench-hours").value) || 0,
+  });
+  api("POST", "/api/auto-settings", body).then(function(){
+    showOk("Auto settings saved.");
+  }).catch(function(err){ setMsg("Save failed: " + err.message); });
+});
+
+// Logs: load and display.
+function loadLogs(){
+  api("GET", "/api/logs").then(function(data){
+    document.getElementById("xray-log").textContent = data.xray || "(empty)";
+    document.getElementById("tun-log").textContent = data.tun2socks || "(empty)";
+  }).catch(function(err){ setMsg("Logs load failed: " + err.message); });
+}
+
+document.getElementById("btn-logs-refresh").addEventListener("click", loadLogs);
+
+document.getElementById("auto-toggle").addEventListener("click", function(){
+  toggleCollapsible("auto-toggle", "auto-panel");
+});
+document.getElementById("logs-toggle").addEventListener("click", function(){
+  toggleCollapsible("logs-toggle", "logs-panel");
+});
+
+// Load initial data.
+loadAutoSettings();
+
+// Auto-refresh status every 5 seconds (lightweight: only /api/status).
+// Does not reload profiles or input fields, so user input is preserved.
+setInterval(function(){
+  api("GET", "/api/status").then(function(s){
+    renderStatus(s);
+    var el = document.getElementById("auto-failover-count");
+    if(el){ el.textContent = s.failover_fail_count || 0; }
+  }).catch(function(){ /* transient, keep last known state */ });
+}, 5000);
 
 refreshAll();
 })();

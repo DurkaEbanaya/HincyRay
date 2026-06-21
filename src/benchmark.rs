@@ -27,7 +27,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-use crate::profiles::{Profile, Protocol};
+use crate::profiles::Profile;
+#[cfg(test)]
+use crate::profiles::Protocol;
 use crate::scoring::quality_score;
 use crate::xray_config::build_xray_config;
 
@@ -190,14 +192,7 @@ fn benchmark_profile(
     let outcome = match method {
         BenchMethod::Tcp => run_tcp(profile),
         BenchMethod::Head | BenchMethod::Get => {
-            if !matches!(profile.protocol, Protocol::Vless) {
-                Err(format!(
-                    "unsupported by xray benchmark: protocol {}",
-                    profile.protocol
-                ))
-            } else {
-                run_via_temp_xray(profile, method, probe_url, download_url, xray_path)
-            }
+            run_via_temp_xray(profile, method, probe_url, download_url, xray_path)
         }
     };
 
@@ -602,7 +597,11 @@ mod tests {
         );
         assert!(!result.success);
         let err = result.error.expect("error message");
-        assert!(err.contains("unsupported by xray benchmark"), "got: {err}");
+        // build_xray_config returns a Russian error for Hysteria2.
+        assert!(
+            err.contains("Hysteria2") || err.contains("не поддерживает"),
+            "got: {err}"
+        );
     }
 
     #[test]

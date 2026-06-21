@@ -8,7 +8,9 @@
 # Run on the router as root:
 #   sh /opt/etc/hincyray/scripts/wifi-segment-setup.sh
 #
-# IMPORTANT: Run this BEFORE tproxy-setup.sh.
+# After running, enable split routing in the HincyRay web panel
+# (http://192.168.1.1:8088/) and click Apply — the daemon handles
+# tun2socks, iproute2, and iptables setup automatically.
 # Config is NOT saved automatically — reboot restores previous state.
 # To save: ndmc -c "system configuration save"
 
@@ -63,10 +65,11 @@ echo "  Gateway: ${GATEWAY}"
 echo "  DHCP: ${DHCP_START} - ${DHCP_END}"
 echo ""
 echo "Next steps:"
-echo "  1. Add TPROXY inbound to Xray: sh /opt/etc/hincyray/scripts/xray-tproxy-inbound.sh"
-echo "  2. Restart core: curl -X POST http://127.0.0.1:8088/api/core/restart"
-echo "  3. Add TPROXY iptables: sh /opt/etc/hincyray/scripts/tproxy-setup.sh"
-echo "  4. Test: connect phone to ${SSID}, open 2ip.ru"
+echo "  1. Open the HincyRay web panel: http://192.168.1.1:8088/"
+echo "  2. Enable 'Split routing' in the Routing section and click Apply"
+echo "  3. The daemon will automatically start tun2socks and install"
+echo "     iproute2/iptables rules for the ${SUBNET} subnet"
+echo "  4. Test: connect a device to ${SSID}, verify exit IP at 2ip.ru"
 echo ""
 echo "NOT saved to flash. To save: ndmc -c 'system configuration save'"
 echo "To rollback WiFi: ndmc -c 'interface WifiMaster0/AccessPoint1 down' && ndmc -c 'interface WifiMaster1/AccessPoint1 down'"
