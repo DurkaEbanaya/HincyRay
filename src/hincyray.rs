@@ -183,6 +183,106 @@ struct DaemonInner {
     /// Reset to 0 on success. When it reaches the threshold (3), the
     /// watchdog triggers a failover to the next-best profile.
     failover_fail_count: u32,
+    /// v0.6.1: previous `/proc/stat` aggregate sample for CPU usage
+    /// delta computation. `None` on first call → usage returns 0%.
+    prev_cpu: Option<CpuTimes>,
+    /// v0.6.1: per-core previous samples for per-core usage.
+    prev_cpu_per_core: Vec<CpuTimes>,
+}
+
+/// One row of `/proc/stat` for a CPU (aggregate or per-core).
+/// Fields: user, nice, system, idle, iowait, irq, softirq, steal.
+/// All in clock ticks (USER_HZ, typically 100 on ARM).
+#[derive(Clone, Copy, Debug, Default)]
+struct CpuTimes {
+    user: u64,
+    nice: u64,
+    system: u64,
+    idle: u64,
+    iowait: u64,
+    irq: u64,
+    softirq: u64,
+    steal: u64,
+}
+
+impl CpuTimes {
+    /// Total of all fields = total time elapsed.
+    fn total(&self) -> u64 {
+        self.user
+            + self.nice
+            + self.system
+            + self.idle
+            + self.iowait
+            + self.irq
+            + self.softirq
+            + self.steal
+    }
+
+    /// Idle time = idle + iowait.
+    fn idle_total(&self) -> u64 {
+        self.idle + self.iowait
+    }
+
+    /// Compute usage percentage (0.0–100.0) between two samples.
+    fn usage_pct(prev: &CpuTimes, cur: &CpuTimes) -> f64 {
+        let total_delta = cur.total().saturating_sub(prev.total());
+        if total_delta == 0 {
+            return 0.0;
+        }
+        let idle_delta = cur.idle_total().saturating_sub(prev.idle_total());
+        let busy_delta = total_delta.saturating_sub(idle_delta);
+        (busy_delta as f64 / total_delta as f64) * 100.0
+    }
+
+    /// Parse a single `cpu` line from `/proc/stat`.
+    /// Format: `cpu  user nice system idle iowait irq softirq steal 0 0`
+    fn parse_line(line: &str) -> Option<Self> {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        // parts[0] = "cpu" or "cpu0" etc.
+        let nums: Vec<u64> = parts[1..]
+            .iter()
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect();
+        if nums.len() < 4 {
+            return None;
+        }
+        Some(Self {
+            user: nums[0],
+            nice: *nums.get(1).unwrap_or(&0),
+            system: nums[2],
+            idle: nums[3],
+            iowait: *nums.get(4).unwrap_or(&0),
+            irq: *nums.get(5).unwrap_or(&0),
+            softirq: *nums.get(6).unwrap_or(&0),
+            steal: *nums.get(7).unwrap_or(&0),
+        })
+    }
+}
+
+/// Decode ARM `CPU part` code to human-readable name.
+/// Source: ARM ARM Table D-13-1 (CPU part numbers).
+fn arm_cpu_part_name(part: &str) -> &'static str {
+    match part {
+        "0xd01" => "Cortex-A32",
+        "0xd03" => "Cortex-A53",
+        "0xd04" => "Cortex-A35",
+        "0xd05" => "Cortex-A55",
+        "0xd07" => "Cortex-A57",
+        "0xd08" => "Cortex-A72",
+        "0xd09" => "Cortex-A73",
+        "0xd0a" => "Cortex-A76",
+        "0xd0b" => "Cortex-A77",
+        "0xd0d" => "Cortex-A78",
+        "0xd40" => "Neoverse-V1",
+        "0xd41" => "Cortex-A78",
+        "0xd44" => "Cortex-X1",
+        "0xd0c" => "Neoverse-N1",
+        "0xd4a" => "Neoverse-N2",
+        _ => "",
+    }
 }
 
 /// Holds the live benchmark job (if any), its cancel flag, and the
@@ -513,6 +613,8 @@ impl Daemon {
                 tun: TunManager::new(),
                 bench: BenchRuntime::new(),
                 failover_fail_count: 0,
+                prev_cpu: None,
+                prev_cpu_per_core: Vec::new(),
             })),
             state_path,
             xray_config_path,
@@ -1515,6 +1617,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/dns") => handle_dns_set(body, daemon),
         ("GET", "/api/dns/leak-test") => handle_dns_leak_test(daemon),
         ("GET", "/api/logs") => handle_logs(daemon),
+        ("GET", "/api/system") => handle_system(daemon),
         ("GET", "/api/auto-settings") => handle_auto_settings_get(daemon),
         ("POST", "/api/auto-settings") => handle_auto_settings_set(body, daemon),
         ("GET", "/api/hwid") => handle_hwid_get(daemon),
@@ -3122,6 +3225,220 @@ fn handle_logs(_daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
+/// Collect and return system resource information: CPU (architecture,
+/// cores, model, features, frequency, temperature, usage), memory
+/// (total/free/available/cached/swap), load average, and uptime.
+///
+/// CPU usage is computed as a delta between the current and previous
+/// `/proc/stat` samples stored in `DaemonInner`. The first call
+/// returns 0% and stores the baseline; subsequent calls return the
+/// real usage percentage since the last call.
+fn handle_system(daemon: &Daemon) -> (u16, &'static str, String) {
+    // ── /proc/stat: CPU usage ──
+    let (cpu_usage, cpu_usage_per_core) = {
+        let mut inner = lock(&daemon.inner);
+        let stat_text = fs::read_to_string("/proc/stat").unwrap_or_default();
+        let mut agg: Option<CpuTimes> = None;
+        let mut per_core: Vec<CpuTimes> = Vec::new();
+        for line in stat_text.lines() {
+            if line.starts_with("cpu ") {
+                agg = CpuTimes::parse_line(line);
+            } else if line.starts_with("cpu")
+                && line[3..].chars().next().is_some_and(|c| c.is_ascii_digit())
+                && let Some(t) = CpuTimes::parse_line(line)
+            {
+                per_core.push(t);
+            }
+        }
+        // Compute deltas against previous samples.
+        let usage = match (&inner.prev_cpu, &agg) {
+            (Some(prev), Some(cur)) => CpuTimes::usage_pct(prev, cur),
+            _ => 0.0,
+        };
+        let mut per_core_usage: Vec<f64> = Vec::new();
+        if !inner.prev_cpu_per_core.is_empty() && inner.prev_cpu_per_core.len() == per_core.len() {
+            for (prev, cur) in inner.prev_cpu_per_core.iter().zip(per_core.iter()) {
+                per_core_usage.push(CpuTimes::usage_pct(prev, cur));
+            }
+        } else {
+            per_core_usage = vec![0.0; per_core.len()];
+        }
+        // Store current samples for next call.
+        inner.prev_cpu = agg;
+        inner.prev_cpu_per_core = per_core;
+        (usage, per_core_usage)
+    };
+
+    // ── /proc/cpuinfo: architecture, model, features ──
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let mut cpu_model = String::new();
+    let mut cpu_cores: u32 = 0;
+    let mut cpu_features = String::new();
+    let mut cpu_bogomips: f64 = 0.0;
+    let mut cpu_part = String::new();
+    for line in cpuinfo.lines() {
+        if let Some(val) = line.strip_prefix("model name")
+            && let Some(val) = val.split(':').nth(1)
+            && cpu_model.is_empty()
+        {
+            cpu_model = val.trim().to_owned();
+        }
+        if line.starts_with("processor") {
+            cpu_cores += 1;
+        }
+        if let Some(val) = line.strip_prefix("Features")
+            && let Some(val) = val.split(':').nth(1)
+            && cpu_features.is_empty()
+        {
+            cpu_features = val.trim().to_owned();
+        }
+        if let Some(val) = line.strip_prefix("BogoMIPS")
+            && let Some(val) = val.split(':').nth(1)
+        {
+            cpu_bogomips = val.trim().parse().unwrap_or(0.0);
+        }
+        if let Some(val) = line.strip_prefix("CPU part")
+            && let Some(val) = val.split(':').nth(1)
+        {
+            cpu_part = val.trim().to_owned();
+        }
+    }
+    let cpu_part_name = arm_cpu_part_name(&cpu_part);
+
+    // ── /sys/class/thermal: temperature ──
+    let cpu_temp: Option<f64> = (|| {
+        let entries = fs::read_dir("/sys/class/thermal").ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path().join("temp");
+            if let Ok(text) = fs::read_to_string(&path)
+                && let Ok(millideg) = text.trim().parse::<f64>()
+            {
+                return Some(millideg / 1000.0);
+            }
+        }
+        None
+    })();
+
+    // ── /sys/devices/system/cpu: frequency ──
+    let cpu_freq_mhz: Option<u64> = (|| {
+        let text = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq").ok()?;
+        let khz: u64 = text.trim().parse().ok()?;
+        Some(khz / 1000)
+    })();
+    let cpu_freq_max_mhz: Option<u64> = (|| {
+        let text = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq").ok()?;
+        let khz: u64 = text.trim().parse().ok()?;
+        Some(khz / 1000)
+    })();
+
+    // ── /proc/meminfo: memory ──
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let mut mem_total_kb: u64 = 0;
+    let mut mem_free_kb: u64 = 0;
+    let mut mem_available_kb: u64 = 0;
+    let mut mem_buffers_kb: u64 = 0;
+    let mut mem_cached_kb: u64 = 0;
+    let mut swap_total_kb: u64 = 0;
+    let mut swap_free_kb: u64 = 0;
+    for line in meminfo.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let key = parts[0].trim_end_matches(':');
+        let val: u64 = parts[1].parse().unwrap_or(0);
+        match key {
+            "MemTotal" => mem_total_kb = val,
+            "MemFree" => mem_free_kb = val,
+            "MemAvailable" => mem_available_kb = val,
+            "Buffers" => mem_buffers_kb = val,
+            "Cached" => mem_cached_kb = val,
+            "SwapTotal" => swap_total_kb = val,
+            "SwapFree" => swap_free_kb = val,
+            _ => {}
+        }
+    }
+    let mem_usage_pct = if mem_total_kb > 0 {
+        let used = mem_total_kb.saturating_sub(mem_available_kb);
+        (used as f64 / mem_total_kb as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // ── /proc/loadavg ──
+    let loadavg = fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let load_parts: Vec<&str> = loadavg.split_whitespace().collect();
+    let load_1: f64 = load_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let load_5: f64 = load_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let load_15: f64 = load_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+
+    // ── /proc/uptime ──
+    let uptime_text = fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let uptime_secs: f64 = uptime_text
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
+    // ── uname / hostname / model ──
+    let kernel = Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+    let hostname = Command::new("uname")
+        .arg("-n")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+    let model = fs::read_to_string("/proc/device-tree/model")
+        .ok()
+        .map(|s| s.trim_end_matches('\0').trim().to_owned())
+        .unwrap_or_default();
+
+    (
+        200,
+        "application/json",
+        json!({
+            "cpu": {
+                "model": cpu_model,
+                "cores": cpu_cores,
+                "part": cpu_part,
+                "part_name": cpu_part_name,
+                "features": cpu_features,
+                "bogomips": cpu_bogomips,
+                "usage_pct": (cpu_usage * 10.0).round() / 10.0,
+                "usage_per_core": cpu_usage_per_core.iter().map(|v| (v * 10.0).round() / 10.0).collect::<Vec<_>>(),
+                "temp_c": cpu_temp.map(|t| (t * 10.0).round() / 10.0),
+                "freq_mhz": cpu_freq_mhz,
+                "freq_max_mhz": cpu_freq_max_mhz,
+            },
+            "memory": {
+                "total_kb": mem_total_kb,
+                "free_kb": mem_free_kb,
+                "available_kb": mem_available_kb,
+                "buffers_kb": mem_buffers_kb,
+                "cached_kb": mem_cached_kb,
+                "usage_pct": (mem_usage_pct * 10.0).round() / 10.0,
+                "swap_total_kb": swap_total_kb,
+                "swap_free_kb": swap_free_kb,
+            },
+            "load": {
+                "1": load_1,
+                "5": load_5,
+                "15": load_15,
+            },
+            "uptime_secs": uptime_secs,
+            "kernel": kernel,
+            "hostname": hostname,
+            "model": model,
+        })
+        .to_string(),
+    )
+}
+
 fn handle_hwid_get(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
     (
@@ -3743,6 +4060,12 @@ progress{width:100%;height:6px;border-radius:3px;overflow:hidden}
 .collapsible{display:none}
 .collapsible.open{display:block}
 .log-box{background:#1a1a2e;color:#c0c0c0;padding:.5em;max-height:300px;overflow:auto;font-size:12px;white-space:pre-wrap;border-radius:4px}
+.bar-wrap{background:#eaeef2;border-radius:3px;height:8px;overflow:hidden;margin-top:.2em}
+.bar-fill{height:100%;border-radius:3px;transition:width .4s ease}
+.bar-fill.cpu{background:linear-gradient(90deg,#4ac26b,#2da44e)}
+.bar-fill.mem{background:linear-gradient(90deg,#58a6ff,#1f6feb)}
+.bar-fill.hot{background:linear-gradient(90deg,#ff8182,#cf222e)}
+.card .bar-wrap{margin-top:.25em}
 pre{background:#1f2328;color:#e6edf3;padding:.7em;border-radius:6px;overflow:auto;max-height:420px;font-size:.82em}
 .star.on::after{content:"\2605"}
 .star:not(.on)::after{content:"\2606"}
@@ -3882,6 +4205,27 @@ tr.group-row.collapsed{display:none}
         <tr><td class="subtle">Leak detected?</td><td id="leak-detected"></td></tr>
       </tbody>
     </table>
+  </div>
+</div>
+
+<h2>System <span id="sys-toggle" class="toggle">hide</span></h2>
+<div id="sys-panel" class="collapsible" style="display:block">
+  <div class="cards">
+    <div class="card"><div class="label">CPU</div><div class="value" id="sys-cpu-model">&mdash;</div></div>
+    <div class="card"><div class="label">Cores</div><div class="value" id="sys-cpu-cores">&mdash;</div></div>
+    <div class="card"><div class="label">CPU usage</div><div class="value" id="sys-cpu-usage">&mdash;</div><div class="bar-wrap"><div class="bar-fill cpu" id="sys-cpu-bar" style="width:0%"></div></div></div>
+    <div class="card"><div class="label">Temperature</div><div class="value" id="sys-cpu-temp">&mdash;</div><div class="bar-wrap"><div class="bar-fill" id="sys-temp-bar" style="width:0%"></div></div></div>
+    <div class="card"><div class="label">Frequency</div><div class="value" id="sys-cpu-freq">&mdash;</div></div>
+    <div class="card"><div class="label">RAM usage</div><div class="value" id="sys-mem-usage">&mdash;</div><div class="bar-wrap"><div class="bar-fill mem" id="sys-mem-bar" style="width:0%"></div></div></div>
+    <div class="card"><div class="label">RAM total</div><div class="value" id="sys-mem-total">&mdash;</div></div>
+    <div class="card"><div class="label">Load average</div><div class="value" id="sys-load">&mdash;</div></div>
+    <div class="card"><div class="label">Uptime</div><div class="value" id="sys-uptime">&mdash;</div></div>
+    <div class="card"><div class="label">Kernel</div><div class="value" id="sys-kernel">&mdash;</div></div>
+  </div>
+  <div class="row" style="margin:.4em 0">
+    <span class="subtle" id="sys-hostname"></span>
+    <span class="subtle" id="sys-model"></span>
+    <span class="subtle" id="sys-features"></span>
   </div>
 </div>
 
@@ -4847,6 +5191,152 @@ document.getElementById("auto-toggle").addEventListener("click", function(){
 document.getElementById("logs-toggle").addEventListener("click", function(){
   toggleCollapsible("logs-toggle", "logs-panel");
 });
+document.getElementById("sys-toggle").addEventListener("click", function(){
+  toggleCollapsible("sys-toggle", "sys-panel");
+});
+
+// ── System info rendering ───────────────────────────────────────────
+
+function formatUptime(secs){
+  if(!secs || secs <= 0){ return "—"; }
+  var d = Math.floor(secs / 86400);
+  var h = Math.floor((secs % 86400) / 3600);
+  var m = Math.floor((secs % 3600) / 60);
+  var s = Math.floor(secs % 60);
+  var parts = [];
+  if(d > 0){ parts.push(d + "d"); }
+  if(h > 0 || d > 0){ parts.push(h + "h"); }
+  if(m > 0 || h > 0 || d > 0){ parts.push(m + "m"); }
+  parts.push(s + "s");
+  return parts.join(" ");
+}
+
+function formatKb(kb){
+  if(!kb || kb <= 0){ return "0 MB"; }
+  if(kb >= 1048576){ return (kb / 1048576).toFixed(1) + " GB"; }
+  if(kb >= 1024){ return Math.round(kb / 1024) + " MB"; }
+  return kb + " kB";
+}
+
+function setBar(id, pct, hotThreshold){
+  var bar = document.getElementById(id);
+  if(!bar){ return; }
+  var clamped = Math.min(100, Math.max(0, pct));
+  bar.style.width = clamped + "%";
+  if(hotThreshold && pct > hotThreshold){
+    bar.className = "bar-fill hot";
+  } else {
+    bar.className = bar.className.replace(" hot", "");
+  }
+}
+
+function renderSystem(s){
+  if(!s){ return; }
+  var cpu = s.cpu || {};
+  var mem = s.memory || {};
+  var load = s.load || {};
+
+  // CPU model
+  var modelEl = document.getElementById("sys-cpu-model");
+  if(modelEl){
+    var modelText = cpu.model || "—";
+    if(cpu.part_name){ modelText += " (" + cpu.part_name + ")"; }
+    modelEl.textContent = modelText;
+  }
+
+  // Cores
+  var coresEl = document.getElementById("sys-cpu-cores");
+  if(coresEl){
+    var perCore = cpu.usage_per_core || [];
+    if(perCore.length > 0){
+      var parts = perCore.map(function(v){ return v.toFixed(1) + "%"; });
+      coresEl.textContent = cpu.cores + " cores  [" + parts.join(", ") + "]";
+    } else {
+      coresEl.textContent = (cpu.cores || "—") + " cores";
+    }
+  }
+
+  // CPU usage
+  var usageEl = document.getElementById("sys-cpu-usage");
+  if(usageEl){
+    usageEl.textContent = (cpu.usage_pct != null ? cpu.usage_pct.toFixed(1) + "%" : "—");
+  }
+  setBar("sys-cpu-bar", cpu.usage_pct || 0, 90);
+
+  // Temperature
+  var tempEl = document.getElementById("sys-cpu-temp");
+  if(tempEl){
+    tempEl.textContent = (cpu.temp_c != null ? cpu.temp_c.toFixed(1) + "°C" : "n/a");
+  }
+  // Temperature bar: 0-100°C scale, hot above 75°C.
+  if(cpu.temp_c != null){
+    setBar("sys-temp-bar", cpu.temp_c, 75);
+    var tempBar = document.getElementById("sys-temp-bar");
+    if(tempBar){
+      tempBar.style.width = Math.min(100, (cpu.temp_c / 100) * 100) + "%";
+    }
+  }
+
+  // Frequency
+  var freqEl = document.getElementById("sys-cpu-freq");
+  if(freqEl){
+    if(cpu.freq_mhz){
+      var freqText = cpu.freq_mhz + " MHz";
+      if(cpu.freq_max_mhz && cpu.freq_max_mhz !== cpu.freq_mhz){
+        freqText += " / " + cpu.freq_max_mhz + " MHz max";
+      }
+      freqEl.textContent = freqText;
+    } else {
+      freqEl.textContent = "n/a (no cpufreq)";
+    }
+  }
+
+  // RAM usage
+  var memUsageEl = document.getElementById("sys-mem-usage");
+  if(memUsageEl){
+    memUsageEl.textContent = (mem.usage_pct != null ? mem.usage_pct.toFixed(1) + "%" : "—");
+  }
+  setBar("sys-mem-bar", mem.usage_pct || 0, 90);
+
+  // RAM total
+  var memTotalEl = document.getElementById("sys-mem-total");
+  if(memTotalEl){
+    var memText = formatKb(mem.total_kb);
+    if(mem.available_kb){
+      memText += "  (free: " + formatKb(mem.available_kb) + ")";
+    }
+    if(mem.swap_total_kb && mem.swap_total_kb > 0){
+      memText += "  swap: " + formatKb(mem.swap_free_kb) + "/" + formatKb(mem.swap_total_kb);
+    }
+    memTotalEl.textContent = memText;
+  }
+
+  // Load average
+  var loadEl = document.getElementById("sys-load");
+  if(loadEl){
+    loadEl.textContent = load["1"].toFixed(2) + " / " + load["5"].toFixed(2) + " / " + load["15"].toFixed(2);
+  }
+
+  // Uptime
+  var upEl = document.getElementById("sys-uptime");
+  if(upEl){
+    upEl.textContent = formatUptime(s.uptime_secs);
+  }
+
+  // Kernel
+  var kernEl = document.getElementById("sys-kernel");
+  if(kernEl){
+    kernEl.textContent = s.kernel || "—";
+  }
+
+  // Hostname + model + features (subtle line)
+  var hostEl = document.getElementById("sys-hostname");
+  if(hostEl){ hostEl.textContent = s.hostname ? "Host: " + s.hostname : ""; }
+  var modelEl2 = document.getElementById("sys-model");
+  if(modelEl2){ modelEl2.textContent = s.model ? "Model: " + s.model : ""; }
+  var featEl = document.getElementById("sys-features");
+  if(featEl){ featEl.textContent = cpu.features ? "Features: " + cpu.features : ""; }
+}
 
 // Load initial data.
 loadAutoSettings();
@@ -4859,6 +5349,10 @@ setInterval(function(){
     var el = document.getElementById("auto-failover-count");
     if(el){ el.textContent = s.failover_fail_count || 0; }
   }).catch(function(){ /* transient, keep last known state */ });
+  // System info also refreshes every 5s (CPU usage delta, temp, etc.)
+  api("GET", "/api/system").then(function(sys){
+    renderSystem(sys);
+  }).catch(function(){ /* transient */ });
 }, 5000);
 
 refreshAll();
