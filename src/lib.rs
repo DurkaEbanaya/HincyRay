@@ -4,13 +4,16 @@ pub mod benchmark;
 pub mod hincyray;
 pub mod profiles;
 pub mod scoring;
-pub mod tester;
 pub mod xray_config;
 
 // Desktop GUI surface: only compiled when the `desktop` feature is on.
 // Keeps eframe/egui/arboard out of the Entware/OpenWrt daemon build.
+// `tester` is gated too — it's only consumed by the GUI and would
+// otherwise compile as dead code into the router binary.
 #[cfg(feature = "desktop")]
 pub mod app;
+#[cfg(feature = "desktop")]
+pub mod tester;
 #[cfg(feature = "desktop")]
 pub mod theme;
 
