@@ -14,7 +14,8 @@ use url::Url;
 
 use crate::profiles::{Profile, Protocol, decode_vmess_json};
 
-pub const WIFI_TUN_INBOUND_TAG: &str = "tun-socks-in";
+pub const REDIR_INBOUND_TAG: &str = "redir-in";
+pub const TPROXY_INBOUND_TAG: &str = "tproxy-in";
 pub const DNS_INBOUND_TAG: &str = "dns-in";
 pub const DNS_INBOUND_PORT: u16 = 1053;
 pub const DIRECT_OUTBOUND_TAG: &str = "direct";
@@ -33,6 +34,20 @@ pub enum PortMode {
     AllowList,
     /// Proxy everything except ports in `bypass_ports` (those go direct).
     DenyList,
+}
+
+/// QUIC (UDP/443) handling mode for the WiFi VPN segment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuicMode {
+    /// Block QUIC at the Xray routing level, forcing TCP fallback.
+    /// Used when TPROXY is unavailable or when the proxy protocol
+    /// doesn't support UDP well.
+    #[default]
+    Block,
+    /// Proxy QUIC through TPROXY. Requires `xt_TPROXY` kernel module
+    /// and `tproxy_available = true`.
+    Proxy,
 }
 
 /// DNS anti-leak settings. When enabled, the Xray config includes a
@@ -96,10 +111,10 @@ pub struct XrayRouteRule {
     pub network: Option<String>,
 }
 
-/// Build an Xray config for router mode: normal SOCKS inbound plus an
-/// optional second SOCKS inbound for tun2socks whose traffic is split by
-/// routing rules. tun2socks creates a TUN device and forwards WiFi VPN
-/// traffic to this second SOCKS port; no iptables/TPROXY needed.
+/// Build an Xray config for router mode: normal SOCKS inbound plus
+/// optional dokodemo-door inbounds for NAT REDIRECT (TCP) and TPROXY
+/// (UDP) transparent proxying. iptables redirects traffic from devices
+/// assigned to the Keenetic "HincyRay" policy into these inbounds.
 #[allow(clippy::too_many_arguments)]
 pub fn build_xray_router_config(
     active_profile: &Profile,
@@ -107,7 +122,9 @@ pub fn build_xray_router_config(
     route_rules: &[XrayRouteRule],
     listen_host: &str,
     socks_port: u16,
-    tun_socks_port: Option<u16>,
+    redirect_port: Option<u16>,
+    tproxy_available: bool,
+    quic_mode: QuicMode,
     active_block_quic: bool,
     extra: &RouterExtra,
 ) -> Result<Value, String> {
@@ -119,25 +136,48 @@ pub fn build_xray_router_config(
         "settings": { "udp": true }
     })];
 
-    if let Some(port) = tun_socks_port {
+    if let Some(port) = redirect_port {
+        // TCP dokodemo-door for NAT REDIRECT. iptables nat PREROUTING
+        // REDIRECTs TCP traffic from policy-marked devices to this port.
+        // followRedirect: true tells Xray to use the original destination
+        // from the redirected connection (SO_ORIGINAL_DST).
         inbounds.push(json!({
-            "tag": WIFI_TUN_INBOUND_TAG,
-            "listen": "127.0.0.1",
+            "tag": REDIR_INBOUND_TAG,
+            "listen": "0.0.0.0",
             "port": port,
-            "protocol": "socks",
-            "settings": { "udp": true },
+            "protocol": "dokodemo-door",
+            "settings": { "network": "tcp", "followRedirect": true },
             "sniffing": {
                 "enabled": true,
-                "destOverride": ["http", "tls", "quic"],
-                "routeOnly": true
+                "routeOnly": true,
+                "destOverride": ["http", "tls"]
             }
         }));
-        // Dokodemo DNS inbound for the VPN WiFi segment.  DNS queries
-        // from br1 are DNAT'd to 127.0.0.1:1053 (see install_dns_redirect
-        // in hincyray.rs).  Xray receives them here and forwards to
-        // 1.1.1.1:53 through the active VLESS outbound.  This avoids
-        // UDP-over-SOCKS5 issues with tun2socks: DNS goes directly to
-        // Xray (local routing), then out through the proxy as TCP.
+
+        // UDP dokodemo-door for mangle TPROXY. Only created when the
+        // kernel has xt_TPROXY + xt_socket modules. iptables mangle
+        // PREROUTING TPROXY-ies UDP traffic to this port. The
+        // sockopt.tproxy: "tproxy" sets IP_TRANSPARENT on the socket.
+        if tproxy_available {
+            inbounds.push(json!({
+                "tag": TPROXY_INBOUND_TAG,
+                "listen": "0.0.0.0",
+                "port": port,
+                "protocol": "dokodemo-door",
+                "settings": { "network": "udp", "followRedirect": true },
+                "streamSettings": { "sockopt": { "tproxy": "tproxy" } },
+                "sniffing": {
+                    "enabled": true,
+                    "routeOnly": true,
+                    "destOverride": ["quic"]
+                }
+            }));
+        }
+
+        // Dokodemo DNS inbound for the VPN WiFi segment. DNS queries
+        // from policy-marked devices are DNAT'd to 127.0.0.1:1053.
+        // Xray receives them here and forwards to 1.1.1.1:53 through
+        // the active outbound, preventing DNS leaks to the ISP.
         inbounds.push(json!({
             "tag": DNS_INBOUND_TAG,
             "listen": "127.0.0.1",
@@ -177,18 +217,30 @@ pub fn build_xray_router_config(
 
     let mut rules = Vec::new();
     // DNS queries from the dokodemo inbound go through the active proxy.
-    if tun_socks_port.is_some() {
+    if redirect_port.is_some() {
         rules.push(json!({
             "type": "field",
             "inboundTag": [DNS_INBOUND_TAG],
             "outboundTag": ACTIVE_OUTBOUND_TAG,
         }));
     }
+
+    // Build the list of transparent-proxy inbound tags. When TPROXY is
+    // available, both TCP (redir-in) and UDP (tproxy-in) inbounds
+    // exist. When TPROXY is unavailable, only TCP (redir-in) exists
+    // and all UDP traffic (including QUIC) is blocked at the iptables
+    // level (not proxied).
+    let vpn_tags: Vec<&str> = if tproxy_available {
+        vec![REDIR_INBOUND_TAG, TPROXY_INBOUND_TAG]
+    } else {
+        vec![REDIR_INBOUND_TAG]
+    };
+
     for rule in route_rules {
         if rule.block_quic {
             rules.push(json!({
                 "type": "field",
-                "inboundTag": [WIFI_TUN_INBOUND_TAG],
+                "inboundTag": vpn_tags,
                 "network": "udp",
                 "port": "443",
                 "outboundTag": BLOCK_OUTBOUND_TAG,
@@ -197,7 +249,7 @@ pub fn build_xray_router_config(
 
         let mut route = json!({
             "type": "field",
-            "inboundTag": [WIFI_TUN_INBOUND_TAG],
+            "inboundTag": vpn_tags,
             "outboundTag": rule.outbound_tag,
         });
         if !rule.domains.is_empty() {
@@ -221,30 +273,30 @@ pub fn build_xray_router_config(
         }
     }
 
-    // Only WiFi tun2socks inbound gets split rules. Anything else,
+    // Only transparent-proxy inbounds get split rules. Anything else,
     // including direct SOCKS clients, keeps the traditional
     // active-profile behaviour.
-    if tun_socks_port.is_some() {
+    if redirect_port.is_some() {
         // Port-based routing: insert port rules before the final fallback.
         match &extra.port_mode {
             PortMode::AllowList if !extra.proxy_ports.is_empty() => {
                 rules.push(json!({
                     "type": "field",
-                    "inboundTag": [WIFI_TUN_INBOUND_TAG],
+                    "inboundTag": vpn_tags,
                     "port": extra.proxy_ports.join(","),
                     "outboundTag": ACTIVE_OUTBOUND_TAG,
                 }));
                 // Everything else goes direct.
                 rules.push(json!({
                     "type": "field",
-                    "inboundTag": [WIFI_TUN_INBOUND_TAG],
+                    "inboundTag": vpn_tags,
                     "outboundTag": DIRECT_OUTBOUND_TAG,
                 }));
             }
             PortMode::DenyList if !extra.bypass_ports.is_empty() => {
                 rules.push(json!({
                     "type": "field",
-                    "inboundTag": [WIFI_TUN_INBOUND_TAG],
+                    "inboundTag": vpn_tags,
                     "port": extra.bypass_ports.join(","),
                     "outboundTag": DIRECT_OUTBOUND_TAG,
                 }));
@@ -253,10 +305,15 @@ pub fn build_xray_router_config(
             _ => {}
         }
 
-        if active_block_quic {
+        // QUIC handling: when QuicMode::Block (or TPROXY unavailable),
+        // block UDP/443 at the Xray routing level. This forces browsers
+        // to fall back to TCP, which works fine for streaming/browsing.
+        let should_block_quic =
+            active_block_quic || quic_mode == QuicMode::Block || !tproxy_available;
+        if should_block_quic {
             rules.push(json!({
                 "type": "field",
-                "inboundTag": [WIFI_TUN_INBOUND_TAG],
+                "inboundTag": vpn_tags,
                 "network": "udp",
                 "port": "443",
                 "outboundTag": BLOCK_OUTBOUND_TAG,
@@ -264,7 +321,7 @@ pub fn build_xray_router_config(
         }
         rules.push(json!({
             "type": "field",
-            "inboundTag": [WIFI_TUN_INBOUND_TAG],
+            "inboundTag": vpn_tags,
             "outboundTag": ACTIVE_OUTBOUND_TAG,
         }));
     }
@@ -931,6 +988,8 @@ mod tests {
             "127.0.0.1",
             10808,
             Some(10810),
+            true,
+            QuicMode::Block,
             false,
             &extra,
         )
@@ -975,6 +1034,8 @@ mod tests {
             "127.0.0.1",
             10808,
             Some(10810),
+            true,
+            QuicMode::Block,
             false,
             &extra,
         )
@@ -1010,6 +1071,8 @@ mod tests {
             "127.0.0.1",
             10808,
             Some(10810),
+            true,
+            QuicMode::Block,
             false,
             &extra,
         )
@@ -1047,6 +1110,8 @@ mod tests {
             "127.0.0.1",
             10808,
             Some(10810),
+            true,
+            QuicMode::Block,
             false,
             &extra,
         )

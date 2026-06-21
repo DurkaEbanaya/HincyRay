@@ -232,9 +232,21 @@ detect_env() {
 
     # Available tools.
     check_cmd curl && HAVE_CURL=1 || HAVE_CURL=0
-    (check_cmd tun2socks || [ -f "${ENTWARE}/sbin/tun2socks" ] || [ -f "${ENTWARE}/bin/tun2socks" ]) && HAVE_TUN2SOCKS=1 || HAVE_TUN2SOCKS=0
     check_cmd unzip && HAVE_UNZIP=1 || HAVE_UNZIP=0
     check_cmd jq && HAVE_JQ=1 || HAVE_JQ=0
+
+    # v0.7: kernel modules for iptables TPROXY/REDIRECT transparent proxy.
+    KERNVER=$(uname -r)
+    HAVE_TPROXY=0
+    HAVE_SOCKET=0
+    HAVE_COMMENT=0
+    [ -f "/lib/modules/${KERNVER}/xt_TPROXY.ko" ] && HAVE_TPROXY=1 || true
+    [ -f "/lib/modules/${KERNVER}/xt_socket.ko" ] && HAVE_SOCKET=1 || true
+    [ -f "/lib/modules/${KERNVER}/xt_comment.ko" ] && HAVE_COMMENT=1 || true
+
+    # v0.7: ndm netfilter hook directory.
+    HAVE_NDM_HOOKS=0
+    [ -d "/opt/etc/ndm/netfilter.d" ] && HAVE_NDM_HOOKS=1 || true
 
     # Free disk space.
     FREE_KB=$(df -k "${ENTWARE}" 2>/dev/null | tail -1 | awk '{print $4}')
@@ -275,9 +287,18 @@ install_deps() {
 
     NEED=""
     [ "$HAVE_CURL" -eq 0 ] && NEED="$NEED curl"
-    [ "$HAVE_TUN2SOCKS" -eq 0 ] && NEED="$NEED tun2socks"
     [ "$HAVE_JQ" -eq 0 ] && NEED="$NEED jq"
     [ "$HAVE_UNZIP" -eq 0 ] && NEED="$NEED unzip"
+
+    # v0.7: create ndm hook directory if missing.
+    if [ "$HAVE_NDM_HOOKS" -eq 0 ]; then
+        mkdir -p /opt/etc/ndm/netfilter.d 2>/dev/null && info "Created /opt/etc/ndm/netfilter.d" || warn "Cannot create ndm hook directory"
+    fi
+
+    # v0.7: check kernel modules.
+    [ "$HAVE_TPROXY" -eq 0 ] && warn "xt_TPROXY.ko not found — UDP TPROXY unavailable (TCP-only REDIRECT will be used)"
+    [ "$HAVE_SOCKET" -eq 0 ] && warn "xt_socket.ko not found — UDP TPROXY unavailable"
+    [ "$HAVE_COMMENT" -eq 0 ] && warn "xt_comment.ko not found — iptables rule tagging unavailable"
 
     if [ -z "$NEED" ]; then
         ok "All dependencies already present"
@@ -787,9 +808,9 @@ do_uninstall() {
         "$INIT_SCRIPT" stop 2>/dev/null || true
     fi
 
-    # Stop Xray and TUN via API.
+    # Stop Xray and firewall via API.
     curl -s -X POST "http://127.0.0.1:${LISTEN_PORT}/api/core/stop" >/dev/null 2>&1 || true
-    curl -s -X POST "http://127.0.0.1:${LISTEN_PORT}/api/routing/tun-stop" >/dev/null 2>&1 || true
+    curl -s -X POST "http://127.0.0.1:${LISTEN_PORT}/api/routing/firewall-stop" >/dev/null 2>&1 || true
     sleep 2
 
     rm -f "$INIT_SCRIPT" "$DAEMON_BIN" "$PID_FILE"
