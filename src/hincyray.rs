@@ -2250,31 +2250,11 @@ fn handle_set_active(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
         );
     };
 
-    inner.state.active_profile_id = Some(id);
-    let config = match build_daemon_xray_config(&inner.state) {
-        Ok(config) => config,
-        Err(error) => {
-            return (
-                400,
-                "application/json",
-                json!({"error": error, "profile_id": id}).to_string(),
-            );
-        }
-    };
-
-    if let Err(error) = write_xray_config(&daemon.xray_config_path, &config) {
+    if let Err(error) = apply_active_profile(&mut inner, daemon, id) {
         return (
-            500,
+            error.http_status(),
             "application/json",
-            json!({"error": format!("write xray config: {error}")}).to_string(),
-        );
-    }
-
-    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
-        return (
-            500,
-            "application/json",
-            json!({"error": format!("persist state: {error}")}).to_string(),
+            json!({"error": error.message(), "profile_id": id}).to_string(),
         );
     }
 
@@ -3950,18 +3930,24 @@ fn socks_health_check(socks_port: u16) -> bool {
 }
 
 /// Find the profile with the highest `last_score` from `ProfileStats`
-/// that is not the `exclude` profile and has at least one success.
+/// that is not in `excluded_profiles` and has at least one successful
+/// probe. A zero score is still a valid low-priority fallback: some
+/// endpoints pass latency/health probes but score zero because the short
+/// download test produced no measurable throughput on the router.
 /// Returns the profile id, or None if no candidate exists.
-fn find_best_profile_by_score(state: &HincyrayState, exclude: Option<usize>) -> Option<usize> {
+fn find_best_profile_by_score(
+    state: &HincyrayState,
+    excluded_profiles: &HashSet<usize>,
+) -> Option<usize> {
     let mut best: Option<(usize, u32)> = None;
     for profile in &state.profiles {
-        if Some(profile.id) == exclude {
+        if excluded_profiles.contains(&profile.id) {
             continue;
         }
         let Some(stat) = state.stats.iter().find(|s| s.profile_raw == profile.raw) else {
             continue;
         };
-        if stat.success_count == 0 || stat.last_score == 0 {
+        if stat.success_count == 0 {
             continue;
         }
         if best
@@ -4013,20 +3999,82 @@ fn start_auto_benchmark(daemon: &Daemon) {
     inner.bench.handle = Some(handle);
 }
 
+enum ActiveProfileApplyError {
+    InvalidConfig(String),
+    Runtime(String),
+}
+
+impl ActiveProfileApplyError {
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::InvalidConfig(_) => 400,
+            Self::Runtime(_) => 500,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::InvalidConfig(message) | Self::Runtime(message) => message,
+        }
+    }
+}
+
+/// Apply a new active profile to every layer that observes it: in-memory
+/// state, generated Xray config, running Xray process, and persisted state.
+///
+/// Xray does not hot-reload `/opt/etc/hincyray/xray-client.json`, so writing
+/// the file without restarting the core creates a split-brain state where the
+/// API reports one active profile while the SOCKS/transparent proxy still uses
+/// the old outbound. Keep all profile-switching entrypoints behind this helper
+/// so that "active profile" has one system-wide meaning.
+fn apply_active_profile(
+    inner: &mut MutexGuard<DaemonInner>,
+    daemon: &Daemon,
+    profile_id: usize,
+) -> Result<(), ActiveProfileApplyError> {
+    let previous_profile_id = inner.state.active_profile_id;
+    let config_path = daemon.xray_config_path.clone();
+    let xray = inner.state.xray_path.clone();
+    let geo = inner.state.split_routing.geo_asset_path.clone();
+
+    inner.state.active_profile_id = Some(profile_id);
+    let config = match build_daemon_xray_config(&inner.state) {
+        Ok(config) => config,
+        Err(error) => {
+            inner.state.active_profile_id = previous_profile_id;
+            return Err(ActiveProfileApplyError::InvalidConfig(error));
+        }
+    };
+
+    let apply_result = write_xray_config(&config_path, &config)
+        .and_then(|()| inner.core.restart(&xray, &config_path, Some(&geo)))
+        .and_then(|()| persist_state(&daemon.state_path, &inner.state).map_err(|e| e.to_string()));
+
+    if let Err(error) = apply_result {
+        inner.state.active_profile_id = previous_profile_id;
+        if previous_profile_id.is_some()
+            && let Err(rollback_error) = regenerate_xray_config(&inner.state, &config_path)
+                .and_then(|()| inner.core.restart(&xray, &config_path, Some(&geo)))
+        {
+            eprintln!(
+                "hincyray: rollback after active profile switch failure failed: {rollback_error}"
+            );
+        }
+        return Err(ActiveProfileApplyError::Runtime(error));
+    }
+
+    Ok(())
+}
+
 /// Switch the active profile, regenerate Xray config, and restart the
 /// core. Caller must hold the lock.
 fn switch_active_profile(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon, profile_id: usize) {
-    inner.state.active_profile_id = Some(profile_id);
-    let config_path = daemon.xray_config_path.clone();
-    if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
-        eprintln!("hincyray: config regeneration failed: {error}");
+    if let Err(error) = apply_active_profile(inner, daemon, profile_id) {
+        eprintln!(
+            "hincyray: active profile switch failed: {}",
+            error.message()
+        );
     }
-    let xray = inner.state.xray_path.clone();
-    let geo = inner.state.split_routing.geo_asset_path.clone();
-    if let Err(error) = inner.core.restart(&xray, &config_path, Some(&geo)) {
-        eprintln!("hincyray: core restart failed: {error}");
-    }
-    let _ = persist_state(&daemon.state_path, &inner.state);
 }
 
 /// Background watchdog thread. Runs every 10 seconds and handles:
@@ -4046,6 +4094,7 @@ fn start_watchdog(daemon: Daemon) {
     thread::spawn(move || {
         let mut bench_was_running = false;
         let mut restart_backoff_secs: u64 = 0;
+        let mut failover_rejected_profiles = HashSet::new();
 
         loop {
             thread::sleep(Duration::from_secs(10));
@@ -4182,6 +4231,7 @@ fn start_watchdog(daemon: Daemon) {
                         eprintln!("hincyray: health check recovered");
                     }
                     inner.failover_fail_count = 0;
+                    failover_rejected_profiles.clear();
                 } else {
                     inner.failover_fail_count += 1;
                     const FAILOVER_THRESHOLD: u32 = 3;
@@ -4190,8 +4240,11 @@ fn start_watchdog(daemon: Daemon) {
                         inner.failover_fail_count, FAILOVER_THRESHOLD
                     );
                     if inner.failover_fail_count >= FAILOVER_THRESHOLD {
+                        if let Some(id) = active_profile_id {
+                            failover_rejected_profiles.insert(id);
+                        }
                         if let Some(next_id) =
-                            find_best_profile_by_score(&inner.state, active_profile_id)
+                            find_best_profile_by_score(&inner.state, &failover_rejected_profiles)
                         {
                             eprintln!("hincyray: failover to profile {next_id}");
                             switch_active_profile(&mut inner, &daemon, next_id);
@@ -4220,7 +4273,7 @@ fn start_watchdog(daemon: Daemon) {
             if bench_was_running && !bench_running && auto_select {
                 eprintln!("hincyray: benchmark finished, auto-selecting best profile");
                 let mut inner = lock(&daemon.inner);
-                if let Some(best_id) = find_best_profile_by_score(&inner.state, None)
+                if let Some(best_id) = find_best_profile_by_score(&inner.state, &HashSet::new())
                     && Some(best_id) != inner.state.active_profile_id
                 {
                     eprintln!("hincyray: auto-switching to profile {best_id}");
@@ -5753,6 +5806,102 @@ mod tests {
         assert!(combined.contains(proxy));
         let direct_only = SubscriptionLoadOutcome::format_error(direct, None);
         assert_eq!(direct_only, direct);
+    }
+
+    #[test]
+    fn best_profile_selector_uses_zero_score_success_as_fallback() {
+        let mut state = HincyrayState::default();
+        state.profiles = vec![
+            Profile {
+                id: 1,
+                name: "failed".to_owned(),
+                protocol: crate::profiles::Protocol::Vless,
+                address: "failed.example".to_owned(),
+                port: Some(443),
+                raw: "vless://11111111-1111-1111-1111-111111111111@failed.example:443#failed"
+                    .to_owned(),
+                selected: true,
+                block_quic: false,
+                group: None,
+            },
+            Profile {
+                id: 2,
+                name: "latency-only".to_owned(),
+                protocol: crate::profiles::Protocol::Vless,
+                address: "fallback.example".to_owned(),
+                port: Some(443),
+                raw: "vless://11111111-1111-1111-1111-111111111111@fallback.example:443#fallback"
+                    .to_owned(),
+                selected: true,
+                block_quic: false,
+                group: None,
+            },
+        ];
+        state.stats = vec![
+            ProfileStats {
+                profile_raw: state.profiles[0].raw.clone(),
+                last_score: 90,
+                success_count: 0,
+                failure_count: 3,
+                ..ProfileStats::default()
+            },
+            ProfileStats {
+                profile_raw: state.profiles[1].raw.clone(),
+                last_score: 0,
+                success_count: 5,
+                ..ProfileStats::default()
+            },
+        ];
+
+        assert_eq!(find_best_profile_by_score(&state, &HashSet::new()), Some(2));
+    }
+
+    #[test]
+    fn best_profile_selector_skips_rejected_profiles() {
+        let mut state = HincyrayState::default();
+        state.profiles = vec![
+            Profile {
+                id: 1,
+                name: "stale-best".to_owned(),
+                protocol: crate::profiles::Protocol::Vless,
+                address: "stale.example".to_owned(),
+                port: Some(443),
+                raw: "vless://11111111-1111-1111-1111-111111111111@stale.example:443#stale"
+                    .to_owned(),
+                selected: true,
+                block_quic: false,
+                group: None,
+            },
+            Profile {
+                id: 2,
+                name: "next-best".to_owned(),
+                protocol: crate::profiles::Protocol::Vless,
+                address: "next.example".to_owned(),
+                port: Some(443),
+                raw: "vless://11111111-1111-1111-1111-111111111111@next.example:443#next"
+                    .to_owned(),
+                selected: true,
+                block_quic: false,
+                group: None,
+            },
+        ];
+        state.stats = vec![
+            ProfileStats {
+                profile_raw: state.profiles[0].raw.clone(),
+                last_score: 90,
+                success_count: 1,
+                ..ProfileStats::default()
+            },
+            ProfileStats {
+                profile_raw: state.profiles[1].raw.clone(),
+                last_score: 10,
+                success_count: 1,
+                ..ProfileStats::default()
+            },
+        ];
+
+        let rejected = HashSet::from([1]);
+        assert_eq!(find_best_profile_by_score(&state, &rejected), Some(2));
     }
 
     #[test]

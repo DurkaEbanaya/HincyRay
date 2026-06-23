@@ -1,5 +1,23 @@
 # HincyRay v0.1 &mdash; Keenetic Entware install / runbook
 
+> **v0.7.0 Fixed note:** current HincyRay transparent routing no longer uses the old v0.1.1/v0.4 helper-script TPROXY/tun2socks path described later in this historical runbook. The daemon now installs NAT REDIRECT + TPROXY rules itself and matches clients by Keenetic traffic-policy connmark. For WiFi VPN clients, creating the `HincyRay-VPN` SSID is not sufficient: every client MAC must be assigned to the Keenetic policy used by HincyRay (for example `Policy0` with description `XKeen`).
+>
+> ```bash
+> # Replace with the real client MAC address.
+> ndmc -c 'ip hotspot host <client-mac> policy Policy0'
+> ndmc -c 'system configuration save'
+> ```
+>
+> Verify that the client is really marked and then redirected:
+>
+> ```bash
+> ndmc -c 'show running-config' | grep -i '<client-mac>'
+> iptables -t mangle -L _NDM_HOTSPOT_PREROUTING_MANGL -n -v | grep -i '<client-mac>'
+> iptables -t nat -L HINCYRAY -n -v
+> ```
+>
+> Expected: `host <client-mac> policy Policy0`, `MARK set 0xffffaaa`, `CONNMARK save`, and increasing `HINCYRAY` counters when the client opens a site. If the host is `conform`, Keenetic emits a plain `RETURN` for that MAC and HincyRay will not see the traffic.
+
 This is the concrete install and operations guide for HincyRay v0.1 on a Keenetic Giga KN-1012 running Keenetic Homebrew / Entware (aarch64). It is written for an isolated router that may not be able to fetch artifacts directly, so several steps fetch files on a workstation and copy them over `scp`.
 
 v0.1 is a **safe SOCKS-only MVP**. It does **not** install `iptables` / `ip rule` / `nftables` rules, Keenetic routing hooks, or any system-wide policy routing. It only starts Xray with a local SOCKS listener on the router at `127.0.0.1:10808`, and you validate by curling through that SOCKS from the router itself. Your main workstation IP and default route are not touched.

@@ -1,4 +1,4 @@
-# HincyRay v0.7.0
+# HincyRay v0.7.0 Fixed
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -7,6 +7,8 @@
 HincyRay is a lightweight VPN/proxy client for Keenetic routers. It ships a router daemon (`hincyray`) that reuses the parser, Xray config generator, and quality scoring from the `XrayVpnTest` desktop tool, and exposes an embedded web panel on the router LAN.
 
 **v0.7 replaces tun2socks with iptables NAT REDIRECT + TPROXY** — a 9-35× throughput improvement (benchmark: [`docs/benchmark-tun2socks-vs-redirect.md`](docs/benchmark-tun2socks-vs-redirect.md)). No TUN device, no userspace TCP stack, no `tun2socks` binary required.
+
+**v0.7.0 Fixed** closes two transparent-proxy reliability gaps: manual active-profile selection now regenerates the Xray config **and restarts the running Xray core**, and auto-failover no longer loops over already-failed stale profiles when a lower-scored profile is the only working fallback.
 
 ## How it works
 
@@ -43,6 +45,8 @@ Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN eve
 
 ## Features
 
+- **v0.7.0 Fixed active-profile apply**: `POST /api/active-profile` now applies the selected profile to state, generated config, running Xray process, and persisted state as one operation. Xray does not hot-reload config files, so profile selection must restart the core.
+- **v0.7.0 Fixed failover selection**: auto-switch remembers profiles that already failed during the current outage and can use a `success_count > 0` / `score = 0` profile as a low-priority fallback instead of cycling between stale winners.
 - **v0.7 NAT REDIRECT + TPROXY**: iptables transparent proxy via Keenetic traffic policy connmarks. TCP via `nat REDIRECT`, UDP via `mangle TPROXY`. No tun2socks, no TUN device.
 - **v0.7 Keenetic RCI integration**: queries `localhost:79/rci/show/ip/policy` for the policy connmark. Auto-creates the policy if not found.
 - **v0.7 ndm hook script**: auto-generated at `/opt/etc/ndm/netfilter.d/hincyray.sh`, called by ndm after every firewall reload. Rules survive ndm restarts.
@@ -136,7 +140,7 @@ Status, profiles, benchmark, import, subscriptions, routing rules, firewall cont
 | `GET` | `/api/status` | Active profile, core status, split routing, DNS, HWID |
 | `GET` | `/api/profiles` | Imported profiles |
 | `POST` | `/api/profiles/import` | Import share links / subscription URL / Xray JSON |
-| `POST` | `/api/active-profile` | Set active profile |
+| `POST` | `/api/active-profile` | Set active profile, regenerate config, restart Xray core, persist state |
 | `GET` | `/api/xray/config` | Generated Xray config |
 | `POST` | `/api/core/start` | Start Xray core |
 | `POST` | `/api/core/stop` | Stop Xray core |
@@ -169,7 +173,7 @@ Status, profiles, benchmark, import, subscriptions, routing rules, firewall cont
 ## WiFi VPN segment (optional)
 
 - `scripts/wifi-segment-setup.sh` — creates the `HincyRay-VPN` SSID on `192.168.2.0/24` via Keenetic `ndmc`.
-- Assign devices to the Keenetic "HincyRay" (or "XKeen") traffic policy in the Keenetic Web UI.
+- Assign every device that must use the VPN to the Keenetic "HincyRay" / "XKeen" traffic policy. **The SSID/subnet alone is not enough**: HincyRay matches packets by the policy connmark that Keenetic writes for `ip hotspot` hosts assigned to that policy.
 - The daemon handles all transparent proxying internally via `FirewallManager`:
   1. Queries the policy connmark from Keenetic RCI API.
   2. Installs iptables nat HINCYRAY chain (TCP REDIRECT to port 10810) matching the connmark.
@@ -177,6 +181,43 @@ Status, profiles, benchmark, import, subscriptions, routing rules, firewall cont
   4. Installs DNS DNAT rules (port 53 → 127.0.0.1:1053).
   5. Generates ndm hook script for firewall reload survival.
   6. Watchdog reinstalls rules if missing.
+
+### Required Keenetic policy assignment
+
+Transparent WiFi routing works only for hosts that Keenetic marks with the traffic-policy connmark. A client connected to `HincyRay-VPN` but left on `conform` / default policy will bypass HincyRay completely; `HINCYRAY` iptables counters will stay at zero.
+
+Assign the client in the Keenetic Web UI, or through `ndmc`:
+
+```bash
+# Replace with the real client MAC address.
+ndmc -c 'ip hotspot host <client-mac> policy Policy0'
+ndmc -c 'system configuration save'
+```
+
+`Policy0` is the internal name Keenetic used in testing for the policy whose description is `XKeen`. Verify the actual policy name/mark on your router:
+
+```bash
+curl -s localhost:79/rci/show/ip/policy
+```
+
+Verify that the host is marked correctly:
+
+```bash
+ndmc -c 'show running-config' | grep -i '<client-mac>'
+iptables -t mangle -L _NDM_HOTSPOT_PREROUTING_MANGL -n -v | grep -i '<client-mac>'
+iptables -t nat -L HINCYRAY -n -v
+```
+
+Expected result for a VPN-routed host:
+
+```text
+host <client-mac> policy Policy0
+MARK set 0xffffaaa
+CONNMARK save
+HINCYRAY ... REDIRECT ... packet counters increase when the client opens a site
+```
+
+If the host shows `conform` instead of `policy Policy0`, Keenetic will emit a plain `RETURN` rule for that MAC and HincyRay will not see the traffic.
 
 ## Documentation
 

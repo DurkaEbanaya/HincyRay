@@ -1,4 +1,4 @@
-# HincyRay v0.7.0
+# HincyRay v0.7.0 Fixed
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -7,6 +7,8 @@
 HincyRay — лёгкий VPN/proxy-клиент для роутеров Keenetic. Поставляет роутер-демон (`hincyray`), который переиспользует парсер, генератор Xray-конфигов и формулу оценки качества из десктопного инструмента `XrayVpnTest`, и предоставляет встроенную веб-панель в локальной сети роутера.
 
 **v0.7 заменяет tun2socks на iptables NAT REDIRECT + TPROXY** — ускорение throughput в 9-35× (бенчмарк: [`docs/benchmark-tun2socks-vs-redirect.md`](docs/benchmark-tun2socks-vs-redirect.md)). Без TUN-устройства, без userspace TCP-стека, без бинарника `tun2socks`.
+
+**v0.7.0 Fixed** закрывает два провала надёжности transparent proxy: ручной выбор active profile теперь регенерирует Xray-конфиг **и перезапускает живой Xray core**, а auto-failover больше не зацикливается на уже провалившихся stale-профилях, если рабочим fallback оказался профиль с низким score.
 
 ## Как это работает
 
@@ -43,6 +45,8 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 
 ## Возможности
 
+- **v0.7.0 Fixed применение active profile**: `POST /api/active-profile` теперь применяет выбранный профиль к state, сгенерированному конфигу, запущенному Xray process и сохранённому state как одну операцию. Xray не hot-reload'ит config-файлы, поэтому выбор профиля обязан перезапускать core.
+- **v0.7.0 Fixed failover selection**: auto-switch запоминает профили, уже провалившие health-check в текущем outage, и может использовать профиль с `success_count > 0` / `score = 0` как низкоприоритетный fallback вместо цикла по stale winner'ам.
 - **v0.7 NAT REDIRECT + TPROXY**: iptables transparent proxy через Keenetic traffic policy connmark. TCP через `nat REDIRECT`, UDP через `mangle TPROXY`. Без tun2socks, без TUN.
 - **v0.7 интеграция с Keenetic RCI**: запрашивает `localhost:79/rci/show/ip/policy` для получения connmark политики. Авто-создаёт политику если не найдена.
 - **v0.7 ndm hook-скрипт**: авто-генерируется в `/opt/etc/ndm/netfilter.d/hincyray.sh`, вызывается ndm после каждой перезагрузки firewall. Правила переживают ndm-перезапуски.
@@ -136,7 +140,7 @@ http://<ip-роутера>:8088/
 | `GET` | `/api/status` | Активный профиль, статус ядра, сплит-роутинг, DNS, HWID |
 | `GET` | `/api/profiles` | Импортированные профили |
 | `POST` | `/api/profiles/import` | Импорт share-ссылок / URL подписки / Xray JSON |
-| `POST` | `/api/active-profile` | Установка активного профиля |
+| `POST` | `/api/active-profile` | Установка активного профиля, регенерация конфига, перезапуск Xray core, сохранение state |
 | `GET` | `/api/xray/config` | Сгенерированный Xray-конфиг |
 | `POST` | `/api/core/start` | Запуск ядра Xray |
 | `POST` | `/api/core/stop` | Остановка ядра |
@@ -169,7 +173,7 @@ http://<ip-роутера>:8088/
 ## WiFi VPN-сегмент (опционально)
 
 - `scripts/wifi-segment-setup.sh` — создаёт SSID `HincyRay-VPN` на `192.168.2.0/24` через Keenetic `ndmc`.
-- Назначьте устройства на Keenetic-политику "HincyRay" (или "XKeen") в Web UI Keenetic.
+- Назначьте каждое устройство, которое должно идти через VPN, на Keenetic-политику "HincyRay" / "XKeen". **Одного SSID/подсети недостаточно**: HincyRay матчится по policy connmark, который Keenetic ставит только `ip hotspot` host'ам, назначенным на эту политику.
 - Демон управляет всем transparent proxying через `FirewallManager`:
   1. Запрашивает connmark политики через Keenetic RCI API.
   2. Устанавливает iptables nat HINCYRAY chain (TCP REDIRECT на порт 10810) по connmark.
@@ -177,6 +181,43 @@ http://<ip-роутера>:8088/
   4. Устанавливает DNS DNAT-правила (порт 53 → 127.0.0.1:1053).
   5. Генерирует ndm hook-скрипт для выживания при firewall reload.
   6. Watchdog переустанавливает правила при отсутствии.
+
+### Обязательное назначение клиента в Keenetic policy
+
+Transparent WiFi routing работает только для host'ов, которым Keenetic ставит connmark traffic policy. Клиент, подключённый к `HincyRay-VPN`, но оставленный в `conform` / default policy, полностью обойдёт HincyRay; counters в `HINCYRAY` останутся нулевыми.
+
+Назначьте клиента в Web UI Keenetic или через `ndmc`:
+
+```bash
+# Замените на реальный MAC клиента.
+ndmc -c 'ip hotspot host <client-mac> policy Policy0'
+ndmc -c 'system configuration save'
+```
+
+`Policy0` — внутреннее имя Keenetic для политики, описание которой в тестовой установке было `XKeen`. Проверьте фактическое имя/mark политики на своём роутере:
+
+```bash
+curl -s localhost:79/rci/show/ip/policy
+```
+
+Проверьте, что host маркируется правильно:
+
+```bash
+ndmc -c 'show running-config' | grep -i '<client-mac>'
+iptables -t mangle -L _NDM_HOTSPOT_PREROUTING_MANGL -n -v | grep -i '<client-mac>'
+iptables -t nat -L HINCYRAY -n -v
+```
+
+Ожидаемый результат для VPN-routed host:
+
+```text
+host <client-mac> policy Policy0
+MARK set 0xffffaaa
+CONNMARK save
+HINCYRAY ... REDIRECT ... counters растут, когда клиент открывает сайт
+```
+
+Если у host'а видно `conform` вместо `policy Policy0`, Keenetic создаст обычный `RETURN` rule для этого MAC, и HincyRay не увидит трафик.
 
 ## Документация
 
