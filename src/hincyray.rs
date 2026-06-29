@@ -2032,6 +2032,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
             handle_subscriptions_refresh_one(body, daemon)
         }
         ("GET", "/api/subscriptions") => handle_subscriptions_list(daemon),
+        ("POST", "/api/subscriptions/delete") => handle_subscriptions_delete(body, daemon),
         ("GET", "/api/routing") => handle_routing_get(daemon),
         ("POST", "/api/routing/settings") => handle_routing_settings(body, daemon),
         ("POST", "/api/routing/rules") => handle_routing_rules(body, daemon),
@@ -2753,6 +2754,85 @@ fn handle_favorites_list(daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
+/// Replace all profiles belonging to subscription `url` with `fresh`.
+/// Old profiles with `group == Some(url)` are removed; fresh profiles
+/// are added (dedup by `raw` against profiles from other sources).
+/// All profiles are re-indexed with sequential IDs and
+/// `active_profile_id` is updated to point to the active profile by
+/// its `raw` string. Returns the number of fresh profiles added.
+fn replace_subscription_profiles(
+    state: &mut HincyrayState,
+    url: &str,
+    fresh: Vec<Profile>,
+) -> usize {
+    let active_raw = state
+        .active_profile_id
+        .and_then(|id| state.profiles.iter().find(|p| p.id == id))
+        .map(|p| p.raw.clone());
+
+    // Remove old profiles belonging to this subscription.
+    state.profiles.retain(|p| p.group.as_deref() != Some(url));
+
+    // Add fresh profiles, dedup by raw against all remaining.
+    let mut seen: HashSet<String> = state.profiles.iter().map(|p| p.raw.clone()).collect();
+    let mut added = 0;
+    for mut profile in fresh {
+        if profile.group.is_none() {
+            profile.group = Some(url.to_owned());
+        }
+        if seen.insert(profile.raw.clone()) {
+            state.profiles.push(profile);
+            added += 1;
+        }
+    }
+
+    // Re-assign sequential IDs after removal + insertion.
+    for (i, p) in state.profiles.iter_mut().enumerate() {
+        p.id = i;
+    }
+
+    // Restore active_profile_id by matching the raw string. If the
+    // active profile was removed (no longer in the subscription),
+    // active_profile_id becomes None — caller should handle this.
+    state.active_profile_id = active_raw
+        .as_ref()
+        .and_then(|raw| state.profiles.iter().find(|p| &p.raw == raw))
+        .map(|p| p.id);
+
+    added
+}
+
+/// Remove a subscription source and all its profiles from the state.
+/// Re-indexes remaining profiles and updates `active_profile_id`.
+/// Returns `true` if the active profile was removed (belonged to the
+/// subscription) — caller should stop the core or switch to another.
+fn purge_subscription(state: &mut HincyrayState, url: &str) -> bool {
+    let active_raw = state
+        .active_profile_id
+        .and_then(|id| state.profiles.iter().find(|p| p.id == id))
+        .map(|p| p.raw.clone());
+
+    // Remove subscription source.
+    state.subscriptions.retain(|s| s.url != url);
+
+    // Remove all profiles belonging to this subscription.
+    state.profiles.retain(|p| p.group.as_deref() != Some(url));
+
+    // Re-assign sequential IDs.
+    for (i, p) in state.profiles.iter_mut().enumerate() {
+        p.id = i;
+    }
+
+    // Restore active_profile_id or detect removal.
+    let new_active = active_raw
+        .as_ref()
+        .and_then(|raw| state.profiles.iter().find(|p| &p.raw == raw))
+        .map(|p| p.id);
+    let removed_active = new_active.is_none();
+    state.active_profile_id = new_active;
+    removed_active
+}
+
 fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) {
     // Read saved subscription sources plus the SOCKS fallback info
     // under a single short lock; network I/O happens below without
@@ -2807,34 +2887,12 @@ fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) 
                     stored.last_error = None;
                     stored.profile_count = count;
                 }
-                let count_before = inner.state.profiles.len();
-                let mut seen: HashSet<String> =
-                    inner.state.profiles.iter().map(|p| p.raw.clone()).collect();
-                let mut sub_profiles = report.profiles;
-                // Tag subscription-loaded profiles with the source URL
-                // so they keep their group across refreshes.
-                for profile in &mut sub_profiles {
-                    if profile.group.is_none() {
-                        profile.group = Some(source.url.clone());
-                    }
-                }
-                for mut profile in sub_profiles {
-                    if seen.insert(profile.raw.clone()) {
-                        profile.id = inner.state.profiles.len();
-                        inner.state.profiles.push(profile);
-                    } else if profile.group.is_some() {
-                        let raw = profile.raw.clone();
-                        if let Some(existing) = inner
-                            .state
-                            .profiles
-                            .iter_mut()
-                            .find(|p| p.raw == raw && p.group.is_none())
-                        {
-                            existing.group = profile.group.take();
-                        }
-                    }
-                }
-                let added = inner.state.profiles.len().saturating_sub(count_before);
+                // Replace all profiles belonging to this subscription
+                // with the fresh set. This removes stale profiles that
+                // are no longer in the subscription and prevents
+                // duplicates from accumulating across refreshes.
+                let added =
+                    replace_subscription_profiles(&mut inner.state, &source.url, report.profiles);
                 added_total += added;
                 refreshed += 1;
             }
@@ -2922,32 +2980,10 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
                 stored.last_error = None;
                 stored.profile_count = count;
             }
-            let mut seen: HashSet<String> =
-                inner.state.profiles.iter().map(|p| p.raw.clone()).collect();
-            let mut sub_profiles = report.profiles;
-            for profile in &mut sub_profiles {
-                if profile.group.is_none() {
-                    profile.group = Some(source.url.clone());
-                }
-            }
-            let mut added = 0usize;
-            for mut profile in sub_profiles {
-                if seen.insert(profile.raw.clone()) {
-                    profile.id = inner.state.profiles.len();
-                    inner.state.profiles.push(profile);
-                    added += 1;
-                } else if profile.group.is_some() {
-                    let raw = profile.raw.clone();
-                    if let Some(existing) = inner
-                        .state
-                        .profiles
-                        .iter_mut()
-                        .find(|p| p.raw == raw && p.group.is_none())
-                    {
-                        existing.group = profile.group.take();
-                    }
-                }
-            }
+            // Replace all profiles belonging to this subscription with
+            // the fresh set — removes stale entries, prevents duplicates.
+            let added =
+                replace_subscription_profiles(&mut inner.state, &source.url, report.profiles);
             let _ = persist_state(&daemon.state_path, &inner.state);
             let response = json!({
                 "url": source.url,
@@ -2999,6 +3035,71 @@ fn handle_subscriptions_list(daemon: &Daemon) -> (u16, &'static str, String) {
         "application/json",
         json!({"subscriptions": entries, "count": entries.len()}).to_string(),
     )
+}
+
+/// Delete a saved subscription and all profiles that belong to it.
+/// Body: `{"url": "..."}`. If the active profile was among the removed
+/// profiles, the core is stopped and `active_profile_id` is cleared.
+fn handle_subscriptions_delete(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(url) = value.get("url").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing url"}).to_string(),
+        );
+    };
+    let url = url.trim();
+    if url.is_empty() {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing url"}).to_string(),
+        );
+    }
+
+    let mut inner = lock(&daemon.inner);
+
+    // Confirm the URL is a known saved subscription.
+    let exists = inner.state.subscriptions.iter().any(|s| s.url == url);
+    if !exists {
+        return (
+            404,
+            "application/json",
+            json!({"error": "subscription not found", "url": url}).to_string(),
+        );
+    }
+
+    let removed_count = inner
+        .state
+        .profiles
+        .iter()
+        .filter(|p| p.group.as_deref() == Some(url))
+        .count();
+
+    let removed_active = purge_subscription(&mut inner.state, url);
+
+    // If the active profile was removed, stop the core and clear the
+    // config so we don't run with a stale outbound.
+    if removed_active {
+        let _ = inner.core.stop();
+        let _ = fs::remove_file(&daemon.xray_config_path);
+    }
+
+    let _ = persist_state(&daemon.state_path, &inner.state);
+
+    let response = json!({
+        "url": url,
+        "removed_profiles": removed_count,
+        "removed_active": removed_active,
+    });
+    (200, "application/json", response.to_string())
 }
 
 fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
@@ -4569,8 +4670,8 @@ tr.group-row.collapsed{display:none}
     <span class="subtle" id="subs-status"></span>
   </div>
   <table style="margin-top:.4em">
-    <thead><tr><th>URL</th><th>Profiles</th><th>Last loaded</th><th>Last error</th></tr></thead>
-    <tbody id="subs-body"><tr><td colspan="4" class="subtle">No saved subscriptions.</td></tr></tbody>
+    <thead><tr><th>URL</th><th>Profiles</th><th>Last loaded</th><th>Last error</th><th></th></tr></thead>
+    <tbody id="subs-body"><tr><td colspan="5" class="subtle">No saved subscriptions.</td></tr></tbody>
   </table>
 </div>
 
@@ -5051,7 +5152,7 @@ function renderFavorites(profiles){
 function renderSubscriptions(subs){
   var tbody = document.getElementById("subs-body");
   if(!subs || !subs.length){
-    tbody.innerHTML = '<tr><td colspan="4" class="subtle">No saved subscriptions. Import a subscription URL to save it here.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" class="subtle">No saved subscriptions. Import a subscription URL to save it here.</td></tr>';
     return;
   }
   var rows = subs.map(function(s){
@@ -5061,9 +5162,20 @@ function renderSubscriptions(subs){
       + '<td>' + (s.profile_count || 0) + '</td>'
       + '<td>' + fmtTime(s.last_loaded_unix) + '</td>'
       + '<td>' + err + '</td>'
+      + '<td><button class="mini danger" data-sub-delete="' + esc(s.url) + '">Delete</button></td>'
       + '</tr>';
   });
   tbody.innerHTML = rows.join("");
+  Array.prototype.forEach.call(tbody.querySelectorAll("[data-sub-delete]"), function(btn){
+    btn.addEventListener("click", function(){
+      var url = btn.getAttribute("data-sub-delete");
+      if(!confirm("Delete this subscription and all its profiles?\n" + url)){ return; }
+      api("POST", "/api/subscriptions/delete", JSON.stringify({url: url})).then(function(data){
+        showOk("Deleted " + (data.removed_profiles || 0) + " profile(s).");
+        return refreshAll();
+      }).catch(function(err){ setMsg("Delete failed: " + err.message); });
+    });
+  });
 }
 
 function linesFrom(id){
@@ -5575,8 +5687,13 @@ api("GET","/api/dns").then(function(data){
 }).catch(function(){ /* ignore */ });
 
 // Auto-settings: load, save, and display.
+// dirty flag prevents the 5-second status refresh from overwriting
+// the user's unsaved changes to the checkboxes and interval field.
+var autoSettingsDirty = false;
+
 function loadAutoSettings(){
   api("GET", "/api/auto-settings").then(function(data){
+    autoSettingsDirty = false;
     document.getElementById("auto-select-chk").checked = !!data.auto_select;
     document.getElementById("auto-switch-chk").checked = !!data.auto_switch;
     document.getElementById("auto-bench-hours").value = data.auto_bench_interval_hours || 0;
@@ -5588,6 +5705,21 @@ function loadAutoSettings(){
   }).catch(function(){ /* ignore */ });
 }
 
+// Sync auto-settings checkboxes from the /api/status response (which
+// includes auto_select, auto_switch, auto_bench_interval_hours) during
+// the 5-second refresh, but only if the user hasn't made local changes.
+function syncAutoSettingsFromStatus(s){
+  if(autoSettingsDirty){ return; }
+  document.getElementById("auto-select-chk").checked = !!s.auto_select;
+  document.getElementById("auto-switch-chk").checked = !!s.auto_switch;
+  document.getElementById("auto-bench-hours").value = s.auto_bench_interval_hours || 0;
+}
+
+["auto-select-chk", "auto-switch-chk"].forEach(function(id){
+  document.getElementById(id).addEventListener("change", function(){ autoSettingsDirty = true; });
+});
+document.getElementById("auto-bench-hours").addEventListener("input", function(){ autoSettingsDirty = true; });
+
 document.getElementById("btn-auto-save").addEventListener("click", function(){
   var body = JSON.stringify({
     auto_select: document.getElementById("auto-select-chk").checked,
@@ -5595,6 +5727,7 @@ document.getElementById("btn-auto-save").addEventListener("click", function(){
     auto_bench_interval_hours: Number(document.getElementById("auto-bench-hours").value) || 0,
   });
   api("POST", "/api/auto-settings", body).then(function(){
+    autoSettingsDirty = false;
     showOk("Auto settings saved.");
   }).catch(function(err){ setMsg("Save failed: " + err.message); });
 });
@@ -5757,6 +5890,7 @@ setInterval(function(){
     renderStatus(s);
     var el = document.getElementById("auto-failover-count");
     if(el){ el.textContent = s.failover_fail_count || 0; }
+    syncAutoSettingsFromStatus(s);
   }).catch(function(){ /* transient, keep last known state */ });
   // System info also refreshes every 5s (CPU usage delta, temp, etc.)
   api("GET", "/api/system").then(function(sys){
@@ -6849,5 +6983,225 @@ mod tests {
         assert_eq!(status, 200);
         let config: Value = serde_json::from_str(&body).expect("parse config");
         assert!(config.get("dns").is_some());
+    }
+
+    // ── Subscription replace / delete tests ───────────────────────────
+
+    fn make_profile(id: usize, name: &str, raw: &str, group: Option<&str>) -> Profile {
+        Profile {
+            id,
+            name: name.to_owned(),
+            protocol: crate::profiles::Protocol::Vless,
+            address: "example.com".to_owned(),
+            port: Some(443),
+            raw: raw.to_owned(),
+            selected: false,
+            block_quic: false,
+            group: group.map(|s| s.to_owned()),
+        }
+    }
+
+    #[test]
+    fn replace_subscription_profiles_removes_old_adds_fresh() {
+        let mut state = HincyrayState::default();
+        let url = "https://provider.example/sub";
+
+        state
+            .profiles
+            .push(make_profile(0, "Sub1", "raw1", Some(url)));
+        state
+            .profiles
+            .push(make_profile(1, "Sub2", "raw2", Some(url)));
+        state
+            .profiles
+            .push(make_profile(2, "Sub3", "raw3", Some(url)));
+        state.profiles.push(make_profile(3, "Direct", "raw4", None));
+        state.active_profile_id = Some(1); // Sub2
+
+        // Fresh set: raw1 (same), raw5 (new). raw2 and raw3 are gone.
+        let fresh = vec![
+            make_profile(0, "Sub1-updated", "raw1", None),
+            make_profile(1, "SubNew", "raw5", None),
+        ];
+
+        let added = replace_subscription_profiles(&mut state, url, fresh);
+
+        // Both fresh profiles are added (old subscription profiles were
+        // removed, so no dedup collision except with Direct/raw4).
+        assert_eq!(added, 2);
+        // Direct (raw4) + 2 fresh = 3 total.
+        assert_eq!(state.profiles.len(), 3);
+        // Sub2 (raw2) was the active profile and is gone.
+        assert_eq!(state.active_profile_id, None);
+        // IDs re-indexed sequentially.
+        assert_eq!(state.profiles[0].id, 0);
+        assert_eq!(state.profiles[1].id, 1);
+        assert_eq!(state.profiles[2].id, 2);
+        // Groups assigned correctly.
+        assert_eq!(state.profiles[1].group.as_deref(), Some(url));
+        assert_eq!(state.profiles[2].group.as_deref(), Some(url));
+    }
+
+    #[test]
+    fn replace_subscription_profiles_preserves_active_by_raw() {
+        let mut state = HincyrayState::default();
+        let url = "https://provider.example/sub";
+
+        state
+            .profiles
+            .push(make_profile(0, "Sub1", "raw1", Some(url)));
+        state
+            .profiles
+            .push(make_profile(1, "Sub2", "raw2", Some(url)));
+        state.active_profile_id = Some(0); // Sub1 (raw1)
+
+        // Fresh set includes raw1 — active should be preserved by raw.
+        let fresh = vec![
+            make_profile(0, "Sub1-updated", "raw1", None),
+            make_profile(1, "Sub2", "raw2", None),
+        ];
+
+        let _added = replace_subscription_profiles(&mut state, url, fresh);
+
+        assert_eq!(state.profiles.len(), 2);
+        // Active should point to the profile with raw1 (now at index 0).
+        assert_eq!(state.active_profile_id, Some(0));
+        assert_eq!(state.profiles[0].raw, "raw1");
+        assert_eq!(state.profiles[0].name, "Sub1-updated");
+    }
+
+    #[test]
+    fn replace_subscription_profiles_no_duplicates_on_refresh() {
+        let mut state = HincyrayState::default();
+        let url = "https://provider.example/sub";
+
+        // Simulate two consecutive refreshes with the same profiles.
+        let fresh = vec![
+            make_profile(0, "Sub1", "raw1", None),
+            make_profile(1, "Sub2", "raw2", None),
+        ];
+
+        let added1 = replace_subscription_profiles(&mut state, url, fresh.clone());
+        assert_eq!(added1, 2);
+        assert_eq!(state.profiles.len(), 2);
+
+        // Second refresh with the same profiles: old ones removed, new
+        // ones added — total should still be 2, not 4.
+        let added2 = replace_subscription_profiles(&mut state, url, fresh);
+        assert_eq!(added2, 2);
+        assert_eq!(state.profiles.len(), 2);
+    }
+
+    #[test]
+    fn purge_subscription_removes_source_and_profiles() {
+        let mut state = HincyrayState::default();
+        let url = "https://provider.example/sub";
+
+        state
+            .profiles
+            .push(make_profile(0, "Sub1", "raw1", Some(url)));
+        state
+            .profiles
+            .push(make_profile(1, "Sub2", "raw2", Some(url)));
+        state.profiles.push(make_profile(2, "Direct", "raw3", None));
+        state.active_profile_id = Some(0); // Sub1 — will be removed
+        state.subscriptions.push(StoredSubscription {
+            url: url.to_owned(),
+            ..Default::default()
+        });
+
+        let removed_active = purge_subscription(&mut state, url);
+
+        assert!(removed_active);
+        assert_eq!(state.profiles.len(), 1);
+        assert_eq!(state.profiles[0].raw, "raw3");
+        assert_eq!(state.profiles[0].id, 0);
+        assert_eq!(state.active_profile_id, None);
+        assert!(state.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn purge_subscription_preserves_active_from_other_group() {
+        let mut state = HincyrayState::default();
+        let url = "https://provider.example/sub";
+
+        state
+            .profiles
+            .push(make_profile(0, "Sub1", "raw1", Some(url)));
+        state.profiles.push(make_profile(1, "Direct", "raw2", None));
+        state.active_profile_id = Some(1); // Direct — not in subscription
+        state.subscriptions.push(StoredSubscription {
+            url: url.to_owned(),
+            ..Default::default()
+        });
+
+        let removed_active = purge_subscription(&mut state, url);
+
+        assert!(!removed_active);
+        assert_eq!(state.profiles.len(), 1);
+        assert_eq!(state.profiles[0].raw, "raw2");
+        assert_eq!(state.profiles[0].id, 0);
+        assert_eq!(state.active_profile_id, Some(0));
+    }
+
+    #[test]
+    fn subscriptions_delete_removes_subscription_and_profiles() {
+        let (_dir, daemon) = test_daemon();
+        let url = "https://provider.example/sub";
+        {
+            let mut inner = lock(&daemon.inner);
+            inner
+                .state
+                .profiles
+                .push(make_profile(0, "Sub1", "raw1", Some(url)));
+            inner
+                .state
+                .profiles
+                .push(make_profile(1, "Sub2", "raw2", Some(url)));
+            inner
+                .state
+                .profiles
+                .push(make_profile(2, "Direct", "raw3", None));
+            inner.state.subscriptions.push(StoredSubscription {
+                url: url.to_owned(),
+                ..Default::default()
+            });
+        }
+
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/subscriptions/delete",
+            &json!({"url": url}).to_string(),
+            &daemon,
+        );
+
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(response["removed_profiles"], 2);
+
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 1);
+        assert_eq!(inner.state.profiles[0].raw, "raw3");
+        assert!(inner.state.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn subscriptions_delete_rejects_unknown_url() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, _) = dispatch(
+            "POST",
+            "/api/subscriptions/delete",
+            r#"{"url":"https://provider.example/sub/never-saved"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn subscriptions_delete_rejects_missing_url() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("POST", "/api/subscriptions/delete", r#"{}"#, &daemon);
+        assert_eq!(status, 400);
+        assert!(body.contains("missing url"));
     }
 }
