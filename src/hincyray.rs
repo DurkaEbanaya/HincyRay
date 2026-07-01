@@ -109,6 +109,19 @@ pub fn run() -> Result<(), String> {
         }
     }
 
+    // Cache the current Mihomo version on startup so the web UI
+    // can display it without spawning `mihomo -v` on every status poll.
+    {
+        let mut inner = lock(&daemon.inner);
+        if inner.state.mihomo_version.is_none()
+            && let Ok(version) = get_mihomo_version(&inner.state.mihomo_path)
+        {
+            eprintln!("hincyray: mihomo version: {version}");
+            inner.state.mihomo_version = Some(version);
+            let _ = persist_state(&daemon.state_path, &inner.state);
+        }
+    }
+
     // Start watchdog on router targets.
     start_watchdog(daemon.clone());
 
@@ -386,6 +399,27 @@ pub struct HincyrayState {
     /// v0.6: Unix timestamp of the last auto-triggered benchmark.
     #[serde(default)]
     pub last_auto_bench_unix: u64,
+    /// v0.7.1: Mihomo auto-update enabled. When true, the watchdog
+    /// periodically checks GitHub for new Mihomo releases through the
+    /// local SOCKS proxy and auto-installs them.
+    #[serde(default)]
+    pub auto_update_enabled: bool,
+    /// v0.7.1: Auto-update check interval in hours.
+    #[serde(default = "default_auto_update_interval_hours")]
+    pub auto_update_interval_hours: u32,
+    /// v0.7.1: Unix timestamp of the last update check.
+    #[serde(default)]
+    pub last_update_check_unix: u64,
+    /// v0.7.1: Latest available version found by the last check
+    /// (e.g. "v1.19.28"). None if no check has been performed or
+    /// the last check found no update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_available_version: Option<String>,
+    /// v0.7.1: Currently installed Mihomo version (cached from
+    /// `mihomo -v`). Refreshed on startup, on check, and after
+    /// applying an update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mihomo_version: Option<String>,
 }
 
 impl Default for HincyrayState {
@@ -408,6 +442,11 @@ impl Default for HincyrayState {
             hwid_config: HwidConfig::default(),
             auto_bench_interval_hours: 0,
             last_auto_bench_unix: 0,
+            auto_update_enabled: false,
+            auto_update_interval_hours: default_auto_update_interval_hours(),
+            last_update_check_unix: 0,
+            update_available_version: None,
+            mihomo_version: None,
         }
     }
 }
@@ -602,6 +641,10 @@ fn default_http_port() -> Option<u16> {
 
 fn default_mihomo_path() -> String {
     "mihomo".to_owned()
+}
+
+fn default_auto_update_interval_hours() -> u32 {
+    24
 }
 
 impl Daemon {
@@ -2016,6 +2059,8 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
                 "state_path": daemon.state_path.to_string_lossy(),
                 "mihomo_path": inner.state.mihomo_path,
                 "core_status": inner.core.status(),
+                "mihomo_version": inner.state.mihomo_version,
+                "update_available_version": inner.state.update_available_version,
                 "split_routing": inner.state.split_routing,
                 "dns_enabled": inner.state.dns_settings.enabled,
                 "hwid": inner.state.hwid_config.hwid,
@@ -2085,6 +2130,10 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/auto-settings") => handle_auto_settings_set(body, daemon),
         ("GET", "/api/hwid") => handle_hwid_get(daemon),
         ("POST", "/api/hwid") => handle_hwid_set(body, daemon),
+        ("GET", "/api/update/status") => handle_update_status(daemon),
+        ("POST", "/api/update/check") => handle_update_check(daemon),
+        ("POST", "/api/update/apply") => handle_update_apply(daemon),
+        ("POST", "/api/update/settings") => handle_update_settings(body, daemon),
         _ => (
             404,
             "application/json",
@@ -4049,6 +4098,209 @@ fn handle_hwid_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
+// ─── Mihomo update API handlers ───────────────────────────────────
+
+/// Return cached update state: current version, available version,
+/// auto-update settings, last check time. Does NOT spawn `mihomo -v`
+/// — the cached version is refreshed only by check/apply/startup.
+fn handle_update_status(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let response = json!({
+        "current_version": inner.state.mihomo_version,
+        "update_available_version": inner.state.update_available_version,
+        "auto_update_enabled": inner.state.auto_update_enabled,
+        "auto_update_interval_hours": inner.state.auto_update_interval_hours,
+        "last_update_check_unix": inner.state.last_update_check_unix,
+        "mihomo_path": inner.state.mihomo_path,
+    });
+    (200, "application/json", response.to_string())
+}
+
+/// Manually check GitHub for the latest Mihomo release through the
+/// local SOCKS proxy. Requires the core to be running (GitHub is
+/// blocked from the router's direct connection).
+fn handle_update_check(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (socks_port, core_running, mihomo_path) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            inner.state.socks_port,
+            inner.core.is_running(),
+            inner.state.mihomo_path.clone(),
+        )
+    };
+    if !core_running {
+        return (
+            400,
+            "application/json",
+            json!({"error": "Mihomo core is not running; cannot check for updates through proxy"})
+                .to_string(),
+        );
+    }
+    match check_latest_mihomo_release(socks_port) {
+        Ok(release) => {
+            // Refresh the cached current version by running `mihomo -v`.
+            let current_version = get_mihomo_version(&mihomo_path).ok();
+            let is_newer = current_version
+                .as_ref()
+                .map(|cv| is_newer_version(cv, &release.tag_name))
+                .unwrap_or(true);
+            let now = unix_now();
+            {
+                let mut inner = lock(&daemon.inner);
+                inner.state.last_update_check_unix = now;
+                inner.state.mihomo_version = current_version.clone();
+                if is_newer {
+                    inner.state.update_available_version = Some(release.tag_name.clone());
+                } else {
+                    inner.state.update_available_version = None;
+                }
+                let _ = persist_state(&daemon.state_path, &inner.state);
+            }
+            let response = json!({
+                "current_version": current_version,
+                "latest_version": release.tag_name,
+                "update_available": is_newer,
+                "asset_name": release.asset_name,
+            });
+            (200, "application/json", response.to_string())
+        }
+        Err(error) => {
+            let mut inner = lock(&daemon.inner);
+            inner.state.last_update_check_unix = unix_now();
+            let _ = persist_state(&daemon.state_path, &inner.state);
+            (500, "application/json", json!({"error": error}).to_string())
+        }
+    }
+}
+
+/// Download and install the latest Mihomo release. Replaces the
+/// binary, restarts the core, and verifies the new process is alive.
+/// On failure, rolls back to the previous binary.
+fn handle_update_apply(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (socks_port, core_running, mihomo_path, config_path, geo_dir) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            inner.state.socks_port,
+            inner.core.is_running(),
+            inner.state.mihomo_path.clone(),
+            daemon.mihomo_config_path.clone(),
+            geo_dir_from_state(&inner.state),
+        )
+    };
+    if !core_running {
+        return (
+            400,
+            "application/json",
+            json!({"error": "Mihomo core is not running; cannot download update through proxy"})
+                .to_string(),
+        );
+    }
+
+    // Check for the latest release (network I/O, no lock).
+    let release = match check_latest_mihomo_release(socks_port) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("check failed: {e}")}).to_string(),
+            );
+        }
+    };
+    let current_version = get_mihomo_version(&mihomo_path).unwrap_or_default();
+    if !current_version.is_empty() && !is_newer_version(&current_version, &release.tag_name) {
+        return (
+            200,
+            "application/json",
+            json!({"message": "already up to date", "current_version": current_version})
+                .to_string(),
+        );
+    }
+
+    // Download and install (network I/O + file ops, no lock).
+    let new_version = match download_and_install_mihomo(&release, &mihomo_path, socks_port) {
+        Ok(v) => v,
+        Err(e) => return (500, "application/json", json!({"error": e}).to_string()),
+    };
+
+    // Restart core with new binary (needs lock).
+    let mut inner = lock(&daemon.inner);
+    if let Err(e) = inner
+        .core
+        .restart(&mihomo_path, &config_path, geo_dir.as_deref())
+    {
+        // Core restart failed — attempt rollback.
+        eprintln!("hincyray: core restart after update failed ({e}), rolling back");
+        let backup_path = format!("{mihomo_path}.bak");
+        let _ = fs::copy(&backup_path, &mihomo_path);
+        let _ = inner
+            .core
+            .restart(&mihomo_path, &config_path, geo_dir.as_deref());
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("core restart failed after update, rolled back: {e}")})
+                .to_string(),
+        );
+    }
+
+    // Wait and verify the new core is alive.
+    drop(inner);
+    thread::sleep(Duration::from_secs(3));
+    let mut inner = lock(&daemon.inner);
+    if !inner.core.is_running() {
+        eprintln!("hincyray: core died after update, rolling back");
+        let backup_path = format!("{mihomo_path}.bak");
+        let _ = fs::copy(&backup_path, &mihomo_path);
+        let _ = inner
+            .core
+            .restart(&mihomo_path, &config_path, geo_dir.as_deref());
+        return (
+            500,
+            "application/json",
+            json!({"error": "core died after update, rolled back to previous version"}).to_string(),
+        );
+    }
+
+    // Success — update state.
+    inner.state.mihomo_version = Some(new_version.clone());
+    inner.state.update_available_version = None;
+    let _ = persist_state(&daemon.state_path, &inner.state);
+    let response = json!({
+        "updated": true,
+        "previous_version": current_version,
+        "new_version": new_version,
+    });
+    (200, "application/json", response.to_string())
+}
+
+/// Toggle auto-update and set the check interval.
+fn handle_update_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let mut inner = lock(&daemon.inner);
+    if let Some(v) = value.get("auto_update_enabled").and_then(Value::as_bool) {
+        inner.state.auto_update_enabled = v;
+    }
+    if let Some(v) = value
+        .get("auto_update_interval_hours")
+        .and_then(Value::as_u64)
+    {
+        inner.state.auto_update_interval_hours = v as u32;
+    }
+    let _ = persist_state(&daemon.state_path, &inner.state);
+    let response = json!({
+        "auto_update_enabled": inner.state.auto_update_enabled,
+        "auto_update_interval_hours": inner.state.auto_update_interval_hours,
+    });
+    (200, "application/json", response.to_string())
+}
+
 fn shell_status(command: &str) -> bool {
     Command::new("sh")
         .arg("-c")
@@ -4112,6 +4364,219 @@ fn find_best_profile_by_score(
         }
     }
     best.map(|(id, _)| id)
+}
+
+// ─── Mihomo auto-update ───────────────────────────────────────────
+
+/// GitHub release info parsed from the latest release API response.
+struct MihomoRelease {
+    tag_name: String,
+    asset_url: String,
+    asset_name: String,
+}
+
+/// Run `mihomo -v` and parse the version string from stdout.
+/// The output looks like:
+/// `Mihomo Meta v1.19.27 linux arm64 with go1.26.4 Sat Jun  6 ...`
+/// The version (e.g. "v1.19.27") is the 3rd whitespace-separated token.
+fn get_mihomo_version(binary_path: &str) -> Result<String, String> {
+    let output = Command::new(binary_path)
+        .arg("-v")
+        .output()
+        .map_err(|e| format!("mihomo -v spawn: {e}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace()
+        .nth(2)
+        .map(|s| s.to_owned())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "could not parse version from mihomo -v output".to_owned())
+}
+
+/// Compare two version strings like "v1.19.27" and "v1.19.28".
+/// Returns true if `latest` is strictly newer than `current`.
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    let parse_parts = |s: &str| -> Vec<u32> {
+        s.trim_start_matches('v')
+            .split('.')
+            .filter_map(|p| p.parse::<u32>().ok())
+            .collect()
+    };
+    let cur = parse_parts(current);
+    let new = parse_parts(latest);
+    for (c, n) in cur.iter().zip(new.iter()) {
+        if n > c {
+            return true;
+        }
+        if n < c {
+            return false;
+        }
+    }
+    new.len() > cur.len()
+}
+
+/// Fetch the latest Mihomo release from the GitHub API through the
+/// local SOCKS proxy. GitHub is blocked from the router's direct
+/// connection, so the proxy is mandatory — the caller must verify
+/// that the core is running before calling this function.
+fn check_latest_mihomo_release(socks_port: u16) -> Result<MihomoRelease, String> {
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "30",
+            "--socks5-hostname",
+            &format!("127.0.0.1:{socks_port}"),
+            "-H",
+            "User-Agent: hincyray",
+            "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest",
+        ])
+        .output()
+        .map_err(|e| format!("curl spawn: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "curl exited with status {}",
+            output.status.code().unwrap_or(-1)
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&text).map_err(|e| format!("parse GitHub JSON: {e}"))?;
+    let tag_name = json
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .ok_or("missing tag_name in GitHub response")?
+        .to_owned();
+    let asset = json
+        .get("assets")
+        .and_then(Value::as_array)
+        .and_then(|assets| {
+            assets.iter().find(|a| {
+                a.get("name").and_then(Value::as_str).is_some_and(|name| {
+                    name.starts_with("mihomo-linux-arm64-")
+                        && name.ends_with(".gz")
+                        && !name.contains("compatible")
+                })
+            })
+        })
+        .ok_or("no mihomo-linux-arm64-*.gz asset found in release")?;
+    let asset_url = asset
+        .get("browser_download_url")
+        .and_then(Value::as_str)
+        .ok_or("missing browser_download_url")?
+        .to_owned();
+    let asset_name = asset
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("missing asset name")?
+        .to_owned();
+    Ok(MihomoRelease {
+        tag_name,
+        asset_url,
+        asset_name,
+    })
+}
+
+/// Download, decompress, verify, back up, and replace the Mihomo
+/// binary. The caller is responsible for restarting the core after
+/// this function returns successfully.
+///
+/// Flow:
+/// 1. Download `.gz` through the SOCKS proxy to `/tmp/mihomo-update.gz`.
+/// 2. Decompress with `gunzip -c` → `/tmp/mihomo-update`.
+/// 3. `chmod +x` the new binary.
+/// 4. Verify the new binary runs (`/tmp/mihomo-update -v`).
+/// 5. Back up the current binary to `<path>.bak`.
+/// 6. Replace the current binary (fs::copy, cross-device safe).
+/// 7. `chmod +x` the replaced binary.
+/// 8. Clean up temp files.
+fn download_and_install_mihomo(
+    release: &MihomoRelease,
+    current_binary: &str,
+    socks_port: u16,
+) -> Result<String, String> {
+    let tmp_gz = "/tmp/mihomo-update.gz";
+    let tmp_bin = "/tmp/mihomo-update";
+
+    // 1. Download
+    let dl_status = Command::new("curl")
+        .args([
+            "-sL",
+            "--max-time",
+            "300",
+            "--socks5-hostname",
+            &format!("127.0.0.1:{socks_port}"),
+            "-H",
+            "User-Agent: hincyray",
+            "-o",
+            tmp_gz,
+            &release.asset_url,
+        ])
+        .status()
+        .map_err(|e| format!("curl download spawn: {e}"))?;
+    if !dl_status.success() {
+        let _ = fs::remove_file(tmp_gz);
+        return Err("download failed (curl exited with non-zero status)".to_owned());
+    }
+
+    // 2. Decompress
+    let gz_output = Command::new("gunzip")
+        .args(["-c", tmp_gz])
+        .output()
+        .map_err(|e| {
+            let _ = fs::remove_file(tmp_gz);
+            format!("gunzip spawn: {e}")
+        })?;
+    if !gz_output.status.success() {
+        let _ = fs::remove_file(tmp_gz);
+        let stderr = String::from_utf8_lossy(&gz_output.stderr);
+        return Err(format!("gunzip failed: {stderr}"));
+    }
+    fs::write(tmp_bin, &gz_output.stdout).map_err(|e| {
+        let _ = fs::remove_file(tmp_gz);
+        format!("write decompressed binary: {e}")
+    })?;
+
+    // 3. Make executable
+    let _ = fs::remove_file(tmp_gz);
+    Command::new("chmod")
+        .arg("+x")
+        .arg(tmp_bin)
+        .status()
+        .map_err(|e| {
+            let _ = fs::remove_file(tmp_bin);
+            format!("chmod: {e}")
+        })?;
+
+    // 4. Verify the new binary runs
+    let new_version = get_mihomo_version(tmp_bin).map_err(|e| {
+        let _ = fs::remove_file(tmp_bin);
+        format!("new binary verification failed: {e}")
+    })?;
+
+    // 5. Back up current binary
+    let backup_path = format!("{current_binary}.bak");
+    fs::copy(current_binary, &backup_path).map_err(|e| {
+        let _ = fs::remove_file(tmp_bin);
+        format!("backup current binary: {e}")
+    })?;
+
+    // 6. Replace: unlink first to avoid ETXTBSY on kernels that block
+    //    writes to executing binaries. The running Mihomo process keeps
+    //    its inode, so it continues running until the caller restarts it.
+    let _ = fs::remove_file(current_binary);
+    fs::copy(tmp_bin, current_binary).map_err(|e| {
+        // Attempt rollback on failure
+        let _ = fs::copy(&backup_path, current_binary);
+        let _ = fs::remove_file(tmp_bin);
+        format!("replace binary: {e}")
+    })?;
+
+    // 7. Ensure executable bit
+    let _ = Command::new("chmod").arg("+x").arg(current_binary).status();
+
+    // 8. Clean up
+    let _ = fs::remove_file(tmp_bin);
+
+    Ok(new_version)
 }
 
 /// Start a TCP benchmark on all profiles from the watchdog. This is
@@ -4284,6 +4749,10 @@ fn start_watchdog(daemon: Daemon) {
                 last_auto_bench,
                 bench_running,
                 active_profile_id,
+                auto_update_enabled,
+                auto_update_interval_hours,
+                last_update_check,
+                mihomo_path,
             ) = {
                 let mut inner = lock(&daemon.inner);
                 (
@@ -4301,6 +4770,10 @@ fn start_watchdog(daemon: Daemon) {
                     inner.state.last_auto_bench_unix,
                     inner.bench.is_running(),
                     inner.state.active_profile_id,
+                    inner.state.auto_update_enabled,
+                    inner.state.auto_update_interval_hours,
+                    inner.state.last_update_check_unix,
+                    inner.state.mihomo_path.clone(),
                 )
             };
 
@@ -4452,6 +4925,75 @@ fn start_watchdog(daemon: Daemon) {
                     switch_active_profile(&mut inner, &daemon, best_id);
                 }
             }
+
+            // --- Phase 6: Auto-update check ---
+            if auto_update_enabled && core_running && !bench_running {
+                let now = unix_now();
+                let interval_secs = u64::from(auto_update_interval_hours) * 3600;
+                if now.saturating_sub(last_update_check) >= interval_secs {
+                    eprintln!("hincyray: auto-update check triggered");
+                    match check_latest_mihomo_release(socks_port) {
+                        Ok(release) => {
+                            let current_version =
+                                get_mihomo_version(&mihomo_path).unwrap_or_default();
+                            if !current_version.is_empty()
+                                && is_newer_version(&current_version, &release.tag_name)
+                            {
+                                eprintln!(
+                                    "hincyray: new Mihomo {} available, auto-installing...",
+                                    release.tag_name
+                                );
+                                match download_and_install_mihomo(
+                                    &release,
+                                    &mihomo_path,
+                                    socks_port,
+                                ) {
+                                    Ok(new_version) => {
+                                        let mut inner = lock(&daemon.inner);
+                                        let geo_dir = geo_dir_from_state(&inner.state);
+                                        if let Err(e) = inner.core.restart(
+                                            &mihomo_path,
+                                            &daemon.mihomo_config_path,
+                                            geo_dir.as_deref(),
+                                        ) {
+                                            eprintln!(
+                                                "hincyray: core restart after auto-update failed: {e}"
+                                            );
+                                        }
+                                        inner.state.mihomo_version = Some(new_version.clone());
+                                        inner.state.update_available_version = None;
+                                        inner.state.last_update_check_unix = now;
+                                        let _ = persist_state(&daemon.state_path, &inner.state);
+                                        eprintln!("hincyray: Mihomo auto-updated to {new_version}");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("hincyray: auto-update install failed: {e}");
+                                        let mut inner = lock(&daemon.inner);
+                                        inner.state.last_update_check_unix = now;
+                                        let _ = persist_state(&daemon.state_path, &inner.state);
+                                    }
+                                }
+                            } else {
+                                eprintln!("hincyray: Mihomo is up to date ({current_version})");
+                                let mut inner = lock(&daemon.inner);
+                                inner.state.last_update_check_unix = now;
+                                inner.state.update_available_version = None;
+                                if !current_version.is_empty() {
+                                    inner.state.mihomo_version = Some(current_version);
+                                }
+                                let _ = persist_state(&daemon.state_path, &inner.state);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("hincyray: auto-update check failed: {e}");
+                            let mut inner = lock(&daemon.inner);
+                            inner.state.last_update_check_unix = now;
+                            let _ = persist_state(&daemon.state_path, &inner.state);
+                        }
+                    }
+                }
+            }
+
             bench_was_running = bench_running;
         }
     });
@@ -4828,6 +5370,29 @@ tr.group-row.collapsed{display:none}
     <button id="btn-auto-save">Save auto settings</button>
     <span class="subtle">Failover failures: <span id="auto-failover-count">0</span>/3</span>
     <span class="subtle" id="auto-last-bench"></span>
+  </div>
+</div>
+
+<h2>Mihomo Update <span id="update-toggle" class="toggle">show</span></h2>
+<div id="update-panel" class="collapsible">
+  <p class="subtle">Checks GitHub releases for new Mihomo versions. Downloads through the local SOCKS proxy (GitHub is blocked from the router's direct connection). Auto-update checks on a schedule and installs automatically when enabled.</p>
+  <div class="cards">
+    <div class="card"><div class="label">Current version</div><div class="value" id="update-current">&mdash;</div></div>
+    <div class="card"><div class="label">Latest available</div><div class="value" id="update-latest">&mdash;</div></div>
+    <div class="card"><div class="label">Last check</div><div class="value" id="update-last-check">&mdash;</div></div>
+    <div class="card"><div class="label">Auto-update</div><div class="value" id="update-auto-status">&mdash;</div></div>
+  </div>
+  <div class="row" style="margin:.45em 0">
+    <button id="btn-update-check">Check for updates</button>
+    <button class="primary" id="btn-update-apply" style="display:none">Update now</button>
+    <span class="subtle" id="update-status-text"></span>
+  </div>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="update-auto-chk"> Enable auto-update (check + install)</label>
+    <div class="field"><label for="update-interval">Check interval (hours)</label><input type="number" id="update-interval" min="1" max="168" value="24"></div>
+  </div>
+  <div class="row" style="margin:.3em 0">
+    <button id="btn-update-save">Save update settings</button>
   </div>
 </div>
 
@@ -5818,6 +6383,106 @@ document.getElementById("auto-toggle").addEventListener("click", function(){
 document.getElementById("logs-toggle").addEventListener("click", function(){
   toggleCollapsible("logs-toggle", "logs-panel");
 });
+
+// ── Mihomo Update ─────────────────────────────────────────────────
+
+function renderUpdateStatus(d){
+  if(!d){ return; }
+  document.getElementById("update-current").textContent = d.current_version || "\u2014";
+  document.getElementById("update-latest").textContent = d.update_available_version || "\u2014";
+  document.getElementById("update-auto-status").textContent = d.auto_update_enabled ? "enabled" : "disabled";
+  if(d.last_update_check_unix){
+    var ago = Math.round((Date.now()/1000 - d.last_update_check_unix) / 3600);
+    document.getElementById("update-last-check").textContent = ago + "h ago";
+  } else {
+    document.getElementById("update-last-check").textContent = "\u2014";
+  }
+  var applyBtn = document.getElementById("btn-update-apply");
+  if(applyBtn){
+    applyBtn.style.display = d.update_available_version ? "" : "none";
+  }
+}
+
+function loadUpdateStatus(){
+  api("GET", "/api/update/status").then(function(data){
+    renderUpdateStatus(data);
+    document.getElementById("update-auto-chk").checked = !!data.auto_update_enabled;
+    document.getElementById("update-interval").value = data.auto_update_interval_hours || 24;
+  }).catch(function(){ /* ignore */ });
+}
+
+// Sync update indicators from /api/status (which includes
+// mihomo_version and update_available_version) during the 5s refresh.
+function syncUpdateFromStatus(s){
+  var cur = document.getElementById("update-current");
+  var lat = document.getElementById("update-latest");
+  var applyBtn = document.getElementById("btn-update-apply");
+  if(cur && s.mihomo_version){ cur.textContent = s.mihomo_version; }
+  if(lat){
+    lat.textContent = s.update_available_version || "\u2014";
+  }
+  if(applyBtn){
+    applyBtn.style.display = s.update_available_version ? "" : "none";
+  }
+}
+
+document.getElementById("btn-update-check").addEventListener("click", function(){
+  var btn = document.getElementById("btn-update-check");
+  var status = document.getElementById("update-status-text");
+  btn.disabled = true;
+  status.textContent = "Checking\u2026 (up to 30s)";
+  api("POST", "/api/update/check").then(function(data){
+    btn.disabled = false;
+    status.textContent = "";
+    if(data.update_available){
+      showOk("Update available: " + data.latest_version + " (current: " + (data.current_version || "?") + ")");
+    } else {
+      showOk("Mihomo is up to date (" + (data.current_version || "?") + ")");
+    }
+    loadUpdateStatus();
+  }).catch(function(err){
+    btn.disabled = false;
+    status.textContent = "";
+    setMsg("Update check failed: " + err.message);
+  });
+});
+
+document.getElementById("btn-update-apply").addEventListener("click", function(){
+  if(!confirm("Update Mihomo to the latest version? The core will be restarted.")){ return; }
+  var btn = document.getElementById("btn-update-apply");
+  var status = document.getElementById("update-status-text");
+  btn.disabled = true;
+  status.textContent = "Downloading and installing\u2026 (up to 5 min)";
+  api("POST", "/api/update/apply").then(function(data){
+    btn.disabled = false;
+    status.textContent = "";
+    if(data.updated){
+      showOk("Mihomo updated: " + data.previous_version + " \u2192 " + data.new_version);
+    } else {
+      showOk(data.message || "Already up to date");
+    }
+    loadUpdateStatus();
+  }).catch(function(err){
+    btn.disabled = false;
+    status.textContent = "";
+    setMsg("Update failed: " + err.message);
+  });
+});
+
+document.getElementById("btn-update-save").addEventListener("click", function(){
+  var body = JSON.stringify({
+    auto_update_enabled: document.getElementById("update-auto-chk").checked,
+    auto_update_interval_hours: Number(document.getElementById("update-interval").value) || 24,
+  });
+  api("POST", "/api/update/settings", body).then(function(){
+    showOk("Update settings saved.");
+  }).catch(function(err){ setMsg("Save failed: " + err.message); });
+});
+
+document.getElementById("update-toggle").addEventListener("click", function(){
+  toggleCollapsible("update-toggle", "update-panel");
+});
+
 document.getElementById("sys-toggle").addEventListener("click", function(){
   toggleCollapsible("sys-toggle", "sys-panel");
 });
@@ -5953,6 +6618,7 @@ function renderSystem(s){
 
 // Load initial data.
 loadAutoSettings();
+loadUpdateStatus();
 
 // Auto-refresh status every 5 seconds (lightweight: only /api/status).
 // Does not reload profiles or input fields, so user input is preserved.
@@ -5962,6 +6628,7 @@ setInterval(function(){
     var el = document.getElementById("auto-failover-count");
     if(el){ el.textContent = s.failover_fail_count || 0; }
     syncAutoSettingsFromStatus(s);
+    syncUpdateFromStatus(s);
   }).catch(function(){ /* transient, keep last known state */ });
   // System info also refreshes every 5s (CPU usage delta, temp, etc.)
   api("GET", "/api/system").then(function(sys){
@@ -7278,5 +7945,103 @@ mod tests {
         let (status, _, body) = dispatch("POST", "/api/subscriptions/delete", r#"{}"#, &daemon);
         assert_eq!(status, 400);
         assert!(body.contains("missing url"));
+    }
+
+    // ── Mihomo update tests ─────────────────────────────────────────
+
+    #[test]
+    fn is_newer_version_compares_correctly() {
+        assert!(is_newer_version("v1.19.27", "v1.19.28"));
+        assert!(is_newer_version("v1.19.27", "v1.20.0"));
+        assert!(is_newer_version("v1.19.27", "v2.0.0"));
+        assert!(!is_newer_version("v1.19.27", "v1.19.27"));
+        assert!(!is_newer_version("v1.19.28", "v1.19.27"));
+        assert!(!is_newer_version("v2.0.0", "v1.19.27"));
+        // Without 'v' prefix
+        assert!(is_newer_version("1.19.27", "1.19.28"));
+        // Different number of parts
+        assert!(is_newer_version("v1.19", "v1.19.1"));
+        assert!(!is_newer_version("v1.19.1", "v1.19"));
+    }
+
+    #[test]
+    fn update_status_endpoint_returns_defaults() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("GET", "/api/update/status", "", &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(response["auto_update_enabled"], false);
+        assert_eq!(response["auto_update_interval_hours"], 24);
+        assert_eq!(response["last_update_check_unix"], 0);
+        assert!(response["current_version"].is_null());
+        assert!(response["update_available_version"].is_null());
+    }
+
+    #[test]
+    fn update_settings_endpoint_persists() {
+        let (_dir, daemon) = test_daemon();
+        let body = r#"{"auto_update_enabled":true,"auto_update_interval_hours":12}"#;
+        let (status, _, response) = dispatch("POST", "/api/update/settings", body, &daemon);
+        assert_eq!(status, 200);
+        assert!(response.contains("\"auto_update_enabled\":true"));
+        assert!(response.contains("\"auto_update_interval_hours\":12"));
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.auto_update_enabled);
+        assert_eq!(inner.state.auto_update_interval_hours, 12);
+    }
+
+    #[test]
+    fn update_check_returns_400_when_core_stopped() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("POST", "/api/update/check", "", &daemon);
+        assert_eq!(status, 400);
+        assert!(body.contains("not running"));
+    }
+
+    #[test]
+    fn update_apply_returns_400_when_core_stopped() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("POST", "/api/update/apply", "", &daemon);
+        assert_eq!(status, 400);
+        assert!(body.contains("not running"));
+    }
+
+    #[test]
+    fn status_endpoint_includes_update_fields() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("GET", "/api/status", "", &daemon);
+        assert_eq!(status, 200);
+        assert!(body.contains("\"mihomo_version\""));
+        assert!(body.contains("\"update_available_version\""));
+    }
+
+    #[test]
+    fn update_settings_rejects_invalid_json() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, _) = dispatch("POST", "/api/update/settings", "not json", &daemon);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn legacy_state_without_update_fields_loads_with_defaults() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let legacy = r#"{
+            "profiles": [],
+            "active_profile_id": null,
+            "auto_select": false,
+            "listen_host": "127.0.0.1",
+            "socks_port": 10808,
+            "mihomo_path": "mihomo",
+            "metrics_history": [],
+            "routing_rules": []
+        }"#;
+        fs::write(&state_path, legacy).expect("write legacy state");
+        let loaded = load_state(&state_path);
+        assert!(!loaded.auto_update_enabled);
+        assert_eq!(loaded.auto_update_interval_hours, 24);
+        assert_eq!(loaded.last_update_check_unix, 0);
+        assert!(loaded.update_available_version.is_none());
+        assert!(loaded.mihomo_version.is_none());
     }
 }
