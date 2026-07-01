@@ -11,6 +11,9 @@
 //! daemon. The desktop benchmark tool (`tester.rs`) still uses
 //! `xray_config` for its own config generation.
 
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -20,6 +23,599 @@ use crate::xray_config::{
     percent_decode, query_value,
 };
 
+// ---------------------------------------------------------------------------
+// MihomoFeatures — all opt-in Mihomo-specific config options
+// ---------------------------------------------------------------------------
+
+/// Sing-mux (multiplexing) settings for proxy connections.
+///
+/// Multiplexes multiple streams over a single TCP connection, reducing
+/// connection-setup overhead — especially valuable on high-latency or
+/// unreliable links (e.g. LTE with poor CINR).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SmuxConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_smux_protocol")]
+    pub protocol: String,
+    #[serde(default)]
+    pub max_connections: u32,
+    #[serde(default)]
+    pub min_streams: u32,
+    #[serde(default)]
+    pub max_streams: u32,
+    #[serde(default)]
+    pub statistic: bool,
+    #[serde(default)]
+    pub only_tcp: bool,
+    #[serde(default)]
+    pub padding: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brutal_up: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brutal_down: Option<u32>,
+}
+
+impl Default for SmuxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protocol: default_smux_protocol(),
+            max_connections: 0,
+            min_streams: 0,
+            max_streams: 0,
+            statistic: false,
+            only_tcp: false,
+            padding: false,
+            brutal_up: None,
+            brutal_down: None,
+        }
+    }
+}
+
+/// Proxy group type. When `enabled`, Mihomo manages failover/auto-select
+/// internally — no core restart needed on profile switch.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyGroupType {
+    /// Manual selection — user picks a proxy from the group.
+    Select,
+    /// Auto-select by lowest latency (health-checked periodically).
+    #[default]
+    UrlTest,
+    /// Failover in list order — switch to next when current fails.
+    Fallback,
+    /// Distribute traffic across proxies by strategy.
+    LoadBalance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LoadBalanceStrategy {
+    /// Round-robin — each request to a different proxy.
+    RoundRobin,
+    /// Same target domain → same proxy (sticky by domain).
+    #[default]
+    ConsistentHashing,
+    /// Same source+target → same proxy (sticky by pair, 10-min TTL).
+    StickySessions,
+}
+
+/// Configuration for the proxy-group feature.
+///
+/// When `enabled`, instead of a single `proxy` outbound, Mihomo gets a
+/// `proxy-groups` section with a group named `proxy` (so existing rules
+/// still work unchanged). The group wraps all profiles and handles
+/// auto-select / failover / load-balance internally.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProxyGroupConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub group_type: ProxyGroupType,
+    #[serde(default = "default_health_check_url")]
+    pub url: String,
+    #[serde(default = "default_health_check_interval")]
+    pub interval: u32,
+    #[serde(default)]
+    pub tolerance: u32,
+    #[serde(default = "default_health_check_timeout")]
+    pub timeout: u32,
+    #[serde(default = "default_true")]
+    pub lazy: bool,
+    #[serde(default = "default_max_failed_times")]
+    pub max_failed_times: u32,
+    #[serde(default)]
+    pub strategy: LoadBalanceStrategy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_status: Option<String>,
+}
+
+impl Default for ProxyGroupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            group_type: ProxyGroupType::default(),
+            url: default_health_check_url(),
+            interval: default_health_check_interval(),
+            tolerance: 0,
+            timeout: default_health_check_timeout(),
+            lazy: true,
+            max_failed_times: default_max_failed_times(),
+            strategy: LoadBalanceStrategy::default(),
+            expected_status: None,
+        }
+    }
+}
+
+/// A single proxy-provider entry — Mihomo fetches and refreshes the
+/// subscription itself, with optional health-check and filtering.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProxyProviderConfig {
+    pub name: String,
+    #[serde(default = "default_provider_type")]
+    pub provider_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default = "default_provider_interval")]
+    pub interval: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_type: Option<String>,
+    #[serde(default)]
+    pub health_check_enabled: bool,
+    #[serde(default = "default_health_check_url")]
+    pub health_check_url: String,
+    #[serde(default = "default_health_check_interval")]
+    pub health_check_interval: u32,
+    #[serde(default = "default_health_check_timeout")]
+    pub health_check_timeout: u32,
+    #[serde(default = "default_true")]
+    pub health_check_lazy: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_expected_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_secret_key: Option<String>,
+    #[serde(default)]
+    pub header: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub size_limit: u64,
+    /// For `inline` type: raw proxy YAML lines.
+    #[serde(default)]
+    pub payload: Vec<String>,
+}
+
+impl Default for ProxyProviderConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            provider_type: default_provider_type(),
+            url: None,
+            path: None,
+            interval: default_provider_interval(),
+            proxy: None,
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
+            health_check_enabled: false,
+            health_check_url: default_health_check_url(),
+            health_check_interval: default_health_check_interval(),
+            health_check_timeout: default_health_check_timeout(),
+            health_check_lazy: true,
+            health_check_expected_status: None,
+            age_secret_key: None,
+            header: HashMap::new(),
+            size_limit: 0,
+            payload: Vec::new(),
+        }
+    }
+}
+
+/// A single rule-provider entry — external rule sets (domain/ipcidr/
+/// classical) loaded from HTTP, file, or inline.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RuleProviderConfig {
+    pub name: String,
+    #[serde(default = "default_provider_type")]
+    pub provider_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default = "default_provider_interval")]
+    pub interval: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    #[serde(default = "default_rule_behavior")]
+    pub behavior: String,
+    #[serde(default = "default_rule_format")]
+    pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_in_bundle: Option<String>,
+    #[serde(default)]
+    pub size_limit: u64,
+    #[serde(default)]
+    pub header: HashMap<String, Vec<String>>,
+    /// For `inline` type: raw rule strings.
+    #[serde(default)]
+    pub payload: Vec<String>,
+}
+
+impl Default for RuleProviderConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            provider_type: default_provider_type(),
+            url: None,
+            path: None,
+            interval: default_provider_interval(),
+            proxy: None,
+            behavior: default_rule_behavior(),
+            format: default_rule_format(),
+            path_in_bundle: None,
+            size_limit: 0,
+            header: HashMap::new(),
+            payload: Vec::new(),
+        }
+    }
+}
+
+/// A single tunnel entry — TCP/UDP port forwarding through Mihomo.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub struct TunnelConfig {
+    /// `["tcp"]`, `["udp"]`, or `["tcp", "udp"]`.
+    pub network: Vec<String>,
+    /// Local listen address, e.g. `"127.0.0.1:6553"`.
+    pub address: String,
+    /// Forward target, e.g. `"8.8.8.8:53"`.
+    pub target: String,
+    /// Optional proxy/group name to route through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+}
+
+/// NTP service configuration. Synchronises system time — critical for
+/// TLS certificate validation after router reboot without RTC battery.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NtpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub write_to_system: bool,
+    #[serde(default = "default_ntp_server")]
+    pub server: String,
+    #[serde(default = "default_ntp_port")]
+    pub port: u16,
+    #[serde(default = "default_ntp_interval")]
+    pub interval: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialer_proxy: Option<String>,
+}
+
+impl Default for NtpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            write_to_system: false,
+            server: default_ntp_server(),
+            port: default_ntp_port(),
+            interval: default_ntp_interval(),
+            dialer_proxy: None,
+        }
+    }
+}
+
+/// External REST API controller. Enables `/proxies/{name}/delay`,
+/// `/connections`, `/traffic`, `/configs` (hot-reload), `/restart`, etc.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExternalControllerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_external_controller_addr")]
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub allow_origins: Vec<String>,
+    #[serde(default)]
+    pub allow_private_network: bool,
+}
+
+impl Default for ExternalControllerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            address: default_external_controller_addr(),
+            secret: None,
+            allow_origins: Vec::new(),
+            allow_private_network: false,
+        }
+    }
+}
+
+/// DNS fallback filter — determines when fallback DNS results are used.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FallbackFilter {
+    #[serde(default = "default_true")]
+    pub geoip: bool,
+    #[serde(default = "default_geoip_code")]
+    pub geoip_code: String,
+    #[serde(default)]
+    pub geosite: Vec<String>,
+    #[serde(default)]
+    pub ipcidr: Vec<String>,
+    #[serde(default)]
+    pub domain: Vec<String>,
+}
+
+impl Default for FallbackFilter {
+    fn default() -> Self {
+        Self {
+            geoip: true,
+            geoip_code: default_geoip_code(),
+            geosite: Vec::new(),
+            ipcidr: Vec::new(),
+            domain: Vec::new(),
+        }
+    }
+}
+
+/// Per-proxy default fields applied to every outbound proxy unless
+/// overridden by individual profile settings.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PerProxyDefaults {
+    /// Allow UDP through proxy (Mihomo default is `false`).
+    #[serde(default = "default_true")]
+    pub udp: bool,
+    #[serde(default)]
+    pub tfo: bool,
+    #[serde(default)]
+    pub mptcp: bool,
+    #[serde(default = "default_ip_version")]
+    pub ip_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smux: Option<SmuxConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialer_proxy: Option<String>,
+}
+
+impl Default for PerProxyDefaults {
+    fn default() -> Self {
+        Self {
+            udp: true,
+            tfo: false,
+            mptcp: false,
+            ip_version: default_ip_version(),
+            smux: None,
+            dialer_proxy: None,
+        }
+    }
+}
+
+/// All Mihomo-specific opt-in features. Stored in `HincyrayState` and
+/// persisted to `state.json`. Passed to `build_mihomo_config` and
+/// `build_mihomo_router_config`.
+///
+/// Defaults are tuned for a resource-constrained router (Keenetic Giga
+/// KN-1012, 496 MB RAM, aarch64, kernel 4.9):
+/// - `geodata-loader = memconservative` — on-demand GEO loading.
+/// - `unified-delay = true` — RTT-based latency.
+/// - `store-fake-ip / store-selected = true` — persist across restarts.
+/// - `keep-alive-interval = 30, keep-alive-idle = 120` — router-tuned.
+/// - `dns-cache-algorithm = arc` — better hit rate than LRU.
+/// - `per-proxy.udp = true` — UDP is needed for QUIC/DNS.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MihomoFeatures {
+    // --- Global config ---
+    #[serde(default = "default_geodata_loader")]
+    pub geodata_loader: String,
+    #[serde(default = "default_true")]
+    pub unified_delay: bool,
+    #[serde(default = "default_true")]
+    pub store_fake_ip: bool,
+    #[serde(default = "default_true")]
+    pub store_selected: bool,
+    #[serde(default = "default_keep_alive_interval")]
+    pub keep_alive_interval: u32,
+    #[serde(default = "default_keep_alive_idle")]
+    pub keep_alive_idle: u32,
+    #[serde(default)]
+    pub disable_keep_alive: bool,
+
+    // --- Experimental ---
+    #[serde(default)]
+    pub quic_go_disable_gso: bool,
+    #[serde(default)]
+    pub quic_go_disable_ecn: bool,
+
+    // --- Authentication ---
+    #[serde(default)]
+    pub authentication: Vec<String>,
+    #[serde(default)]
+    pub skip_auth_prefixes: Vec<String>,
+
+    // --- Hosts ---
+    #[serde(default)]
+    pub hosts: HashMap<String, String>,
+
+    // --- Tunnels ---
+    #[serde(default)]
+    pub tunnels: Vec<TunnelConfig>,
+
+    // --- NTP ---
+    #[serde(default)]
+    pub ntp: NtpConfig,
+
+    // --- External Controller ---
+    #[serde(default)]
+    pub external_controller: ExternalControllerConfig,
+
+    // --- Proxy Groups ---
+    #[serde(default)]
+    pub proxy_group: ProxyGroupConfig,
+
+    // --- Proxy Providers ---
+    #[serde(default)]
+    pub proxy_providers: Vec<ProxyProviderConfig>,
+
+    // --- Rule Providers ---
+    #[serde(default)]
+    pub rule_providers: Vec<RuleProviderConfig>,
+
+    // --- Per-proxy defaults ---
+    #[serde(default)]
+    pub per_proxy: PerProxyDefaults,
+
+    // --- DNS extra ---
+    #[serde(default = "default_dns_cache_algorithm")]
+    pub dns_cache_algorithm: String,
+    #[serde(default)]
+    pub dns_prefer_h3: bool,
+    #[serde(default)]
+    pub dns_respect_rules: bool,
+    #[serde(default)]
+    pub dns_proxy_server_nameserver: Vec<String>,
+    #[serde(default)]
+    pub dns_direct_nameserver: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_fallback_filter: Option<FallbackFilter>,
+
+    // --- Sniffer extra ---
+    #[serde(default)]
+    pub sniffer_force_domain: Vec<String>,
+    #[serde(default)]
+    pub sniffer_skip_domain: Vec<String>,
+    #[serde(default)]
+    pub sniffer_skip_src_address: Vec<String>,
+    #[serde(default)]
+    pub sniffer_skip_dst_address: Vec<String>,
+}
+
+impl Default for MihomoFeatures {
+    fn default() -> Self {
+        Self {
+            geodata_loader: default_geodata_loader(),
+            unified_delay: true,
+            store_fake_ip: true,
+            store_selected: true,
+            keep_alive_interval: default_keep_alive_interval(),
+            keep_alive_idle: default_keep_alive_idle(),
+            disable_keep_alive: false,
+            quic_go_disable_gso: false,
+            quic_go_disable_ecn: false,
+            authentication: Vec::new(),
+            skip_auth_prefixes: Vec::new(),
+            hosts: HashMap::new(),
+            tunnels: Vec::new(),
+            ntp: NtpConfig::default(),
+            external_controller: ExternalControllerConfig::default(),
+            proxy_group: ProxyGroupConfig::default(),
+            proxy_providers: Vec::new(),
+            rule_providers: Vec::new(),
+            per_proxy: PerProxyDefaults::default(),
+            dns_cache_algorithm: default_dns_cache_algorithm(),
+            dns_prefer_h3: false,
+            dns_respect_rules: false,
+            dns_proxy_server_nameserver: Vec::new(),
+            dns_direct_nameserver: Vec::new(),
+            dns_fallback_filter: None,
+            sniffer_force_domain: Vec::new(),
+            sniffer_skip_domain: Vec::new(),
+            sniffer_skip_src_address: Vec::new(),
+            sniffer_skip_dst_address: Vec::new(),
+        }
+    }
+}
+
+// --- Serde default helpers ---
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_geodata_loader() -> String {
+    "memconservative".to_owned()
+}
+
+fn default_keep_alive_interval() -> u32 {
+    30
+}
+
+fn default_keep_alive_idle() -> u32 {
+    120
+}
+
+fn default_dns_cache_algorithm() -> String {
+    "arc".to_owned()
+}
+
+fn default_ip_version() -> String {
+    "dual".to_owned()
+}
+
+fn default_ntp_server() -> String {
+    "time.apple.com".to_owned()
+}
+
+fn default_ntp_port() -> u16 {
+    123
+}
+
+fn default_ntp_interval() -> u32 {
+    30
+}
+
+fn default_external_controller_addr() -> String {
+    "127.0.0.1:9090".to_owned()
+}
+
+fn default_health_check_url() -> String {
+    "https://www.gstatic.com/generate_204".to_owned()
+}
+
+fn default_health_check_interval() -> u32 {
+    300
+}
+
+fn default_health_check_timeout() -> u32 {
+    5000
+}
+
+fn default_max_failed_times() -> u32 {
+    5
+}
+
+fn default_provider_type() -> String {
+    "http".to_owned()
+}
+
+fn default_provider_interval() -> u32 {
+    3600
+}
+
+fn default_rule_behavior() -> String {
+    "classical".to_owned()
+}
+
+fn default_rule_format() -> String {
+    "yaml".to_owned()
+}
+
+fn default_geoip_code() -> String {
+    "CN".to_owned()
+}
+
+fn default_smux_protocol() -> String {
+    "h2mux".to_owned()
+}
+
 /// Tag/name constants used in generated Mihomo configs.
 pub const PROXY_NAME: &str = "proxy";
 pub const DIRECT_NAME: &str = "DIRECT";
@@ -27,15 +623,373 @@ pub const REJECT_NAME: &str = "REJECT";
 pub const REDIR_LISTENER: &str = "redir-in";
 pub const TPROXY_LISTENER: &str = "tproxy-in";
 
+// ---------------------------------------------------------------------------
+// Feature application helpers
+// ---------------------------------------------------------------------------
+
+/// Apply global Mihomo feature flags to a config JSON object.
+///
+/// Adds: `geodata-loader`, `unified-delay`, `profile.store-*`,
+/// `keep-alive-*`, `experimental`, `authentication`, `skip-auth-prefixes`,
+/// `hosts`, `tunnels`, `ntp`, `external-controller`.
+fn apply_global_features(config: &mut Value, features: &MihomoFeatures) {
+    config["geodata-loader"] = json!(features.geodata_loader);
+    config["unified-delay"] = json!(features.unified_delay);
+
+    // profile.store-* — persist fake-ip map and group selections
+    let mut profile = json!({});
+    if features.store_fake_ip {
+        profile["store-fake-ip"] = json!(true);
+    }
+    if features.store_selected {
+        profile["store-selected"] = json!(true);
+    }
+    if !profile.as_object().is_some_and(|m| m.is_empty()) {
+        config["profile"] = profile;
+    }
+
+    if features.keep_alive_interval > 0 {
+        config["keep-alive-interval"] = json!(features.keep_alive_interval);
+    }
+    if features.keep_alive_idle > 0 {
+        config["keep-alive-idle"] = json!(features.keep_alive_idle);
+    }
+    if features.disable_keep_alive {
+        config["disable-keep-alive"] = json!(true);
+    }
+
+    // Experimental QUIC tuning
+    if features.quic_go_disable_gso || features.quic_go_disable_ecn {
+        let mut exp = json!({});
+        if features.quic_go_disable_gso {
+            exp["quic-go-disable-gso"] = json!(true);
+        }
+        if features.quic_go_disable_ecn {
+            exp["quic-go-disable-ecn"] = json!(true);
+        }
+        config["experimental"] = exp;
+    }
+
+    if !features.authentication.is_empty() {
+        config["authentication"] = json!(features.authentication);
+    }
+    if !features.skip_auth_prefixes.is_empty() {
+        config["skip-auth-prefixes"] = json!(features.skip_auth_prefixes);
+    }
+
+    if !features.hosts.is_empty() {
+        config["hosts"] = json!(features.hosts);
+    }
+
+    if !features.tunnels.is_empty() {
+        config["tunnels"] = build_tunnels_json(&features.tunnels);
+    }
+
+    if features.ntp.enabled {
+        config["ntp"] = build_ntp_json(&features.ntp);
+    }
+
+    if features.external_controller.enabled {
+        config["external-controller"] = json!(features.external_controller.address);
+        if let Some(secret) = &features.external_controller.secret
+            && !secret.is_empty()
+        {
+            config["secret"] = json!(secret);
+        }
+        if !features.external_controller.allow_origins.is_empty()
+            || features.external_controller.allow_private_network
+        {
+            let mut cors = json!({});
+            if !features.external_controller.allow_origins.is_empty() {
+                cors["allow-origins"] = json!(features.external_controller.allow_origins);
+            }
+            if features.external_controller.allow_private_network {
+                cors["allow-private-network"] = json!(true);
+            }
+            config["external-controller-cors"] = cors;
+        }
+    }
+}
+
+/// Apply per-proxy default fields (udp, tfo, mptcp, ip-version, smux,
+/// dialer-proxy) to a proxy JSON object.
+fn apply_per_proxy_fields(proxy: &mut Value, features: &MihomoFeatures) {
+    let pp = &features.per_proxy;
+    if pp.udp {
+        proxy["udp"] = json!(true);
+    }
+    if pp.tfo {
+        proxy["tfo"] = json!(true);
+    }
+    if pp.mptcp {
+        proxy["mptcp"] = json!(true);
+    }
+    if pp.ip_version != "dual" {
+        proxy["ip-version"] = json!(pp.ip_version);
+    }
+    // smux is incompatible with flow-based proxies (xtls-rprx-vision etc.)
+    // because flow requires raw TCP passthrough for TLS splicing, while
+    // smux multiplexes streams and breaks the TLS handshake.
+    let has_flow = proxy
+        .get("flow")
+        .and_then(Value::as_str)
+        .is_some_and(|f| !f.is_empty());
+    if let Some(smux) = &pp.smux
+        && smux.enabled
+        && !has_flow
+    {
+        proxy["smux"] = build_smux_json(smux);
+    }
+    if let Some(dialer) = &pp.dialer_proxy
+        && !dialer.is_empty()
+    {
+        proxy["dialer-proxy"] = json!(dialer);
+    }
+}
+
+/// Build the `smux` JSON object from `SmuxConfig`.
+fn build_smux_json(smux: &SmuxConfig) -> Value {
+    let mut s = json!({
+        "enabled": true,
+        "protocol": smux.protocol,
+        "statistic": smux.statistic,
+        "only-tcp": smux.only_tcp,
+        "padding": smux.padding,
+    });
+    if smux.max_connections > 0 {
+        s["max-connections"] = json!(smux.max_connections);
+    }
+    if smux.min_streams > 0 {
+        s["min-streams"] = json!(smux.min_streams);
+    }
+    if smux.max_streams > 0 {
+        s["max-streams"] = json!(smux.max_streams);
+    }
+    if smux.brutal_up.is_some() || smux.brutal_down.is_some() {
+        let mut brutal = json!({"enabled": true});
+        if let Some(up) = smux.brutal_up {
+            brutal["up"] = json!(up);
+        }
+        if let Some(down) = smux.brutal_down {
+            brutal["down"] = json!(down);
+        }
+        s["brutal-opts"] = brutal;
+    }
+    s
+}
+
+/// Build the `ntp` JSON object from `NtpConfig`.
+fn build_ntp_json(ntp: &NtpConfig) -> Value {
+    let mut n = json!({
+        "enable": true,
+        "server": ntp.server,
+        "port": ntp.port,
+        "interval": ntp.interval,
+    });
+    if ntp.write_to_system {
+        n["write-to-system"] = json!(true);
+    }
+    if let Some(dp) = &ntp.dialer_proxy
+        && !dp.is_empty()
+    {
+        n["dialer-proxy"] = json!(dp);
+    }
+    n
+}
+
+/// Build the `tunnels` JSON array from a list of `TunnelConfig`.
+fn build_tunnels_json(tunnels: &[TunnelConfig]) -> Value {
+    json!(
+        tunnels
+            .iter()
+            .map(|t| {
+                let mut tunnel = json!({
+                    "network": t.network,
+                    "address": t.address,
+                    "target": t.target,
+                });
+                if let Some(proxy) = &t.proxy
+                    && !proxy.is_empty()
+                {
+                    tunnel["proxy"] = json!(proxy);
+                }
+                tunnel
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
+/// Build the `proxy-providers` JSON object from a list of configs.
+fn build_proxy_providers_json(providers: &[ProxyProviderConfig]) -> Value {
+    let mut map = serde_json::Map::new();
+    for p in providers {
+        let mut entry = json!({
+            "type": p.provider_type,
+            "interval": p.interval,
+        });
+        if let Some(url) = &p.url {
+            entry["url"] = json!(url);
+        }
+        if let Some(path) = &p.path {
+            entry["path"] = json!(path);
+        }
+        if let Some(proxy) = &p.proxy {
+            entry["proxy"] = json!(proxy);
+        }
+        if let Some(filter) = &p.filter {
+            entry["filter"] = json!(filter);
+        }
+        if let Some(exclude) = &p.exclude_filter {
+            entry["exclude-filter"] = json!(exclude);
+        }
+        if let Some(exclude_type) = &p.exclude_type {
+            entry["exclude-type"] = json!(exclude_type);
+        }
+        if p.health_check_enabled {
+            let mut hc = json!({
+                "enable": true,
+                "url": p.health_check_url,
+                "interval": p.health_check_interval,
+                "timeout": p.health_check_timeout,
+                "lazy": p.health_check_lazy,
+            });
+            if let Some(status) = &p.health_check_expected_status {
+                hc["expected-status"] = json!(status);
+            }
+            entry["health-check"] = hc;
+        }
+        if let Some(key) = &p.age_secret_key {
+            entry["age-secret-key"] = json!(key);
+        }
+        if !p.header.is_empty() {
+            entry["header"] = json!(p.header);
+        }
+        if p.size_limit > 0 {
+            entry["size-limit"] = json!(p.size_limit);
+        }
+        if !p.payload.is_empty() {
+            entry["payload"] = json!(p.payload);
+        }
+        map.insert(p.name.clone(), entry);
+    }
+    Value::Object(map)
+}
+
+/// Build the `rule-providers` JSON object from a list of configs.
+fn build_rule_providers_json(providers: &[RuleProviderConfig]) -> Value {
+    let mut map = serde_json::Map::new();
+    for r in providers {
+        let mut entry = json!({
+            "type": r.provider_type,
+            "behavior": r.behavior,
+            "format": r.format,
+            "interval": r.interval,
+        });
+        if let Some(url) = &r.url {
+            entry["url"] = json!(url);
+        }
+        if let Some(path) = &r.path {
+            entry["path"] = json!(path);
+        }
+        if let Some(proxy) = &r.proxy {
+            entry["proxy"] = json!(proxy);
+        }
+        if let Some(pib) = &r.path_in_bundle {
+            entry["path-in-bundle"] = json!(pib);
+        }
+        if r.size_limit > 0 {
+            entry["size-limit"] = json!(r.size_limit);
+        }
+        if !r.header.is_empty() {
+            entry["header"] = json!(r.header);
+        }
+        if !r.payload.is_empty() {
+            entry["payload"] = json!(r.payload);
+        }
+        map.insert(r.name.clone(), entry);
+    }
+    Value::Object(map)
+}
+
+/// Build a proxy-groups JSON array.
+///
+/// When proxy groups are enabled, the active profile and all extra
+/// profiles become individual proxies (named `profile-0`, `profile-1`,
+/// etc.), and a proxy group named `proxy` (so existing rules still
+/// work) wraps them with auto-select / failover / load-balance.
+fn build_proxy_groups_json(
+    group_config: &ProxyGroupConfig,
+    proxy_names: &[String],
+    extra_group_names: &[String],
+) -> Option<Value> {
+    if !group_config.enabled || proxy_names.is_empty() {
+        return None;
+    }
+
+    let mut group = json!({
+        "name": PROXY_NAME,
+        "url": group_config.url,
+        "interval": group_config.interval,
+        "timeout": group_config.timeout,
+        "lazy": group_config.lazy,
+        "max-failed-times": group_config.max_failed_times,
+    });
+
+    let group_type_str = match group_config.group_type {
+        ProxyGroupType::Select => "select",
+        ProxyGroupType::UrlTest => "url-test",
+        ProxyGroupType::Fallback => "fallback",
+        ProxyGroupType::LoadBalance => "load-balance",
+    };
+    group["type"] = json!(group_type_str);
+
+    // DIRECT is only included in "select" groups where the user can
+    // manually choose it. In url-test / fallback / load-balance groups,
+    // DIRECT would always win the latency test (direct connection is
+    // always faster than any VPN), defeating the purpose of the group.
+    let mut proxies = Vec::new();
+    if group_config.group_type == ProxyGroupType::Select {
+        proxies.push(DIRECT_NAME.to_owned());
+    }
+    proxies.extend(proxy_names.iter().cloned());
+    proxies.extend(extra_group_names.iter().cloned());
+    group["proxies"] = json!(proxies);
+
+    if group_config.group_type == ProxyGroupType::UrlTest {
+        group["tolerance"] = json!(group_config.tolerance);
+    }
+
+    if group_config.group_type == ProxyGroupType::LoadBalance {
+        let strategy_str = match group_config.strategy {
+            LoadBalanceStrategy::RoundRobin => "round-robin",
+            LoadBalanceStrategy::ConsistentHashing => "consistent-hashing",
+            LoadBalanceStrategy::StickySessions => "sticky-sessions",
+        };
+        group["strategy"] = json!(strategy_str);
+    }
+
+    if let Some(status) = &group_config.expected_status {
+        group["expected-status"] = json!(status);
+    }
+
+    Some(json!([group]))
+}
+
+// ---------------------------------------------------------------------------
+// Config builders
+// ---------------------------------------------------------------------------
+
 /// Build a simple Mihomo config with just a SOCKS5 listener.
 /// Used when split routing is disabled.
 pub fn build_mihomo_config(
     profile: &Profile,
     listen_host: &str,
     socks_port: u16,
+    features: &MihomoFeatures,
 ) -> Result<String, String> {
-    let proxy = build_proxy(profile, PROXY_NAME)?;
-    let config = json!({
+    let mut proxy = build_proxy(profile, PROXY_NAME)?;
+    apply_per_proxy_fields(&mut proxy, features);
+    let mut config = json!({
         "mode": "rule",
         "log-level": "info",
         "allow-lan": true,
@@ -46,7 +1000,47 @@ pub fn build_mihomo_config(
         "proxies": [proxy],
         "rules": [format!("MATCH,{}", PROXY_NAME)],
     });
+    apply_global_features(&mut config, features);
     serde_yaml::to_string(&config).map_err(|error| error.to_string())
+}
+
+/// Build the sniffer JSON section with feature-enhanced options.
+///
+/// Base sniffer: HTTP/TLS/QUIC domain detection on common ports.
+/// Feature additions: `force-domain`, `skip-domain`, `skip-src-address`,
+/// `skip-dst-address` for granular sniffer control.
+fn build_sniffer_json(features: &MihomoFeatures) -> Value {
+    let mut sniffer = json!({
+        "enable": true,
+        "force-dns-mapping": true,
+        "parse-pure-ip": true,
+        "override-destination": false,
+        "sniff": {
+            "HTTP": {
+                "ports": [80, "8080-8880"],
+                "override-destination": true,
+            },
+            "TLS": {
+                "ports": [443, 8443],
+            },
+            "QUIC": {
+                "ports": [443, 8443],
+            },
+        },
+    });
+    if !features.sniffer_force_domain.is_empty() {
+        sniffer["force-domain"] = json!(features.sniffer_force_domain);
+    }
+    if !features.sniffer_skip_domain.is_empty() {
+        sniffer["skip-domain"] = json!(features.sniffer_skip_domain);
+    }
+    if !features.sniffer_skip_src_address.is_empty() {
+        sniffer["skip-src-address"] = json!(features.sniffer_skip_src_address);
+    }
+    if !features.sniffer_skip_dst_address.is_empty() {
+        sniffer["skip-dst-address"] = json!(features.sniffer_skip_dst_address);
+    }
+    sniffer
 }
 
 /// Build a full router Mihomo config with transparent proxy listeners
@@ -64,10 +1058,23 @@ pub fn build_mihomo_router_config(
     quic_mode: QuicMode,
     active_block_quic: bool,
     extra: &RouterExtra,
+    features: &MihomoFeatures,
 ) -> Result<String, String> {
-    let mut proxies = vec![build_proxy(active_profile, PROXY_NAME)?];
+    // When proxy groups are enabled, the active profile is named
+    // "proxy-active" and a proxy group named "proxy" wraps all
+    // profiles — so existing rules referencing PROXY_NAME still work.
+    let active_proxy_name = if features.proxy_group.enabled {
+        "proxy-active".to_owned()
+    } else {
+        PROXY_NAME.to_owned()
+    };
+
+    let mut proxies = vec![build_proxy(active_profile, &active_proxy_name)?];
     for (profile, name) in extra_profiles {
         proxies.push(build_proxy(profile, name)?);
+    }
+    for proxy in proxies.iter_mut() {
+        apply_per_proxy_fields(proxy, features);
     }
 
     let mut rules = Vec::new();
@@ -103,12 +1110,7 @@ pub fn build_mihomo_router_config(
 
     let redirect_port = redirect_port.unwrap_or(10810);
     // TPROXY listener uses a separate port (redirect_port + 1) to
-    // avoid a TCP bind conflict with the redir listener.  Both
-    // listener types try to bind TCP on their port — if they share
-    // the same port, whichever binds first wins and the other fails.
-    // When tproxy wins, TCP REDIRECT connections are not handled by
-    // the redir listener, SO_ORIGINAL_DST is not set, and traffic
-    // loops back to the router instead of being proxied.
+    // avoid a TCP bind conflict with the redir listener.
     let tproxy_port = redirect_port + 1;
     let mut listeners = vec![json!({
         "name": REDIR_LISTENER,
@@ -133,45 +1135,56 @@ pub fn build_mihomo_router_config(
         "bind-address": bind_address(listen_host),
         "find-process-mode": "off",
         "ipv6": false,
-        // Prevent Mihomo from trying to auto-download geoip.metadb
-        // on startup — GitHub is blocked from the router, and the
-        // download hangs indefinitely, blocking all listeners.  The
-        // local geoip.dat/geosite.dat files are used instead.
         "geo-auto-update": false,
         "socks-port": socks_port,
         "listeners": listeners,
         "proxies": proxies,
         "rules": rules,
-        "sniffer": {
-            "enable": true,
-            "force-dns-mapping": true,
-            "parse-pure-ip": true,
-            "override-destination": false,
-            "sniff": {
-                "HTTP": {
-                    "ports": [80, "8080-8880"],
-                    "override-destination": true,
-                },
-                "TLS": {
-                    "ports": [443, 8443],
-                },
-                "QUIC": {
-                    "ports": [443, 8443],
-                },
-            },
-        },
+        "sniffer": build_sniffer_json(features),
     });
 
-    // The transparent proxy (NAT REDIRECT + TPROXY) requires a DNS
-    // listener on the DNS_INBOUND_PORT (1053) — the firewall
-    // unconditionally DNATs DNS queries to that port.  The
-    // `dns.enabled` flag is a desktop-Xray concept that does not
-    // apply here: there is no valid "transparent proxy without DNS"
-    // mode.  Always include the DNS section so the listener matches
-    // the firewall DNAT rules.
-    if let Some(dns) = &extra.dns {
-        config["dns"] = build_dns_config(dns);
+    // Proxy groups — wraps all profiles in an auto-select / failover /
+    // load-balance group named "proxy" (so existing rules still work).
+    if features.proxy_group.enabled {
+        let proxy_names: Vec<String> = std::iter::once(active_proxy_name.clone())
+            .chain(extra_profiles.iter().map(|(_, name)| name.clone()))
+            .collect();
+        if let Some(groups) = build_proxy_groups_json(&features.proxy_group, &proxy_names, &[]) {
+            config["proxy-groups"] = groups;
+        }
     }
+
+    // Proxy providers — Mihomo fetches subscriptions itself.
+    if !features.proxy_providers.is_empty() {
+        config["proxy-providers"] = build_proxy_providers_json(&features.proxy_providers);
+        // If proxy groups are enabled, add `use` to reference providers.
+        if let Some(groups) = config
+            .get_mut("proxy-groups")
+            .and_then(|g| g.as_array_mut())
+            && let Some(first_group) = groups.first_mut()
+        {
+            let provider_names: Vec<String> = features
+                .proxy_providers
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+            first_group["use"] = json!(provider_names);
+        }
+    }
+
+    // Rule providers — external rule sets loaded from HTTP/file/inline.
+    if !features.rule_providers.is_empty() {
+        config["rule-providers"] = build_rule_providers_json(&features.rule_providers);
+    }
+
+    // DNS — always included in router config (firewall DNATs DNS to 1053).
+    if let Some(dns) = &extra.dns {
+        config["dns"] = build_dns_config(dns, features);
+    }
+
+    // Global features (geodata-loader, unified-delay, profile.store-*,
+    // keep-alive, experimental, auth, hosts, tunnels, NTP, external-controller).
+    apply_global_features(&mut config, features);
 
     serde_yaml::to_string(&config).map_err(|error| error.to_string())
 }
@@ -190,18 +1203,52 @@ pub fn build_mihomo_router_config(
 /// `fake-ip-filter` is set to an empty array to prevent Mihomo from
 /// using its default filter (which references `geosite:cn` and
 /// requires the MMDB database).
-fn build_dns_config(dns: &crate::xray_config::DnsSettings) -> Value {
+///
+/// Feature-enhanced DNS options (cache-algorithm, proxy-server-nameserver,
+/// direct-nameserver, prefer-h3, respect-rules, fallback-filter) are
+/// applied from `MihomoFeatures`.
+fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeatures) -> Value {
     let mut dns_config = json!({
         "enable": true,
         "listen": format!("0.0.0.0:{}", DNS_INBOUND_PORT),
         "enhanced-mode": "fake-ip",
         "fake-ip-range": "198.18.0.1/16",
         "fake-ip-filter": [],
+        "cache-algorithm": features.dns_cache_algorithm,
         "nameserver": dns.remote_servers,
         "fallback": dns.remote_servers,
     });
     if dns.query_strategy == "UseIPv6" || dns.query_strategy == "UseIP" {
         dns_config["ipv6"] = json!(true);
+    }
+    if features.dns_prefer_h3 {
+        dns_config["prefer-h3"] = json!(true);
+    }
+    if features.dns_respect_rules {
+        dns_config["respect-rules"] = json!(true);
+    }
+    if !features.dns_proxy_server_nameserver.is_empty() {
+        dns_config["proxy-server-nameserver"] = json!(features.dns_proxy_server_nameserver);
+    }
+    if !features.dns_direct_nameserver.is_empty() {
+        dns_config["direct-nameserver"] = json!(features.dns_direct_nameserver);
+    }
+    if let Some(filter) = &features.dns_fallback_filter {
+        let mut ff = json!({});
+        if filter.geoip {
+            ff["geoip"] = json!(true);
+        }
+        ff["geoip-code"] = json!(filter.geoip_code);
+        if !filter.geosite.is_empty() {
+            ff["geosite"] = json!(filter.geosite);
+        }
+        if !filter.ipcidr.is_empty() {
+            ff["ipcidr"] = json!(filter.ipcidr);
+        }
+        if !filter.domain.is_empty() {
+            ff["domain"] = json!(filter.domain);
+        }
+        dns_config["fallback-filter"] = ff;
     }
     dns_config
 }
@@ -579,13 +1626,24 @@ fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
 }
 
 /// Build a single domain rule string for Mihomo.
+///
+/// Supported prefixes:
+/// - `geosite:xxx` → `GEOSITE,xxx,target`
+/// - `=exact` → `DOMAIN,exact,target`
+/// - `regex:xxx` → `DOMAIN-REGEX,xxx,target`
+/// - `wildcard:xxx` → `DOMAIN-WILDCARD,xxx,target`
+/// - bare domain → `DOMAIN-SUFFIX,domain,target`
 fn domain_rule(domain: &str, target: &str) -> String {
     if let Some(name) = domain.strip_prefix("geosite:") {
-        format!("GEOSITE,{},{}", name, target)
+        format!("GEOSITE,{name},{target}")
     } else if let Some(exact) = domain.strip_prefix('=') {
-        format!("DOMAIN,{},{}", exact, target)
+        format!("DOMAIN,{exact},{target}")
+    } else if let Some(regex) = domain.strip_prefix("regex:") {
+        format!("DOMAIN-REGEX,{regex},{target}")
+    } else if let Some(wildcard) = domain.strip_prefix("wildcard:") {
+        format!("DOMAIN-WILDCARD,{wildcard},{target}")
     } else {
-        format!("DOMAIN-SUFFIX,{},{}", domain, target)
+        format!("DOMAIN-SUFFIX,{domain},{target}")
     }
 }
 
@@ -606,9 +1664,11 @@ fn is_truthy_option(value: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROXY_NAME, REDIR_LISTENER, TPROXY_LISTENER, build_hysteria2_proxy, build_mihomo_config,
-        build_mihomo_router_config, build_shadowsocks_proxy, build_trojan_proxy, build_vless_proxy,
-        build_vmess_proxy,
+        ExternalControllerConfig, FallbackFilter, LoadBalanceStrategy, MihomoFeatures, NtpConfig,
+        PROXY_NAME, PerProxyDefaults, ProxyGroupConfig, ProxyGroupType, ProxyProviderConfig,
+        REDIR_LISTENER, RuleProviderConfig, SmuxConfig, TPROXY_LISTENER, TunnelConfig,
+        build_hysteria2_proxy, build_mihomo_config, build_mihomo_router_config,
+        build_shadowsocks_proxy, build_trojan_proxy, build_vless_proxy, build_vmess_proxy,
     };
     use crate::profiles::parse_profiles;
     use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule};
@@ -761,7 +1821,8 @@ mod tests {
             "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
         );
         let profile = &profiles[0];
-        let yaml = build_mihomo_config(profile, "127.0.0.1", 10808).expect("mihomo config");
+        let yaml = build_mihomo_config(profile, "127.0.0.1", 10808, &MihomoFeatures::default())
+            .expect("mihomo config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
 
         assert_eq!(
@@ -797,6 +1858,7 @@ mod tests {
             QuicMode::Block,
             false,
             &RouterExtra::default(),
+            &MihomoFeatures::default(),
         )
         .expect("router config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
@@ -830,6 +1892,7 @@ mod tests {
             QuicMode::Block,
             false,
             &RouterExtra::default(),
+            &MihomoFeatures::default(),
         )
         .expect("router config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
@@ -862,6 +1925,7 @@ mod tests {
             QuicMode::Block,
             false,
             &RouterExtra::default(),
+            &MihomoFeatures::default(),
         )
         .expect("router config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
@@ -899,6 +1963,7 @@ mod tests {
             QuicMode::Block,
             false,
             &extra,
+            &MihomoFeatures::default(),
         )
         .expect("router config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
@@ -943,6 +2008,7 @@ mod tests {
             QuicMode::Block,
             false,
             &RouterExtra::default(),
+            &MihomoFeatures::default(),
         )
         .expect("router config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
@@ -984,6 +2050,7 @@ mod tests {
                 QuicMode::Block,
                 false,
                 &RouterExtra::default(),
+                &MihomoFeatures::default(),
             )
             .expect("router config for all protocols");
             assert!(yaml.contains("mode: rule"));
@@ -1015,6 +2082,7 @@ mod tests {
             QuicMode::Block,
             false,
             &RouterExtra::default(),
+            &MihomoFeatures::default(),
         )
         .expect("router config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
@@ -1052,6 +2120,7 @@ mod tests {
             QuicMode::Block,
             false,
             &extra,
+            &MihomoFeatures::default(),
         )
         .expect("router config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
@@ -1064,5 +2133,868 @@ mod tests {
         assert!(rule_strings.contains(&"DST-PORT,443,proxy"));
         assert!(rule_strings.contains(&"DST-PORT,8443,proxy"));
         assert_eq!(rule_strings.last().copied(), Some("MATCH,DIRECT"));
+    }
+
+    // --- Helper for feature tests ---
+
+    fn build_test_router_config(features: &MihomoFeatures) -> Value {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let extra = RouterExtra {
+            dns: Some(DnsSettings::default()),
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &extra,
+            features,
+        )
+        .expect("router config");
+        serde_yaml::from_str(&yaml).expect("parse yaml")
+    }
+
+    fn default_features() -> MihomoFeatures {
+        MihomoFeatures::default()
+    }
+
+    // --- Global features tests ---
+
+    #[test]
+    fn global_features_include_geodata_loader_and_unified_delay() {
+        let config = build_test_router_config(&default_features());
+        assert_eq!(
+            config.get("geodata-loader").and_then(Value::as_str),
+            Some("memconservative")
+        );
+        assert_eq!(
+            config.get("unified-delay").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn global_features_include_profile_store_fake_ip_and_selected() {
+        let config = build_test_router_config(&default_features());
+        let profile = config.get("profile").expect("profile section");
+        assert_eq!(
+            profile.get("store-fake-ip").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            profile.get("store-selected").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn global_features_include_keep_alive_settings() {
+        let config = build_test_router_config(&default_features());
+        assert_eq!(
+            config.get("keep-alive-interval").and_then(Value::as_u64),
+            Some(30)
+        );
+        assert_eq!(
+            config.get("keep-alive-idle").and_then(Value::as_u64),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn experimental_section_added_when_enabled() {
+        let mut features = default_features();
+        features.quic_go_disable_gso = true;
+        features.quic_go_disable_ecn = true;
+        let config = build_test_router_config(&features);
+        let exp = config.get("experimental").expect("experimental");
+        assert_eq!(
+            exp.get("quic-go-disable-gso").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            exp.get("quic-go-disable-ecn").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    // --- Authentication tests ---
+
+    #[test]
+    fn authentication_added_when_configured() {
+        let mut features = default_features();
+        features.authentication = vec!["user1:pass1".to_owned()];
+        features.skip_auth_prefixes = vec!["127.0.0.1/8".to_owned()];
+        let config = build_test_router_config(&features);
+        assert_eq!(
+            config
+                .get("authentication")
+                .and_then(Value::as_array)
+                .expect("authentication")[0]
+                .as_str(),
+            Some("user1:pass1")
+        );
+        assert_eq!(
+            config
+                .get("skip-auth-prefixes")
+                .and_then(Value::as_array)
+                .expect("skip-auth-prefixes")[0]
+                .as_str(),
+            Some("127.0.0.1/8")
+        );
+    }
+
+    // --- Hosts tests ---
+
+    #[test]
+    fn hosts_added_when_configured() {
+        let mut features = default_features();
+        features
+            .hosts
+            .insert("example.com".to_owned(), "1.2.3.4".to_owned());
+        let config = build_test_router_config(&features);
+        let hosts = config.get("hosts").expect("hosts");
+        assert_eq!(
+            hosts.get("example.com").and_then(Value::as_str),
+            Some("1.2.3.4")
+        );
+    }
+
+    // --- Tunnels tests ---
+
+    #[test]
+    fn tunnels_added_when_configured() {
+        let mut features = default_features();
+        features.tunnels = vec![TunnelConfig {
+            network: vec!["tcp".to_owned(), "udp".to_owned()],
+            address: "127.0.0.1:6553".to_owned(),
+            target: "8.8.8.8:53".to_owned(),
+            proxy: Some("proxy".to_owned()),
+        }];
+        let config = build_test_router_config(&features);
+        let tunnels = config
+            .get("tunnels")
+            .and_then(Value::as_array)
+            .expect("tunnels");
+        assert_eq!(tunnels.len(), 1);
+        let tunnel = &tunnels[0];
+        assert_eq!(
+            tunnel.get("address").and_then(Value::as_str),
+            Some("127.0.0.1:6553")
+        );
+        assert_eq!(
+            tunnel.get("target").and_then(Value::as_str),
+            Some("8.8.8.8:53")
+        );
+        assert_eq!(tunnel.get("proxy").and_then(Value::as_str), Some("proxy"));
+    }
+
+    // --- NTP tests ---
+
+    #[test]
+    fn ntp_section_added_when_enabled() {
+        let mut features = default_features();
+        features.ntp = NtpConfig {
+            enabled: true,
+            write_to_system: true,
+            server: "pool.ntp.org".to_owned(),
+            port: 123,
+            interval: 60,
+            dialer_proxy: None,
+        };
+        let config = build_test_router_config(&features);
+        let ntp = config.get("ntp").expect("ntp");
+        assert_eq!(ntp.get("enable").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            ntp.get("server").and_then(Value::as_str),
+            Some("pool.ntp.org")
+        );
+        assert_eq!(
+            ntp.get("write-to-system").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn ntp_section_omitted_when_disabled() {
+        let config = build_test_router_config(&default_features());
+        assert!(config.get("ntp").is_none());
+    }
+
+    // --- External controller tests ---
+
+    #[test]
+    fn external_controller_added_when_enabled() {
+        let mut features = default_features();
+        features.external_controller = ExternalControllerConfig {
+            enabled: true,
+            address: "0.0.0.0:9090".to_owned(),
+            secret: Some("test-secret".to_owned()),
+            allow_origins: vec!["*".to_owned()],
+            allow_private_network: true,
+        };
+        let config = build_test_router_config(&features);
+        assert_eq!(
+            config.get("external-controller").and_then(Value::as_str),
+            Some("0.0.0.0:9090")
+        );
+        assert_eq!(
+            config.get("secret").and_then(Value::as_str),
+            Some("test-secret")
+        );
+    }
+
+    #[test]
+    fn external_controller_omitted_when_disabled() {
+        let config = build_test_router_config(&default_features());
+        assert!(config.get("external-controller").is_none());
+    }
+
+    // --- DNS enhancement tests ---
+
+    #[test]
+    fn dns_includes_cache_algorithm_arc() {
+        let config = build_test_router_config(&default_features());
+        let dns = config.get("dns").expect("dns");
+        assert_eq!(
+            dns.get("cache-algorithm").and_then(Value::as_str),
+            Some("arc")
+        );
+    }
+
+    #[test]
+    fn dns_includes_proxy_server_nameserver_when_configured() {
+        let mut features = default_features();
+        features.dns_proxy_server_nameserver = vec!["223.5.5.5".to_owned()];
+        let config = build_test_router_config(&features);
+        let dns = config.get("dns").expect("dns");
+        assert_eq!(
+            dns.get("proxy-server-nameserver")
+                .and_then(Value::as_array)
+                .expect("proxy-server-nameserver")[0]
+                .as_str(),
+            Some("223.5.5.5")
+        );
+    }
+
+    #[test]
+    fn dns_includes_direct_nameserver_when_configured() {
+        let mut features = default_features();
+        features.dns_direct_nameserver = vec!["system".to_owned()];
+        let config = build_test_router_config(&features);
+        let dns = config.get("dns").expect("dns");
+        assert_eq!(
+            dns.get("direct-nameserver")
+                .and_then(Value::as_array)
+                .expect("direct-nameserver")[0]
+                .as_str(),
+            Some("system")
+        );
+    }
+
+    #[test]
+    fn dns_includes_prefer_h3_when_enabled() {
+        let mut features = default_features();
+        features.dns_prefer_h3 = true;
+        let config = build_test_router_config(&features);
+        let dns = config.get("dns").expect("dns");
+        assert_eq!(dns.get("prefer-h3").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn dns_includes_respect_rules_when_enabled() {
+        let mut features = default_features();
+        features.dns_respect_rules = true;
+        let config = build_test_router_config(&features);
+        let dns = config.get("dns").expect("dns");
+        assert_eq!(
+            dns.get("respect-rules").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn dns_includes_fallback_filter_when_configured() {
+        let mut features = default_features();
+        features.dns_fallback_filter = Some(FallbackFilter {
+            geoip: true,
+            geoip_code: "CN".to_owned(),
+            geosite: vec!["gfw".to_owned()],
+            ipcidr: vec!["240.0.0.0/4".to_owned()],
+            domain: vec!["+.google.com".to_owned()],
+        });
+        let config = build_test_router_config(&features);
+        let dns = config.get("dns").expect("dns");
+        let ff = dns.get("fallback-filter").expect("fallback-filter");
+        assert_eq!(ff.get("geoip").and_then(Value::as_bool), Some(true));
+        assert_eq!(ff.get("geoip-code").and_then(Value::as_str), Some("CN"));
+    }
+
+    // --- Sniffer enhancement tests ---
+
+    #[test]
+    fn sniffer_includes_force_domain_when_configured() {
+        let mut features = default_features();
+        features.sniffer_force_domain = vec!["+.v2ex.com".to_owned()];
+        let config = build_test_router_config(&features);
+        let sniffer = config.get("sniffer").expect("sniffer");
+        let fd = sniffer
+            .get("force-domain")
+            .and_then(Value::as_array)
+            .expect("force-domain");
+        assert_eq!(fd[0].as_str(), Some("+.v2ex.com"));
+    }
+
+    #[test]
+    fn sniffer_includes_skip_domain_when_configured() {
+        let mut features = default_features();
+        features.sniffer_skip_domain = vec!["Mijia Cloud".to_owned()];
+        let config = build_test_router_config(&features);
+        let sniffer = config.get("sniffer").expect("sniffer");
+        let sd = sniffer
+            .get("skip-domain")
+            .and_then(Value::as_array)
+            .expect("skip-domain");
+        assert_eq!(sd[0].as_str(), Some("Mijia Cloud"));
+    }
+
+    #[test]
+    fn sniffer_includes_skip_addresses_when_configured() {
+        let mut features = default_features();
+        features.sniffer_skip_src_address = vec!["192.168.0.3/32".to_owned()];
+        features.sniffer_skip_dst_address = vec!["10.0.0.0/8".to_owned()];
+        let config = build_test_router_config(&features);
+        let sniffer = config.get("sniffer").expect("sniffer");
+        assert!(sniffer.get("skip-src-address").is_some());
+        assert!(sniffer.get("skip-dst-address").is_some());
+    }
+
+    // --- Per-proxy field tests ---
+
+    #[test]
+    fn per_proxy_udp_added_by_default() {
+        let config = build_test_router_config(&default_features());
+        let proxies = config
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("proxies");
+        assert_eq!(proxies[0].get("udp").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn per_proxy_tfo_added_when_enabled() {
+        let mut features = default_features();
+        features.per_proxy.tfo = true;
+        let config = build_test_router_config(&features);
+        let proxies = config
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("proxies");
+        assert_eq!(proxies[0].get("tfo").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn per_proxy_ip_version_added_when_not_dual() {
+        let mut features = default_features();
+        features.per_proxy.ip_version = "ipv4-prefer".to_owned();
+        let config = build_test_router_config(&features);
+        let proxies = config
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("proxies");
+        assert_eq!(
+            proxies[0].get("ip-version").and_then(Value::as_str),
+            Some("ipv4-prefer")
+        );
+    }
+
+    #[test]
+    fn per_proxy_smux_added_when_enabled() {
+        let mut features = default_features();
+        features.per_proxy.smux = Some(SmuxConfig {
+            enabled: true,
+            protocol: "h2mux".to_owned(),
+            padding: true,
+            ..SmuxConfig::default()
+        });
+        let config = build_test_router_config(&features);
+        let proxies = config
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("proxies");
+        let smux = &proxies[0].get("smux").expect("smux");
+        assert_eq!(smux.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(smux.get("protocol").and_then(Value::as_str), Some("h2mux"));
+        assert_eq!(smux.get("padding").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn per_proxy_smux_skipped_for_flow_proxy() {
+        // VLESS Reality with xtls-rprx-vision flow is incompatible with smux.
+        // The config builder must skip smux for proxies that have a flow field.
+        let mut features = default_features();
+        features.per_proxy.smux = Some(SmuxConfig {
+            enabled: true,
+            protocol: "h2mux".to_owned(),
+            padding: true,
+            ..SmuxConfig::default()
+        });
+        // Build a config with a Reality+vision profile (has flow field)
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=reality&flow=xtls-rprx-vision&pbk=AAAA&sid=00#TestReality",
+        );
+        let profile = &profiles[0];
+        let extra = RouterExtra {
+            dns: Some(DnsSettings::default()),
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &extra,
+            &features,
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let proxies = config
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("proxies");
+        // The proxy should have flow but NOT smux
+        assert!(
+            proxies[0].get("flow").is_some(),
+            "proxy should have flow field"
+        );
+        assert!(
+            proxies[0].get("smux").is_none(),
+            "smux must NOT be applied to flow-based proxies"
+        );
+    }
+
+    #[test]
+    fn per_proxy_dialer_proxy_added_when_configured() {
+        let mut features = default_features();
+        features.per_proxy.dialer_proxy = Some("dialer-group".to_owned());
+        let config = build_test_router_config(&features);
+        let proxies = config
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("proxies");
+        assert_eq!(
+            proxies[0].get("dialer-proxy").and_then(Value::as_str),
+            Some("dialer-group")
+        );
+    }
+
+    // --- Proxy group tests ---
+
+    #[test]
+    fn proxy_group_url_test_generates_group_section() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            group_type: ProxyGroupType::UrlTest,
+            url: "https://www.gstatic.com/generate_204".to_owned(),
+            interval: 300,
+            tolerance: 50,
+            timeout: 5000,
+            lazy: true,
+            max_failed_times: 5,
+            strategy: LoadBalanceStrategy::default(),
+            expected_status: None,
+        };
+        let config = build_test_router_config(&features);
+        let groups = config
+            .get("proxy-groups")
+            .and_then(Value::as_array)
+            .expect("proxy-groups");
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(group.get("name").and_then(Value::as_str), Some("proxy"));
+        assert_eq!(group.get("type").and_then(Value::as_str), Some("url-test"));
+        assert_eq!(group.get("tolerance").and_then(Value::as_u64), Some(50));
+        // Active profile renamed to "proxy-active"
+        let proxies = group
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("group proxies");
+        // DIRECT must NOT be in url-test groups (it would always win)
+        assert!(
+            !proxies.iter().any(|p| p.as_str() == Some("DIRECT")),
+            "DIRECT must not be in url-test groups"
+        );
+        assert!(proxies.iter().any(|p| p.as_str() == Some("proxy-active")));
+    }
+
+    #[test]
+    fn proxy_group_select_includes_direct() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            group_type: ProxyGroupType::Select,
+            ..ProxyGroupConfig::default()
+        };
+        let config = build_test_router_config(&features);
+        let groups = config
+            .get("proxy-groups")
+            .and_then(Value::as_array)
+            .expect("proxy-groups");
+        let proxies = groups[0]
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("group proxies");
+        // SELECT groups should include DIRECT as a manual option
+        assert!(
+            proxies.iter().any(|p| p.as_str() == Some("DIRECT")),
+            "SELECT groups should include DIRECT"
+        );
+        assert!(proxies.iter().any(|p| p.as_str() == Some("proxy-active")));
+    }
+
+    #[test]
+    fn proxy_group_load_balance_includes_strategy() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            group_type: ProxyGroupType::LoadBalance,
+            strategy: LoadBalanceStrategy::RoundRobin,
+            ..ProxyGroupConfig::default()
+        };
+        let config = build_test_router_config(&features);
+        let groups = config
+            .get("proxy-groups")
+            .and_then(Value::as_array)
+            .expect("proxy-groups");
+        assert_eq!(
+            groups[0].get("strategy").and_then(Value::as_str),
+            Some("round-robin")
+        );
+    }
+
+    #[test]
+    fn proxy_group_disabled_uses_single_proxy_name() {
+        let config = build_test_router_config(&default_features());
+        // When proxy groups disabled, active proxy is named "proxy"
+        let proxies = config
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("proxies");
+        assert_eq!(
+            proxies[0].get("name").and_then(Value::as_str),
+            Some("proxy")
+        );
+        // No proxy-groups section
+        assert!(config.get("proxy-groups").is_none());
+    }
+
+    // --- Proxy provider tests ---
+
+    #[test]
+    fn proxy_providers_added_when_configured() {
+        let mut features = default_features();
+        features.proxy_providers = vec![ProxyProviderConfig {
+            name: "provider1".to_owned(),
+            provider_type: "http".to_owned(),
+            url: Some("https://provider.example/sub".to_owned()),
+            interval: 3600,
+            health_check_enabled: true,
+            ..ProxyProviderConfig::default()
+        }];
+        let config = build_test_router_config(&features);
+        let providers = config
+            .get("proxy-providers")
+            .and_then(Value::as_object)
+            .expect("proxy-providers");
+        assert!(providers.contains_key("provider1"));
+        let p = &providers["provider1"];
+        assert_eq!(p.get("type").and_then(Value::as_str), Some("http"));
+        assert_eq!(
+            p.get("url").and_then(Value::as_str),
+            Some("https://provider.example/sub")
+        );
+        assert!(p.get("health-check").is_some());
+    }
+
+    // --- Rule provider tests ---
+
+    #[test]
+    fn rule_providers_added_when_configured() {
+        let mut features = default_features();
+        features.rule_providers = vec![RuleProviderConfig {
+            name: "ads".to_owned(),
+            provider_type: "http".to_owned(),
+            url: Some("https://example.com/ads.yaml".to_owned()),
+            behavior: "domain".to_owned(),
+            format: "yaml".to_owned(),
+            interval: 86400,
+            ..RuleProviderConfig::default()
+        }];
+        let config = build_test_router_config(&features);
+        let providers = config
+            .get("rule-providers")
+            .and_then(Value::as_object)
+            .expect("rule-providers");
+        assert!(providers.contains_key("ads"));
+        let r = &providers["ads"];
+        assert_eq!(r.get("behavior").and_then(Value::as_str), Some("domain"));
+        assert_eq!(r.get("format").and_then(Value::as_str), Some("yaml"));
+    }
+
+    // --- Domain rule prefix tests ---
+
+    #[test]
+    fn domain_rule_regex_prefix_generates_domain_regex() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec!["regex:^abc.*com".to_owned()],
+            ips: vec![],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("DOMAIN-REGEX,^abc.*com,DIRECT"))
+        );
+    }
+
+    #[test]
+    fn domain_rule_wildcard_prefix_generates_domain_wildcard() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec!["wildcard:*.google.com".to_owned()],
+            ips: vec![],
+            outbound_tag: "active".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("DOMAIN-WILDCARD,*.google.com,proxy"))
+        );
+    }
+
+    // --- MihomoFeatures serde round-trip test ---
+
+    #[test]
+    fn mihomo_features_serde_round_trip() {
+        let features = MihomoFeatures {
+            geodata_loader: "standard".to_owned(),
+            unified_delay: false,
+            store_fake_ip: false,
+            store_selected: false,
+            keep_alive_interval: 60,
+            keep_alive_idle: 240,
+            disable_keep_alive: true,
+            quic_go_disable_gso: true,
+            quic_go_disable_ecn: false,
+            authentication: vec!["admin:secret".to_owned()],
+            skip_auth_prefixes: vec!["10.0.0.0/8".to_owned()],
+            hosts: {
+                let mut h = std::collections::HashMap::new();
+                h.insert("local.test".to_owned(), "127.0.0.1".to_owned());
+                h
+            },
+            tunnels: vec![TunnelConfig {
+                network: vec!["tcp".to_owned()],
+                address: "127.0.0.1:1234".to_owned(),
+                target: "example.com:443".to_owned(),
+                proxy: None,
+            }],
+            ntp: NtpConfig {
+                enabled: true,
+                write_to_system: true,
+                server: "time.cloudflare.com".to_owned(),
+                port: 123,
+                interval: 15,
+                dialer_proxy: Some("DIRECT".to_owned()),
+            },
+            external_controller: ExternalControllerConfig {
+                enabled: true,
+                address: "0.0.0.0:9090".to_owned(),
+                secret: Some("secret123".to_owned()),
+                allow_origins: vec!["*".to_owned()],
+                allow_private_network: true,
+            },
+            proxy_group: ProxyGroupConfig {
+                enabled: true,
+                group_type: ProxyGroupType::Fallback,
+                url: "https://cp.cloudflare.com".to_owned(),
+                interval: 600,
+                tolerance: 100,
+                timeout: 3000,
+                lazy: false,
+                max_failed_times: 3,
+                strategy: LoadBalanceStrategy::StickySessions,
+                expected_status: Some("204".to_owned()),
+            },
+            proxy_providers: vec![],
+            rule_providers: vec![],
+            per_proxy: PerProxyDefaults {
+                udp: false,
+                tfo: true,
+                mptcp: false,
+                ip_version: "ipv4".to_owned(),
+                smux: Some(SmuxConfig {
+                    enabled: true,
+                    protocol: "smux".to_owned(),
+                    max_connections: 4,
+                    min_streams: 4,
+                    max_streams: 0,
+                    statistic: true,
+                    only_tcp: false,
+                    padding: true,
+                    brutal_up: Some(50),
+                    brutal_down: Some(100),
+                }),
+                dialer_proxy: Some("relay".to_owned()),
+            },
+            dns_cache_algorithm: "lru".to_owned(),
+            dns_prefer_h3: true,
+            dns_respect_rules: true,
+            dns_proxy_server_nameserver: vec!["223.5.5.5".to_owned()],
+            dns_direct_nameserver: vec!["system".to_owned()],
+            dns_fallback_filter: Some(FallbackFilter {
+                geoip: false,
+                geoip_code: "US".to_owned(),
+                geosite: vec!["gfw".to_owned()],
+                ipcidr: vec!["240.0.0.0/4".to_owned()],
+                domain: vec!["+.google.com".to_owned()],
+            }),
+            sniffer_force_domain: vec!["+.test.com".to_owned()],
+            sniffer_skip_domain: vec!["skip.test".to_owned()],
+            sniffer_skip_src_address: vec!["192.168.1.0/24".to_owned()],
+            sniffer_skip_dst_address: vec!["10.0.0.0/8".to_owned()],
+        };
+        let json = serde_json::to_string(&features).expect("serialize");
+        let deserialized: MihomoFeatures = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(features, deserialized);
+    }
+
+    #[test]
+    fn mihomo_features_default_serde_uses_defaults() {
+        // Empty JSON should produce default MihomoFeatures
+        let json = "{}";
+        let features: MihomoFeatures = serde_json::from_str(json).expect("deserialize empty");
+        assert_eq!(features.geodata_loader, "memconservative");
+        assert!(features.unified_delay);
+        assert!(features.store_fake_ip);
+        assert!(features.store_selected);
+        assert_eq!(features.keep_alive_interval, 30);
+        assert_eq!(features.keep_alive_idle, 120);
+        assert_eq!(features.dns_cache_algorithm, "arc");
+        assert!(features.per_proxy.udp);
+        assert_eq!(features.per_proxy.ip_version, "dual");
+    }
+
+    // --- Simple config (build_mihomo_config) feature tests ---
+
+    #[test]
+    fn simple_config_includes_global_features() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let features = default_features();
+        let yaml =
+            build_mihomo_config(profile, "127.0.0.1", 10808, &features).expect("mihomo config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        assert_eq!(
+            config.get("geodata-loader").and_then(Value::as_str),
+            Some("memconservative")
+        );
+        assert_eq!(
+            config.get("unified-delay").and_then(Value::as_bool),
+            Some(true)
+        );
+        // Per-proxy udp should be applied
+        let proxies = config
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("proxies");
+        assert_eq!(proxies[0].get("udp").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn simple_config_includes_external_controller_when_enabled() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let mut features = default_features();
+        features.external_controller = ExternalControllerConfig {
+            enabled: true,
+            address: "127.0.0.1:9090".to_owned(),
+            secret: None,
+            allow_origins: vec![],
+            allow_private_network: false,
+        };
+        let yaml =
+            build_mihomo_config(profile, "127.0.0.1", 10808, &features).expect("mihomo config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        assert!(config.get("external-controller").is_some());
     }
 }

@@ -32,7 +32,7 @@ use crate::benchmark::{
     run_bench,
 };
 use crate::mihomo_config::{
-    DIRECT_NAME, PROXY_NAME, build_mihomo_config, build_mihomo_router_config,
+    DIRECT_NAME, MihomoFeatures, PROXY_NAME, build_mihomo_config, build_mihomo_router_config,
 };
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionSource, load_subscription_detailed_via_proxy_with_hwid,
@@ -420,6 +420,11 @@ pub struct HincyrayState {
     /// applying an update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mihomo_version: Option<String>,
+    /// v0.9: All Mihomo-specific opt-in features (proxy groups,
+    /// external controller, NTP, smux, DNS enhancements, sniffer
+    /// enhancements, tunnels, hosts, authentication, experimental).
+    #[serde(default)]
+    pub mihomo_features: MihomoFeatures,
 }
 
 impl Default for HincyrayState {
@@ -447,6 +452,7 @@ impl Default for HincyrayState {
             last_update_check_unix: 0,
             update_available_version: None,
             mihomo_version: None,
+            mihomo_features: MihomoFeatures::default(),
         }
     }
 }
@@ -1750,7 +1756,12 @@ fn build_daemon_config(state: &HincyrayState) -> Result<String, String> {
     };
 
     if !state.split_routing.enabled {
-        return build_mihomo_config(active_profile, &state.listen_host, state.socks_port);
+        return build_mihomo_config(
+            active_profile,
+            &state.listen_host,
+            state.socks_port,
+            &state.mihomo_features,
+        );
     }
 
     // Split routing: build the full router config.
@@ -1768,6 +1779,7 @@ fn build_daemon_config(state: &HincyrayState) -> Result<String, String> {
         state.split_routing.quic_mode.clone(),
         active_block_quic,
         &extra,
+        &state.mihomo_features,
     )
 }
 
@@ -2159,6 +2171,8 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/update/check") => handle_update_check(daemon),
         ("POST", "/api/update/apply") => handle_update_apply(daemon),
         ("POST", "/api/update/settings") => handle_update_settings(body, daemon),
+        ("GET", "/api/mihomo-features") => handle_mihomo_features_get(daemon),
+        ("POST", "/api/mihomo-features") => handle_mihomo_features_set(body, daemon),
         _ => (
             404,
             "application/json",
@@ -3846,6 +3860,40 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
     )
 }
 
+/// Return the current MihomoFeatures configuration.
+fn handle_mihomo_features_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    (
+        200,
+        "application/json",
+        serde_json::to_string(&inner.state.mihomo_features).unwrap_or_else(|_| "{}".to_owned()),
+    )
+}
+
+/// Update the MihomoFeatures configuration. The body must be a complete
+/// `MihomoFeatures` JSON object (obtainable via GET /api/mihomo-features).
+/// All fields have serde defaults, so missing fields use their defaults.
+fn handle_mihomo_features_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let features: MihomoFeatures = match serde_json::from_str(body) {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                json!({"error": format!("invalid MihomoFeatures JSON: {e}")}).to_string(),
+            );
+        }
+    };
+    let mut inner = lock(&daemon.inner);
+    inner.state.mihomo_features = features;
+    let _ = persist_state(&daemon.state_path, &inner.state);
+    (
+        200,
+        "application/json",
+        serde_json::to_string(&inner.state.mihomo_features).unwrap_or_else(|_| "{}".to_owned()),
+    )
+}
+
 /// Return the last N lines of the Mihomo log file so the user can
 /// diagnose start failures from the web panel without SSH.
 fn handle_logs(_daemon: &Daemon) -> (u16, &'static str, String) {
@@ -5426,6 +5474,55 @@ tr.group-row.collapsed{display:none}
   </div>
 </div>
 
+<h2>Mihomo Features <span id="features-toggle" class="toggle">show</span></h2>
+<div id="features-panel" class="collapsible">
+  <p class="subtle">Advanced Mihomo (Clash.Meta) features: proxy groups for auto-failover, external REST API, NTP, DNS enhancements, smux multiplexing, and more. Restart core after changing.</p>
+  <h3>Proxy Groups</h3>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="feat-pg-enabled"> Enable proxy groups (auto-select / failover)</label>
+    <div class="field"><label for="feat-pg-type">Group type</label><select id="feat-pg-type"><option value="url-test">url-test (auto-select by latency)</option><option value="fallback">fallback (failover in order)</option><option value="load-balance">load-balance (distribute traffic)</option><option value="select">select (manual)</option></select></div>
+    <div class="field"><label for="feat-pg-interval">Health check interval (sec)</label><input type="number" id="feat-pg-interval" min="30" max="86400" value="300"></div>
+    <div class="field"><label for="feat-pg-tolerance">Tolerance (ms, url-test only)</label><input type="number" id="feat-pg-tolerance" min="0" max="5000" value="0"></div>
+    <div class="field"><label for="feat-pg-timeout">Health check timeout (ms)</label><input type="number" id="feat-pg-timeout" min="1000" max="30000" value="5000"></div>
+  </div>
+  <h3>External Controller (REST API)</h3>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="feat-ec-enabled"> Enable external controller</label>
+    <div class="field"><label for="feat-ec-addr">Listen address</label><input type="text" id="feat-ec-addr" value="127.0.0.1:9090"></div>
+    <div class="field"><label for="feat-ec-secret">Secret (optional)</label><input type="text" id="feat-ec-secret" placeholder="API key"></div>
+  </div>
+  <h3>NTP Service</h3>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="feat-ntp-enabled"> Enable NTP</label>
+    <label class="chip"><input type="checkbox" id="feat-ntp-write"> Write to system time</label>
+    <div class="field"><label for="feat-ntp-server">NTP server</label><input type="text" id="feat-ntp-server" value="time.apple.com"></div>
+    <div class="field"><label for="feat-ntp-interval">Interval (min)</label><input type="number" id="feat-ntp-interval" min="5" max="1440" value="30"></div>
+  </div>
+  <h3>Per-Proxy Defaults</h3>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="feat-pp-udp" checked> Allow UDP</label>
+    <label class="chip"><input type="checkbox" id="feat-pp-tfo"> TCP Fast Open</label>
+    <label class="chip"><input type="checkbox" id="feat-pp-smux"> Enable smux (multiplexing)</label>
+    <div class="field"><label for="feat-pp-smux-proto">smux protocol</label><select id="feat-pp-smux-proto"><option value="h2mux">h2mux</option><option value="yamux">yamux</option><option value="smux">smux</option></select></div>
+    <label class="chip"><input type="checkbox" id="feat-pp-smux-pad"> smux padding (anti-DPI)</label>
+  </div>
+  <h3>DNS Enhancements</h3>
+  <div class="grid2">
+    <div class="field"><label for="feat-dns-cache">Cache algorithm</label><select id="feat-dns-cache"><option value="arc">arc (Adaptive Replacement)</option><option value="lru">lru (Least Recently Used)</option></select></div>
+    <label class="chip"><input type="checkbox" id="feat-dns-h3"> Prefer HTTP/3 for DoH</label>
+    <label class="chip"><input type="checkbox" id="feat-dns-rr"> Respect routing rules for DNS</label>
+  </div>
+  <h3>Experimental</h3>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="feat-exp-gso"> Disable QUIC GSO</label>
+    <label class="chip"><input type="checkbox" id="feat-exp-ecn"> Disable QUIC ECN</label>
+  </div>
+  <div class="row" style="margin:.45em 0">
+    <button id="btn-features-save">Save Mihomo features</button>
+    <span class="subtle" id="features-status"></span>
+  </div>
+</div>
+
 <h2>Logs <span id="logs-toggle" class="toggle">show</span></h2>
 <div id="logs-panel" class="collapsible">
   <div class="row" style="margin:.45em 0">
@@ -6512,6 +6609,102 @@ document.getElementById("btn-update-save").addEventListener("click", function(){
 document.getElementById("update-toggle").addEventListener("click", function(){
   toggleCollapsible("update-toggle", "update-panel");
 });
+
+// ── Mihomo Features ─────────────────────────────────────────────
+function loadFeatures(){
+  api("GET", "/api/mihomo-features").then(function(f){
+    document.getElementById("feat-pg-enabled").checked = !!(f.proxy_group && f.proxy_group.enabled);
+    document.getElementById("feat-pg-type").value = (f.proxy_group && f.proxy_group.group_type) || "url-test";
+    document.getElementById("feat-pg-interval").value = (f.proxy_group && f.proxy_group.interval) || 300;
+    document.getElementById("feat-pg-tolerance").value = (f.proxy_group && f.proxy_group.tolerance) || 0;
+    document.getElementById("feat-pg-timeout").value = (f.proxy_group && f.proxy_group.timeout) || 5000;
+    document.getElementById("feat-ec-enabled").checked = !!(f.external_controller && f.external_controller.enabled);
+    document.getElementById("feat-ec-addr").value = (f.external_controller && f.external_controller.address) || "127.0.0.1:9090";
+    document.getElementById("feat-ec-secret").value = (f.external_controller && f.external_controller.secret) || "";
+    document.getElementById("feat-ntp-enabled").checked = !!(f.ntp && f.ntp.enabled);
+    document.getElementById("feat-ntp-write").checked = !!(f.ntp && f.ntp.write_to_system);
+    document.getElementById("feat-ntp-server").value = (f.ntp && f.ntp.server) || "time.apple.com";
+    document.getElementById("feat-ntp-interval").value = (f.ntp && f.ntp.interval) || 30;
+    document.getElementById("feat-pp-udp").checked = !(f.per_proxy && f.per_proxy.udp === false);
+    document.getElementById("feat-pp-tfo").checked = !!(f.per_proxy && f.per_proxy.tfo);
+    document.getElementById("feat-pp-smux").checked = !!(f.per_proxy && f.per_proxy.smux && f.per_proxy.smux.enabled);
+    document.getElementById("feat-pp-smux-proto").value = (f.per_proxy && f.per_proxy.smux && f.per_proxy.smux.protocol) || "h2mux";
+    document.getElementById("feat-pp-smux-pad").checked = !!(f.per_proxy && f.per_proxy.smux && f.per_proxy.smux.padding);
+    document.getElementById("feat-dns-cache").value = f.dns_cache_algorithm || "arc";
+    document.getElementById("feat-dns-h3").checked = !!f.dns_prefer_h3;
+    document.getElementById("feat-dns-rr").checked = !!f.dns_respect_rules;
+    document.getElementById("feat-exp-gso").checked = !!f.quic_go_disable_gso;
+    document.getElementById("feat-exp-ecn").checked = !!f.quic_go_disable_ecn;
+  });
+}
+
+document.getElementById("btn-features-save").addEventListener("click", function(){
+  var f = {
+    proxy_group: {
+      enabled: document.getElementById("feat-pg-enabled").checked,
+      group_type: document.getElementById("feat-pg-type").value,
+      interval: parseInt(document.getElementById("feat-pg-interval").value) || 300,
+      tolerance: parseInt(document.getElementById("feat-pg-tolerance").value) || 0,
+      timeout: parseInt(document.getElementById("feat-pg-timeout").value) || 5000,
+      lazy: true, max_failed_times: 5, strategy: "consistent-hashing", expected_status: null
+    },
+    external_controller: {
+      enabled: document.getElementById("feat-ec-enabled").checked,
+      address: document.getElementById("feat-ec-addr").value,
+      secret: document.getElementById("feat-ec-secret").value || null,
+      allow_origins: [], allow_private_network: false
+    },
+    ntp: {
+      enabled: document.getElementById("feat-ntp-enabled").checked,
+      write_to_system: document.getElementById("feat-ntp-write").checked,
+      server: document.getElementById("feat-ntp-server").value,
+      port: 123, interval: parseInt(document.getElementById("feat-ntp-interval").value) || 30,
+      dialer_proxy: null
+    },
+    per_proxy: {
+      udp: document.getElementById("feat-pp-udp").checked,
+      tfo: document.getElementById("feat-pp-tfo").checked,
+      mptcp: false, ip_version: "dual",
+      smux: document.getElementById("feat-pp-smux").checked ? {
+        enabled: true, protocol: document.getElementById("feat-pp-smux-proto").value,
+        max_connections: 0, min_streams: 0, max_streams: 0,
+        statistic: false, only_tcp: false,
+        padding: document.getElementById("feat-pp-smux-pad").checked,
+        brutal_up: null, brutal_down: null
+      } : null,
+      dialer_proxy: null
+    },
+    dns_cache_algorithm: document.getElementById("feat-dns-cache").value,
+    dns_prefer_h3: document.getElementById("feat-dns-h3").checked,
+    dns_respect_rules: document.getElementById("feat-dns-rr").checked,
+    dns_proxy_server_nameserver: [], dns_direct_nameserver: [],
+    dns_fallback_filter: null,
+    sniffer_force_domain: [], sniffer_skip_domain: [],
+    sniffer_skip_src_address: [], sniffer_skip_dst_address: [],
+    geodata_loader: "memconservative", unified_delay: true,
+    store_fake_ip: true, store_selected: true,
+    keep_alive_interval: 30, keep_alive_idle: 120,
+    disable_keep_alive: false,
+    quic_go_disable_gso: document.getElementById("feat-exp-gso").checked,
+    quic_go_disable_ecn: document.getElementById("feat-exp-ecn").checked,
+    authentication: [], skip_auth_prefixes: [],
+    hosts: {}, tunnels: [],
+    proxy_providers: [], rule_providers: []
+  };
+  api("POST", "/api/mihomo-features", JSON.stringify(f)).then(function(){
+    document.getElementById("features-status").textContent = "Saved. Restart core to apply.";
+    showOk("Mihomo features saved. Restart core to apply.");
+  }).catch(function(err){
+    document.getElementById("features-status").textContent = "Save failed";
+    setMsg("Save failed: " + err.message);
+  });
+});
+
+document.getElementById("features-toggle").addEventListener("click", function(){
+  toggleCollapsible("features-toggle", "features-panel");
+});
+
+loadFeatures();
 
 document.getElementById("sys-toggle").addEventListener("click", function(){
   toggleCollapsible("sys-toggle", "sys-panel");
