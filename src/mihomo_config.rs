@@ -141,6 +141,12 @@ pub struct ProxyGroupConfig {
     /// Auto-include all nodes from all proxy-providers in this group.
     #[serde(default)]
     pub include_all_providers: bool,
+    /// Include all proxies AND all proxy-providers (sorted by name).
+    #[serde(default)]
+    pub include_all: bool,
+    /// Include all proxies only (no providers), sorted by name.
+    #[serde(default)]
+    pub include_all_proxies: bool,
 }
 
 impl Default for ProxyGroupConfig {
@@ -160,6 +166,8 @@ impl Default for ProxyGroupConfig {
             exclude_filter: None,
             exclude_type: None,
             include_all_providers: false,
+            include_all: false,
+            include_all_proxies: false,
         }
     }
 }
@@ -534,6 +542,11 @@ pub struct MihomoFeatures {
     pub dns_proxy_server_nameserver: Vec<String>,
     #[serde(default)]
     pub dns_direct_nameserver: Vec<String>,
+    /// DNS nameserver-policy: domain → list of DNS servers.
+    /// Keys support domain wildcards (e.g. `+.google.com`) and geosite
+    /// references (e.g. `geosite:cn`). Values are DNS server URLs.
+    #[serde(default)]
+    pub dns_nameserver_policy: HashMap<String, Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_fallback_filter: Option<FallbackFilter>,
 
@@ -546,6 +559,12 @@ pub struct MihomoFeatures {
     pub sniffer_skip_src_address: Vec<String>,
     #[serde(default)]
     pub sniffer_skip_dst_address: Vec<String>,
+
+    // --- Raw rules ---
+    /// Raw Mihomo rule strings appended before MATCH (e.g. AND/OR/NOT
+    /// logic rules that can't be expressed via the domain/ip/port model).
+    #[serde(default)]
+    pub raw_rules: Vec<String>,
 }
 
 impl Default for MihomoFeatures {
@@ -577,11 +596,13 @@ impl Default for MihomoFeatures {
             dns_respect_rules: false,
             dns_proxy_server_nameserver: Vec::new(),
             dns_direct_nameserver: Vec::new(),
+            dns_nameserver_policy: HashMap::new(),
             dns_fallback_filter: None,
             sniffer_force_domain: Vec::new(),
             sniffer_skip_domain: Vec::new(),
             sniffer_skip_src_address: Vec::new(),
             sniffer_skip_dst_address: Vec::new(),
+            raw_rules: Vec::new(),
         }
     }
 }
@@ -1063,6 +1084,14 @@ fn build_proxy_groups_json(
     if group_config.include_all_providers {
         group["include-all-providers"] = json!(true);
     }
+    // Include all proxies AND all proxy-providers (sorted by name).
+    if group_config.include_all {
+        group["include-all"] = json!(true);
+    }
+    // Include all proxies only (no providers), sorted by name.
+    if group_config.include_all_proxies {
+        group["include-all-proxies"] = json!(true);
+    }
 
     Some(json!([group]))
 }
@@ -1081,6 +1110,13 @@ pub fn build_mihomo_config(
 ) -> Result<String, String> {
     let mut proxy = build_proxy(profile, PROXY_NAME)?;
     apply_per_proxy_fields(&mut proxy, features);
+    let mut rules: Vec<String> = features
+        .raw_rules
+        .iter()
+        .filter(|r| !r.is_empty())
+        .cloned()
+        .collect();
+    rules.push(format!("MATCH,{}", PROXY_NAME));
     let mut config = json!({
         "mode": "rule",
         "log-level": "info",
@@ -1090,7 +1126,7 @@ pub fn build_mihomo_config(
         "ipv6": false,
         "socks-port": socks_port,
         "proxies": [proxy],
-        "rules": [format!("MATCH,{}", PROXY_NAME)],
+        "rules": rules,
     });
     apply_global_features(&mut config, features);
 
@@ -1190,6 +1226,10 @@ pub fn build_mihomo_router_config(
             REJECT_NAME
         ));
     }
+
+    // User-defined raw Mihomo rules (AND/OR/NOT/SUB-RULE logic, etc.)
+    // inserted before port-mode fallbacks and MATCH.
+    rules.extend(features.raw_rules.iter().filter(|r| !r.is_empty()).cloned());
 
     match extra.port_mode {
         PortMode::AllowList if !extra.proxy_ports.is_empty() => {
@@ -1342,6 +1382,17 @@ fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeat
     if !features.dns_direct_nameserver.is_empty() {
         dns_config["direct-nameserver"] = json!(features.dns_direct_nameserver);
     }
+    if !features.dns_nameserver_policy.is_empty() {
+        let mut policy = json!({});
+        for (domain, servers) in &features.dns_nameserver_policy {
+            if !servers.is_empty() {
+                policy[domain] = json!(servers);
+            }
+        }
+        if policy.as_object().is_some_and(|m| !m.is_empty()) {
+            dns_config["nameserver-policy"] = policy;
+        }
+    }
     if let Some(filter) = &features.dns_fallback_filter {
         let mut ff = json!({});
         if filter.geoip {
@@ -1440,6 +1491,9 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         );
     }
 
+    // mTLS (mutual TLS) — certificate + private-key, both required.
+    apply_mtls_cert_key(&mut proxy, &url);
+
     if security == "reality"
         && let Some(public_key) = query_value(&url, "pbk")
     {
@@ -1484,7 +1538,10 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
             }
 
             // x-padding-* fields
-            if let Some(v) = query_value_multi(&url, &["xPaddingBytes", "x_padding_bytes", "x-padding-bytes"]) {
+            if let Some(v) = query_value_multi(
+                &url,
+                &["xPaddingBytes", "x_padding_bytes", "x-padding-bytes"],
+            ) {
                 xhttp_opts["x-padding-bytes"] = json!(v);
             }
             if let Some(v) = query_value_multi(&url, &["xPaddingObfsMode", "x_padding_obfs_mode"]) {
@@ -1496,7 +1553,8 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
             if let Some(v) = query_value_multi(&url, &["xPaddingHeader", "x_padding_header"]) {
                 xhttp_opts["x-padding-header"] = json!(v);
             }
-            if let Some(v) = query_value_multi(&url, &["xPaddingPlacement", "x_padding_placement"]) {
+            if let Some(v) = query_value_multi(&url, &["xPaddingPlacement", "x_padding_placement"])
+            {
                 xhttp_opts["x-padding-placement"] = json!(v);
             }
             if let Some(v) = query_value_multi(&url, &["xPaddingMethod", "x_padding_method"]) {
@@ -1504,7 +1562,14 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
             }
 
             // uplink-http-method
-            if let Some(v) = query_value_multi(&url, &["uplinkHttpMethod", "uplink_http_method", "uplink-http-method"]) {
+            if let Some(v) = query_value_multi(
+                &url,
+                &[
+                    "uplinkHttpMethod",
+                    "uplink_http_method",
+                    "uplink-http-method",
+                ],
+            ) {
                 xhttp_opts["uplink-http-method"] = json!(v);
             }
 
@@ -1525,7 +1590,9 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
             }
 
             // uplink-data-* fields
-            if let Some(v) = query_value_multi(&url, &["uplinkDataPlacement", "uplink_data_placement"]) {
+            if let Some(v) =
+                query_value_multi(&url, &["uplinkDataPlacement", "uplink_data_placement"])
+            {
                 xhttp_opts["uplink-data-placement"] = json!(v);
             }
             if let Some(v) = query_value_multi(&url, &["uplinkDataKey", "uplink_data_key"]) {
@@ -1540,48 +1607,56 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
             }
 
             // sc-max-each-post-bytes (integer, stream-up mode)
-            if let Some(v) = query_value_multi(&url, &["scMaxEachPostBytes", "sc_max_each_post_bytes"])
-                .and_then(|s| s.parse::<u32>().ok())
+            if let Some(v) =
+                query_value_multi(&url, &["scMaxEachPostBytes", "sc_max_each_post_bytes"])
+                    .and_then(|s| s.parse::<u32>().ok())
             {
                 xhttp_opts["sc-max-each-post-bytes"] = json!(v);
             }
 
             // sc-min-posts-interval-ms (integer, stream-up mode)
-            if let Some(v) = query_value_multi(&url, &["scMinPostsIntervalMs", "sc_min_posts_interval_ms"])
-                .and_then(|s| s.parse::<u32>().ok())
+            if let Some(v) =
+                query_value_multi(&url, &["scMinPostsIntervalMs", "sc_min_posts_interval_ms"])
+                    .and_then(|s| s.parse::<u32>().ok())
             {
                 xhttp_opts["sc-min-posts-interval-ms"] = json!(v);
             }
 
             // reuse-settings (XMUX-like connection reuse)
             let mut reuse = json!({});
-            if let Some(v) = query_value_multi(&url, &["xmuxMaxConcurrency", "xmux_max_concurrency"])
-                .and_then(|s| s.parse::<u32>().ok())
+            if let Some(v) =
+                query_value_multi(&url, &["xmuxMaxConcurrency", "xmux_max_concurrency"])
+                    .and_then(|s| s.parse::<u32>().ok())
             {
                 reuse["max-concurrency"] = json!(v);
             }
-            if let Some(v) = query_value_multi(&url, &["xmuxMaxConnections", "xmux_max_connections"])
-                .and_then(|s| s.parse::<u32>().ok())
+            if let Some(v) =
+                query_value_multi(&url, &["xmuxMaxConnections", "xmux_max_connections"])
+                    .and_then(|s| s.parse::<u32>().ok())
             {
                 reuse["max-connections"] = json!(v);
             }
-            if let Some(v) = query_value_multi(&url, &["xmuxCMaxReuseTimes", "xmux_c_max_reuse_times"])
-                .and_then(|s| s.parse::<u32>().ok())
+            if let Some(v) =
+                query_value_multi(&url, &["xmuxCMaxReuseTimes", "xmux_c_max_reuse_times"])
+                    .and_then(|s| s.parse::<u32>().ok())
             {
                 reuse["c-max-reuse-times"] = json!(v);
             }
-            if let Some(v) = query_value_multi(&url, &["xmuxHMaxRequestTimes", "xmux_h_max_request_times"])
-                .and_then(|s| s.parse::<u32>().ok())
+            if let Some(v) =
+                query_value_multi(&url, &["xmuxHMaxRequestTimes", "xmux_h_max_request_times"])
+                    .and_then(|s| s.parse::<u32>().ok())
             {
                 reuse["h-max-request-times"] = json!(v);
             }
-            if let Some(v) = query_value_multi(&url, &["xmuxHMaxReusableSecs", "xmux_h_max_reusable_secs"])
-                .and_then(|s| s.parse::<u32>().ok())
+            if let Some(v) =
+                query_value_multi(&url, &["xmuxHMaxReusableSecs", "xmux_h_max_reusable_secs"])
+                    .and_then(|s| s.parse::<u32>().ok())
             {
                 reuse["h-max-reusable-secs"] = json!(v);
             }
-            if let Some(v) = query_value_multi(&url, &["xmuxHKeepAlivePeriod", "xmux_h_keep_alive_period"])
-                .and_then(|s| s.parse::<u32>().ok())
+            if let Some(v) =
+                query_value_multi(&url, &["xmuxHKeepAlivePeriod", "xmux_h_keep_alive_period"])
+                    .and_then(|s| s.parse::<u32>().ok())
             {
                 reuse["h-keep-alive-period"] = json!(v);
             }
@@ -1599,13 +1674,19 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
             if let Some(host) = query_value(&url, "host").filter(|value| !value.is_empty()) {
                 ws_opts["headers"] = json!({ "Host": host });
             }
+            apply_ws_early_data(&mut ws_opts, &url);
             proxy["ws-opts"] = ws_opts;
         }
         "grpc" => {
+            let mut grpc_opts = json!({});
             if let Some(service_name) =
                 query_value(&url, "serviceName").filter(|value| !value.is_empty())
             {
-                proxy["grpc-opts"] = json!({ "grpc-service-name": service_name });
+                grpc_opts["grpc-service-name"] = json!(service_name);
+            }
+            apply_grpc_advanced(&mut grpc_opts, &url);
+            if grpc_opts.as_object().is_some_and(|m| !m.is_empty()) {
+                proxy["grpc-opts"] = grpc_opts;
             }
         }
         _ => {}
@@ -1691,13 +1772,31 @@ fn build_vmess_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         );
     }
 
+    // mTLS (mutual TLS) — certificate + private-key, both required.
+    let cert = json
+        .get("certificate")
+        .and_then(Value::as_str)
+        .or_else(|| json.get("cert").and_then(Value::as_str));
+    let key = json
+        .get("privateKey")
+        .and_then(Value::as_str)
+        .or_else(|| json.get("private_key").and_then(Value::as_str));
+    if let (Some(cert), Some(key)) = (cert, key) {
+        proxy["certificate"] = json!(cert);
+        proxy["private-key"] = json!(key);
+    }
+
     // ECH (Encrypted Client Hello) — parsed from vmess JSON `ech` field.
     if let Some(ech) = json.get("ech").and_then(Value::as_str) {
-        if ech == "1" || ech.eq_ignore_ascii_case("true") {
-            proxy["ech-opts"] = json!({ "enable": true });
+        let mut ech_opts = if ech == "1" || ech.eq_ignore_ascii_case("true") {
+            json!({ "enable": true })
         } else {
-            proxy["ech-opts"] = json!({ "enable": true, "config": ech });
+            json!({ "enable": true, "config": ech })
+        };
+        if let Some(qsn) = json.get("echServerName").and_then(Value::as_str) {
+            ech_opts["query-server-name"] = json!(qsn);
         }
+        proxy["ech-opts"] = ech_opts;
     }
 
     if network == "ws" {
@@ -1708,7 +1807,59 @@ fn build_vmess_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         if let Some(host) = json.get("host").and_then(Value::as_str) {
             ws_opts["headers"] = json!({ "Host": host });
         }
+        if let Some(v) = json.get("maxEarlyData").and_then(Value::as_u64) {
+            ws_opts["max-early-data"] = json!(v);
+        }
+        if let Some(v) = json.get("earlyDataHeaderName").and_then(Value::as_str) {
+            ws_opts["early-data-header-name"] = json!(v);
+        }
+        if let Some(v) = json.get("v2rayHttpUpgrade").and_then(Value::as_str)
+            && (v == "1" || v.eq_ignore_ascii_case("true"))
+        {
+            ws_opts["v2ray-http-upgrade"] = json!(true);
+        }
+        if let Some(v) = json.get("v2rayHttpUpgradeFastOpen").and_then(Value::as_str)
+            && (v == "1" || v.eq_ignore_ascii_case("true"))
+        {
+            ws_opts["v2ray-http-upgrade-fast-open"] = json!(true);
+        }
         proxy["ws-opts"] = ws_opts;
+    } else if network == "grpc" {
+        let mut grpc_opts = json!({});
+        // VMess stores grpc serviceName in the `path` JSON field.
+        if let Some(service_name) = json.get("path").and_then(Value::as_str) {
+            grpc_opts["grpc-service-name"] = json!(service_name);
+        }
+        if let Some(v) = json.get("grpcUserAgent").and_then(Value::as_str) {
+            grpc_opts["grpc-user-agent"] = json!(v);
+        }
+        if let Some(v) = json.get("pingInterval").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        }) {
+            grpc_opts["ping-interval"] = json!(v);
+        }
+        if let Some(v) = json.get("maxConnections").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        }) {
+            grpc_opts["max-connections"] = json!(v);
+        }
+        if let Some(v) = json.get("minStreams").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        }) {
+            grpc_opts["min-streams"] = json!(v);
+        }
+        if let Some(v) = json.get("maxStreams").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        }) {
+            grpc_opts["max-streams"] = json!(v);
+        }
+        if grpc_opts.as_object().is_some_and(|m| !m.is_empty()) {
+            proxy["grpc-opts"] = grpc_opts;
+        }
     }
 
     Ok(proxy)
@@ -1762,6 +1913,9 @@ fn build_trojan_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         );
     }
 
+    // mTLS (mutual TLS) — certificate + private-key, both required.
+    apply_mtls_cert_key(&mut proxy, &url);
+
     // ECH (Encrypted Client Hello) — parsed from `ech` query param.
     if let Some(ech_opts) = build_ech_opts(&url) {
         proxy["ech-opts"] = ech_opts;
@@ -1777,7 +1931,19 @@ fn build_trojan_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
             if let Some(host) = query_value(&url, "host").filter(|value| !value.is_empty()) {
                 ws_opts["headers"] = json!({ "Host": host });
             }
+            apply_ws_early_data(&mut ws_opts, &url);
             proxy["ws-opts"] = ws_opts;
+        } else if net == "grpc" {
+            let mut grpc_opts = json!({});
+            if let Some(service_name) =
+                query_value(&url, "serviceName").filter(|value| !value.is_empty())
+            {
+                grpc_opts["grpc-service-name"] = json!(service_name);
+            }
+            apply_grpc_advanced(&mut grpc_opts, &url);
+            if grpc_opts.as_object().is_some_and(|m| !m.is_empty()) {
+                proxy["grpc-opts"] = grpc_opts;
+            }
         }
     }
 
@@ -1987,10 +2153,7 @@ fn build_tuic_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         return Err("TUIC ссылка без UUID".to_owned());
     }
 
-    let password = url
-        .password()
-        .map(percent_decode)
-        .unwrap_or_default();
+    let password = url.password().map(percent_decode).unwrap_or_default();
 
     let mut proxy = json!({
         "name": name,
@@ -2021,11 +2184,19 @@ fn build_tuic_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         proxy["ip"] = json!(ip);
     }
 
-    if is_truthy_option(query_value(&url, "disable-sni").or_else(|| query_value(&url, "disable_sni")).as_deref()) {
+    if is_truthy_option(
+        query_value(&url, "disable-sni")
+            .or_else(|| query_value(&url, "disable_sni"))
+            .as_deref(),
+    ) {
         proxy["disable-sni"] = json!(true);
     }
 
-    if is_truthy_option(query_value(&url, "reduce-rtt").or_else(|| query_value(&url, "reduce_rtt")).as_deref()) {
+    if is_truthy_option(
+        query_value(&url, "reduce-rtt")
+            .or_else(|| query_value(&url, "reduce_rtt"))
+            .as_deref(),
+    ) {
         proxy["reduce-rtt"] = json!(true);
     }
 
@@ -2036,8 +2207,8 @@ fn build_tuic_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         proxy["request-timeout"] = json!(timeout);
     }
 
-    if let Some(mode) = query_value(&url, "udp-relay-mode")
-        .or_else(|| query_value(&url, "udp_relay_mode"))
+    if let Some(mode) =
+        query_value(&url, "udp-relay-mode").or_else(|| query_value(&url, "udp_relay_mode"))
     {
         proxy["udp-relay-mode"] = json!(mode);
     }
@@ -2069,7 +2240,11 @@ fn build_tuic_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         proxy["max-open-streams"] = json!(max_streams);
     }
 
-    if is_truthy_option(query_value(&url, "fast-open").or_else(|| query_value(&url, "fast_open")).as_deref()) {
+    if is_truthy_option(
+        query_value(&url, "fast-open")
+            .or_else(|| query_value(&url, "fast_open"))
+            .as_deref(),
+    ) {
         proxy["fast-open"] = json!(true);
     }
 
@@ -2092,7 +2267,13 @@ fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
         result.push(ip_rule(ip, &target));
     }
     for port in &rule.ports {
-        result.push(format!("DST-PORT,{},{}", port, target));
+        if let Some(rest) = port.strip_prefix("src-port:") {
+            result.push(format!("SRC-PORT,{rest},{target}"));
+        } else if let Some(rest) = port.strip_prefix("in-port:") {
+            result.push(format!("IN-PORT,{rest},{target}"));
+        } else {
+            result.push(format!("DST-PORT,{port},{target}"));
+        }
     }
     if let Some(network) = &rule.network {
         result.push(format!("NETWORK,{},{}", network, target));
@@ -2106,14 +2287,17 @@ fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
 /// Supported prefixes:
 /// - `geosite:xxx` → `GEOSITE,xxx,target`
 /// - `=exact` → `DOMAIN,exact,target`
+/// - `keyword:xxx` → `DOMAIN-KEYWORD,xxx,target`
 /// - `regex:xxx` → `DOMAIN-REGEX,xxx,target`
-/// - `wildcard:xxx` → `DOMAIN-WILDCARD,xxx,target`
+/// - `wildcard:xxx` → `DOMAIN-WILDCARD,wildcard,target`
 /// - bare domain → `DOMAIN-SUFFIX,domain,target`
 fn domain_rule(domain: &str, target: &str) -> String {
     if let Some(name) = domain.strip_prefix("geosite:") {
         format!("GEOSITE,{name},{target}")
     } else if let Some(exact) = domain.strip_prefix('=') {
         format!("DOMAIN,{exact},{target}")
+    } else if let Some(keyword) = domain.strip_prefix("keyword:") {
+        format!("DOMAIN-KEYWORD,{keyword},{target}")
     } else if let Some(regex) = domain.strip_prefix("regex:") {
         format!("DOMAIN-REGEX,{regex},{target}")
     } else if let Some(wildcard) = domain.strip_prefix("wildcard:") {
@@ -2132,6 +2316,9 @@ fn domain_rule(domain: &str, target: &str) -> String {
 /// - `ip-asn:13335` → `IP-ASN,13335,target`
 /// - `src-geoip:CN` → `SRC-GEOIP,CN,target`
 /// - `src-ip-asn:13335` → `SRC-IP-ASN,13335,target`
+/// - `ip-suffix:8.8.8.8/24` → `IP-SUFFIX,8.8.8.8/24,target`
+/// - `src-ip-cidr:192.168.1.0/24` → `SRC-IP-CIDR,192.168.1.0/24,target`
+/// - `src-ip-suffix:192.168.1.0/8` → `SRC-IP-SUFFIX,192.168.1.0/8,target`
 /// - bare IP/CIDR → `IP-CIDR,<ip>,<target>`
 fn ip_rule(ip: &str, target: &str) -> String {
     if let Some(rest) = ip.strip_prefix("geoip:") {
@@ -2141,7 +2328,10 @@ fn ip_rule(ip: &str, target: &str) -> String {
         } else {
             format!("GEOIP,{rest},{target}")
         }
-    } else if let Some(rest) = ip.strip_prefix("geoip-asn:").or_else(|| ip.strip_prefix("ip-asn:")) {
+    } else if let Some(rest) = ip
+        .strip_prefix("geoip-asn:")
+        .or_else(|| ip.strip_prefix("ip-asn:"))
+    {
         if let Some((asn, suffix)) = rest.split_once(',') {
             format!("IP-ASN,{asn},{target},{suffix}")
         } else {
@@ -2151,6 +2341,16 @@ fn ip_rule(ip: &str, target: &str) -> String {
         format!("SRC-GEOIP,{rest},{target}")
     } else if let Some(rest) = ip.strip_prefix("src-ip-asn:") {
         format!("SRC-IP-ASN,{rest},{target}")
+    } else if let Some(rest) = ip.strip_prefix("ip-suffix:") {
+        if let Some((code, suffix)) = rest.split_once(',') {
+            format!("IP-SUFFIX,{code},{target},{suffix}")
+        } else {
+            format!("IP-SUFFIX,{rest},{target}")
+        }
+    } else if let Some(rest) = ip.strip_prefix("src-ip-cidr:") {
+        format!("SRC-IP-CIDR,{rest},{target}")
+    } else if let Some(rest) = ip.strip_prefix("src-ip-suffix:") {
+        format!("SRC-IP-SUFFIX,{rest},{target}")
     } else {
         format!("IP-CIDR,{ip},{target}")
     }
@@ -2185,11 +2385,19 @@ fn query_value_multi(url: &Url, names: &[&str]) -> Option<String> {
 ///
 /// If `ech` is `1` or `true`, emits `ech-opts.enable: true` with no
 /// config (Mihomo resolves via DNS). If `ech` is a base64 string, emits
-/// both `enable: true` and `config: <base64>`.
+/// both `enable: true` and `config: <base64>`. Optionally includes
+/// `query-server-name` from `echServerName`/`ech_server_name` param.
 fn build_ech_opts(url: &Url) -> Option<Value> {
     let ech = query_value(url, "ech")?;
     if ech == "1" || ech.eq_ignore_ascii_case("true") {
-        return Some(json!({ "enable": true }));
+        let mut opts = json!({ "enable": true });
+        if let Some(qsn) = query_value_multi(
+            url,
+            &["echServerName", "ech_server_name", "ech-server-name"],
+        ) {
+            opts["query-server-name"] = json!(qsn);
+        }
+        return Some(opts);
     }
     // Also check `echConfig` / `ech_config` for explicit base64 config.
     let config = if ech.contains('=') || ech.contains('+') || ech.len() > 20 {
@@ -2199,7 +2407,87 @@ fn build_ech_opts(url: &Url) -> Option<Value> {
         // Check for explicit config param.
         query_value_multi(url, &["echConfig", "ech_config", "ech-config"])?
     };
-    Some(json!({ "enable": true, "config": config }))
+    let mut opts = json!({ "enable": true, "config": config });
+    if let Some(qsn) = query_value_multi(
+        url,
+        &["echServerName", "ech_server_name", "ech-server-name"],
+    ) {
+        opts["query-server-name"] = json!(qsn);
+    }
+    Some(opts)
+}
+
+/// Add certificate and private-key (mTLS) fields from URL query parameters.
+/// Both must be present to enable mTLS — if only one is set, it is ignored.
+fn apply_mtls_cert_key(proxy: &mut Value, url: &Url) {
+    let cert = query_value_multi(url, &["certificate", "cert"]);
+    let key = query_value_multi(url, &["privateKey", "private_key", "private-key"]);
+    if let (Some(cert), Some(key)) = (cert, key) {
+        proxy["certificate"] = json!(cert);
+        proxy["private-key"] = json!(key);
+    }
+}
+
+/// Add ws-opts early-data fields from URL query parameters (VLESS/Trojan).
+///
+/// Parses `maxEarlyData`/`max_early_data` (int), `earlyDataHeaderName`/
+/// `early_data_header_name` (string), `v2rayHttpUpgrade`/
+/// `v2ray_http_upgrade` (bool), `v2rayHttpUpgradeFastOpen`/
+/// `v2ray_http_upgrade_fast_open` (bool).
+fn apply_ws_early_data(ws_opts: &mut Value, url: &Url) {
+    if let Some(v) = query_value_multi(url, &["maxEarlyData", "max_early_data"])
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        ws_opts["max-early-data"] = json!(v);
+    }
+    if let Some(v) = query_value_multi(url, &["earlyDataHeaderName", "early_data_header_name"]) {
+        ws_opts["early-data-header-name"] = json!(v);
+    }
+    if is_truthy_option(
+        query_value_multi(url, &["v2rayHttpUpgrade", "v2ray_http_upgrade"]).as_deref(),
+    ) {
+        ws_opts["v2ray-http-upgrade"] = json!(true);
+    }
+    if is_truthy_option(
+        query_value_multi(
+            url,
+            &["v2rayHttpUpgradeFastOpen", "v2ray_http_upgrade_fast_open"],
+        )
+        .as_deref(),
+    ) {
+        ws_opts["v2ray-http-upgrade-fast-open"] = json!(true);
+    }
+}
+
+/// Add grpc-opts advanced fields from URL query parameters (VLESS/Trojan).
+///
+/// Parses `grpcUserAgent`/`grpc_user_agent`, `pingInterval`/
+/// `ping_interval` (int), `maxConnections`/`max_connections` (int),
+/// `minStreams`/`min_streams` (int), `maxStreams`/`max_streams` (int).
+fn apply_grpc_advanced(grpc_opts: &mut Value, url: &Url) {
+    if let Some(v) = query_value_multi(url, &["grpcUserAgent", "grpc_user_agent"]) {
+        grpc_opts["grpc-user-agent"] = json!(v);
+    }
+    if let Some(v) = query_value_multi(url, &["pingInterval", "ping_interval"])
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        grpc_opts["ping-interval"] = json!(v);
+    }
+    if let Some(v) = query_value_multi(url, &["maxConnections", "max_connections"])
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        grpc_opts["max-connections"] = json!(v);
+    }
+    if let Some(v) =
+        query_value_multi(url, &["minStreams", "min_streams"]).and_then(|s| s.parse::<u32>().ok())
+    {
+        grpc_opts["min-streams"] = json!(v);
+    }
+    if let Some(v) =
+        query_value_multi(url, &["maxStreams", "max_streams"]).and_then(|s| s.parse::<u32>().ok())
+    {
+        grpc_opts["max-streams"] = json!(v);
+    }
 }
 
 #[cfg(test)]
@@ -3466,6 +3754,11 @@ mod tests {
             dns_respect_rules: true,
             dns_proxy_server_nameserver: vec!["223.5.5.5".to_owned()],
             dns_direct_nameserver: vec!["system".to_owned()],
+            dns_nameserver_policy: {
+                let mut p = std::collections::HashMap::new();
+                p.insert("+.google.com".to_owned(), vec!["https://dns.google/dns-query".to_owned()]);
+                p
+            },
             dns_fallback_filter: Some(FallbackFilter {
                 geoip: false,
                 geoip_code: "US".to_owned(),
@@ -3477,6 +3770,7 @@ mod tests {
             sniffer_skip_domain: vec!["skip.test".to_owned()],
             sniffer_skip_src_address: vec!["192.168.1.0/24".to_owned()],
             sniffer_skip_dst_address: vec!["10.0.0.0/8".to_owned()],
+            raw_rules: vec!["AND,((DOMAIN,test.com),(NETWORK,udp)),DIRECT".to_owned()],
         };
         let json = serde_json::to_string(&features).expect("serialize");
         let deserialized: MihomoFeatures = serde_json::from_str(&json).expect("deserialize");
@@ -3657,19 +3951,13 @@ mod tests {
         let profile = &profiles[0];
         let proxy = build_wireguard_proxy(profile, PROXY_NAME).expect("wg proxy");
 
-        assert_eq!(
-            proxy.get("type").and_then(Value::as_str),
-            Some("wireguard")
-        );
+        assert_eq!(proxy.get("type").and_then(Value::as_str), Some("wireguard"));
         assert_eq!(
             proxy.get("server").and_then(Value::as_str),
             Some("162.159.192.1")
         );
         assert_eq!(proxy.get("port").and_then(Value::as_u64), Some(2480));
-        assert_eq!(
-            proxy.get("ip").and_then(Value::as_str),
-            Some("172.16.0.2")
-        );
+        assert_eq!(proxy.get("ip").and_then(Value::as_str), Some("172.16.0.2"));
         assert_eq!(
             proxy.get("private-key").and_then(Value::as_str),
             Some("eCtXsJZ27+4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU=")
@@ -3690,15 +3978,15 @@ mod tests {
         let profile = &profiles[0];
         let proxy = build_wireguard_proxy(profile, PROXY_NAME).expect("wg proxy");
 
-        assert_eq!(
-            proxy.get("ip").and_then(Value::as_str),
-            Some("172.16.0.2")
-        );
+        assert_eq!(proxy.get("ip").and_then(Value::as_str), Some("172.16.0.2"));
         assert_eq!(
             proxy.get("ipv6").and_then(Value::as_str),
             Some("fd01:5ca1:ab1e::1")
         );
-        let reserved = proxy.get("reserved").and_then(Value::as_array).expect("reserved");
+        let reserved = proxy
+            .get("reserved")
+            .and_then(Value::as_array)
+            .expect("reserved");
         assert_eq!(reserved.len(), 3);
         assert_eq!(reserved[0].as_u64(), Some(209));
         assert_eq!(reserved[1].as_u64(), Some(98));
@@ -3713,10 +4001,7 @@ mod tests {
         );
         let profile = &profiles[0];
         let proxy = build_wireguard_proxy(profile, PROXY_NAME).expect("wg proxy");
-        assert_eq!(
-            proxy.get("ip").and_then(Value::as_str),
-            Some("172.16.0.2")
-        );
+        assert_eq!(proxy.get("ip").and_then(Value::as_str), Some("172.16.0.2"));
     }
 
     #[test]
@@ -3793,10 +4078,7 @@ mod tests {
             proxy.get("disable-sni").and_then(Value::as_bool),
             Some(true)
         );
-        assert_eq!(
-            proxy.get("reduce-rtt").and_then(Value::as_bool),
-            Some(true)
-        );
+        assert_eq!(proxy.get("reduce-rtt").and_then(Value::as_bool), Some(true));
     }
 
     #[test]
@@ -3900,9 +4182,7 @@ mod tests {
         let profile = &profiles[0];
         let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
         let xhttp_opts = proxy.get("xhttp-opts").expect("xhttp-opts");
-        let reuse = xhttp_opts
-            .get("reuse-settings")
-            .expect("reuse-settings");
+        let reuse = xhttp_opts.get("reuse-settings").expect("reuse-settings");
         assert_eq!(
             reuse.get("max-concurrency").and_then(Value::as_u64),
             Some(16)
@@ -3962,9 +4242,7 @@ mod tests {
             .and_then(Value::as_object)
             .expect("sub-rules");
         assert!(sub_rules.contains_key("ad-block"));
-        let rules = sub_rules["ad-block"]
-            .as_array()
-            .expect("rules array");
+        let rules = sub_rules["ad-block"].as_array().expect("rules array");
         assert_eq!(rules.len(), 2);
     }
 
@@ -4020,11 +4298,7 @@ mod tests {
             .get("rules")
             .and_then(Value::as_array)
             .expect("rules");
-        assert!(
-            rules
-                .iter()
-                .any(|r| r.as_str() == Some("GEOIP,CN,DIRECT"))
-        );
+        assert!(rules.iter().any(|r| r.as_str() == Some("GEOIP,CN,DIRECT")));
     }
 
     #[test]
@@ -4202,6 +4476,545 @@ mod tests {
                 .get("support-x25519mlkem768")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    // ── v0.11.0: DOMAIN-KEYWORD rule ───────────────────────────────
+
+    #[test]
+    fn domain_rule_keyword_prefix_generates_domain_keyword() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec!["keyword:google".to_owned()],
+            ips: vec![],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("DOMAIN-KEYWORD,google,DIRECT"))
+        );
+    }
+
+    // ── v0.11.0: IP-SUFFIX / SRC-IP-CIDR / SRC-IP-SUFFIX rules ─────
+
+    #[test]
+    fn ip_rule_ip_suffix_prefix_generates_ip_suffix() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec!["ip-suffix:8.8.8.8/24".to_owned()],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("IP-SUFFIX,8.8.8.8/24,DIRECT"))
+        );
+    }
+
+    #[test]
+    fn ip_rule_src_ip_cidr_prefix() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec!["src-ip-cidr:192.168.1.0/24".to_owned()],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("SRC-IP-CIDR,192.168.1.0/24,DIRECT"))
+        );
+    }
+
+    #[test]
+    fn ip_rule_src_ip_suffix_prefix() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec!["src-ip-suffix:192.168.1.0/8".to_owned()],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("SRC-IP-SUFFIX,192.168.1.0/8,DIRECT"))
+        );
+    }
+
+    // ── v0.11.0: SRC-PORT / IN-PORT rules ──────────────────────────
+
+    #[test]
+    fn rule_to_strings_src_port_prefix() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec![],
+            outbound_tag: "active".to_owned(),
+            block_quic: false,
+            ports: vec!["src-port:7777".to_owned()],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("SRC-PORT,7777,proxy"))
+        );
+    }
+
+    #[test]
+    fn rule_to_strings_in_port_prefix() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec![],
+            outbound_tag: "active".to_owned(),
+            block_quic: false,
+            ports: vec!["in-port:7890".to_owned()],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("IN-PORT,7890,proxy"))
+        );
+    }
+
+    // ── v0.11.0: ws-opts early-data ────────────────────────────────
+
+    #[test]
+    fn vless_ws_early_data_fields() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws&security=tls&sni=example.com&path=/ws&host=example.com&maxEarlyData=2048&earlyDataHeaderName=Sec-WebSocket-Protocol&v2rayHttpUpgrade=1#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let ws_opts = proxy.get("ws-opts").expect("ws-opts");
+        assert_eq!(
+            ws_opts.get("max-early-data").and_then(Value::as_u64),
+            Some(2048)
+        );
+        assert_eq!(
+            ws_opts
+                .get("early-data-header-name")
+                .and_then(Value::as_str),
+            Some("Sec-WebSocket-Protocol")
+        );
+        assert_eq!(
+            ws_opts.get("v2ray-http-upgrade").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn vmess_ws_early_data_fields() {
+        let vmess_json = r#"{"v":"2","ps":"VMess WS","add":"example.com","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"ws","type":"none","host":"example.com","path":"/ws","tls":"tls","sni":"example.com","maxEarlyData":1024,"earlyDataHeaderName":"Sec-WebSocket-Protocol"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(vmess_json.as_bytes());
+        let link = format!("vmess://{encoded}#VMess WS");
+        let profiles = parse_profiles(&link);
+        let profile = &profiles[0];
+        let proxy = build_vmess_proxy(profile, PROXY_NAME).expect("vmess proxy");
+        let ws_opts = proxy.get("ws-opts").expect("ws-opts");
+        assert_eq!(
+            ws_opts.get("max-early-data").and_then(Value::as_u64),
+            Some(1024)
+        );
+        assert_eq!(
+            ws_opts
+                .get("early-data-header-name")
+                .and_then(Value::as_str),
+            Some("Sec-WebSocket-Protocol")
+        );
+    }
+
+    // ── v0.11.0: grpc-opts advanced ────────────────────────────────
+
+    #[test]
+    fn vless_grpc_advanced_fields() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=grpc&security=tls&sni=example.com&serviceName=grpc_service&grpcUserAgent=custom-agent&pingInterval=30&maxConnections=4&minStreams=2&maxStreams=10#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let grpc_opts = proxy.get("grpc-opts").expect("grpc-opts");
+        assert_eq!(
+            grpc_opts.get("grpc-service-name").and_then(Value::as_str),
+            Some("grpc_service")
+        );
+        assert_eq!(
+            grpc_opts.get("grpc-user-agent").and_then(Value::as_str),
+            Some("custom-agent")
+        );
+        assert_eq!(
+            grpc_opts.get("ping-interval").and_then(Value::as_u64),
+            Some(30)
+        );
+        assert_eq!(
+            grpc_opts.get("max-connections").and_then(Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            grpc_opts.get("min-streams").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            grpc_opts.get("max-streams").and_then(Value::as_u64),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn trojan_grpc_transport() {
+        let profiles = parse_profiles(
+            "trojan://secretpass@example.com:443?security=tls&sni=example.com&type=grpc&serviceName=grpc_service#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_trojan_proxy(profile, PROXY_NAME).expect("trojan proxy");
+        assert_eq!(proxy.get("network").and_then(Value::as_str), Some("grpc"));
+        let grpc_opts = proxy.get("grpc-opts").expect("grpc-opts");
+        assert_eq!(
+            grpc_opts.get("grpc-service-name").and_then(Value::as_str),
+            Some("grpc_service")
+        );
+    }
+
+    // ── v0.11.0: mTLS certificate/private-key ──────────────────────
+
+    #[test]
+    fn vless_mtls_certificate_and_key() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=tls&sni=example.com&certificate=cert123&privateKey=key456#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        assert_eq!(
+            proxy.get("certificate").and_then(Value::as_str),
+            Some("cert123")
+        );
+        assert_eq!(
+            proxy.get("private-key").and_then(Value::as_str),
+            Some("key456")
+        );
+    }
+
+    #[test]
+    fn vmess_mtls_certificate_and_key() {
+        let vmess_json = r#"{"v":"2","ps":"VMess mTLS","add":"example.com","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"tcp","tls":"tls","sni":"example.com","certificate":"cert123","privateKey":"key456"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(vmess_json.as_bytes());
+        let link = format!("vmess://{encoded}#VMess mTLS");
+        let profiles = parse_profiles(&link);
+        let profile = &profiles[0];
+        let proxy = build_vmess_proxy(profile, PROXY_NAME).expect("vmess proxy");
+        assert_eq!(
+            proxy.get("certificate").and_then(Value::as_str),
+            Some("cert123")
+        );
+        assert_eq!(
+            proxy.get("private-key").and_then(Value::as_str),
+            Some("key456")
+        );
+    }
+
+    // ── v0.11.0: ECH query-server-name ─────────────────────────────
+
+    #[test]
+    fn vless_ech_with_query_server_name() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&sni=example.com&ech=1&echServerName=ech.example.com#ECH",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let ech_opts = proxy.get("ech-opts").expect("ech-opts");
+        assert_eq!(ech_opts.get("enable").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            ech_opts.get("query-server-name").and_then(Value::as_str),
+            Some("ech.example.com")
+        );
+    }
+
+    #[test]
+    fn vmess_ech_with_query_server_name() {
+        let vmess_json = r#"{"v":"2","ps":"VMess ECH","add":"example.com","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"tcp","tls":"tls","sni":"example.com","ech":"1","echServerName":"ech.example.com"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(vmess_json.as_bytes());
+        let link = format!("vmess://{encoded}#VMess ECH");
+        let profiles = parse_profiles(&link);
+        let profile = &profiles[0];
+        let proxy = build_vmess_proxy(profile, PROXY_NAME).expect("vmess proxy");
+        let ech_opts = proxy.get("ech-opts").expect("ech-opts");
+        assert_eq!(ech_opts.get("enable").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            ech_opts.get("query-server-name").and_then(Value::as_str),
+            Some("ech.example.com")
+        );
+    }
+
+    // ── v0.11.0: DNS nameserver-policy ─────────────────────────────
+
+    #[test]
+    fn dns_includes_nameserver_policy_when_configured() {
+        let mut features = default_features();
+        let mut policy = std::collections::HashMap::new();
+        policy.insert(
+            "+.google.com".to_owned(),
+            vec!["https://dns.google/dns-query".to_owned()],
+        );
+        policy.insert(
+            "geosite:cn".to_owned(),
+            vec!["223.5.5.5".to_owned(), "223.6.6.6".to_owned()],
+        );
+        features.dns_nameserver_policy = policy;
+        let config = build_test_router_config(&features);
+        let dns = config.get("dns").expect("dns");
+        let np = dns.get("nameserver-policy").expect("nameserver-policy");
+        let google = np
+            .get("+.google.com")
+            .and_then(Value::as_array)
+            .expect("google servers");
+        assert_eq!(google.len(), 1);
+        assert_eq!(google[0].as_str(), Some("https://dns.google/dns-query"));
+        let cn = np
+            .get("geosite:cn")
+            .and_then(Value::as_array)
+            .expect("cn servers");
+        assert_eq!(cn.len(), 2);
+        assert_eq!(cn[0].as_str(), Some("223.5.5.5"));
+        assert_eq!(cn[1].as_str(), Some("223.6.6.6"));
+    }
+
+    #[test]
+    fn dns_omits_nameserver_policy_when_empty() {
+        let config = build_test_router_config(&default_features());
+        let dns = config.get("dns").expect("dns");
+        assert!(dns.get("nameserver-policy").is_none());
+    }
+
+    // ── v0.11.0: Proxy group include-all / include-all-proxies ────
+
+    #[test]
+    fn proxy_group_include_all_flag() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            include_all: true,
+            ..ProxyGroupConfig::default()
+        };
+        let config = build_test_router_config(&features);
+        let group = &config["proxy-groups"][0];
+        assert_eq!(
+            group.get("include-all").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn proxy_group_include_all_proxies_flag() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            include_all_proxies: true,
+            ..ProxyGroupConfig::default()
+        };
+        let config = build_test_router_config(&features);
+        let group = &config["proxy-groups"][0];
+        assert_eq!(
+            group.get("include-all-proxies").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    // ── v0.11.0: Raw rules (AND/OR/NOT logic) ──────────────────────
+
+    #[test]
+    fn raw_rules_emitted_in_router_config() {
+        let mut features = default_features();
+        features.raw_rules = vec![
+            "AND,((DOMAIN,baidu.com),(NETWORK,udp)),DIRECT".to_owned(),
+            "NOT,((DOMAIN,baidu.com)),PROXY".to_owned(),
+        ];
+        let config = build_test_router_config(&features);
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("AND,((DOMAIN,baidu.com),(NETWORK,udp)),DIRECT")),
+            "AND rule should be present"
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("NOT,((DOMAIN,baidu.com)),PROXY")),
+            "NOT rule should be present"
+        );
+        // Raw rules should appear before MATCH
+        let match_idx = rules
+            .iter()
+            .position(|r| r.as_str().is_some_and(|s| s.starts_with("MATCH,")));
+        let and_idx = rules
+            .iter()
+            .position(|r| r.as_str() == Some("AND,((DOMAIN,baidu.com),(NETWORK,udp)),DIRECT"));
+        assert!(and_idx.is_some_and(|ai| match_idx.is_some_and(|mi| ai < mi)));
+    }
+
+    #[test]
+    fn raw_rules_absent_when_empty() {
+        let config = build_test_router_config(&default_features());
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        // Only the QUIC block AND rule and MATCH should be present — no user raw rules
+        assert!(
+            !rules
+                .iter()
+                .any(|r| { r.as_str().is_some_and(|s| s.starts_with("NOT,")) })
         );
     }
 }

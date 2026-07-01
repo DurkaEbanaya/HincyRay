@@ -402,9 +402,7 @@ fn build_profile_outbound(profile: &Profile, tag: &str) -> Result<Value, String>
         Protocol::Tuic => {
             Err("Xray не поддерживает TUIC; используйте sing-box или mihomo".to_owned())
         }
-        Protocol::Unknown(scheme) => {
-            Err(format!("Xray не поддерживает протокол {scheme}"))
-        }
+        Protocol::Unknown(scheme) => Err(format!("Xray не поддерживает протокол {scheme}")),
     }
 }
 

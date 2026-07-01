@@ -5770,6 +5770,8 @@ tr.group-row.collapsed{display:none}
     <div class="field"><label for="feat-pg-exclude-filter">Exclude filter (regex, exclude by name)</label><input type="text" id="feat-pg-exclude-filter" placeholder="REJECT|DIRECT"></div>
     <div class="field"><label for="feat-pg-exclude-type">Exclude type (pipe-separated)</label><input type="text" id="feat-pg-exclude-type" placeholder="Shadowsocks|Http"></div>
     <label class="chip"><input type="checkbox" id="feat-pg-include-all-providers"> Include all proxy-provider nodes</label>
+    <label class="chip"><input type="checkbox" id="feat-pg-include-all"> Include all proxies + providers</label>
+    <label class="chip"><input type="checkbox" id="feat-pg-include-all-proxies"> Include all proxies only</label>
   </div>
   <h3>External Controller (REST API)</h3>
   <div class="grid2">
@@ -5798,6 +5800,7 @@ tr.group-row.collapsed{display:none}
     <label class="chip"><input type="checkbox" id="feat-dns-h3"> Prefer HTTP/3 for DoH</label>
     <label class="chip"><input type="checkbox" id="feat-dns-rr"> Respect routing rules for DNS</label>
   </div>
+  <div class="field"><label for="feat-dns-nameserver-policy">Nameserver policy (one per line: <code>domain: server1,server2</code>)</label><textarea id="feat-dns-nameserver-policy" rows="4" style="width:100%;font-family:monospace" placeholder="+.google.com: https://dns.google/dns-query&#10;geosite:cn: 223.5.5.5,223.6.6.6"></textarea></div>
   <h3>Experimental</h3>
   <div class="grid2">
     <label class="chip"><input type="checkbox" id="feat-exp-gso"> Disable QUIC GSO</label>
@@ -5807,6 +5810,9 @@ tr.group-row.collapsed{display:none}
   <h3>Sub-rules</h3>
   <p class="subtle">Named rule groups referenced via <code>SUB-RULE,(conditions),name</code>. Format: <code>[name]</code> on its own line, then one rule per line. Blank line separates groups.</p>
   <div class="field"><textarea id="feat-sub-rules" rows="6" style="width:100%;font-family:monospace" placeholder="[ad-block]&#10;DOMAIN-SUFFIX,doubleclick.net,REJECT&#10;MATCH,PROXY&#10;&#10;[dns-protect]&#10;IP-CIDR,1.1.1.1/32,REJECT"></textarea></div>
+  <h3>Raw Rules</h3>
+  <p class="subtle">Raw Mihomo rule strings appended before <code>MATCH</code> (one per line). Use for AND/OR/NOT logic rules and other rule types not covered by the routing UI.</p>
+  <div class="field"><textarea id="feat-raw-rules" rows="5" style="width:100%;font-family:monospace" placeholder="AND,((DOMAIN,baidu.com),(NETWORK,udp)),DIRECT&#10;OR,((NETWORK,udp),(DOMAIN,baidu.com)),REJECT&#10;NOT,((DOMAIN,baidu.com)),PROXY"></textarea></div>
   <div class="row" style="margin:.45em 0">
     <button id="btn-features-save">Save Mihomo features</button>
     <span class="subtle" id="features-status"></span>
@@ -6983,6 +6989,8 @@ function loadFeatures(){
     document.getElementById("feat-pg-exclude-filter").value = (f.proxy_group && f.proxy_group.exclude_filter) || "";
     document.getElementById("feat-pg-exclude-type").value = (f.proxy_group && f.proxy_group.exclude_type) || "";
     document.getElementById("feat-pg-include-all-providers").checked = !!(f.proxy_group && f.proxy_group.include_all_providers);
+    document.getElementById("feat-pg-include-all").checked = !!(f.proxy_group && f.proxy_group.include_all);
+    document.getElementById("feat-pg-include-all-proxies").checked = !!(f.proxy_group && f.proxy_group.include_all_proxies);
     document.getElementById("feat-ec-enabled").checked = !!(f.external_controller && f.external_controller.enabled);
     document.getElementById("feat-ec-addr").value = (f.external_controller && f.external_controller.address) || "127.0.0.1:9090";
     document.getElementById("feat-ec-secret").value = (f.external_controller && f.external_controller.secret) || "";
@@ -6998,6 +7006,15 @@ function loadFeatures(){
     document.getElementById("feat-dns-cache").value = f.dns_cache_algorithm || "arc";
     document.getElementById("feat-dns-h3").checked = !!f.dns_prefer_h3;
     document.getElementById("feat-dns-rr").checked = !!f.dns_respect_rules;
+    // Nameserver policy: convert object to textarea (domain: server1,server2)
+    var npText = "";
+    if (f.dns_nameserver_policy && typeof f.dns_nameserver_policy === "object") {
+      Object.keys(f.dns_nameserver_policy).forEach(function(domain) {
+        var servers = f.dns_nameserver_policy[domain];
+        npText += domain + ": " + (Array.isArray(servers) ? servers.join(",") : servers) + "\\n";
+      });
+    }
+    document.getElementById("feat-dns-nameserver-policy").value = npText;
     document.getElementById("feat-exp-gso").checked = !!f.quic_go_disable_gso;
     document.getElementById("feat-exp-ecn").checked = !!f.quic_go_disable_ecn;
     document.getElementById("feat-tcp-concurrent").checked = !!f.tcp_concurrent;
@@ -7013,6 +7030,12 @@ function loadFeatures(){
       });
     }
     document.getElementById("feat-sub-rules").value = srText;
+    // Raw rules: convert array to textarea (one per line)
+    var rrText = "";
+    if (f.raw_rules && Array.isArray(f.raw_rules)) {
+      f.raw_rules.forEach(function(r) { if (r) rrText += r + "\\n"; });
+    }
+    document.getElementById("feat-raw-rules").value = rrText;
   });
 }
 
@@ -7028,7 +7051,9 @@ document.getElementById("btn-features-save").addEventListener("click", function(
       filter: document.getElementById("feat-pg-filter").value || null,
       exclude_filter: document.getElementById("feat-pg-exclude-filter").value || null,
       exclude_type: document.getElementById("feat-pg-exclude-type").value || null,
-      include_all_providers: document.getElementById("feat-pg-include-all-providers").checked
+      include_all_providers: document.getElementById("feat-pg-include-all-providers").checked,
+      include_all: document.getElementById("feat-pg-include-all").checked,
+      include_all_proxies: document.getElementById("feat-pg-include-all-proxies").checked
     },
     external_controller: {
       enabled: document.getElementById("feat-ec-enabled").checked,
@@ -7060,6 +7085,21 @@ document.getElementById("btn-features-save").addEventListener("click", function(
     dns_prefer_h3: document.getElementById("feat-dns-h3").checked,
     dns_respect_rules: document.getElementById("feat-dns-rr").checked,
     dns_proxy_server_nameserver: [], dns_direct_nameserver: [],
+    dns_nameserver_policy: (function() {
+      var text = document.getElementById("feat-dns-nameserver-policy").value.trim();
+      var obj = {};
+      if (!text) return obj;
+      text.split("\\n").forEach(function(line) {
+        line = line.trim();
+        if (!line) return;
+        var idx = line.indexOf(":");
+        if (idx < 0) return;
+        var domain = line.slice(0, idx).trim();
+        var servers = line.slice(idx + 1).trim().split(",").map(function(s) { return s.trim(); }).filter(function(s) { return s; });
+        if (domain && servers.length) obj[domain] = servers;
+      });
+      return obj;
+    })(),
     dns_fallback_filter: null,
     sniffer_force_domain: [], sniffer_skip_domain: [],
     sniffer_skip_src_address: [], sniffer_skip_dst_address: [],
@@ -7092,6 +7132,11 @@ document.getElementById("btn-features-save").addEventListener("click", function(
       });
       if (curName) groups.push({name: curName, rules: curRules});
       return groups;
+    })(),
+    raw_rules: (function() {
+      var text = document.getElementById("feat-raw-rules").value.trim();
+      if (!text) return [];
+      return text.split("\\n").map(function(r) { return r.trim(); }).filter(function(r) { return r; });
     })()
   };
   api("POST", "/api/mihomo-features", JSON.stringify(f)).then(function(){
