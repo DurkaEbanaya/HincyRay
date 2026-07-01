@@ -13,6 +13,8 @@ pub enum Protocol {
     Trojan,
     Shadowsocks,
     Hysteria2,
+    WireGuard,
+    Tuic,
     Unknown(String),
 }
 
@@ -24,6 +26,8 @@ impl Protocol {
             "trojan" => Self::Trojan,
             "ss" | "shadowsocks" => Self::Shadowsocks,
             "hysteria" | "hysteria2" | "hy2" => Self::Hysteria2,
+            "wireguard" | "wg" => Self::WireGuard,
+            "tuic" => Self::Tuic,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -37,6 +41,8 @@ impl fmt::Display for Protocol {
             Self::Trojan => f.write_str("Trojan"),
             Self::Shadowsocks => f.write_str("Shadowsocks"),
             Self::Hysteria2 => f.write_str("Hysteria2"),
+            Self::WireGuard => f.write_str("WireGuard"),
+            Self::Tuic => f.write_str("TUIC"),
             Self::Unknown(value) => f.write_str(value),
         }
     }
@@ -447,6 +453,17 @@ fn parse_profile_candidate(candidate: &str) -> Option<Profile> {
         return parse_shadowsocks_legacy_candidate(candidate);
     }
 
+    // WireGuard links: the private key may be in the username position
+    // (percent-encoded) or in a `privatekey` query parameter.
+    if matches!(protocol, Protocol::WireGuard) {
+        return parse_wireguard_candidate(candidate);
+    }
+
+    // TUIC links: uuid:password in userinfo, same as standard URL.
+    if matches!(protocol, Protocol::Tuic) {
+        return parse_tuic_candidate(candidate);
+    }
+
     let address = url.host_str()?.to_owned();
     let port = url.port();
     let name = url
@@ -529,6 +546,91 @@ fn parse_shadowsocks_legacy_candidate(raw: &str) -> Option<Profile> {
         protocol: Protocol::Shadowsocks,
         address: host.to_owned(),
         port: Some(port),
+        raw: raw.to_owned(),
+        selected: true,
+        block_quic: false,
+        group: None,
+    })
+}
+
+/// Parse a `wireguard://` (or `wg://`) share link into a Profile.
+///
+/// Supported format:
+/// `wireguard://<private_key>@<host>:<port>?address=<ip>[&address=<ipv6>]&publickey=<peer_pub>&presharedkey=<psk>&mtu=<mtu>&reserved=<csv>#<name>`
+///
+/// The private key may be percent-encoded in the username position
+/// or supplied via a `privatekey` query parameter. The `address`
+/// parameter may include a CIDR suffix (stripped) and multiple
+/// addresses are comma-separated (IPv4 and IPv6 separated).
+fn parse_wireguard_candidate(raw: &str) -> Option<Profile> {
+    let url = Url::parse(raw).ok()?;
+    let address = url.host_str()?.to_owned();
+    let port = url.port();
+
+    // Private key: username (percent-decoded by url crate) or query param.
+    let private_key = if !url.username().is_empty() {
+        percent_decode_str(url.username())
+            .decode_utf8_lossy()
+            .to_string()
+    } else {
+        url.query_pairs()
+            .find(|(k, _)| k == "privatekey" || k == "private-key")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default()
+    };
+    if private_key.is_empty() {
+        return None;
+    }
+
+    let name = url
+        .fragment()
+        .filter(|fragment| !fragment.is_empty())
+        .map(percent_decode_name)
+        .unwrap_or_else(|| format!("{}:{}", address, port.unwrap_or(0)));
+
+    Some(Profile {
+        id: 0,
+        name,
+        protocol: Protocol::WireGuard,
+        address,
+        port,
+        raw: raw.to_owned(),
+        selected: true,
+        block_quic: false,
+        group: None,
+    })
+}
+
+/// Parse a `tuic://` share link into a Profile.
+///
+/// Supported format:
+/// `tuic://<uuid>:<password>@<host>:<port>?sni=<sni>&alpn=<alpn>&...#<name>`
+///
+/// Uses standard URL userinfo (uuid as username, password as password).
+/// All TUIC-specific parameters are preserved in the raw link for the
+/// Mihomo config builder to parse.
+fn parse_tuic_candidate(raw: &str) -> Option<Profile> {
+    let url = Url::parse(raw).ok()?;
+    let address = url.host_str()?.to_owned();
+    let port = url.port();
+
+    // TUIC requires uuid (username) — if missing, it's not a valid link.
+    if url.username().is_empty() {
+        return None;
+    }
+
+    let name = url
+        .fragment()
+        .filter(|fragment| !fragment.is_empty())
+        .map(percent_decode_name)
+        .unwrap_or_else(|| format!("{}:{}", address, port.unwrap_or(0)));
+
+    Some(Profile {
+        id: 0,
+        name,
+        protocol: Protocol::Tuic,
+        address,
+        port,
         raw: raw.to_owned(),
         selected: true,
         block_quic: false,
@@ -1200,5 +1302,47 @@ https://provider.example/sub/token-b}"#;
         assert_eq!(output.profiles.len(), 1);
         assert_eq!(output.profiles[0].name, "SS JSON");
         assert!(output.profiles[0].raw.starts_with("ss://"));
+    }
+
+    #[test]
+    fn parses_wireguard_share_link() {
+        let output = parse_input(
+            "wireguard://eCtXsJZ27%2B4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU%3D@162.159.192.1:2480?address=172.16.0.2&publickey=Cr8hWlKvtDt7nrvf%2Bf0brNQQzabAqrjfBvas9pmowjo%3D&mtu=1280#WARP",
+        );
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].name, "WARP");
+        assert_eq!(output.profiles[0].address, "162.159.192.1");
+        assert_eq!(output.profiles[0].port, Some(2480));
+    }
+
+    #[test]
+    fn parses_wireguard_with_privatekey_param() {
+        let output = parse_input(
+            "wg://162.159.192.1:2480?privatekey=eCtXsJZ27%2B4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU%3D&address=172.16.0.2&publickey=Cr8hWlKvtDt7nrvf%2Bf0brNQQzabAqrjfBvas9pmowjo%3D#WARP",
+        );
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].name, "WARP");
+        assert_eq!(output.profiles[0].address, "162.159.192.1");
+    }
+
+    #[test]
+    fn parses_tuic_share_link() {
+        let output = parse_input(
+            "tuic://00000000-0000-0000-0000-000000000001:secretpass@example.com:443?sni=example.com&alpn=h3&congestion_controller=bbr&udp_relay_mode=native#TUIC_Test",
+        );
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].name, "TUIC_Test");
+        assert_eq!(output.profiles[0].address, "example.com");
+        assert_eq!(output.profiles[0].port, Some(443));
+    }
+
+    #[test]
+    fn parses_tuic_link_without_password() {
+        // Some TUIC links use only uuid (no password in userinfo).
+        let output = parse_input(
+            "tuic://00000000-0000-0000-0000-000000000001@example.com:443?sni=example.com#TUIC_NoPass",
+        );
+        assert_eq!(output.profiles.len(), 1);
+        assert_eq!(output.profiles[0].name, "TUIC_NoPass");
     }
 }

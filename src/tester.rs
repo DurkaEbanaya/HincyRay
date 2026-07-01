@@ -456,6 +456,12 @@ fn build_sing_box_config(profile: &Profile, port: u16) -> Result<Value, String> 
         Protocol::Trojan => build_trojan_outbound(profile)?,
         Protocol::Shadowsocks => build_shadowsocks_outbound(profile)?,
         Protocol::Hysteria2 => build_hysteria2_outbound(profile)?,
+        Protocol::WireGuard => {
+            return Err("WireGuard бенчмарк не поддерживается в desktop; используйте роутер".to_owned())
+        }
+        Protocol::Tuic => {
+            return Err("TUIC бенчмарк не поддерживается в desktop; используйте роутер".to_owned())
+        }
         Protocol::Unknown(_) => return Err("неподдерживаемый протокол".to_owned()),
     };
 

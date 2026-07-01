@@ -5804,6 +5804,9 @@ tr.group-row.collapsed{display:none}
     <label class="chip"><input type="checkbox" id="feat-exp-ecn"> Disable QUIC ECN</label>
     <label class="chip"><input type="checkbox" id="feat-tcp-concurrent"> TCP concurrent (connect all IPs, first wins)</label>
   </div>
+  <h3>Sub-rules</h3>
+  <p class="subtle">Named rule groups referenced via <code>SUB-RULE,(conditions),name</code>. Format: <code>[name]</code> on its own line, then one rule per line. Blank line separates groups.</p>
+  <div class="field"><textarea id="feat-sub-rules" rows="6" style="width:100%;font-family:monospace" placeholder="[ad-block]&#10;DOMAIN-SUFFIX,doubleclick.net,REJECT&#10;MATCH,PROXY&#10;&#10;[dns-protect]&#10;IP-CIDR,1.1.1.1/32,REJECT"></textarea></div>
   <div class="row" style="margin:.45em 0">
     <button id="btn-features-save">Save Mihomo features</button>
     <span class="subtle" id="features-status"></span>
@@ -6998,6 +7001,18 @@ function loadFeatures(){
     document.getElementById("feat-exp-gso").checked = !!f.quic_go_disable_gso;
     document.getElementById("feat-exp-ecn").checked = !!f.quic_go_disable_ecn;
     document.getElementById("feat-tcp-concurrent").checked = !!f.tcp_concurrent;
+    // Sub-rules: convert array of {name, rules} to textarea format
+    var srText = "";
+    if (f.sub_rules && Array.isArray(f.sub_rules)) {
+      f.sub_rules.forEach(function(sr, i) {
+        if (i > 0) srText += "\\n";
+        srText += "[" + (sr.name || "") + "]\\n";
+        if (sr.rules && Array.isArray(sr.rules)) {
+          sr.rules.forEach(function(r) { srText += r + "\\n"; });
+        }
+      });
+    }
+    document.getElementById("feat-sub-rules").value = srText;
   });
 }
 
@@ -7057,7 +7072,27 @@ document.getElementById("btn-features-save").addEventListener("click", function(
     tcp_concurrent: document.getElementById("feat-tcp-concurrent").checked,
     authentication: [], skip_auth_prefixes: [],
     hosts: {}, tunnels: [],
-    proxy_providers: [], rule_providers: []
+    proxy_providers: [], rule_providers: [],
+    sub_rules: (function() {
+      var text = document.getElementById("feat-sub-rules").value.trim();
+      if (!text) return [];
+      var groups = [], curName = null, curRules = [];
+      text.split("\\n").forEach(function(line) {
+        line = line.trim();
+        if (!line) { // blank line — end of group
+          if (curName) { groups.push({name: curName, rules: curRules}); curName = null; curRules = []; }
+          return;
+        }
+        if (line.charAt(0) === "[") { // [name] — start of group
+          if (curName) { groups.push({name: curName, rules: curRules}); }
+          curName = line.slice(1, -1); curRules = [];
+        } else {
+          if (curName) curRules.push(line);
+        }
+      });
+      if (curName) groups.push({name: curName, rules: curRules});
+      return groups;
+    })()
   };
   api("POST", "/api/mihomo-features", JSON.stringify(f)).then(function(){
     document.getElementById("features-status").textContent = "Saved. Restart core to apply.";

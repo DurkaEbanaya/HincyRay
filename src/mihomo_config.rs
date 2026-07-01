@@ -415,6 +415,33 @@ impl Default for PerProxyDefaults {
     }
 }
 
+/// A single sub-rule group — a named set of routing rules that can be
+/// referenced from the main rules via `SUB-RULE,(conditions),<name>`.
+///
+/// Sub-rules allow complex nested routing: the main rule set delegates
+/// to a named sub-rule group, which evaluates its own rules and
+/// returns the first match. If no sub-rule matches, evaluation
+/// continues in the main rule set.
+///
+/// Example Mihomo config:
+/// ```yaml
+/// sub-rules:
+///   ad-block:
+///     - DOMAIN-SUFFIX,doubleclick.net,REJECT
+///     - DOMAIN-SUFFIX,googleadservices.com,REJECT
+///     - MATCH,PROXY
+/// rules:
+///   - GEOSITE,category-ads,SUB-RULE,(>ad-block)
+/// ```
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubRuleConfig {
+    /// Name of the sub-rule group — referenced in main rules.
+    pub name: String,
+    /// Rules in this group (Mihomo rule strings).
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
 /// All Mihomo-specific opt-in features. Stored in `HincyrayState` and
 /// persisted to `state.json`. Passed to `build_mihomo_config` and
 /// `build_mihomo_router_config`.
@@ -488,6 +515,10 @@ pub struct MihomoFeatures {
     #[serde(default)]
     pub rule_providers: Vec<RuleProviderConfig>,
 
+    // --- Sub-rules ---
+    #[serde(default)]
+    pub sub_rules: Vec<SubRuleConfig>,
+
     // --- Per-proxy defaults ---
     #[serde(default)]
     pub per_proxy: PerProxyDefaults,
@@ -539,6 +570,7 @@ impl Default for MihomoFeatures {
             proxy_group: ProxyGroupConfig::default(),
             proxy_providers: Vec::new(),
             rule_providers: Vec::new(),
+            sub_rules: Vec::new(),
             per_proxy: PerProxyDefaults::default(),
             dns_cache_algorithm: default_dns_cache_algorithm(),
             dns_prefer_h3: false,
@@ -935,6 +967,20 @@ fn build_rule_providers_json(providers: &[RuleProviderConfig]) -> Value {
     Value::Object(map)
 }
 
+/// Build the `sub-rules` JSON object from a list of `SubRuleConfig`.
+///
+/// Each sub-rule group becomes a named key with an array of rule strings.
+fn build_sub_rules_json(sub_rules: &[SubRuleConfig]) -> Value {
+    let mut map = serde_json::Map::new();
+    for sr in sub_rules {
+        if sr.name.is_empty() || sr.rules.is_empty() {
+            continue;
+        }
+        map.insert(sr.name.clone(), json!(sr.rules));
+    }
+    Value::Object(map)
+}
+
 /// Build a proxy-groups JSON array.
 ///
 /// When proxy groups are enabled, the active profile and all extra
@@ -1047,6 +1093,15 @@ pub fn build_mihomo_config(
         "rules": [format!("MATCH,{}", PROXY_NAME)],
     });
     apply_global_features(&mut config, features);
+
+    // Sub-rules — named rule groups referenced via SUB-RULE rule type.
+    if !features.sub_rules.is_empty() {
+        let sub_rules = build_sub_rules_json(&features.sub_rules);
+        if sub_rules.as_object().is_some_and(|m| !m.is_empty()) {
+            config["sub-rules"] = sub_rules;
+        }
+    }
+
     serde_yaml::to_string(&config).map_err(|error| error.to_string())
 }
 
@@ -1223,6 +1278,14 @@ pub fn build_mihomo_router_config(
         config["rule-providers"] = build_rule_providers_json(&features.rule_providers);
     }
 
+    // Sub-rules — named rule groups referenced via SUB-RULE rule type.
+    if !features.sub_rules.is_empty() {
+        let sub_rules = build_sub_rules_json(&features.sub_rules);
+        if sub_rules.as_object().is_some_and(|m| !m.is_empty()) {
+            config["sub-rules"] = sub_rules;
+        }
+    }
+
     // DNS — always included in router config (firewall DNATs DNS to 1053).
     if let Some(dns) = &extra.dns {
         config["dns"] = build_dns_config(dns, features);
@@ -1317,6 +1380,8 @@ fn build_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         Protocol::Trojan => build_trojan_proxy(profile, name),
         Protocol::Shadowsocks => build_shadowsocks_proxy(profile, name),
         Protocol::Hysteria2 => build_hysteria2_proxy(profile, name),
+        Protocol::WireGuard => build_wireguard_proxy(profile, name),
+        Protocol::Tuic => build_tuic_proxy(profile, name),
         Protocol::Unknown(ref scheme) => Err(format!("Mihomo не поддерживает протокол {scheme}")),
     }
 }
@@ -1384,7 +1449,15 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         if let Some(short_id) = query_value(&url, "sid") {
             reality_opts["short-id"] = json!(short_id);
         }
+        if is_truthy_option(query_value(&url, "support-x25519mlkem768").as_deref()) {
+            reality_opts["support-x25519mlkem768"] = json!(true);
+        }
         proxy["reality-opts"] = reality_opts;
+    }
+
+    // ECH (Encrypted Client Hello) — parsed from `ech` query param.
+    if let Some(ech_opts) = build_ech_opts(&url) {
+        proxy["ech-opts"] = ech_opts;
     }
 
     match network.as_str() {
@@ -1399,6 +1472,123 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
             if let Some(mode) = query_value(&url, "mode").filter(|value| !value.is_empty()) {
                 xhttp_opts["mode"] = json!(mode);
             }
+
+            // ── Advanced xhttp fields (anti-DPI / XMUX / session) ──
+
+            // no-grpc-header
+            if is_truthy_option(
+                query_value_multi(&url, &["noGRPCHeader", "no_grpc_header", "no-grpc-header"])
+                    .as_deref(),
+            ) {
+                xhttp_opts["no-grpc-header"] = json!(true);
+            }
+
+            // x-padding-* fields
+            if let Some(v) = query_value_multi(&url, &["xPaddingBytes", "x_padding_bytes", "x-padding-bytes"]) {
+                xhttp_opts["x-padding-bytes"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["xPaddingObfsMode", "x_padding_obfs_mode"]) {
+                xhttp_opts["x-padding-obfs-mode"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["xPaddingKey", "x_padding_key"]) {
+                xhttp_opts["x-padding-key"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["xPaddingHeader", "x_padding_header"]) {
+                xhttp_opts["x-padding-header"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["xPaddingPlacement", "x_padding_placement"]) {
+                xhttp_opts["x-padding-placement"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["xPaddingMethod", "x_padding_method"]) {
+                xhttp_opts["x-padding-method"] = json!(v);
+            }
+
+            // uplink-http-method
+            if let Some(v) = query_value_multi(&url, &["uplinkHttpMethod", "uplink_http_method", "uplink-http-method"]) {
+                xhttp_opts["uplink-http-method"] = json!(v);
+            }
+
+            // session-* fields
+            if let Some(v) = query_value_multi(&url, &["sessionPlacement", "session_placement"]) {
+                xhttp_opts["session-placement"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["sessionKey", "session_key"]) {
+                xhttp_opts["session-key"] = json!(v);
+            }
+
+            // seq-* fields
+            if let Some(v) = query_value_multi(&url, &["seqPlacement", "seq_placement"]) {
+                xhttp_opts["seq-placement"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["seqKey", "seq_key"]) {
+                xhttp_opts["seq-key"] = json!(v);
+            }
+
+            // uplink-data-* fields
+            if let Some(v) = query_value_multi(&url, &["uplinkDataPlacement", "uplink_data_placement"]) {
+                xhttp_opts["uplink-data-placement"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["uplinkDataKey", "uplink_data_key"]) {
+                xhttp_opts["uplink-data-key"] = json!(v);
+            }
+
+            // uplink-chunk-size (integer)
+            if let Some(v) = query_value_multi(&url, &["uplinkChunkSize", "uplink_chunk_size"])
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                xhttp_opts["uplink-chunk-size"] = json!(v);
+            }
+
+            // sc-max-each-post-bytes (integer, stream-up mode)
+            if let Some(v) = query_value_multi(&url, &["scMaxEachPostBytes", "sc_max_each_post_bytes"])
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                xhttp_opts["sc-max-each-post-bytes"] = json!(v);
+            }
+
+            // sc-min-posts-interval-ms (integer, stream-up mode)
+            if let Some(v) = query_value_multi(&url, &["scMinPostsIntervalMs", "sc_min_posts_interval_ms"])
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                xhttp_opts["sc-min-posts-interval-ms"] = json!(v);
+            }
+
+            // reuse-settings (XMUX-like connection reuse)
+            let mut reuse = json!({});
+            if let Some(v) = query_value_multi(&url, &["xmuxMaxConcurrency", "xmux_max_concurrency"])
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                reuse["max-concurrency"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["xmuxMaxConnections", "xmux_max_connections"])
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                reuse["max-connections"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["xmuxCMaxReuseTimes", "xmux_c_max_reuse_times"])
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                reuse["c-max-reuse-times"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["xmuxHMaxRequestTimes", "xmux_h_max_request_times"])
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                reuse["h-max-request-times"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["xmuxHMaxReusableSecs", "xmux_h_max_reusable_secs"])
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                reuse["h-max-reusable-secs"] = json!(v);
+            }
+            if let Some(v) = query_value_multi(&url, &["xmuxHKeepAlivePeriod", "xmux_h_keep_alive_period"])
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                reuse["h-keep-alive-period"] = json!(v);
+            }
+            if reuse.as_object().is_some_and(|m| !m.is_empty()) {
+                xhttp_opts["reuse-settings"] = reuse;
+            }
+
             proxy["xhttp-opts"] = xhttp_opts;
         }
         "ws" => {
@@ -1501,6 +1691,15 @@ fn build_vmess_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         );
     }
 
+    // ECH (Encrypted Client Hello) — parsed from vmess JSON `ech` field.
+    if let Some(ech) = json.get("ech").and_then(Value::as_str) {
+        if ech == "1" || ech.eq_ignore_ascii_case("true") {
+            proxy["ech-opts"] = json!({ "enable": true });
+        } else {
+            proxy["ech-opts"] = json!({ "enable": true, "config": ech });
+        }
+    }
+
     if network == "ws" {
         let mut ws_opts = json!({});
         if let Some(path) = json.get("path").and_then(Value::as_str) {
@@ -1561,6 +1760,11 @@ fn build_trojan_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
                 .filter(|value| !value.is_empty())
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ECH (Encrypted Client Hello) — parsed from `ech` query param.
+    if let Some(ech_opts) = build_ech_opts(&url) {
+        proxy["ech-opts"] = ech_opts;
     }
 
     if let Some(net) = network {
@@ -1650,6 +1854,232 @@ fn build_hysteria2_proxy(profile: &Profile, name: &str) -> Result<Value, String>
     Ok(proxy)
 }
 
+/// Build a WireGuard proxy for Mihomo.
+///
+/// Parses `wireguard://` (or `wg://`) share links with the private key
+/// in the username position or as a `privatekey` query parameter.
+///
+/// Mihomo WireGuard outbound fields (verified against wiki.metacubex.one):
+/// `type: wireguard`, `server`, `port`, `ip` (IPv4), `ipv6`,
+/// `private-key`, `public-key`, `allowed-ips`, `pre-shared-key`,
+/// `reserved`, `mtu`, `udp: true`.
+fn build_wireguard_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+
+    // Private key: username (percent-decoded) or query param.
+    let private_key = if !url.username().is_empty() {
+        percent_decode(url.username())
+    } else {
+        url.query_pairs()
+            .find(|(k, _)| k == "privatekey" || k == "private-key")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default()
+    };
+    if private_key.is_empty() {
+        return Err("WireGuard ссылка без приватного ключа".to_owned());
+    }
+
+    // Public key: required for the simplified (single-peer) format.
+    let public_key = url
+        .query_pairs()
+        .find(|(k, _)| k == "publickey" || k == "public-key" || k == "peer")
+        .map(|(_, v)| v.into_owned())
+        .ok_or_else(|| "WireGuard ссылка без публичного ключа (publickey)".to_owned())?;
+
+    let mut proxy = json!({
+        "name": name,
+        "type": "wireguard",
+        "server": profile.address,
+        "port": profile.port.unwrap_or(51820),
+        "private-key": private_key,
+        "public-key": public_key,
+        "udp": true,
+    });
+
+    // Interface addresses: `address` param may appear multiple times
+    // or be comma-separated. Strip CIDR suffixes. Classify as IPv4/IPv6.
+    let addresses: Vec<String> = url
+        .query_pairs()
+        .filter(|(k, _)| k == "address")
+        .flat_map(|(_, v)| {
+            v.split(',')
+                .map(|s| s.trim().split('/').next().unwrap_or("").to_owned())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let ipv4: Vec<&String> = addresses.iter().filter(|a| a.contains('.')).collect();
+    let ipv6: Vec<&String> = addresses.iter().filter(|a| a.contains(':')).collect();
+    if let Some(ip) = ipv4.first() {
+        proxy["ip"] = json!(ip);
+    }
+    if let Some(ip) = ipv6.first() {
+        proxy["ipv6"] = json!(ip);
+    }
+
+    // Allowed IPs — default to 0.0.0.0/0 if not specified.
+    let allowed_ips: Vec<String> = url
+        .query_pairs()
+        .find(|(k, _)| k == "allowedips" || k == "allowed-ips")
+        .map(|(_, v)| v.split(',').map(|s| s.trim().to_owned()).collect())
+        .unwrap_or_else(|| vec!["0.0.0.0/0".to_owned()]);
+    proxy["allowed-ips"] = json!(allowed_ips);
+
+    if let Some(psk) = url
+        .query_pairs()
+        .find(|(k, _)| k == "presharedkey" || k == "pre-shared-key" || k == "psk")
+    {
+        let (_, v) = psk;
+        if !v.is_empty() {
+            proxy["pre-shared-key"] = json!(v.into_owned());
+        }
+    }
+
+    if let Some(mtu) = url
+        .query_pairs()
+        .find(|(k, _)| k == "mtu")
+        .and_then(|(_, v)| v.parse::<u32>().ok())
+    {
+        proxy["mtu"] = json!(mtu);
+    }
+
+    // Reserved bytes — comma-separated integers (e.g. "209,98,59").
+    if let Some(reserved) = url.query_pairs().find(|(k, _)| k == "reserved") {
+        let (_, v) = reserved;
+        let parts: Vec<u32> = v
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect();
+        if !parts.is_empty() {
+            proxy["reserved"] = json!(parts);
+        }
+    }
+
+    if let Some(keepalive) = url
+        .query_pairs()
+        .find(|(k, _)| k == "keepalive" || k == "persistent-keepalive")
+        .and_then(|(_, v)| v.parse::<u32>().ok())
+    {
+        proxy["persistent-keepalive"] = json!(keepalive);
+    }
+
+    Ok(proxy)
+}
+
+/// Build a TUIC proxy for Mihomo.
+///
+/// Parses `tuic://<uuid>:<password>@<host>:<port>?<params>#<name>` links.
+/// TUIC V5 uses uuid+password; V4 uses token (not commonly seen in
+/// share links — V5 is the modern standard).
+///
+/// Mihomo TUIC outbound fields (verified against wiki.metacubex.one):
+/// `type: tuic`, `server`, `port`, `uuid`, `password`, `ip`,
+/// `heartbeat-interval`, `alpn`, `disable-sni`, `reduce-rtt`,
+/// `request-timeout`, `udp-relay-mode`, `congestion-controller`,
+/// `max-udp-relay-packet-size`, `fast-open`, `max-open-streams`,
+/// `sni`, `skip-cert-verify`.
+fn build_tuic_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+
+    let uuid = percent_decode(url.username());
+    if uuid.is_empty() {
+        return Err("TUIC ссылка без UUID".to_owned());
+    }
+
+    let password = url
+        .password()
+        .map(percent_decode)
+        .unwrap_or_default();
+
+    let mut proxy = json!({
+        "name": name,
+        "type": "tuic",
+        "server": profile.address,
+        "port": profile.port.unwrap_or(443),
+        "uuid": uuid,
+    });
+
+    if !password.is_empty() {
+        proxy["password"] = json!(password);
+    }
+
+    if let Some(sni) = query_value(&url, "sni") {
+        proxy["sni"] = json!(sni);
+    }
+
+    if let Some(alpn) = query_value(&url, "alpn").filter(|value| !value.is_empty()) {
+        proxy["alpn"] = json!(
+            alpn.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    if let Some(ip) = query_value(&url, "ip") {
+        proxy["ip"] = json!(ip);
+    }
+
+    if is_truthy_option(query_value(&url, "disable-sni").or_else(|| query_value(&url, "disable_sni")).as_deref()) {
+        proxy["disable-sni"] = json!(true);
+    }
+
+    if is_truthy_option(query_value(&url, "reduce-rtt").or_else(|| query_value(&url, "reduce_rtt")).as_deref()) {
+        proxy["reduce-rtt"] = json!(true);
+    }
+
+    if let Some(timeout) = query_value(&url, "request-timeout")
+        .or_else(|| query_value(&url, "request_timeout"))
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        proxy["request-timeout"] = json!(timeout);
+    }
+
+    if let Some(mode) = query_value(&url, "udp-relay-mode")
+        .or_else(|| query_value(&url, "udp_relay_mode"))
+    {
+        proxy["udp-relay-mode"] = json!(mode);
+    }
+
+    if let Some(cc) = query_value(&url, "congestion-controller")
+        .or_else(|| query_value(&url, "congestion_controller"))
+    {
+        proxy["congestion-controller"] = json!(cc);
+    }
+
+    if let Some(size) = query_value(&url, "max-udp-relay-packet-size")
+        .or_else(|| query_value(&url, "max_udp_relay_packet_size"))
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        proxy["max-udp-relay-packet-size"] = json!(size);
+    }
+
+    if let Some(hb) = query_value(&url, "heartbeat-interval")
+        .or_else(|| query_value(&url, "heartbeat_interval"))
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        proxy["heartbeat-interval"] = json!(hb);
+    }
+
+    if let Some(max_streams) = query_value(&url, "max-open-streams")
+        .or_else(|| query_value(&url, "max_open_streams"))
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        proxy["max-open-streams"] = json!(max_streams);
+    }
+
+    if is_truthy_option(query_value(&url, "fast-open").or_else(|| query_value(&url, "fast_open")).as_deref()) {
+        proxy["fast-open"] = json!(true);
+    }
+
+    if is_truthy_option(query_value(&url, "insecure").as_deref()) {
+        proxy["skip-cert-verify"] = json!(true);
+    }
+
+    Ok(proxy)
+}
+
 /// Convert a daemon-level route rule into Mihomo rule strings.
 fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
     let target = outbound_tag_to_name(&rule.outbound_tag);
@@ -1659,7 +2089,7 @@ fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
         result.push(domain_rule(domain, &target));
     }
     for ip in &rule.ips {
-        result.push(format!("IP-CIDR,{},{}", ip, target));
+        result.push(ip_rule(ip, &target));
     }
     for port in &rule.ports {
         result.push(format!("DST-PORT,{},{}", port, target));
@@ -1693,6 +2123,39 @@ fn domain_rule(domain: &str, target: &str) -> String {
     }
 }
 
+/// Build a single IP/routing rule string for Mihomo.
+///
+/// Supported prefixes:
+/// - `geoip:CN` → `GEOIP,CN,target`
+/// - `geoip:CN,no-resolve` → `GEOIP,CN,target,no-resolve`
+/// - `geoip-asn:13335` → `IP-ASN,13335,target`
+/// - `ip-asn:13335` → `IP-ASN,13335,target`
+/// - `src-geoip:CN` → `SRC-GEOIP,CN,target`
+/// - `src-ip-asn:13335` → `SRC-IP-ASN,13335,target`
+/// - bare IP/CIDR → `IP-CIDR,<ip>,<target>`
+fn ip_rule(ip: &str, target: &str) -> String {
+    if let Some(rest) = ip.strip_prefix("geoip:") {
+        // Support optional no-resolve suffix: `geoip:CN,no-resolve`
+        if let Some((code, suffix)) = rest.split_once(',') {
+            format!("GEOIP,{code},{target},{suffix}")
+        } else {
+            format!("GEOIP,{rest},{target}")
+        }
+    } else if let Some(rest) = ip.strip_prefix("geoip-asn:").or_else(|| ip.strip_prefix("ip-asn:")) {
+        if let Some((asn, suffix)) = rest.split_once(',') {
+            format!("IP-ASN,{asn},{target},{suffix}")
+        } else {
+            format!("IP-ASN,{rest},{target}")
+        }
+    } else if let Some(rest) = ip.strip_prefix("src-geoip:") {
+        format!("SRC-GEOIP,{rest},{target}")
+    } else if let Some(rest) = ip.strip_prefix("src-ip-asn:") {
+        format!("SRC-IP-ASN,{rest},{target}")
+    } else {
+        format!("IP-CIDR,{ip},{target}")
+    }
+}
+
 /// Map an Xray outbound tag to a Mihomo proxy name.
 fn outbound_tag_to_name(tag: &str) -> String {
     match tag {
@@ -1707,14 +2170,47 @@ fn is_truthy_option(value: Option<&str>) -> bool {
     value.is_some_and(|text| text == "1" || text.eq_ignore_ascii_case("true"))
 }
 
+/// Query a URL parameter trying multiple naming conventions
+/// (camelCase, snake_case, kebab-case). Returns the first match.
+fn query_value_multi(url: &Url, names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Some(value) = query_value(url, name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Build ECH options JSON from a share link's `ech` query parameter.
+///
+/// If `ech` is `1` or `true`, emits `ech-opts.enable: true` with no
+/// config (Mihomo resolves via DNS). If `ech` is a base64 string, emits
+/// both `enable: true` and `config: <base64>`.
+fn build_ech_opts(url: &Url) -> Option<Value> {
+    let ech = query_value(url, "ech")?;
+    if ech == "1" || ech.eq_ignore_ascii_case("true") {
+        return Some(json!({ "enable": true }));
+    }
+    // Also check `echConfig` / `ech_config` for explicit base64 config.
+    let config = if ech.contains('=') || ech.contains('+') || ech.len() > 20 {
+        // Looks like base64 — use it as the config.
+        ech
+    } else {
+        // Check for explicit config param.
+        query_value_multi(url, &["echConfig", "ech_config", "ech-config"])?
+    };
+    Some(json!({ "enable": true, "config": config }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ExternalControllerConfig, FallbackFilter, LoadBalanceStrategy, MihomoFeatures, NtpConfig,
         PROXY_NAME, PerProxyDefaults, ProxyGroupConfig, ProxyGroupType, ProxyProviderConfig,
-        REDIR_LISTENER, RuleProviderConfig, SmuxConfig, TPROXY_LISTENER, TunnelConfig,
-        build_hysteria2_proxy, build_mihomo_config, build_mihomo_router_config,
-        build_shadowsocks_proxy, build_trojan_proxy, build_vless_proxy, build_vmess_proxy,
+        REDIR_LISTENER, RuleProviderConfig, SmuxConfig, SubRuleConfig, TPROXY_LISTENER,
+        TunnelConfig, build_hysteria2_proxy, build_mihomo_config, build_mihomo_router_config,
+        build_shadowsocks_proxy, build_trojan_proxy, build_tuic_proxy, build_vless_proxy,
+        build_vmess_proxy, build_wireguard_proxy,
     };
     use crate::profiles::parse_profiles;
     use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule};
@@ -2942,6 +3438,10 @@ mod tests {
             },
             proxy_providers: vec![],
             rule_providers: vec![],
+            sub_rules: vec![SubRuleConfig {
+                name: "ad-block".to_owned(),
+                rules: vec!["DOMAIN-SUFFIX,doubleclick.net,REJECT".to_owned()],
+            }],
             per_proxy: PerProxyDefaults {
                 udp: false,
                 tfo: true,
@@ -3145,5 +3645,563 @@ mod tests {
     fn tcp_concurrent_absent_when_disabled() {
         let config = build_test_router_config(&default_features());
         assert!(config.get("tcp-concurrent").is_none());
+    }
+
+    // ── WireGuard proxy tests ───────────────────────────────────────
+
+    #[test]
+    fn build_wireguard_proxy_has_correct_fields() {
+        let profiles = parse_profiles(
+            "wireguard://eCtXsJZ27%2B4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU%3D@162.159.192.1:2480?address=172.16.0.2&publickey=Cr8hWlKvtDt7nrvf%2Bf0brNQQzabAqrjfBvas9pmowjo%3D&mtu=1280#WARP",
+        );
+        let profile = &profiles[0];
+        let proxy = build_wireguard_proxy(profile, PROXY_NAME).expect("wg proxy");
+
+        assert_eq!(
+            proxy.get("type").and_then(Value::as_str),
+            Some("wireguard")
+        );
+        assert_eq!(
+            proxy.get("server").and_then(Value::as_str),
+            Some("162.159.192.1")
+        );
+        assert_eq!(proxy.get("port").and_then(Value::as_u64), Some(2480));
+        assert_eq!(
+            proxy.get("ip").and_then(Value::as_str),
+            Some("172.16.0.2")
+        );
+        assert_eq!(
+            proxy.get("private-key").and_then(Value::as_str),
+            Some("eCtXsJZ27+4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU=")
+        );
+        assert_eq!(
+            proxy.get("public-key").and_then(Value::as_str),
+            Some("Cr8hWlKvtDt7nrvf+f0brNQQzabAqrjfBvas9pmowjo=")
+        );
+        assert_eq!(proxy.get("mtu").and_then(Value::as_u64), Some(1280));
+        assert_eq!(proxy.get("udp").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn build_wireguard_proxy_with_ipv6_and_reserved() {
+        let profiles = parse_profiles(
+            "wireguard://eCtXsJZ27%2B4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU%3D@162.159.192.1:2480?address=172.16.0.2,fd01:5ca1:ab1e::1&publickey=Cr8hWlKvtDt7nrvf%2Bf0brNQQzabAqrjfBvas9pmowjo%3D&reserved=209,98,59&presharedkey=31aIhAPwktDGpH4JDhA8GNvjFXEf%2Fa6%2BUaQRyOAiyfM%3D#WARP",
+        );
+        let profile = &profiles[0];
+        let proxy = build_wireguard_proxy(profile, PROXY_NAME).expect("wg proxy");
+
+        assert_eq!(
+            proxy.get("ip").and_then(Value::as_str),
+            Some("172.16.0.2")
+        );
+        assert_eq!(
+            proxy.get("ipv6").and_then(Value::as_str),
+            Some("fd01:5ca1:ab1e::1")
+        );
+        let reserved = proxy.get("reserved").and_then(Value::as_array).expect("reserved");
+        assert_eq!(reserved.len(), 3);
+        assert_eq!(reserved[0].as_u64(), Some(209));
+        assert_eq!(reserved[1].as_u64(), Some(98));
+        assert_eq!(reserved[2].as_u64(), Some(59));
+        assert!(proxy.get("pre-shared-key").is_some());
+    }
+
+    #[test]
+    fn build_wireguard_proxy_strips_cidr_from_address() {
+        let profiles = parse_profiles(
+            "wireguard://eCtXsJZ27%2B4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU%3D@162.159.192.1:2480?address=172.16.0.2/32&publickey=Cr8hWlKvtDt7nrvf%2Bf0brNQQzabAqrjfBvas9pmowjo%3D#WARP",
+        );
+        let profile = &profiles[0];
+        let proxy = build_wireguard_proxy(profile, PROXY_NAME).expect("wg proxy");
+        assert_eq!(
+            proxy.get("ip").and_then(Value::as_str),
+            Some("172.16.0.2")
+        );
+    }
+
+    #[test]
+    fn build_wireguard_proxy_uses_privatekey_param() {
+        let profiles = parse_profiles(
+            "wg://162.159.192.1:2480?privatekey=eCtXsJZ27%2B4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU%3D&address=172.16.0.2&publickey=Cr8hWlKvtDt7nrvf%2Bf0brNQQzabAqrjfBvas9pmowjo%3D#WARP",
+        );
+        let profile = &profiles[0];
+        let proxy = build_wireguard_proxy(profile, PROXY_NAME).expect("wg proxy");
+        assert_eq!(
+            proxy.get("private-key").and_then(Value::as_str),
+            Some("eCtXsJZ27+4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU=")
+        );
+    }
+
+    // ── TUIC proxy tests ────────────────────────────────────────────
+
+    #[test]
+    fn build_tuic_proxy_has_correct_fields() {
+        let profiles = parse_profiles(
+            "tuic://00000000-0000-0000-0000-000000000001:secretpass@example.com:443?sni=example.com&alpn=h3&congestion_controller=bbr&udp_relay_mode=native#TUIC",
+        );
+        let profile = &profiles[0];
+        let proxy = build_tuic_proxy(profile, PROXY_NAME).expect("tuic proxy");
+
+        assert_eq!(proxy.get("type").and_then(Value::as_str), Some("tuic"));
+        assert_eq!(
+            proxy.get("server").and_then(Value::as_str),
+            Some("example.com")
+        );
+        assert_eq!(proxy.get("port").and_then(Value::as_u64), Some(443));
+        assert_eq!(
+            proxy.get("uuid").and_then(Value::as_str),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(
+            proxy.get("password").and_then(Value::as_str),
+            Some("secretpass")
+        );
+        assert_eq!(
+            proxy.get("sni").and_then(Value::as_str),
+            Some("example.com")
+        );
+        assert_eq!(
+            proxy.get("congestion-controller").and_then(Value::as_str),
+            Some("bbr")
+        );
+        assert_eq!(
+            proxy.get("udp-relay-mode").and_then(Value::as_str),
+            Some("native")
+        );
+    }
+
+    #[test]
+    fn build_tuic_proxy_with_alpn_list() {
+        let profiles = parse_profiles(
+            "tuic://uuid:pass@example.com:443?alpn=h3,h2,http/1.1&sni=example.com#TUIC",
+        );
+        let profile = &profiles[0];
+        let proxy = build_tuic_proxy(profile, PROXY_NAME).expect("tuic proxy");
+        let alpn = proxy.get("alpn").and_then(Value::as_array).expect("alpn");
+        assert_eq!(alpn.len(), 3);
+        assert_eq!(alpn[0].as_str(), Some("h3"));
+    }
+
+    #[test]
+    fn build_tuic_proxy_with_disable_sni_and_reduce_rtt() {
+        let profiles = parse_profiles(
+            "tuic://uuid:pass@example.com:443?disable_sni=1&reduce_rtt=true&sni=example.com#TUIC",
+        );
+        let profile = &profiles[0];
+        let proxy = build_tuic_proxy(profile, PROXY_NAME).expect("tuic proxy");
+        assert_eq!(
+            proxy.get("disable-sni").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            proxy.get("reduce-rtt").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn build_tuic_proxy_without_password() {
+        let profiles = parse_profiles(
+            "tuic://00000000-0000-0000-0000-000000000001@example.com:443?sni=example.com#TUIC",
+        );
+        let profile = &profiles[0];
+        let proxy = build_tuic_proxy(profile, PROXY_NAME).expect("tuic proxy");
+        assert!(proxy.get("password").is_none());
+    }
+
+    // ── ECH tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn build_vless_proxy_with_ech_enable_only() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&sni=example.com&ech=1#ECH",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let ech_opts = proxy.get("ech-opts").expect("ech-opts");
+        assert_eq!(ech_opts.get("enable").and_then(Value::as_bool), Some(true));
+        assert!(ech_opts.get("config").is_none());
+    }
+
+    #[test]
+    fn build_vless_proxy_with_ech_config() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&sni=example.com&ech=AEn%2BDQBFKwAgACABWIHUGj4u%2BPIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA#ECH",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let ech_opts = proxy.get("ech-opts").expect("ech-opts");
+        assert_eq!(ech_opts.get("enable").and_then(Value::as_bool), Some(true));
+        assert!(ech_opts.get("config").is_some());
+    }
+
+    #[test]
+    fn build_trojan_proxy_with_ech() {
+        let profiles = parse_profiles(
+            "trojan://secretpass@example.com:443?security=tls&sni=example.com&ech=1#ECH",
+        );
+        let profile = &profiles[0];
+        let proxy = build_trojan_proxy(profile, PROXY_NAME).expect("trojan proxy");
+        let ech_opts = proxy.get("ech-opts").expect("ech-opts");
+        assert_eq!(ech_opts.get("enable").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn build_vless_proxy_without_ech_when_not_specified() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&sni=example.com#NoECH",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        assert!(proxy.get("ech-opts").is_none());
+    }
+
+    // ── xhttp advanced tests ────────────────────────────────────────
+
+    #[test]
+    fn build_vless_xhttp_with_no_grpc_header() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=reality&pbk=pubkey&noGRPCHeader=1#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let xhttp_opts = proxy.get("xhttp-opts").expect("xhttp-opts");
+        assert_eq!(
+            xhttp_opts.get("no-grpc-header").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn build_vless_xhttp_with_padding_fields() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=reality&pbk=pubkey&xPaddingBytes=100-1000&xPaddingObfsMode=random#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let xhttp_opts = proxy.get("xhttp-opts").expect("xhttp-opts");
+        assert_eq!(
+            xhttp_opts.get("x-padding-bytes").and_then(Value::as_str),
+            Some("100-1000")
+        );
+        assert_eq!(
+            xhttp_opts
+                .get("x-padding-obfs-mode")
+                .and_then(Value::as_str),
+            Some("random")
+        );
+    }
+
+    #[test]
+    fn build_vless_xhttp_with_reuse_settings() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=reality&pbk=pubkey&xmuxMaxConcurrency=16&xmuxMaxConnections=4&xmuxHKeepAlivePeriod=30#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let xhttp_opts = proxy.get("xhttp-opts").expect("xhttp-opts");
+        let reuse = xhttp_opts
+            .get("reuse-settings")
+            .expect("reuse-settings");
+        assert_eq!(
+            reuse.get("max-concurrency").and_then(Value::as_u64),
+            Some(16)
+        );
+        assert_eq!(
+            reuse.get("max-connections").and_then(Value::as_u64),
+            Some(4)
+        );
+        assert_eq!(
+            reuse.get("h-keep-alive-period").and_then(Value::as_u64),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn build_vless_xhttp_with_uplink_http_method() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=reality&pbk=pubkey&uplinkHttpMethod=PUT#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let xhttp_opts = proxy.get("xhttp-opts").expect("xhttp-opts");
+        assert_eq!(
+            xhttp_opts.get("uplink-http-method").and_then(Value::as_str),
+            Some("PUT")
+        );
+    }
+
+    #[test]
+    fn build_vless_xhttp_advanced_absent_when_not_set() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=reality&pbk=pubkey&path=/path&mode=auto#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let xhttp_opts = proxy.get("xhttp-opts").expect("xhttp-opts");
+        assert!(xhttp_opts.get("no-grpc-header").is_none());
+        assert!(xhttp_opts.get("x-padding-bytes").is_none());
+        assert!(xhttp_opts.get("reuse-settings").is_none());
+    }
+
+    // ── Sub-rules tests ─────────────────────────────────────────────
+
+    #[test]
+    fn sub_rules_emitted_when_configured() {
+        let mut features = default_features();
+        features.sub_rules = vec![SubRuleConfig {
+            name: "ad-block".to_owned(),
+            rules: vec![
+                "DOMAIN-SUFFIX,doubleclick.net,REJECT".to_owned(),
+                "MATCH,PROXY".to_owned(),
+            ],
+        }];
+        let config = build_test_router_config(&features);
+        let sub_rules = config
+            .get("sub-rules")
+            .and_then(Value::as_object)
+            .expect("sub-rules");
+        assert!(sub_rules.contains_key("ad-block"));
+        let rules = sub_rules["ad-block"]
+            .as_array()
+            .expect("rules array");
+        assert_eq!(rules.len(), 2);
+    }
+
+    #[test]
+    fn sub_rules_absent_when_empty() {
+        let config = build_test_router_config(&default_features());
+        assert!(config.get("sub-rules").is_none());
+    }
+
+    #[test]
+    fn sub_rules_skips_empty_names() {
+        let mut features = default_features();
+        features.sub_rules = vec![SubRuleConfig {
+            name: String::new(),
+            rules: vec!["MATCH,PROXY".to_owned()],
+        }];
+        let config = build_test_router_config(&features);
+        assert!(config.get("sub-rules").is_none());
+    }
+
+    // ── GEOIP / IP-ASN rule tests ───────────────────────────────────
+
+    #[test]
+    fn ip_rule_geoip_prefix_generates_geoip_rule() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec!["geoip:CN".to_owned()],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("GEOIP,CN,DIRECT"))
+        );
+    }
+
+    #[test]
+    fn ip_rule_geoip_with_no_resolve() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec!["geoip:CN,no-resolve".to_owned()],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("GEOIP,CN,DIRECT,no-resolve"))
+        );
+    }
+
+    #[test]
+    fn ip_rule_asn_prefix_generates_ip_asn_rule() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec!["geoip-asn:13335".to_owned()],
+            outbound_tag: "active".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("IP-ASN,13335,proxy"))
+        );
+    }
+
+    #[test]
+    fn ip_rule_src_geoip_prefix() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec!["src-geoip:cn".to_owned()],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("SRC-GEOIP,cn,DIRECT"))
+        );
+    }
+
+    #[test]
+    fn ip_rule_bare_ip_still_uses_ip_cidr() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec!["192.168.0.0/16".to_owned()],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("IP-CIDR,192.168.0.0/16,DIRECT"))
+        );
+    }
+
+    // ── VLESS reality support-x25519mlkem768 ────────────────────────
+
+    #[test]
+    fn build_vless_reality_with_support_x25519mlkem768() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=reality&pbk=pubkey123&sid=shortid&sni=example.com&support-x25519mlkem768=1#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
+        let reality_opts = proxy.get("reality-opts").expect("reality-opts");
+        assert_eq!(
+            reality_opts
+                .get("support-x25519mlkem768")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
     }
 }

@@ -396,12 +396,14 @@ fn build_profile_outbound(profile: &Profile, tag: &str) -> Result<Value, String>
         Protocol::Hysteria2 => {
             Err("Xray не поддерживает Hysteria2; используйте sing-box или mihomo".to_owned())
         }
+        Protocol::WireGuard => {
+            Err("Xray не поддерживает WireGuard; используйте sing-box или mihomo".to_owned())
+        }
+        Protocol::Tuic => {
+            Err("Xray не поддерживает TUIC; используйте sing-box или mihomo".to_owned())
+        }
         Protocol::Unknown(scheme) => {
-            if scheme.eq_ignore_ascii_case("wireguard") || scheme.eq_ignore_ascii_case("wg") {
-                Err("Xray не поддерживает WireGuard; используйте sing-box или mihomo".to_owned())
-            } else {
-                Err(format!("Xray не поддерживает протокол {scheme}"))
-            }
+            Err(format!("Xray не поддерживает протокол {scheme}"))
         }
     }
 }
@@ -847,7 +849,7 @@ mod tests {
             parse_profiles("vless://11111111-1111-1111-1111-111111111111@example.com:443#Test")
                 .remove(0);
         let mut profile = profile;
-        profile.protocol = crate::profiles::Protocol::Unknown("wireguard".to_owned());
+        profile.protocol = crate::profiles::Protocol::WireGuard;
         let error = build_xray_config(&profile, "127.0.0.1", 10808)
             .expect_err("wireguard should be rejected");
         assert!(error.to_lowercase().contains("wireguard"));
