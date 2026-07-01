@@ -2,6 +2,7 @@
 // `hincyray` router daemon built with `--no-default-features`.
 pub mod benchmark;
 pub mod hincyray;
+pub mod mihomo_config;
 pub mod profiles;
 pub mod scoring;
 pub mod xray_config;

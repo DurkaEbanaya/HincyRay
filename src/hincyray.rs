@@ -7,7 +7,7 @@
 //!
 //! Default bind: `0.0.0.0:8088`. Override with `HINCYRAY_LISTEN`.
 //! State path: see `resolve_state_path`. Override with `HINCYRAY_STATE`.
-//! Xray config path: alongside state. Override with `HINCYRAY_XRAY_CONFIG`.
+//! Mihomo config path: alongside state. Override with `HINCYRAY_MIHOMO_CONFIG`.
 
 use std::{
     collections::HashSet,
@@ -31,15 +31,14 @@ use crate::benchmark::{
     BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL, SharedJob,
     run_bench,
 };
+use crate::mihomo_config::{
+    DIRECT_NAME, PROXY_NAME, build_mihomo_config, build_mihomo_router_config,
+};
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionSource, load_subscription_detailed_via_proxy_with_hwid,
     parse_input,
 };
-use crate::xray_config::build_xray_config;
-use crate::xray_config::{
-    ACTIVE_OUTBOUND_TAG, DIRECT_OUTBOUND_TAG, DnsSettings, PortMode, QuicMode, RouterExtra,
-    XrayRouteRule, build_xray_router_config,
-};
+use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -75,15 +74,15 @@ pub fn run() -> Result<(), String> {
 
     let listen = std::env::var("HINCYRAY_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_owned());
     let state_path = resolve_state_path();
-    let xray_config_path = resolve_xray_config_path(&state_path);
+    let mihomo_config_path = resolve_mihomo_config_path(&state_path);
     let state = load_state(&state_path);
-    let daemon = Daemon::new(state, state_path, xray_config_path);
+    let daemon = Daemon::new(state, state_path, mihomo_config_path);
 
-    // Regenerate Xray config from state on startup so the
-    // dokodemo-door inbounds are included when split routing is enabled.
+    // Regenerate config from state on startup so the transparent proxy
+    // inbounds are included when split routing is enabled.
     {
         let mut inner = lock(&daemon.inner);
-        if let Err(error) = regenerate_xray_config(&inner.state, &daemon.xray_config_path) {
+        if let Err(error) = regenerate_config(&inner.state, &daemon) {
             eprintln!("hincyray: startup config regeneration failed: {error}");
         }
         let split = &inner.state.split_routing;
@@ -120,8 +119,8 @@ pub fn run() -> Result<(), String> {
     eprintln!("hincyray listening on {listen}");
     eprintln!("hincyray state: {}", daemon.state_path.to_string_lossy());
     eprintln!(
-        "hincyray xray config: {}",
-        daemon.xray_config_path.to_string_lossy()
+        "hincyray mihomo config: {}",
+        daemon.mihomo_config_path.to_string_lossy()
     );
 
     loop {
@@ -169,7 +168,7 @@ pub fn run() -> Result<(), String> {
 pub struct Daemon {
     inner: Arc<Mutex<DaemonInner>>,
     state_path: PathBuf,
-    xray_config_path: PathBuf,
+    mihomo_config_path: PathBuf,
 }
 
 struct DaemonInner {
@@ -284,7 +283,7 @@ fn arm_cpu_part_name(part: &str) -> &'static str {
 }
 
 /// Holds the live benchmark job (if any), its cancel flag, and the
-/// worker thread handle. The active Xray `CoreManager` is intentionally
+/// worker thread handle. The active Mihomo `CoreManager` is intentionally
 /// separate: benchmarks spin up their own temporary Xray children and
 /// must never touch the running core.
 struct BenchRuntime {
@@ -350,8 +349,11 @@ pub struct HincyrayState {
     pub socks_port: u16,
     #[serde(default = "default_http_port")]
     pub http_port: Option<u16>,
-    #[serde(default = "default_xray_path")]
-    pub xray_path: String,
+    /// Path to the Mihomo binary. Mihomo handles all protocols
+    /// (VLESS/Reality/XHTTP, VMess, Trojan, Shadowsocks, Hysteria2)
+    /// in a single binary, replacing the previous dual-engine approach.
+    #[serde(default = "default_mihomo_path")]
+    pub mihomo_path: String,
     #[serde(default)]
     pub metrics_history: Vec<MetricSample>,
     #[serde(default)]
@@ -369,7 +371,7 @@ pub struct HincyrayState {
     /// v0.2: per-profile benchmark statistics keyed by raw share link.
     #[serde(default)]
     pub stats: Vec<ProfileStats>,
-    /// v0.5: DNS anti-leak settings for the router Xray config.
+    /// v0.5: DNS anti-leak settings for the router core config.
     #[serde(default)]
     pub dns_settings: DnsSettings,
     /// v0.5: Hardcoded HWID fingerprint for Happ subscription fetches.
@@ -395,7 +397,7 @@ impl Default for HincyrayState {
             listen_host: default_listen_host(),
             socks_port: default_socks_port(),
             http_port: default_http_port(),
-            xray_path: default_xray_path(),
+            mihomo_path: default_mihomo_path(),
             metrics_history: Vec::new(),
             routing_rules: Vec::new(),
             split_routing: SplitRoutingSettings::default(),
@@ -459,8 +461,8 @@ pub struct ProfileStats {
 
 /// WiFi split-routing controls. Traffic from devices assigned to the
 /// Keenetic "HincyRay" policy is transparent-proxied via iptables NAT
-/// REDIRECT (TCP) + mangle TPROXY (UDP) to Xray's dokodemo-door
-/// inbounds. Direct SOCKS clients keep using the active server.
+/// REDIRECT (TCP) + mangle TPROXY (UDP) to Mihomo's redirect/tproxy
+/// listeners. Direct SOCKS clients keep using the active server.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SplitRoutingSettings {
     #[serde(default)]
@@ -498,8 +500,8 @@ pub struct SplitRoutingSettings {
     /// v0.5: Ports to bypass (direct) when `port_mode` is `DenyList`.
     #[serde(default)]
     pub bypass_ports: Vec<String>,
-    /// v0.5: Path to GeoIP/GeoSite .dat files for Xray. Sets the
-    /// `XRAY_LOCATION_ASSET` env var when starting the core.
+    /// v0.5: Path to GeoIP/GeoSite .dat files for the core. The parent
+    /// directory is passed as the Mihomo `-d` home directory flag.
     #[serde(default = "default_geo_asset_path")]
     pub geo_asset_path: String,
 }
@@ -598,12 +600,12 @@ fn default_http_port() -> Option<u16> {
     Some(10809)
 }
 
-fn default_xray_path() -> String {
-    "xray".to_owned()
+fn default_mihomo_path() -> String {
+    "mihomo".to_owned()
 }
 
 impl Daemon {
-    fn new(state: HincyrayState, state_path: PathBuf, xray_config_path: PathBuf) -> Self {
+    fn new(state: HincyrayState, state_path: PathBuf, mihomo_config_path: PathBuf) -> Self {
         Self {
             inner: Arc::new(Mutex::new(DaemonInner {
                 state,
@@ -615,13 +617,15 @@ impl Daemon {
                 prev_cpu_per_core: Vec::new(),
             })),
             state_path,
-            xray_config_path,
+            mihomo_config_path,
         }
     }
 }
 
-/// Xray core lifecycle. Holds at most one child in memory; restart
-/// stops and starts in sequence.
+/// Proxy core lifecycle (Mihomo). Holds at most one child in memory;
+/// restart stops and starts in sequence. Mihomo handles all supported
+/// protocols in a single binary, replacing the previous dual-engine
+/// approach.
 struct CoreManager {
     child: Option<Child>,
 }
@@ -655,34 +659,30 @@ impl CoreManager {
 
     fn start(
         &mut self,
-        xray_path: &str,
+        binary_path: &str,
         config_path: &Path,
-        geo_asset_path: Option<&str>,
+        geo_dir: Option<&str>,
     ) -> Result<(), String> {
         if self.is_running() {
             return Ok(());
         }
         if !config_path.exists() {
             return Err(format!(
-                "xray config not found at {}",
+                "mihomo config not found at {}",
                 config_path.display()
             ));
         }
-        let stderr = open_log_file("xray.log").unwrap_or(Stdio::null());
-        let mut cmd = Command::new(xray_path);
-        cmd.arg("run")
-            .arg("-format")
-            .arg("json")
-            .arg("-c")
-            .arg(config_path)
-            .stdout(Stdio::null())
-            .stderr(stderr);
-        if let Some(path) = geo_asset_path.filter(|p| !p.is_empty()) {
-            cmd.env("XRAY_LOCATION_ASSET", path);
+        let stderr = open_log_file("mihomo.log").unwrap_or(Stdio::null());
+
+        let mut cmd = Command::new(binary_path);
+        cmd.arg("-f").arg(config_path);
+        if let Some(dir) = geo_dir.filter(|d| !d.is_empty()) {
+            cmd.arg("-d").arg(dir);
         }
+        cmd.stdout(Stdio::null()).stderr(stderr);
         let child = cmd
             .spawn()
-            .map_err(|error| format!("xray spawn: {error}"))?;
+            .map_err(|error| format!("mihomo spawn: {error}"))?;
         self.child = Some(child);
         Ok(())
     }
@@ -698,12 +698,12 @@ impl CoreManager {
 
     fn restart(
         &mut self,
-        xray_path: &str,
+        binary_path: &str,
         config_path: &Path,
-        geo_asset_path: Option<&str>,
+        geo_dir: Option<&str>,
     ) -> Result<(), String> {
         self.stop()?;
-        self.start(xray_path, config_path, geo_asset_path)
+        self.start(binary_path, config_path, geo_dir)
     }
 }
 
@@ -712,7 +712,7 @@ impl CoreManager {
 /// assigned to the Keenetic "HincyRay" traffic policy. Survives ndm
 /// firewall reloads via an ndm hook script in
 /// `/opt/etc/ndm/netfilter.d/`. No tun2socks, no TUN device, no
-/// userspace TCP stack — kernel iptables + Xray dokodemo-door only.
+/// userspace TCP stack — kernel iptables + Mihomo redirect/tproxy only.
 struct FirewallManager {
     active: bool,
     tproxy_available: bool,
@@ -1105,8 +1105,8 @@ fn install_firewall_rules(
         .status();
 
     // ── nat table: DNS DNAT (connmark-matched) ──
-    // Redirect DNS queries from policy-marked devices to Xray's
-    // dokodemo-door DNS inbound (127.0.0.1:1053).
+    // Redirect DNS queries from policy-marked devices to Mihomo's
+    // DNS inbound (127.0.0.1:1053).
     let dns_dst = DNS_REDIRECT;
     // Remove old rules first (idempotent).
     let _ = Command::new("iptables")
@@ -1631,11 +1631,11 @@ fn resolve_state_path() -> PathBuf {
     PathBuf::from("./hincyray-state.json")
 }
 
-fn resolve_xray_config_path(state_path: &Path) -> PathBuf {
-    if let Some(path) = std::env::var_os("HINCYRAY_XRAY_CONFIG") {
+fn resolve_mihomo_config_path(state_path: &Path) -> PathBuf {
+    if let Some(path) = std::env::var_os("HINCYRAY_MIHOMO_CONFIG") {
         return PathBuf::from(path);
     }
-    state_path.with_file_name("xray-client.json")
+    state_path.with_file_name("mihomo-config.yaml")
 }
 
 fn load_state(state_path: &Path) -> HincyrayState {
@@ -1668,15 +1668,17 @@ fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String>
     fs::rename(&tmp, state_path).map_err(|error| error.to_string())
 }
 
-fn write_xray_config(path: &Path, config: &Value) -> Result<(), String> {
+fn write_config_file(path: &Path, config_yaml: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let text = serde_json::to_string_pretty(config).map_err(|error| error.to_string())?;
-    fs::write(path, text).map_err(|error| error.to_string())
+    fs::write(path, config_yaml).map_err(|error| error.to_string())
 }
 
-fn build_daemon_xray_config(state: &HincyrayState) -> Result<Value, String> {
+/// Build the single Mihomo config (YAML) for the current active profile.
+/// Returns the YAML string so callers can write it to the daemon's
+/// config path.
+fn build_daemon_config(state: &HincyrayState) -> Result<String, String> {
     let Some(active_id) = state.active_profile_id else {
         return Err("no active profile".to_owned());
     };
@@ -1689,9 +1691,41 @@ fn build_daemon_xray_config(state: &HincyrayState) -> Result<Value, String> {
     };
 
     if !state.split_routing.enabled {
-        return build_xray_config(active_profile, &state.listen_host, state.socks_port);
+        return build_mihomo_config(active_profile, &state.listen_host, state.socks_port);
     }
 
+    // Split routing: build the full router config.
+    let (extra_profiles, routes, active_block_quic, extra) =
+        build_routing_context(state, active_id, active_profile);
+
+    build_mihomo_router_config(
+        active_profile,
+        &extra_profiles,
+        &routes,
+        &state.listen_host,
+        state.socks_port,
+        Some(state.split_routing.redirect_port),
+        state.split_routing.tproxy_available,
+        state.split_routing.quic_mode.clone(),
+        active_block_quic,
+        &extra,
+    )
+}
+
+/// Build the routing context shared by the daemon's config generator.
+/// Returns the list of extra profile/outbound-name pairs, the routing
+/// rules, whether the active profile should block QUIC, and the extra
+/// router options.
+fn build_routing_context<'a>(
+    state: &'a HincyrayState,
+    active_id: usize,
+    active_profile: &'a Profile,
+) -> (
+    Vec<(&'a Profile, String)>,
+    Vec<XrayRouteRule>,
+    bool,
+    RouterExtra,
+) {
     let mut extra_profiles: Vec<(&Profile, String)> = Vec::new();
     let mut routes = Vec::new();
     for rule in state.routing_rules.iter().filter(|rule| rule.enabled) {
@@ -1720,13 +1754,13 @@ fn build_daemon_xray_config(state: &HincyrayState) -> Result<Value, String> {
         }
 
         let outbound_tag = match rule.target.as_str() {
-            "direct" => DIRECT_OUTBOUND_TAG.to_owned(),
-            "active" | "best" | "" => ACTIVE_OUTBOUND_TAG.to_owned(),
+            "direct" => DIRECT_NAME.to_owned(),
+            "active" | "best" | "" => PROXY_NAME.to_owned(),
             target if target.starts_with("profile:") => {
                 let id = target.trim_start_matches("profile:").parse::<usize>().ok();
                 if let Some(id) = id {
                     if id == active_id {
-                        ACTIVE_OUTBOUND_TAG.to_owned()
+                        PROXY_NAME.to_owned()
                     } else if let Some(profile) = state.profiles.iter().find(|p| p.id == id) {
                         let tag = format!("profile-{id}");
                         if !extra_profiles.iter().any(|(_, existing)| existing == &tag) {
@@ -1734,13 +1768,13 @@ fn build_daemon_xray_config(state: &HincyrayState) -> Result<Value, String> {
                         }
                         tag
                     } else {
-                        ACTIVE_OUTBOUND_TAG.to_owned()
+                        PROXY_NAME.to_owned()
                     }
                 } else {
-                    ACTIVE_OUTBOUND_TAG.to_owned()
+                    PROXY_NAME.to_owned()
                 }
             }
-            _ => ACTIVE_OUTBOUND_TAG.to_owned(),
+            _ => PROXY_NAME.to_owned(),
         };
 
         let profile_for_quic = match rule.target.as_str() {
@@ -1777,18 +1811,18 @@ fn build_daemon_xray_config(state: &HincyrayState) -> Result<Value, String> {
             Some(state.split_routing.geo_asset_path.clone())
         },
     };
-    build_xray_router_config(
-        active_profile,
-        &extra_profiles,
-        &routes,
-        &state.listen_host,
-        state.socks_port,
-        Some(state.split_routing.redirect_port),
-        state.split_routing.tproxy_available,
-        state.split_routing.quic_mode.clone(),
-        active_block_quic,
-        &extra,
-    )
+    (extra_profiles, routes, active_block_quic, extra)
+}
+
+/// Extract the parent directory of the configured geo asset path to pass
+/// to Mihomo's `-d` home directory flag.
+fn geo_dir_from_state(state: &HincyrayState) -> Option<String> {
+    let path = state.split_routing.geo_asset_path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let p = Path::new(path);
+    p.parent().map(|p| p.to_string_lossy().into_owned())
 }
 
 fn normalize_route_items(items: &[String]) -> Vec<String> {
@@ -1847,7 +1881,7 @@ fn proxy_info_for_daemon(inner: &mut DaemonInner) -> DaemonProxyInfo {
     }
 }
 
-/// Try direct fetch first; on failure, fall back to the local Xray
+/// Try direct fetch first; on failure, fall back to the local core
 /// SOCKS inbound (`socks5h://127.0.0.1:<socks_port>`) iff the active
 /// core is running. Network I/O happens here, so the caller must NOT
 /// hold the daemon mutex.
@@ -1968,6 +2002,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
             let response = json!({
                 "active_profile_id": inner.state.active_profile_id,
                 "active_profile_name": active.map(|p| p.name.clone()),
+                "active_profile_protocol": active.map(|p| p.protocol.to_string()),
                 "profile_count": inner.state.profiles.len(),
                 "auto_select": inner.state.auto_select,
                 "auto_bench_interval_hours": inner.state.auto_bench_interval_hours,
@@ -1977,9 +2012,9 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
                 "listen_host": inner.state.listen_host,
                 "socks_port": inner.state.socks_port,
                 "http_port": inner.state.http_port,
-                "xray_config_path": daemon.xray_config_path.to_string_lossy(),
+                "mihomo_config_path": daemon.mihomo_config_path.to_string_lossy(),
                 "state_path": daemon.state_path.to_string_lossy(),
-                "xray_path": inner.state.xray_path,
+                "mihomo_path": inner.state.mihomo_path,
                 "core_status": inner.core.status(),
                 "split_routing": inner.state.split_routing,
                 "dns_enabled": inner.state.dns_settings.enabled,
@@ -2017,7 +2052,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/profiles/import") => handle_import(body, daemon),
         ("POST", "/api/profiles/block-quic") => handle_profile_block_quic(body, daemon),
         ("POST", "/api/active-profile") => handle_set_active(body, daemon),
-        ("GET", "/api/xray/config") => handle_get_xray_config(daemon),
+        ("GET", "/api/mihomo-config") => handle_get_mihomo_config(daemon),
         ("POST", "/api/core/start") => handle_core_start(daemon),
         ("POST", "/api/core/stop") => handle_core_stop(daemon),
         ("POST", "/api/core/restart") => handle_core_restart(daemon),
@@ -2262,15 +2297,15 @@ fn handle_set_active(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
     let response = json!({
         "active_profile_id": id,
         "active_profile_name": profile.name,
-        "xray_config_path": daemon.xray_config_path.to_string_lossy(),
+        "mihomo_config_path": daemon.mihomo_config_path.to_string_lossy(),
     });
     (200, "application/json", response.to_string())
 }
 
-fn handle_get_xray_config(daemon: &Daemon) -> (u16, &'static str, String) {
+fn handle_get_mihomo_config(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
-    match build_daemon_xray_config(&inner.state) {
-        Ok(config) => (200, "application/json", config.to_string()),
+    match build_daemon_config(&inner.state) {
+        Ok(config_yaml) => (200, "text/yaml; charset=utf-8", config_yaml),
         Err(error) => (
             400,
             "application/json",
@@ -2279,20 +2314,33 @@ fn handle_get_xray_config(daemon: &Daemon) -> (u16, &'static str, String) {
     }
 }
 
-fn regenerate_xray_config(state: &HincyrayState, config_path: &Path) -> Result<(), String> {
-    let config = build_daemon_xray_config(state)?;
-    write_xray_config(config_path, &config)
+/// Regenerate the Mihomo config and write it to the daemon's config
+/// path. Returns the binary path and config path so the caller can start
+/// the core.
+fn regenerate_config(state: &HincyrayState, daemon: &Daemon) -> Result<(String, PathBuf), String> {
+    let config_yaml = build_daemon_config(state)?;
+    let config_path = daemon.mihomo_config_path.clone();
+    write_config_file(&config_path, &config_yaml)?;
+    Ok((state.mihomo_path.clone(), config_path))
 }
 
 fn handle_core_start(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
-    let xray_path = inner.state.xray_path.clone();
-    let config_path = daemon.xray_config_path.clone();
-    let geo_asset = inner.state.split_routing.geo_asset_path.clone();
-    if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
-        eprintln!("hincyray: config regeneration on core start failed: {error}");
-    }
-    match inner.core.start(&xray_path, &config_path, Some(&geo_asset)) {
+    let geo_dir = geo_dir_from_state(&inner.state);
+    let (binary_path, config_path) = match regenerate_config(&inner.state, daemon) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("config regeneration: {error}")}).to_string(),
+            );
+        }
+    };
+    match inner
+        .core
+        .start(&binary_path, &config_path, geo_dir.as_deref())
+    {
         Ok(()) => (
             200,
             "application/json",
@@ -2316,15 +2364,20 @@ fn handle_core_stop(daemon: &Daemon) -> (u16, &'static str, String) {
 
 fn handle_core_restart(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
-    let xray_path = inner.state.xray_path.clone();
-    let config_path = daemon.xray_config_path.clone();
-    let geo_asset = inner.state.split_routing.geo_asset_path.clone();
-    if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
-        eprintln!("hincyray: config regeneration on core restart failed: {error}");
-    }
+    let geo_dir = geo_dir_from_state(&inner.state);
+    let (binary_path, config_path) = match regenerate_config(&inner.state, daemon) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("config regeneration: {error}")}).to_string(),
+            );
+        }
+    };
     match inner
         .core
-        .restart(&xray_path, &config_path, Some(&geo_asset))
+        .restart(&binary_path, &config_path, geo_dir.as_deref())
     {
         Ok(()) => (
             200,
@@ -2423,7 +2476,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
                     .collect()
             });
 
-    let (profiles, xray_path) = {
+    let profiles = {
         let inner = lock(&daemon.inner);
         if inner.bench.is_running() {
             return (
@@ -2443,7 +2496,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
                 .collect(),
             _ => inner.state.profiles.clone(),
         };
-        (profiles, inner.state.xray_path.clone())
+        profiles
     };
 
     if profiles.is_empty() {
@@ -2466,7 +2519,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         method,
         probe_url,
         download_url,
-        xray_path,
+        "xray".to_owned(),
         Arc::clone(&job),
         Arc::clone(&cancel),
         on_result,
@@ -3089,7 +3142,7 @@ fn handle_subscriptions_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
     // config so we don't run with a stale outbound.
     if removed_active {
         let _ = inner.core.stop();
-        let _ = fs::remove_file(&daemon.xray_config_path);
+        let _ = fs::remove_file(&daemon.mihomo_config_path);
     }
 
     let _ = persist_state(&daemon.state_path, &inner.state);
@@ -3274,26 +3327,26 @@ fn handle_routing_catalog_refresh(body: &str, daemon: &Daemon) -> (u16, &'static
 
 fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
-    let config = match build_daemon_xray_config(&inner.state) {
-        Ok(config) => config,
+    let config_yaml = match build_daemon_config(&inner.state) {
+        Ok(yaml) => yaml,
         Err(error) => return (400, "application/json", json!({"error": error}).to_string()),
     };
-    if let Err(error) = write_xray_config(&daemon.xray_config_path, &config) {
+    let config_path = daemon.mihomo_config_path.clone();
+    let binary_path = inner.state.mihomo_path.clone();
+    if let Err(error) = write_config_file(&config_path, &config_yaml) {
         return (
             500,
             "application/json",
-            json!({"error": format!("write xray config: {error}")}).to_string(),
+            json!({"error": format!("write config: {error}")}).to_string(),
         );
     }
     let was_running = inner.core.is_running();
-    let xray_path = inner.state.xray_path.clone();
-    let config_path = daemon.xray_config_path.clone();
     let split = inner.state.split_routing.clone();
-    let geo_asset = split.geo_asset_path.clone();
+    let geo_dir = geo_dir_from_state(&inner.state);
     let core_status = if was_running {
         match inner
             .core
-            .restart(&xray_path, &config_path, Some(&geo_asset))
+            .restart(&binary_path, &config_path, geo_dir.as_deref())
         {
             Ok(()) => inner.core.status().to_owned(),
             Err(error) => return (500, "application/json", json!({"error": error}).to_string()),
@@ -3323,7 +3376,7 @@ fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
                 inner.state.split_routing.tproxy_available = inner.firewall.tproxy_available;
                 let _ = persist_state(&daemon.state_path, &inner.state);
                 // Regenerate config with correct tproxy_available flag.
-                if let Err(e) = regenerate_xray_config(&inner.state, &config_path) {
+                if let Err(e) = regenerate_config(&inner.state, daemon) {
                     eprintln!("hincyray: config regen after firewall start: {e}");
                 }
                 "running".to_owned()
@@ -3527,11 +3580,11 @@ fn handle_dns_leak_test(daemon: &Daemon) -> (u16, &'static str, String) {
         return (
             400,
             "application/json",
-            json!({"error": "Xray core is not running"}).to_string(),
+            json!({"error": "Mihomo core is not running"}).to_string(),
         );
     }
 
-    // Infrastructure checks: iptables rules + Xray DNS inbound.
+    // Infrastructure checks: iptables rules + Mihomo DNS inbound.
     let dns_redirect_ok =
         shell_status("iptables -t nat -S PREROUTING 2>/dev/null | grep -q 'hincyray.*DNAT.*1053'");
     let nat_ok =
@@ -3714,11 +3767,11 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
     )
 }
 
-/// Return the last N lines of the Xray and tun2socks log files so the
-/// user can diagnose start failures from the web panel without SSH.
+/// Return the last N lines of the Mihomo log file so the user can
+/// diagnose start failures from the web panel without SSH.
 fn handle_logs(_daemon: &Daemon) -> (u16, &'static str, String) {
     let dir = resolve_log_dir();
-    let xray_log = dir.join("xray.log");
+    let mihomo_log = dir.join("mihomo.log");
 
     let read_tail = |path: &Path| -> String {
         let Ok(text) = fs::read_to_string(path) else {
@@ -3733,8 +3786,8 @@ fn handle_logs(_daemon: &Daemon) -> (u16, &'static str, String) {
         200,
         "application/json",
         json!({
-            "xray": read_tail(&xray_log),
-            "xray_log_path": xray_log.to_string_lossy(),
+            "mihomo": read_tail(&mihomo_log),
+            "mihomo_log_path": mihomo_log.to_string_lossy(),
         })
         .to_string(),
     )
@@ -4065,12 +4118,12 @@ fn find_best_profile_by_score(
 /// the same mechanism as `handle_bench_start` but uses the TCP method
 /// (lightweight, no temp Xray processes) and covers all profiles.
 fn start_auto_benchmark(daemon: &Daemon) {
-    let (profiles, xray_path) = {
+    let profiles = {
         let inner = lock(&daemon.inner);
         if inner.bench.is_running() {
             return;
         }
-        (inner.state.profiles.clone(), inner.state.xray_path.clone())
+        inner.state.profiles.clone()
     };
     if profiles.is_empty() {
         return;
@@ -4086,7 +4139,7 @@ fn start_auto_benchmark(daemon: &Daemon) {
         BenchMethod::Tcp,
         DEFAULT_PROBE_URL.to_owned(),
         DEFAULT_DOWNLOAD_URL.to_owned(),
-        xray_path,
+        "xray".to_owned(),
         Arc::clone(&job),
         Arc::clone(&cancel),
         on_result,
@@ -4121,45 +4174,60 @@ impl ActiveProfileApplyError {
 }
 
 /// Apply a new active profile to every layer that observes it: in-memory
-/// state, generated Xray config, running Xray process, and persisted state.
+/// state, generated Mihomo config, running Mihomo process, and persisted state.
 ///
-/// Xray does not hot-reload `/opt/etc/hincyray/xray-client.json`, so writing
-/// the file without restarting the core creates a split-brain state where the
-/// API reports one active profile while the SOCKS/transparent proxy still uses
-/// the old outbound. Keep all profile-switching entrypoints behind this helper
-/// so that "active profile" has one system-wide meaning.
+/// Mihomo does not hot-reload its config, so writing the file without
+/// restarting the core creates a split-brain state where the API reports one
+/// active profile while the SOCKS/transparent proxy still uses the old
+/// outbound. Keep all profile-switching entrypoints behind this helper so that
+/// "active profile" has one system-wide meaning.
 fn apply_active_profile(
     inner: &mut MutexGuard<DaemonInner>,
     daemon: &Daemon,
     profile_id: usize,
 ) -> Result<(), ActiveProfileApplyError> {
     let previous_profile_id = inner.state.active_profile_id;
-    let config_path = daemon.xray_config_path.clone();
-    let xray = inner.state.xray_path.clone();
-    let geo = inner.state.split_routing.geo_asset_path.clone();
+    let geo_dir = geo_dir_from_state(&inner.state);
 
     inner.state.active_profile_id = Some(profile_id);
-    let config = match build_daemon_xray_config(&inner.state) {
-        Ok(config) => config,
+    let config_yaml = match build_daemon_config(&inner.state) {
+        Ok(yaml) => yaml,
         Err(error) => {
             inner.state.active_profile_id = previous_profile_id;
             return Err(ActiveProfileApplyError::InvalidConfig(error));
         }
     };
 
-    let apply_result = write_xray_config(&config_path, &config)
-        .and_then(|()| inner.core.restart(&xray, &config_path, Some(&geo)))
+    let config_path = daemon.mihomo_config_path.clone();
+    let binary_path = inner.state.mihomo_path.clone();
+
+    let apply_result = write_config_file(&config_path, &config_yaml)
+        .and_then(|()| {
+            inner
+                .core
+                .restart(&binary_path, &config_path, geo_dir.as_deref())
+        })
         .and_then(|()| persist_state(&daemon.state_path, &inner.state).map_err(|e| e.to_string()));
 
     if let Err(error) = apply_result {
         inner.state.active_profile_id = previous_profile_id;
-        if previous_profile_id.is_some()
-            && let Err(rollback_error) = regenerate_xray_config(&inner.state, &config_path)
-                .and_then(|()| inner.core.restart(&xray, &config_path, Some(&geo)))
-        {
-            eprintln!(
-                "hincyray: rollback after active profile switch failure failed: {rollback_error}"
-            );
+        if previous_profile_id.is_some() {
+            let (rollback_binary, rollback_path) = match regenerate_config(&inner.state, daemon) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("hincyray: rollback config regeneration failed: {e}");
+                    return Err(ActiveProfileApplyError::Runtime(error));
+                }
+            };
+            if let Err(rollback_error) =
+                inner
+                    .core
+                    .restart(&rollback_binary, &rollback_path, geo_dir.as_deref())
+            {
+                eprintln!(
+                    "hincyray: rollback after active profile switch failure failed: {rollback_error}"
+                );
+            }
         }
         return Err(ActiveProfileApplyError::Runtime(error));
     }
@@ -4167,7 +4235,7 @@ fn apply_active_profile(
     Ok(())
 }
 
-/// Switch the active profile, regenerate Xray config, and restart the
+/// Switch the active profile, regenerate Mihomo config, and restart the
 /// core. Caller must hold the lock.
 fn switch_active_profile(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon, profile_id: usize) {
     if let Err(error) = apply_active_profile(inner, daemon, profile_id) {
@@ -4180,7 +4248,7 @@ fn switch_active_profile(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon, p
 
 /// Background watchdog thread. Runs every 10 seconds and handles:
 ///
-/// 1. **Core monitoring (always)** — if the Xray core has crashed,
+/// 1. **Core monitoring (always)** — if the Mihomo core has crashed,
 ///    regenerate config and restart it with exponential backoff.
 /// 2. **Firewall/iptables monitoring (split routing only)** — restart
 ///    tun2socks if dead, reinstall iptables rules wiped by ndm.
@@ -4210,8 +4278,6 @@ fn start_watchdog(daemon: Daemon) {
                 policy_name,
                 cached_mark,
                 socks_port,
-                xray_path,
-                geo_asset,
                 auto_switch,
                 auto_select,
                 auto_bench_hours,
@@ -4229,8 +4295,6 @@ fn start_watchdog(daemon: Daemon) {
                     inner.state.split_routing.policy_name.clone(),
                     inner.state.split_routing.policy_mark.clone(),
                     inner.state.socks_port,
-                    inner.state.xray_path.clone(),
-                    inner.state.split_routing.geo_asset_path.clone(),
                     inner.state.split_routing.auto_switch,
                     inner.state.auto_select,
                     inner.state.auto_bench_interval_hours,
@@ -4252,18 +4316,25 @@ fn start_watchdog(daemon: Daemon) {
                 } else {
                     eprintln!("hincyray: core not running, restarting...");
                     let mut inner = lock(&daemon.inner);
-                    let config_path = daemon.xray_config_path.clone();
-                    if let Err(error) = regenerate_xray_config(&inner.state, &config_path) {
-                        eprintln!("hincyray: watchdog config regeneration failed: {error}");
-                    }
-                    if let Err(error) = inner.core.start(&xray_path, &config_path, Some(&geo_asset))
-                    {
-                        eprintln!("hincyray: watchdog core restart failed: {error}");
-                        // Exponential backoff: 10 → 20 → 40 → 80 → 160 → 300 max.
-                        restart_backoff_secs = restart_backoff_secs.clamp(10, 150) * 2;
-                    } else {
-                        restart_backoff_secs = 0;
-                        eprintln!("hincyray: core restarted by watchdog");
+                    match regenerate_config(&inner.state, &daemon) {
+                        Ok((binary_path, config_path)) => {
+                            let geo_dir = geo_dir_from_state(&inner.state);
+                            if let Err(error) =
+                                inner
+                                    .core
+                                    .start(&binary_path, &config_path, geo_dir.as_deref())
+                            {
+                                eprintln!("hincyray: watchdog core restart failed: {error}");
+                                restart_backoff_secs = restart_backoff_secs.clamp(10, 150) * 2;
+                            } else {
+                                restart_backoff_secs = 0;
+                                eprintln!("hincyray: core restarted by watchdog");
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("hincyray: watchdog config regeneration failed: {error}");
+                            restart_backoff_secs = restart_backoff_secs.clamp(10, 150) * 2;
+                        }
                     }
                     continue;
                 }
@@ -4611,7 +4682,7 @@ tr.group-row.collapsed{display:none}
   <div class="card"><div class="label">Profiles</div><div class="value" id="card-count">&mdash;</div></div>
   <div class="card"><div class="label">SOCKS listen</div><div class="value" id="card-socks">&mdash;</div></div>
   <div class="card"><div class="label">State path</div><div class="value" id="card-state">&mdash;</div></div>
-  <div class="card"><div class="label">Xray config path</div><div class="value" id="card-xray-path">&mdash;</div></div>
+  <div class="card"><div class="label">Config path</div><div class="value" id="card-config-path">&mdash;</div></div>
 </div>
 
 <div class="row">
@@ -4622,7 +4693,7 @@ tr.group-row.collapsed{display:none}
 </div>
 
 <h2>Benchmark / ping</h2>
-<p class="subtle">TCP probes <code>address:port</code> directly (no Xray). HEAD/GET spin up a temporary Xray SOCKS per VLESS profile, run curl, then tear it down &mdash; the active core is never touched. Hysteria2 is unsupported by the Xray benchmark; use TCP for it.</p>
+<p class="subtle">TCP probes <code>address:port</code> directly (no core). HEAD/GET spin up a temporary Xray SOCKS per VLESS/VMess/Trojan/SS profile, run curl, then tear it down &mdash; the active core is never touched. Hysteria2 profiles use TCP only (Mihomo benchmark not yet implemented).</p>
 <div class="grid2">
   <div class="field">
     <label for="bench-method">Method</label>
@@ -4690,7 +4761,7 @@ tr.group-row.collapsed{display:none}
 
 <h2>DNS Anti-Leak <span id="dns-toggle" class="toggle">show</span></h2>
 <div id="dns-panel" class="collapsible">
-  <p class="subtle">When enabled, Xray uses configured DNS servers instead of the system resolver, preventing DNS leaks. Remote DNS queries go through the proxy; local DNS handles direct domains (e.g. CN).</p>
+  <p class="subtle">When enabled, Mihomo uses configured DNS servers instead of the system resolver, preventing DNS leaks. Remote DNS queries go through the proxy; local DNS handles direct domains (e.g. CN).</p>
   <div class="row" style="margin:.3em 0">
     <label class="chip"><input type="checkbox" id="dns-enabled"> Enable DNS anti-leak</label>
     <div class="field"><label for="dns-strategy">Query strategy</label><select id="dns-strategy"><option value="UseIPv4">UseIPv4</option><option value="UseIPv6">UseIPv6</option><option value="UseIP">UseIP (v4+v6)</option></select></div>
@@ -4715,7 +4786,7 @@ tr.group-row.collapsed{display:none}
         <tr><td class="subtle">Status</td><td id="leak-status"></td></tr>
         <tr><td class="subtle">DNS redirect (iptables)</td><td id="leak-dns-redirect"></td></tr>
         <tr><td class="subtle">Mangle MARK (iptables)</td><td id="leak-mangle"></td></tr>
-        <tr><td class="subtle">Xray DNS inbound (port 1053)</td><td id="leak-dns-inbound"></td></tr>
+        <tr><td class="subtle">Mihomo DNS inbound (port 1053)</td><td id="leak-dns-inbound"></td></tr>
         <tr><td class="subtle">Proxy exit IP</td><td id="leak-proxy-ip"></td></tr>
         <tr><td class="subtle">Proxy location</td><td id="leak-proxy-loc"></td></tr>
         <tr><td class="subtle">DNS via proxy (whoami.akamai.net)</td><td id="leak-dns-proxy"></td></tr>
@@ -4765,8 +4836,8 @@ tr.group-row.collapsed{display:none}
   <div class="row" style="margin:.45em 0">
     <button id="btn-logs-refresh">Refresh logs</button>
   </div>
-  <h3 class="subtle">Xray</h3>
-  <pre id="xray-log" class="log-box"></pre>
+  <h3 class="subtle">Core (Mihomo)</h3>
+  <pre id="mihomo-log" class="log-box"></pre>
 </div>
 
 <h2>WiFi Traffic Split <span id="routing-toggle" class="toggle">show</span></h2>
@@ -4788,7 +4859,7 @@ tr.group-row.collapsed{display:none}
   <div class="row" style="margin:.45em 0">
     <button id="btn-routing-save">Save settings</button>
     <button id="btn-catalog-refresh">Refresh service catalog</button>
-    <button class="primary" id="btn-routing-apply">Apply Xray config</button>
+    <button class="primary" id="btn-routing-apply">Apply Mihomo config</button>
     <button id="btn-firewall-status">Firewall status</button>
     <button id="btn-firewall-start">Start firewall</button>
     <button class="danger" id="btn-firewall-stop">Stop firewall</button>
@@ -4835,15 +4906,15 @@ tr.group-row.collapsed{display:none}
   </table>
 </div>
 
-<h2>Generated Xray config</h2>
+<h2>Generated Mihomo config</h2>
 <div class="row">
   <button id="btn-load-config">Load / show</button>
-  <span class="subtle">Fetches <code>GET /api/xray/config</code> for the active profile.</span>
+  <span class="subtle">Fetches <code>GET /api/mihomo-config</code> for the active profile.</span>
 </div>
-<pre id="xray-config">&mdash;</pre>
+<pre id="mihomo-config">&mdash;</pre>
 
 <hr class="subtle">
-<p class="subtle">HincyRay daemon &middot; API: <code>/api/health</code>, <code>/api/status</code>, <code>/api/profiles</code>, <code>/api/bench/*</code>, <code>/api/stats</code>, <code>/api/favorites/*</code>, <code>/api/subscriptions/*</code>, <code>/api/xray/config</code>, <code>/api/core/*</code>, <code>/api/routing/*</code>, <code>/api/routing/firewall-*</code>, <code>/api/dns</code>, <code>/api/hwid</code>.</p>
+<p class="subtle">HincyRay daemon &middot; API: <code>/api/health</code>, <code>/api/status</code>, <code>/api/profiles</code>, <code>/api/bench/*</code>, <code>/api/stats</code>, <code>/api/favorites/*</code>, <code>/api/subscriptions/*</code>, <code>/api/mihomo-config</code>, <code>/api/core/*</code>, <code>/api/routing/*</code>, <code>/api/routing/firewall-*</code>, <code>/api/dns</code>, <code>/api/hwid</code>.</p>
 
 <script>
 (function(){
@@ -4910,7 +4981,7 @@ function renderStatus(s){
   document.getElementById("card-count").textContent = String(s.profile_count);
   document.getElementById("card-socks").textContent = s.listen_host + ":" + s.socks_port;
   document.getElementById("card-state").textContent = s.state_path;
-  document.getElementById("card-xray-path").textContent = s.xray_config_path;
+  document.getElementById("card-config-path").textContent = s.mihomo_config_path;
 }
 
 function groupLabel(group){
@@ -5090,7 +5161,7 @@ function renderProfiles(profiles, stats){
       var id = btn.getAttribute("data-id");
       api("POST", "/api/active-profile", JSON.stringify({profile_id: Number(id)}))
         .then(function(){
-          showOk("Profile " + id + " selected. Xray config regenerated.");
+          showOk("Profile " + id + " selected. Mihomo config regenerated.");
           return refreshAll();
         })
         .catch(function(err){ setMsg("Select failed: " + err.message); });
@@ -5491,8 +5562,8 @@ document.getElementById("btn-subs-refresh").addEventListener("click", function()
 });
 
 document.getElementById("btn-load-config").addEventListener("click", function(){
-  api("GET", "/api/xray/config").then(function(data){
-    document.getElementById("xray-config").textContent = JSON.stringify(data, null, 2);
+  api("GET", "/api/mihomo-config").then(function(data){
+    document.getElementById("mihomo-config").textContent = data;
   }).catch(function(err){ setMsg("Load config failed: " + err.message); });
 });
 
@@ -5607,7 +5678,7 @@ document.getElementById("btn-dns-leak-test").addEventListener("click", function(
       "ok": "No leak detected",
       "leak_detected": "LEAK DETECTED",
       "proxy_unreachable": "Proxy unreachable",
-      "dns_inbound_down": "Xray DNS inbound not listening",
+                "dns_inbound_down": "Mihomo DNS inbound not listening",
       "rules_missing": "iptables rules missing"
     };
     setCell("leak-status", statusMap[d.status] || d.status, d.status === "ok");
@@ -5735,7 +5806,7 @@ document.getElementById("btn-auto-save").addEventListener("click", function(){
 // Logs: load and display.
 function loadLogs(){
   api("GET", "/api/logs").then(function(data){
-    document.getElementById("xray-log").textContent = data.xray || "(empty)";
+    document.getElementById("mihomo-log").textContent = data.mihomo || "(empty)";
   }).catch(function(err){ setMsg("Logs load failed: " + err.message); });
 }
 
@@ -5913,8 +5984,15 @@ mod tests {
     fn test_daemon() -> (TempDir, Daemon) {
         let dir = TempDir::new().expect("temp dir");
         let state_path = dir.path().join("state.json");
-        let xray_config_path = dir.path().join("xray-client.json");
-        let daemon = Daemon::new(HincyrayState::default(), state_path, xray_config_path);
+        let mihomo_config_path = dir.path().join("mihomo-config.yaml");
+        // Point the daemon at a no-op executable so tests that restart the
+        // core (e.g. profile activation) don't fail just because `mihomo` is
+        // not installed in the test environment.
+        let state = HincyrayState {
+            mihomo_path: "/usr/bin/true".to_owned(),
+            ..HincyrayState::default()
+        };
+        let daemon = Daemon::new(state, state_path, mihomo_config_path);
         (dir, daemon)
     }
 
@@ -6063,7 +6141,7 @@ mod tests {
         assert_eq!(loaded.active_profile_id, Some(0));
         assert_eq!(loaded.socks_port, 10808);
         assert_eq!(loaded.http_port, Some(10809));
-        assert_eq!(loaded.xray_path, "xray");
+        assert_eq!(loaded.mihomo_path, "mihomo");
         assert_eq!(loaded.listen_host, "127.0.0.1");
         assert!(state_path.exists());
     }
@@ -6116,7 +6194,7 @@ mod tests {
     }
 
     #[test]
-    fn set_active_profile_writes_xray_config() {
+    fn set_active_profile_writes_mihomo_config() {
         let (_dir, daemon) = test_daemon();
         let body = "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=reality&sni=www.example.com&fp=chrome&pbk=0123456789abcdef0123456789abcdef0123456789a&sid=abcd#XHTTP";
         handle_import(body, &daemon);
@@ -6127,11 +6205,11 @@ mod tests {
         assert_eq!(response["active_profile_id"], 0);
         assert_eq!(response["active_profile_name"], "XHTTP");
 
-        let config_text = fs::read_to_string(&daemon.xray_config_path).expect("read config");
-        let config: Value = serde_json::from_str(&config_text).expect("parse config");
-        assert_eq!(config["inbounds"][0]["protocol"], "socks");
-        assert_eq!(config["outbounds"][0]["protocol"], "vless");
-        assert_eq!(config["outbounds"][0]["streamSettings"]["network"], "xhttp");
+        let config_text = fs::read_to_string(&daemon.mihomo_config_path).expect("read config");
+        let config: Value = serde_yaml::from_str(&config_text).expect("parse config");
+        assert_eq!(config["socks-port"], 10808);
+        assert_eq!(config["proxies"][0]["type"], "vless");
+        assert_eq!(config["proxies"][0]["network"], "xhttp");
     }
 
     #[test]
@@ -6164,46 +6242,33 @@ mod tests {
             });
         }
 
-        let (status, _, body) = handle_get_xray_config(&daemon);
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
         assert_eq!(status, 200);
-        let config: Value = serde_json::from_str(&body).expect("parse config");
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
         assert!(
-            config["inbounds"]
+            config["listeners"]
                 .as_array()
-                .expect("inbounds array")
+                .expect("listeners array")
                 .iter()
-                .any(|inbound| {
-                    inbound["tag"] == "redir-in" && inbound["protocol"] == "dokodemo-door"
-                })
+                .any(|listener| listener["name"] == "redir-in" && listener["type"] == "redir")
         );
         assert!(
-            config["outbounds"]
+            config["proxies"]
                 .as_array()
-                .expect("outbounds array")
+                .expect("proxies array")
                 .iter()
-                .any(|outbound| {
-                    outbound["tag"] == "profile-1" && outbound["protocol"] == "vless"
-                })
+                .any(|proxy| proxy["name"] == "profile-1" && proxy["type"] == "vless")
         );
-        let rules = config["routing"]["rules"]
-            .as_array()
-            .expect("routing rules");
+        let rules = config["rules"].as_array().expect("routing rules");
         assert!(rules.iter().any(|rule| {
-            rule["outboundTag"] == "direct"
-                && rule["domain"]
-                    .as_array()
-                    .is_some_and(|d| d.contains(&json!("geosite:ru")))
-                && rule["ip"]
-                    .as_array()
-                    .is_some_and(|d| d.contains(&json!("geoip:ru")))
+            rule.as_str()
+                .is_some_and(|s| s.contains("GEOSITE,ru") && s.contains("DIRECT"))
         }));
-        assert!(rules.iter().any(|rule| rule["outboundTag"] == "block"
-            && rule["network"] == "udp"
-            && rule["port"] == "443"));
-        assert_eq!(
-            rules.last().expect("fallback rule")["outboundTag"],
-            "active"
-        );
+        assert!(rules.iter().any(|rule| {
+            rule.as_str()
+                .is_some_and(|s| s == "AND,((NETWORK,udp),(DST-PORT,443)),REJECT")
+        }));
+        assert_eq!(rules.last().expect("fallback rule"), "MATCH,proxy");
     }
 
     #[test]
@@ -6248,34 +6313,29 @@ mod tests {
             });
         }
 
-        // Toggle block_quic on the fixed target profile (id=1).
+        // Toggle block_quic on the active profile (id=0) and the fixed target
+        // profile (id=1). Mihomo emits a single global QUIC reject rule when
+        // the active profile blocks QUIC, while the per-profile flag is
+        // persisted in state for future active selections.
+        let (status, _, _) =
+            handle_profile_block_quic(r#"{"profile_id":0,"block_quic":true}"#, &daemon);
+        assert_eq!(status, 200);
         let (status, _, _) =
             handle_profile_block_quic(r#"{"profile_id":1,"block_quic":true}"#, &daemon);
         assert_eq!(status, 200);
 
-        let (status, _, body) = handle_get_xray_config(&daemon);
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
         assert_eq!(status, 200);
-        let config: Value = serde_json::from_str(&body).expect("parse config");
-        let rules = config["routing"]["rules"]
-            .as_array()
-            .expect("routing rules");
-        let mut block_count = 0usize;
-        let mut youtube_block_seen = false;
-        for (i, rule) in rules.iter().enumerate() {
-            if rule["outboundTag"] == "block" && rule["network"] == "udp" && rule["port"] == "443" {
-                block_count += 1;
-                // The block should appear immediately before a YouTube rule if it
-                // belongs to the fixed profile target.
-                if i + 1 < rules.len() && rules[i + 1]["outboundTag"] == "profile-1" {
-                    youtube_block_seen = true;
-                }
-            }
-        }
-        assert!(block_count > 0, "expected at least one QUIC block rule");
-        assert!(
-            youtube_block_seen,
-            "expected QUIC block before fixed-profile YouTube rule"
-        );
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let rules = config["rules"].as_array().expect("routing rules");
+        assert!(rules.iter().any(|rule| {
+            rule.as_str()
+                .is_some_and(|s| s == "AND,((NETWORK,udp),(DST-PORT,443)),REJECT")
+        }));
+
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.profiles[0].block_quic);
+        assert!(inner.state.profiles[1].block_quic);
     }
 
     #[test]
@@ -6291,15 +6351,19 @@ mod tests {
     }
 
     #[test]
-    fn set_active_rejects_hysteria2_with_400() {
+    fn set_active_accepts_hysteria2_via_mihomo() {
         let (_dir, daemon) = test_daemon();
         handle_import(
             "hysteria2://secret@example.com:443?sni=example.com#Hy2",
             &daemon,
         );
         let (status, _, response_text) = handle_set_active(r#"{"profile_id":0}"#, &daemon);
-        assert_eq!(status, 400);
-        assert!(response_text.contains("Hysteria2"));
+        // Hysteria2 is supported natively by Mihomo. The config build
+        // succeeds, so we should NOT see a 400 "Hysteria2" rejection. The
+        // core restart may fail in the test environment (no mihomo binary),
+        // but that's a runtime error (500), not a config error (400).
+        assert_ne!(status, 400);
+        assert!(!response_text.contains("Hysteria2"));
     }
 
     #[test]
@@ -6321,24 +6385,24 @@ mod tests {
     }
 
     #[test]
-    fn get_xray_config_returns_400_without_active() {
+    fn get_mihomo_config_returns_400_without_active() {
         let (_dir, daemon) = test_daemon();
-        let (status, _, _) = handle_get_xray_config(&daemon);
+        let (status, _, _) = handle_get_mihomo_config(&daemon);
         assert_eq!(status, 400);
     }
 
     #[test]
-    fn get_xray_config_returns_config_after_activation() {
+    fn get_mihomo_config_returns_config_after_activation() {
         let (_dir, daemon) = test_daemon();
         handle_import(
             "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
             &daemon,
         );
         handle_set_active(r#"{"profile_id":0}"#, &daemon);
-        let (status, content_type, body) = handle_get_xray_config(&daemon);
+        let (status, content_type, body) = handle_get_mihomo_config(&daemon);
         assert_eq!(status, 200);
-        assert_eq!(content_type, "application/json");
-        assert!(body.contains("\"protocol\":\"socks\""));
+        assert_eq!(content_type, "text/yaml; charset=utf-8");
+        assert!(body.contains("socks-port: 10808"));
     }
 
     #[test]
@@ -6359,12 +6423,17 @@ mod tests {
 
     #[test]
     fn status_endpoint_reports_defaults_and_paths() {
-        let (_dir, daemon) = test_daemon();
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let mihomo_config_path = dir.path().join("mihomo-config.yaml");
+        let daemon = Daemon::new(HincyrayState::default(), state_path, mihomo_config_path);
         let (status, _, body) = dispatch("GET", "/api/status", "", &daemon);
         assert_eq!(status, 200);
         assert!(body.contains("\"socks_port\":10808"));
         assert!(body.contains("\"core_status\":\"stopped\""));
-        assert!(body.contains("\"xray_path\":\"xray\""));
+        assert!(body.contains("\"mihomo_path\":\"mihomo\""));
+        assert!(body.contains("\"mihomo_config_path\":\""));
+        assert!(!body.contains("core_engine"));
     }
 
     #[test]
@@ -6600,7 +6669,6 @@ mod tests {
             "listen_host": "127.0.0.1",
             "socks_port": 10808,
             "http_port": 10809,
-            "xray_path": "xray",
             "metrics_history": [],
             "routing_rules": []
         }"#;
@@ -6937,7 +7005,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_rule_with_ports_and_network_generates_xray_rule() {
+    fn routing_rule_with_ports_and_network_generates_mihomo_rule() {
         let (_dir, daemon) = test_daemon();
         handle_import(
             "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active",
@@ -6956,13 +7024,20 @@ mod tests {
                 ..Default::default()
             });
         }
-        let (status, _, body) = handle_get_xray_config(&daemon);
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
         assert_eq!(status, 200);
-        let config: Value = serde_json::from_str(&body).expect("parse config");
-        let rules = config["routing"]["rules"].as_array().expect("rules");
-        assert!(rules.iter().any(|r| {
-            r["outboundTag"] == "direct" && r.get("port").is_some() && r.get("network").is_some()
-        }));
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let rules = config["rules"].as_array().expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| { r.as_str() == Some("DST-PORT,27000-27050,DIRECT") })
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| { r.as_str() == Some("NETWORK,udp,DIRECT") })
+        );
     }
 
     #[test]
@@ -6979,9 +7054,9 @@ mod tests {
             inner.state.dns_settings.enabled = true;
             inner.state.dns_settings.remote_servers = vec!["https://1.1.1.1/dns-query".to_owned()];
         }
-        let (status, _, body) = handle_get_xray_config(&daemon);
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
         assert_eq!(status, 200);
-        let config: Value = serde_json::from_str(&body).expect("parse config");
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
         assert!(config.get("dns").is_some());
     }
 
