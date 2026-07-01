@@ -129,6 +129,18 @@ pub struct ProxyGroupConfig {
     pub strategy: LoadBalanceStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_status: Option<String>,
+    /// Regex filter — only include nodes whose name matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Regex filter — exclude nodes whose name matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_filter: Option<String>,
+    /// Exclude by proxy type, pipe-separated (e.g. "Shadowsocks|Http").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_type: Option<String>,
+    /// Auto-include all nodes from all proxy-providers in this group.
+    #[serde(default)]
+    pub include_all_providers: bool,
 }
 
 impl Default for ProxyGroupConfig {
@@ -144,6 +156,10 @@ impl Default for ProxyGroupConfig {
             max_failed_times: default_max_failed_times(),
             strategy: LoadBalanceStrategy::default(),
             expected_status: None,
+            filter: None,
+            exclude_filter: None,
+            exclude_type: None,
+            include_all_providers: false,
         }
     }
 }
@@ -428,6 +444,9 @@ pub struct MihomoFeatures {
     pub keep_alive_idle: u32,
     #[serde(default)]
     pub disable_keep_alive: bool,
+    /// Connect to all resolved IPs concurrently, use first success.
+    #[serde(default)]
+    pub tcp_concurrent: bool,
 
     // --- Experimental ---
     #[serde(default)]
@@ -508,6 +527,7 @@ impl Default for MihomoFeatures {
             keep_alive_interval: default_keep_alive_interval(),
             keep_alive_idle: default_keep_alive_idle(),
             disable_keep_alive: false,
+            tcp_concurrent: false,
             quic_go_disable_gso: false,
             quic_go_disable_ecn: false,
             authentication: Vec::new(),
@@ -656,6 +676,10 @@ fn apply_global_features(config: &mut Value, features: &MihomoFeatures) {
     }
     if features.disable_keep_alive {
         config["disable-keep-alive"] = json!(true);
+    }
+
+    if features.tcp_concurrent {
+        config["tcp-concurrent"] = json!(true);
     }
 
     // Experimental QUIC tuning
@@ -970,6 +994,28 @@ fn build_proxy_groups_json(
 
     if let Some(status) = &group_config.expected_status {
         group["expected-status"] = json!(status);
+    }
+
+    // Node filtering by name regex or proxy type.
+    if let Some(filter) = &group_config.filter
+        && !filter.is_empty()
+    {
+        group["filter"] = json!(filter);
+    }
+    if let Some(exclude) = &group_config.exclude_filter
+        && !exclude.is_empty()
+    {
+        group["exclude-filter"] = json!(exclude);
+    }
+    if let Some(exclude_type) = &group_config.exclude_type
+        && !exclude_type.is_empty()
+    {
+        group["exclude-type"] = json!(exclude_type);
+    }
+
+    // Auto-include all nodes from all proxy-providers.
+    if group_config.include_all_providers {
+        group["include-all-providers"] = json!(true);
     }
 
     Some(json!([group]))
@@ -2617,6 +2663,7 @@ mod tests {
             max_failed_times: 5,
             strategy: LoadBalanceStrategy::default(),
             expected_status: None,
+            ..ProxyGroupConfig::default()
         };
         let config = build_test_router_config(&features);
         let groups = config
@@ -2849,6 +2896,7 @@ mod tests {
             keep_alive_interval: 60,
             keep_alive_idle: 240,
             disable_keep_alive: true,
+            tcp_concurrent: true,
             quic_go_disable_gso: true,
             quic_go_disable_ecn: false,
             authentication: vec!["admin:secret".to_owned()],
@@ -2890,6 +2938,7 @@ mod tests {
                 max_failed_times: 3,
                 strategy: LoadBalanceStrategy::StickySessions,
                 expected_status: Some("204".to_owned()),
+                ..ProxyGroupConfig::default()
             },
             proxy_providers: vec![],
             rule_providers: vec![],
@@ -2996,5 +3045,105 @@ mod tests {
             build_mihomo_config(profile, "127.0.0.1", 10808, &features).expect("mihomo config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
         assert!(config.get("external-controller").is_some());
+    }
+
+    // ── Tier 1: proxy group filtering ──────────────────────────────
+
+    #[test]
+    fn proxy_group_filter_emits_filter_field() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            filter: Some("HK|Hong Kong".to_owned()),
+            ..ProxyGroupConfig::default()
+        };
+        let config = build_test_router_config(&features);
+        let group = &config["proxy-groups"][0];
+        assert_eq!(
+            group.get("filter").and_then(Value::as_str),
+            Some("HK|Hong Kong")
+        );
+    }
+
+    #[test]
+    fn proxy_group_exclude_filter_emits_exclude_filter() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            exclude_filter: Some("REJECT|DIRECT".to_owned()),
+            ..ProxyGroupConfig::default()
+        };
+        let config = build_test_router_config(&features);
+        let group = &config["proxy-groups"][0];
+        assert_eq!(
+            group.get("exclude-filter").and_then(Value::as_str),
+            Some("REJECT|DIRECT")
+        );
+    }
+
+    #[test]
+    fn proxy_group_exclude_type_emits_exclude_type() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            exclude_type: Some("Shadowsocks|Http".to_owned()),
+            ..ProxyGroupConfig::default()
+        };
+        let config = build_test_router_config(&features);
+        let group = &config["proxy-groups"][0];
+        assert_eq!(
+            group.get("exclude-type").and_then(Value::as_str),
+            Some("Shadowsocks|Http")
+        );
+    }
+
+    #[test]
+    fn proxy_group_include_all_providers_flag() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            include_all_providers: true,
+            ..ProxyGroupConfig::default()
+        };
+        let config = build_test_router_config(&features);
+        let group = &config["proxy-groups"][0];
+        assert_eq!(
+            group.get("include-all-providers").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn proxy_group_no_filter_fields_when_not_set() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            ..ProxyGroupConfig::default()
+        };
+        let config = build_test_router_config(&features);
+        let group = &config["proxy-groups"][0];
+        assert!(group.get("filter").is_none());
+        assert!(group.get("exclude-filter").is_none());
+        assert!(group.get("exclude-type").is_none());
+        assert!(group.get("include-all-providers").is_none());
+    }
+
+    // ── Tier 1: tcp-concurrent global feature ──────────────────────
+
+    #[test]
+    fn tcp_concurrent_emitted_when_enabled() {
+        let mut features = default_features();
+        features.tcp_concurrent = true;
+        let config = build_test_router_config(&features);
+        assert_eq!(
+            config.get("tcp-concurrent").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn tcp_concurrent_absent_when_disabled() {
+        let config = build_test_router_config(&default_features());
+        assert!(config.get("tcp-concurrent").is_none());
     }
 }

@@ -27,6 +27,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use percent_encoding::NON_ALPHANUMERIC;
+use percent_encoding::utf8_percent_encode;
+
 use crate::benchmark::{
     BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL, SharedJob,
     run_bench,
@@ -2101,6 +2104,8 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
                 "split_routing": inner.state.split_routing,
                 "dns_enabled": inner.state.dns_settings.enabled,
                 "hwid": inner.state.hwid_config.hwid,
+                "proxy_group_enabled": inner.state.mihomo_features.proxy_group.enabled,
+                "ec_enabled": inner.state.mihomo_features.external_controller.enabled,
             });
             (200, "application/json", response.to_string())
         }
@@ -2173,6 +2178,9 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/update/settings") => handle_update_settings(body, daemon),
         ("GET", "/api/mihomo-features") => handle_mihomo_features_get(daemon),
         ("POST", "/api/mihomo-features") => handle_mihomo_features_set(body, daemon),
+        ("GET", "/api/mihomo-api/proxies") => handle_mihomo_api_proxies(daemon),
+        ("GET", "/api/mihomo-api/connections") => handle_mihomo_api_connections(daemon),
+        ("POST", "/api/mihomo-api/delay") => handle_mihomo_api_delay(body, daemon),
         _ => (
             404,
             "application/json",
@@ -3894,6 +3902,110 @@ fn handle_mihomo_features_set(body: &str, daemon: &Daemon) -> (u16, &'static str
     )
 }
 
+// ---------------------------------------------------------------------------
+// Mihomo external-controller API proxy endpoints
+// ---------------------------------------------------------------------------
+
+/// Forward `GET /proxies` to the Mihomo external controller.
+/// Returns all proxies, proxy groups, and their current state (alive,
+/// delay, selected node). Used by the Web UI to display proxy status.
+fn handle_mihomo_api_proxies(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (addr, secret) = {
+        let inner = lock(&daemon.inner);
+        match mihomo_controller(&inner.state.mihomo_features) {
+            Some(ec) => ec,
+            None => {
+                return (
+                    400,
+                    "application/json",
+                    json!({"error": "external controller not enabled"}).to_string(),
+                );
+            }
+        }
+    };
+    match mihomo_api_get(&addr, secret.as_deref(), "/proxies") {
+        Ok(body) => (200, "application/json", body),
+        Err(e) => (
+            502,
+            "application/json",
+            json!({"error": format!("Mihomo API: {e}")}).to_string(),
+        ),
+    }
+}
+
+/// Forward `GET /connections` to the Mihomo external controller.
+/// Returns real-time connection list with traffic stats. Used by the
+/// Web UI to display active connections.
+fn handle_mihomo_api_connections(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (addr, secret) = {
+        let inner = lock(&daemon.inner);
+        match mihomo_controller(&inner.state.mihomo_features) {
+            Some(ec) => ec,
+            None => {
+                return (
+                    400,
+                    "application/json",
+                    json!({"error": "external controller not enabled"}).to_string(),
+                );
+            }
+        }
+    };
+    match mihomo_api_get(&addr, secret.as_deref(), "/connections") {
+        Ok(body) => (200, "application/json", body),
+        Err(e) => (
+            502,
+            "application/json",
+            json!({"error": format!("Mihomo API: {e}")}).to_string(),
+        ),
+    }
+}
+
+/// Forward `GET /proxies/{name}/delay` to the Mihomo external controller.
+/// Accepts JSON body `{"name": "proxy", "url": "https://...", "timeout": 5000}`.
+/// Returns `{"delay": 107}` on success.
+fn handle_mihomo_api_delay(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let (addr, secret) = {
+        let inner = lock(&daemon.inner);
+        match mihomo_controller(&inner.state.mihomo_features) {
+            Some(ec) => ec,
+            None => {
+                return (
+                    400,
+                    "application/json",
+                    json!({"error": "external controller not enabled"}).to_string(),
+                );
+            }
+        }
+    };
+    let req: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                400,
+                "application/json",
+                json!({"error": format!("invalid JSON: {e}")}).to_string(),
+            );
+        }
+    };
+    let name = req
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(PROXY_NAME);
+    let url = req
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("https://www.gstatic.com/generate_204");
+    let timeout = req.get("timeout").and_then(Value::as_u64).unwrap_or(5000) as u32;
+    match mihomo_api_delay(&addr, secret.as_deref(), name, url, timeout) {
+        Ok(delay) => (200, "application/json", json!({"delay": delay}).to_string()),
+        Err(e) => (
+            502,
+            "application/json",
+            json!({"error": format!("delay test failed: {e}")}).to_string(),
+        ),
+    }
+}
+
 /// Return the last N lines of the Mihomo log file so the user can
 /// diagnose start failures from the web panel without SSH.
 fn handle_logs(_daemon: &Daemon) -> (u16, &'static str, String) {
@@ -4413,6 +4525,84 @@ fn socks_health_check(socks_port: u16) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// Mihomo external-controller REST API client
+// ---------------------------------------------------------------------------
+
+/// Extract the external-controller address and secret from `MihomoFeatures`,
+/// returning `None` if the controller is disabled.
+fn mihomo_controller(
+    features: &crate::mihomo_config::MihomoFeatures,
+) -> Option<(String, Option<String>)> {
+    if features.external_controller.enabled {
+        Some((
+            features.external_controller.address.clone(),
+            features.external_controller.secret.clone(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Make a GET request to the Mihomo external-controller REST API.
+///
+/// Returns the response body as a string, or an error message.
+/// Timeout is 3 seconds (localhost, should be <100ms).
+fn mihomo_api_get(addr: &str, secret: Option<&str>, path: &str) -> Result<String, String> {
+    let url = format!("http://{addr}{path}");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.get(&url);
+    if let Some(s) = secret
+        && !s.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {s}"));
+    }
+    let resp = req.send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Mihomo API {path}: HTTP {}", resp.status()));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+/// Make a GET request and parse the response as JSON.
+fn mihomo_api_get_json(addr: &str, secret: Option<&str>, path: &str) -> Result<Value, String> {
+    let body = mihomo_api_get(addr, secret, path)?;
+    serde_json::from_str(&body).map_err(|e| format!("Mihomo API {path}: parse error: {e}"))
+}
+
+/// Test the delay (latency) of a specific proxy through the Mihomo API.
+///
+/// Calls `GET /proxies/{name}/delay?url={test_url}&timeout={ms}`.
+/// Returns the delay in milliseconds on success.
+fn mihomo_api_delay(
+    addr: &str,
+    secret: Option<&str>,
+    proxy_name: &str,
+    test_url: &str,
+    timeout_ms: u32,
+) -> Result<u32, String> {
+    let path = format!(
+        "/proxies/{}/delay?url={}&timeout={}",
+        utf8_percent_encode(proxy_name, NON_ALPHANUMERIC),
+        utf8_percent_encode(test_url, NON_ALPHANUMERIC),
+        timeout_ms
+    );
+    let json = mihomo_api_get_json(addr, secret, &path)?;
+    json.get("delay")
+        .and_then(Value::as_u64)
+        .map(|d| d as u32)
+        .ok_or_else(|| {
+            json.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("no delay in response")
+                .to_owned()
+        })
+}
+
 /// Find the profile with the highest `last_score` from `ProfileStats`
 /// that is not in `excluded_profiles` and has at least one successful
 /// probe. A zero score is still a valid low-priority fallback: some
@@ -4831,8 +5021,16 @@ fn start_watchdog(daemon: Daemon) {
                 auto_update_interval_hours,
                 last_update_check,
                 mihomo_path,
+                proxy_group_enabled,
+                ec_addr,
+                ec_secret,
             ) = {
                 let mut inner = lock(&daemon.inner);
+                let ec = mihomo_controller(&inner.state.mihomo_features);
+                let (ec_addr, ec_secret) = match ec {
+                    Some((a, s)) => (Some(a), s),
+                    None => (None, None),
+                };
                 (
                     inner.core.is_running(),
                     inner.state.split_routing.enabled,
@@ -4852,6 +5050,9 @@ fn start_watchdog(daemon: Daemon) {
                     inner.state.auto_update_interval_hours,
                     inner.state.last_update_check_unix,
                     inner.state.mihomo_path.clone(),
+                    inner.state.mihomo_features.proxy_group.enabled,
+                    ec_addr,
+                    ec_secret,
                 )
             };
 
@@ -4947,34 +5148,115 @@ fn start_watchdog(daemon: Daemon) {
 
             // --- Phase 3: Health check + failover (auto_switch) ---
             if auto_switch && !bench_running && core_running {
-                let healthy = socks_health_check(socks_port);
-                let mut inner = lock(&daemon.inner);
-                if healthy {
-                    if inner.failover_fail_count > 0 {
-                        eprintln!("hincyray: health check recovered");
-                    }
-                    inner.failover_fail_count = 0;
-                    failover_rejected_profiles.clear();
-                } else {
-                    inner.failover_fail_count += 1;
-                    const FAILOVER_THRESHOLD: u32 = 3;
-                    eprintln!(
-                        "hincyray: health check failed ({}/{})",
-                        inner.failover_fail_count, FAILOVER_THRESHOLD
-                    );
-                    if inner.failover_fail_count >= FAILOVER_THRESHOLD {
-                        if let Some(id) = active_profile_id {
-                            failover_rejected_profiles.insert(id);
-                        }
-                        if let Some(next_id) =
-                            find_best_profile_by_score(&inner.state, &failover_rejected_profiles)
-                        {
-                            eprintln!("hincyray: failover to profile {next_id}");
-                            switch_active_profile(&mut inner, &daemon, next_id);
+                // When proxy groups are enabled, Mihomo handles failover
+                // natively via url-test / fallback / load-balance groups.
+                // The daemon must NOT restart the core or switch profiles —
+                // that would destroy the group's internal state (latency
+                // history, selected node, sticky sessions) and cause a
+                // traffic blip. Instead, we just log and skip.
+                if proxy_group_enabled {
+                    // Optionally query the API for group health display.
+                    // No action needed — Mihomo url-test runs on its own
+                    // interval and switches nodes automatically.
+                    if let Some(ref addr) = ec_addr
+                        && let Ok(proxies) =
+                            mihomo_api_get_json(addr, ec_secret.as_deref(), "/proxies/proxy")
+                    {
+                        let alive = proxies
+                            .get("alive")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let now_name = proxies.get("now").and_then(Value::as_str).unwrap_or("?");
+                        if !alive {
+                            eprintln!("hincyray: proxy group not alive (Mihomo handling failover)");
                         } else {
-                            eprintln!("hincyray: no alternative profile for failover");
+                            // Reset fail counter — group is healthy.
+                            let mut inner = lock(&daemon.inner);
+                            if inner.failover_fail_count > 0 {
+                                eprintln!("hincyray: proxy group healthy (now={now_name})");
+                            }
+                            inner.failover_fail_count = 0;
+                            failover_rejected_profiles.clear();
+                        }
+                    }
+                } else if let Some(ref addr) = ec_addr {
+                    // External controller enabled but no proxy groups —
+                    // use Mihomo API delay test for health check. This is
+                    // more accurate than the SOCKS curl approach because
+                    // it tests the actual proxy through Mihomo's internal
+                    // mechanism and returns latency, not just a boolean.
+                    let delay = mihomo_api_delay(
+                        addr,
+                        ec_secret.as_deref(),
+                        PROXY_NAME,
+                        "https://www.gstatic.com/generate_204",
+                        5000,
+                    );
+                    let mut inner = lock(&daemon.inner);
+                    match delay {
+                        Ok(ms) => {
+                            if inner.failover_fail_count > 0 {
+                                eprintln!("hincyray: health check recovered ({ms}ms)");
+                            }
+                            inner.failover_fail_count = 0;
+                            failover_rejected_profiles.clear();
+                        }
+                        Err(error) => {
+                            inner.failover_fail_count += 1;
+                            const FAILOVER_THRESHOLD: u32 = 3;
+                            eprintln!(
+                                "hincyray: API health check failed ({}/{}) — {error}",
+                                inner.failover_fail_count, FAILOVER_THRESHOLD
+                            );
+                            if inner.failover_fail_count >= FAILOVER_THRESHOLD {
+                                if let Some(id) = active_profile_id {
+                                    failover_rejected_profiles.insert(id);
+                                }
+                                if let Some(next_id) = find_best_profile_by_score(
+                                    &inner.state,
+                                    &failover_rejected_profiles,
+                                ) {
+                                    eprintln!("hincyray: failover to profile {next_id}");
+                                    switch_active_profile(&mut inner, &daemon, next_id);
+                                } else {
+                                    eprintln!("hincyray: no alternative profile for failover");
+                                }
+                                inner.failover_fail_count = 0;
+                            }
+                        }
+                    }
+                } else {
+                    // Fallback: no external controller, use SOCKS curl.
+                    let healthy = socks_health_check(socks_port);
+                    let mut inner = lock(&daemon.inner);
+                    if healthy {
+                        if inner.failover_fail_count > 0 {
+                            eprintln!("hincyray: health check recovered");
                         }
                         inner.failover_fail_count = 0;
+                        failover_rejected_profiles.clear();
+                    } else {
+                        inner.failover_fail_count += 1;
+                        const FAILOVER_THRESHOLD: u32 = 3;
+                        eprintln!(
+                            "hincyray: health check failed ({}/{})",
+                            inner.failover_fail_count, FAILOVER_THRESHOLD
+                        );
+                        if inner.failover_fail_count >= FAILOVER_THRESHOLD {
+                            if let Some(id) = active_profile_id {
+                                failover_rejected_profiles.insert(id);
+                            }
+                            if let Some(next_id) = find_best_profile_by_score(
+                                &inner.state,
+                                &failover_rejected_profiles,
+                            ) {
+                                eprintln!("hincyray: failover to profile {next_id}");
+                                switch_active_profile(&mut inner, &daemon, next_id);
+                            } else {
+                                eprintln!("hincyray: no alternative profile for failover");
+                            }
+                            inner.failover_fail_count = 0;
+                        }
                     }
                 }
             }
@@ -5484,6 +5766,10 @@ tr.group-row.collapsed{display:none}
     <div class="field"><label for="feat-pg-interval">Health check interval (sec)</label><input type="number" id="feat-pg-interval" min="30" max="86400" value="300"></div>
     <div class="field"><label for="feat-pg-tolerance">Tolerance (ms, url-test only)</label><input type="number" id="feat-pg-tolerance" min="0" max="5000" value="0"></div>
     <div class="field"><label for="feat-pg-timeout">Health check timeout (ms)</label><input type="number" id="feat-pg-timeout" min="1000" max="30000" value="5000"></div>
+    <div class="field"><label for="feat-pg-filter">Filter (regex, include by name)</label><input type="text" id="feat-pg-filter" placeholder="HK|Hong Kong"></div>
+    <div class="field"><label for="feat-pg-exclude-filter">Exclude filter (regex, exclude by name)</label><input type="text" id="feat-pg-exclude-filter" placeholder="REJECT|DIRECT"></div>
+    <div class="field"><label for="feat-pg-exclude-type">Exclude type (pipe-separated)</label><input type="text" id="feat-pg-exclude-type" placeholder="Shadowsocks|Http"></div>
+    <label class="chip"><input type="checkbox" id="feat-pg-include-all-providers"> Include all proxy-provider nodes</label>
   </div>
   <h3>External Controller (REST API)</h3>
   <div class="grid2">
@@ -5516,11 +5802,32 @@ tr.group-row.collapsed{display:none}
   <div class="grid2">
     <label class="chip"><input type="checkbox" id="feat-exp-gso"> Disable QUIC GSO</label>
     <label class="chip"><input type="checkbox" id="feat-exp-ecn"> Disable QUIC ECN</label>
+    <label class="chip"><input type="checkbox" id="feat-tcp-concurrent"> TCP concurrent (connect all IPs, first wins)</label>
   </div>
   <div class="row" style="margin:.45em 0">
     <button id="btn-features-save">Save Mihomo features</button>
     <span class="subtle" id="features-status"></span>
   </div>
+</div>
+
+<h2 id="proxy-status-header" style="display:none">Proxy Status <span id="ps-toggle" class="toggle">show</span></h2>
+<div id="proxy-status-panel" class="collapsible">
+  <p class="subtle">Live data from Mihomo external controller REST API. Auto-refreshed every 5s.</p>
+  <div class="grid2">
+    <div class="field"><label>Group</label><span id="ps-group-name" class="mono">—</span></div>
+    <div class="field"><label>Type</label><span id="ps-group-type" class="mono">—</span></div>
+    <div class="field"><label>Current node</label><span id="ps-now" class="mono">—</span></div>
+    <div class="field"><label>Alive</label><span id="ps-alive" class="mono">—</span></div>
+    <div class="field"><label>Delay (ms)</label><span id="ps-delay" class="mono">—</span></div>
+    <div class="field"><label>Connections</label><span id="ps-conn-count" class="mono">—</span></div>
+  </div>
+  <div class="row" style="margin:.45em 0">
+    <button id="btn-ps-delay">Test delay</button>
+    <button id="btn-ps-refresh">Refresh</button>
+    <span class="subtle" id="ps-status"></span>
+  </div>
+  <h3 class="subtle">Active Connections</h3>
+  <div id="ps-connections" style="max-height:300px;overflow:auto"></div>
 </div>
 
 <h2>Logs <span id="logs-toggle" class="toggle">show</span></h2>
@@ -6510,6 +6817,57 @@ document.getElementById("auto-toggle").addEventListener("click", function(){
 document.getElementById("logs-toggle").addEventListener("click", function(){
   toggleCollapsible("logs-toggle", "logs-panel");
 });
+document.getElementById("ps-toggle").addEventListener("click", function(){
+  toggleCollapsible("ps-toggle", "proxy-status-panel");
+});
+
+// ── Proxy Status (Mihomo external controller API) ──────────────
+function loadProxyStatus(){
+  var hdr = document.getElementById("proxy-status-header");
+  api("GET", "/api/status").then(function(s){
+    if(!s.ec_enabled && !s.proxy_group_enabled){
+      hdr.style.display = "none";
+      return;
+    }
+    hdr.style.display = "";
+  });
+  api("GET", "/api/mihomo-api/proxies").then(function(data){
+    var grp = data && data["proxies"] && data["proxies"]["proxy"];
+    if(!grp){ document.getElementById("ps-status").textContent = "no group"; return; }
+    document.getElementById("ps-group-name").textContent = grp.name || "—";
+    document.getElementById("ps-group-type").textContent = grp.type || "—";
+    document.getElementById("ps-now").textContent = grp.now || "—";
+    document.getElementById("ps-alive").textContent = grp.alive ? "yes" : "no";
+    document.getElementById("ps-alive").style.color = grp.alive ? "#4f4" : "#f44";
+    var h = grp.history && grp.history[0];
+    document.getElementById("ps-delay").textContent = h ? (h.delay + "ms") : "—";
+  }).catch(function(){ document.getElementById("ps-status").textContent = "API unavailable"; });
+  api("GET", "/api/mihomo-api/connections").then(function(data){
+    var conns = data && data["connections"];
+    document.getElementById("ps-conn-count").textContent = conns ? conns.length : 0;
+    var box = document.getElementById("ps-connections");
+    if(!conns || conns.length === 0){ box.innerHTML = "<p class='subtle'>No active connections</p>"; return; }
+    var rows = conns.slice(0, 50).map(function(c){
+      var src = c.metadata && c.metadata.sourceIP || "?";
+      var dst = c.metadata && c.metadata.host || c.metadata && c.metadata.destinationIP || "?";
+      var chains = c.chains && c.chains.join(" → ") || "?";
+      var dl = (c.download || 0) / 1024 | 0;
+      var ul = (c.upload || 0) / 1024 | 0;
+      return "<div class='mono subtle' style='padding:2px 0'>" + src + " → " + dst + " [" + chains + "] ↓" + dl + "KB ↑" + ul + "KB</div>";
+    });
+    box.innerHTML = rows.join("");
+  }).catch(function(){ /* silent */ });
+}
+document.getElementById("btn-ps-refresh").addEventListener("click", loadProxyStatus);
+document.getElementById("btn-ps-delay").addEventListener("click", function(){
+  document.getElementById("ps-status").textContent = "Testing...";
+  api("POST", "/api/mihomo-api/delay", JSON.stringify({name: "proxy", url: "https://www.gstatic.com/generate_204", timeout: 5000})).then(function(r){
+    document.getElementById("ps-status").textContent = "Delay: " + r.delay + "ms";
+    loadProxyStatus();
+  }).catch(function(e){
+    document.getElementById("ps-status").textContent = "Delay test failed: " + e;
+  });
+});
 
 // ── Mihomo Update ─────────────────────────────────────────────────
 
@@ -6618,6 +6976,10 @@ function loadFeatures(){
     document.getElementById("feat-pg-interval").value = (f.proxy_group && f.proxy_group.interval) || 300;
     document.getElementById("feat-pg-tolerance").value = (f.proxy_group && f.proxy_group.tolerance) || 0;
     document.getElementById("feat-pg-timeout").value = (f.proxy_group && f.proxy_group.timeout) || 5000;
+    document.getElementById("feat-pg-filter").value = (f.proxy_group && f.proxy_group.filter) || "";
+    document.getElementById("feat-pg-exclude-filter").value = (f.proxy_group && f.proxy_group.exclude_filter) || "";
+    document.getElementById("feat-pg-exclude-type").value = (f.proxy_group && f.proxy_group.exclude_type) || "";
+    document.getElementById("feat-pg-include-all-providers").checked = !!(f.proxy_group && f.proxy_group.include_all_providers);
     document.getElementById("feat-ec-enabled").checked = !!(f.external_controller && f.external_controller.enabled);
     document.getElementById("feat-ec-addr").value = (f.external_controller && f.external_controller.address) || "127.0.0.1:9090";
     document.getElementById("feat-ec-secret").value = (f.external_controller && f.external_controller.secret) || "";
@@ -6635,6 +6997,7 @@ function loadFeatures(){
     document.getElementById("feat-dns-rr").checked = !!f.dns_respect_rules;
     document.getElementById("feat-exp-gso").checked = !!f.quic_go_disable_gso;
     document.getElementById("feat-exp-ecn").checked = !!f.quic_go_disable_ecn;
+    document.getElementById("feat-tcp-concurrent").checked = !!f.tcp_concurrent;
   });
 }
 
@@ -6646,7 +7009,11 @@ document.getElementById("btn-features-save").addEventListener("click", function(
       interval: parseInt(document.getElementById("feat-pg-interval").value) || 300,
       tolerance: parseInt(document.getElementById("feat-pg-tolerance").value) || 0,
       timeout: parseInt(document.getElementById("feat-pg-timeout").value) || 5000,
-      lazy: true, max_failed_times: 5, strategy: "consistent-hashing", expected_status: null
+      lazy: true, max_failed_times: 5, strategy: "consistent-hashing", expected_status: null,
+      filter: document.getElementById("feat-pg-filter").value || null,
+      exclude_filter: document.getElementById("feat-pg-exclude-filter").value || null,
+      exclude_type: document.getElementById("feat-pg-exclude-type").value || null,
+      include_all_providers: document.getElementById("feat-pg-include-all-providers").checked
     },
     external_controller: {
       enabled: document.getElementById("feat-ec-enabled").checked,
@@ -6687,6 +7054,7 @@ document.getElementById("btn-features-save").addEventListener("click", function(
     disable_keep_alive: false,
     quic_go_disable_gso: document.getElementById("feat-exp-gso").checked,
     quic_go_disable_ecn: document.getElementById("feat-exp-ecn").checked,
+    tcp_concurrent: document.getElementById("feat-tcp-concurrent").checked,
     authentication: [], skip_auth_prefixes: [],
     hosts: {}, tunnels: [],
     proxy_providers: [], rule_providers: []
@@ -6857,9 +7225,12 @@ setInterval(function(){
   api("GET", "/api/system").then(function(sys){
     renderSystem(sys);
   }).catch(function(){ /* transient */ });
+  // Proxy status (Mihomo external controller API)
+  loadProxyStatus();
 }, 5000);
 
 refreshAll();
+loadProxyStatus();
 })();
 </script>
 </body>
@@ -8327,5 +8698,70 @@ mod tests {
         assert_eq!(loaded.last_update_check_unix, 0);
         assert!(loaded.update_available_version.is_none());
         assert!(loaded.mihomo_version.is_none());
+    }
+
+    // ── Mihomo external-controller API proxy tests ─────────────────
+
+    #[test]
+    fn mihomo_controller_returns_none_when_disabled() {
+        let features = MihomoFeatures::default();
+        assert!(mihomo_controller(&features).is_none());
+    }
+
+    #[test]
+    fn mihomo_controller_returns_some_when_enabled() {
+        let mut features = MihomoFeatures::default();
+        features.external_controller.enabled = true;
+        features.external_controller.address = "127.0.0.1:9090".to_owned();
+        let ec = mihomo_controller(&features).expect("ec");
+        assert_eq!(ec.0, "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn api_proxies_returns_400_when_ec_disabled() {
+        let (_dir, daemon) = test_daemon();
+        let (code, _, body) = handle_mihomo_api_proxies(&daemon);
+        assert_eq!(code, 400);
+        assert!(body.contains("not enabled"));
+    }
+
+    #[test]
+    fn api_connections_returns_400_when_ec_disabled() {
+        let (_dir, daemon) = test_daemon();
+        let (code, _, body) = handle_mihomo_api_connections(&daemon);
+        assert_eq!(code, 400);
+        assert!(body.contains("not enabled"));
+    }
+
+    #[test]
+    fn api_delay_returns_400_when_ec_disabled() {
+        let (_dir, daemon) = test_daemon();
+        let (code, _, body) = handle_mihomo_api_delay(r#"{"name":"proxy"}"#, &daemon);
+        assert_eq!(code, 400);
+        assert!(body.contains("not enabled"));
+    }
+
+    #[test]
+    fn api_delay_returns_400_on_invalid_json() {
+        let (_dir, daemon) = test_daemon();
+        // Enable EC so we pass the first check, then test JSON parsing.
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.mihomo_features.external_controller.enabled = true;
+            inner.state.mihomo_features.external_controller.address = "127.0.0.1:9090".to_owned();
+        }
+        let (code, _, body) = handle_mihomo_api_delay("not json", &daemon);
+        assert_eq!(code, 400);
+        assert!(body.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn status_includes_proxy_group_and_ec_flags() {
+        let (_dir, daemon) = test_daemon();
+        let (code, _, body) = dispatch("GET", "/api/status", "", &daemon);
+        assert_eq!(code, 200);
+        let json: Value = serde_json::from_str(&body).expect("parse status");
+        assert!(json.get("proxy_group_enabled").is_some());
+        assert!(json.get("ec_enabled").is_some());
     }
 }
