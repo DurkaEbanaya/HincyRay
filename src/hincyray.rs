@@ -35,7 +35,8 @@ use crate::benchmark::{
     run_bench,
 };
 use crate::mihomo_config::{
-    DIRECT_NAME, MihomoFeatures, PROXY_NAME, build_mihomo_config, build_mihomo_router_config,
+    DIRECT_NAME, MihomoFeatures, PROXY_NAME, REJECT_NAME, build_mihomo_config,
+    build_mihomo_router_config,
 };
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionSource, load_subscription_detailed_via_proxy_with_hwid,
@@ -202,6 +203,9 @@ struct DaemonInner {
     prev_cpu: Option<CpuTimes>,
     /// v0.6.1: per-core previous samples for per-core usage.
     prev_cpu_per_core: Vec<CpuTimes>,
+    /// v0.13: active session tokens for Web UI authentication.
+    /// In-memory only — cleared on restart.
+    sessions: std::collections::HashSet<String>,
 }
 
 /// One row of `/proc/stat` for a CPU (aggregate or per-core).
@@ -351,6 +355,24 @@ impl BenchRuntime {
     }
 }
 
+/// v0.13: Web UI authentication settings. When enabled, API endpoints
+/// require a valid session token obtained via `POST /api/auth/login`.
+/// The password is stored in plain text — acceptable for a router daemon
+/// on a trusted LAN, not for internet-facing deployments.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WebUiAuth {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_auth_username")]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+fn default_auth_username() -> String {
+    "admin".to_owned()
+}
+
 /// Persisted HincyRay state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HincyrayState {
@@ -452,6 +474,9 @@ pub struct HincyrayState {
     /// enhancements, tunnels, hosts, authentication, experimental).
     #[serde(default)]
     pub mihomo_features: MihomoFeatures,
+    /// v0.13: Web UI authentication (login/password).
+    #[serde(default)]
+    pub web_ui_auth: WebUiAuth,
 }
 
 impl Default for HincyrayState {
@@ -487,6 +512,7 @@ impl Default for HincyrayState {
             update_available_version: None,
             mihomo_version: None,
             mihomo_features: MihomoFeatures::default(),
+            web_ui_auth: WebUiAuth::default(),
         }
     }
 }
@@ -530,6 +556,119 @@ pub struct DeviceRoute {
     /// "direct", "active", "best", or "profile:<id>".
     #[serde(default = "default_routing_target")]
     pub target: String,
+}
+
+/// v0.13: Predefined routing rule bundles that can be applied in one click.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoutingPreset {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub rules: Vec<RoutingRule>,
+    /// Optional port mode change: "all", "allow_list", "deny_list".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_mode: Option<String>,
+    /// Proxy ports for allow_list mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proxy_ports: Vec<&'static str>,
+}
+
+fn routing_presets() -> Vec<RoutingPreset> {
+    vec![
+        RoutingPreset {
+            id: "ru-direct",
+            name: "RU Direct",
+            description: "Russian traffic goes direct, rest through VPN",
+            rules: vec![
+                RoutingRule {
+                    enabled: true,
+                    name: "RU domains direct".to_owned(),
+                    target: "direct".to_owned(),
+                    domains: vec!["geosite:ru".to_owned()],
+                    ..Default::default()
+                },
+                RoutingRule {
+                    enabled: true,
+                    name: "RU IPs direct".to_owned(),
+                    target: "direct".to_owned(),
+                    ips: vec!["geoip:RU".to_owned()],
+                    ..Default::default()
+                },
+            ],
+            port_mode: None,
+            proxy_ports: vec![],
+        },
+        RoutingPreset {
+            id: "ad-block",
+            name: "Ad Block",
+            description: "Block ad domains via geosite:category-ads-all",
+            rules: vec![RoutingRule {
+                enabled: true,
+                name: "Block ads".to_owned(),
+                target: "reject".to_owned(),
+                domains: vec!["geosite:category-ads-all".to_owned()],
+                ..Default::default()
+            }],
+            port_mode: None,
+            proxy_ports: vec![],
+        },
+        RoutingPreset {
+            id: "only-web-vpn",
+            name: "Only Web VPN",
+            description: "Proxy only ports 80 and 443, everything else direct",
+            rules: vec![],
+            port_mode: Some("allow_list".to_owned()),
+            proxy_ports: vec!["80", "443"],
+        },
+        RoutingPreset {
+            id: "block-social",
+            name: "Block Social",
+            description: "Block Facebook, Instagram, Twitter/X domains",
+            rules: vec![RoutingRule {
+                enabled: true,
+                name: "Block social media".to_owned(),
+                target: "reject".to_owned(),
+                domains: vec![
+                    "geosite:facebook".to_owned(),
+                    "geosite:instagram".to_owned(),
+                    "geosite:twitter".to_owned(),
+                ],
+                ..Default::default()
+            }],
+            port_mode: None,
+            proxy_ports: vec![],
+        },
+        RoutingPreset {
+            id: "ru-direct-ad-block",
+            name: "RU Direct + Ad Block",
+            description: "Russian traffic direct + block ads",
+            rules: vec![
+                RoutingRule {
+                    enabled: true,
+                    name: "RU domains direct".to_owned(),
+                    target: "direct".to_owned(),
+                    domains: vec!["geosite:ru".to_owned()],
+                    ..Default::default()
+                },
+                RoutingRule {
+                    enabled: true,
+                    name: "RU IPs direct".to_owned(),
+                    target: "direct".to_owned(),
+                    ips: vec!["geoip:RU".to_owned()],
+                    ..Default::default()
+                },
+                RoutingRule {
+                    enabled: true,
+                    name: "Block ads".to_owned(),
+                    target: "reject".to_owned(),
+                    domains: vec!["geosite:category-ads-all".to_owned()],
+                    ..Default::default()
+                },
+            ],
+            port_mode: None,
+            proxy_ports: vec![],
+        },
+    ]
 }
 
 /// v0.2: persisted subscription source plus its last refresh metadata.
@@ -729,6 +868,7 @@ impl Daemon {
                 failover_fail_count: 0,
                 prev_cpu: None,
                 prev_cpu_per_core: Vec::new(),
+                sessions: std::collections::HashSet::new(),
             })),
             state_path,
             mihomo_config_path,
@@ -1841,6 +1981,7 @@ fn build_daemon_config(state: &HincyrayState) -> Result<String, String> {
             continue;
         }
         let outbound_tag = match dr.target.as_str() {
+            "reject" => REJECT_NAME.to_owned(),
             "direct" => DIRECT_NAME.to_owned(),
             "active" | "best" | "" => PROXY_NAME.to_owned(),
             target if target.starts_with("profile:") => {
@@ -1932,6 +2073,7 @@ fn build_routing_context<'a>(
         }
 
         let outbound_tag = match rule.target.as_str() {
+            "reject" => REJECT_NAME.to_owned(),
             "direct" => DIRECT_NAME.to_owned(),
             "active" | "best" | "" => PROXY_NAME.to_owned(),
             target if target.starts_with("profile:") => {
@@ -2101,6 +2243,36 @@ fn load_subscription_for_daemon(
     }
 }
 
+/// v0.13: Check if a request is authorized. Returns true if:
+/// - Auth is disabled, or
+/// - The path is in the public allowlist, or
+/// - The request carries a valid session token.
+fn check_auth(daemon: &Daemon, auth_header: &Option<String>, path: &str, method: &str) -> bool {
+    let inner = lock(&daemon.inner);
+    if !inner.state.web_ui_auth.enabled {
+        return true;
+    }
+
+    // Public endpoints — always accessible even when auth is on.
+    if path == "/" || path == "/api/health" || path == "/api/auth/login" {
+        return true;
+    }
+    // Auth settings GET is public so the login page can check if auth is enabled.
+    if method == "GET" && path == "/api/auth-settings" {
+        return true;
+    }
+
+    // Check Bearer token.
+    if let Some(header) = auth_header
+        && let Some(token) = header
+            .strip_prefix("bearer ")
+            .or_else(|| header.strip_prefix("Bearer "))
+    {
+        return inner.sessions.contains(token);
+    }
+    false
+}
+
 fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
 
@@ -2113,6 +2285,7 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
     }
 
     let mut content_length = 0usize;
+    let mut auth_header: Option<String> = None;
     loop {
         let mut line = String::new();
         let read = reader
@@ -2128,6 +2301,8 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
         let lower = trimmed.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("content-length:") {
             content_length = rest.trim().parse::<usize>().unwrap_or(0);
+        } else if let Some(rest) = lower.strip_prefix("authorization:") {
+            auth_header = Some(rest.trim().to_owned());
         }
     }
 
@@ -2154,6 +2329,13 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
     let raw_path = parts[1];
     let (path, _query) = split_query(raw_path);
     let body_text = String::from_utf8_lossy(&body).to_string();
+
+    // v0.13: Web UI authentication middleware.
+    if !check_auth(daemon, &auth_header, path, method) {
+        let response_body = json!({"error": "unauthorized"}).to_string();
+        write_response(&mut stream, 401, "application/json", &response_body)?;
+        return Ok(());
+    }
 
     let (status, content_type, response_body) = dispatch(method, path, &body_text, daemon);
     write_response(&mut stream, status, content_type, &response_body)
@@ -2267,6 +2449,8 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/routing/rules") => handle_routing_rules(body, daemon),
         ("POST", "/api/routing/catalog/refresh") => handle_routing_catalog_refresh(body, daemon),
         ("POST", "/api/routing/apply") => handle_routing_apply(daemon),
+        ("GET", "/api/routing-presets") => handle_routing_presets_list(),
+        ("POST", "/api/routing-presets/apply") => handle_routing_preset_apply(body, daemon),
         ("GET", "/api/routing/firewall-status") => handle_firewall_status(daemon),
         ("POST", "/api/routing/firewall-start") => handle_firewall_start(daemon),
         ("POST", "/api/routing/firewall-stop") => handle_firewall_stop(daemon),
@@ -2298,6 +2482,10 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/devices") => handle_devices_scan(daemon),
         ("POST", "/api/device-routes/apply") => handle_device_routes_apply(daemon),
         ("POST", "/api/mihomo-api/speed-test") => handle_speed_test(body, daemon),
+        ("POST", "/api/auth/login") => handle_auth_login(body, daemon),
+        ("POST", "/api/auth/logout") => handle_auth_logout(body, daemon),
+        ("GET", "/api/auth-settings") => handle_auth_settings_get(daemon),
+        ("POST", "/api/auth-settings") => handle_auth_settings_set(body, daemon),
         _ => (
             404,
             "application/json",
@@ -3867,6 +4055,86 @@ fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
+fn handle_routing_presets_list() -> (u16, &'static str, String) {
+    let presets = routing_presets();
+    (
+        200,
+        "application/json",
+        json!({"presets": presets}).to_string(),
+    )
+}
+
+fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(preset_id) = value.get("preset").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing \"preset\" field"}).to_string(),
+        );
+    };
+    let Some(preset) = routing_presets().into_iter().find(|p| p.id == preset_id) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "unknown preset", "preset": preset_id}).to_string(),
+        );
+    };
+
+    let mut inner = lock(&daemon.inner);
+
+    // Add preset rules to existing rules, deduplicating by name.
+    let mut existing = inner.state.routing_rules.clone();
+    for rule in &preset.rules {
+        if !existing.iter().any(|r| r.name == rule.name) {
+            existing.push(rule.clone());
+        }
+    }
+    inner.state.routing_rules = existing;
+
+    // Apply optional port mode change.
+    if let Some(ref mode) = preset.port_mode {
+        match mode.as_str() {
+            "all" => inner.state.split_routing.port_mode = PortMode::All,
+            "allow_list" => {
+                inner.state.split_routing.port_mode = PortMode::AllowList;
+                inner.state.split_routing.proxy_ports =
+                    preset.proxy_ports.iter().map(|s| s.to_string()).collect();
+            }
+            "deny_list" => {
+                inner.state.split_routing.port_mode = PortMode::DenyList;
+            }
+            _ => {}
+        }
+    }
+
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+
+    (
+        200,
+        "application/json",
+        json!({
+            "applied": true,
+            "preset": preset.id,
+            "rules_added": preset.rules.len(),
+            "port_mode": preset.port_mode,
+        })
+        .to_string(),
+    )
+}
+
 fn handle_firewall_status(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
     let fw_active = inner.firewall.is_running();
@@ -4582,6 +4850,135 @@ fn handle_speed_test(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
             json!({"error": format!("request failed: {e}")}).to_string(),
         ),
     }
+}
+
+/// Generate a pseudo-random session token. Uses nanosecond timestamp
+/// + process ID as entropy — sufficient for a LAN router daemon.
+fn generate_session_token() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    format!("{nanos:016x}{pid:08x}")
+}
+
+/// v0.13: Authenticate a user and return a session token.
+fn handle_auth_login(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let username = value.get("username").and_then(Value::as_str).unwrap_or("");
+    let password = value.get("password").and_then(Value::as_str).unwrap_or("");
+
+    let mut inner = lock(&daemon.inner);
+    let auth = &inner.state.web_ui_auth;
+    if !auth.enabled {
+        return (
+            200,
+            "application/json",
+            json!({"token": null, "auth_enabled": false}).to_string(),
+        );
+    }
+    if username == auth.username && password == auth.password {
+        let token = generate_session_token();
+        inner.sessions.insert(token.clone());
+        (
+            200,
+            "application/json",
+            json!({"token": token, "auth_enabled": true}).to_string(),
+        )
+    } else {
+        (
+            401,
+            "application/json",
+            json!({"error": "invalid credentials"}).to_string(),
+        )
+    }
+}
+
+/// v0.13: Invalidate a session token.
+fn handle_auth_logout(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let token = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("token").and_then(Value::as_str).map(str::to_owned));
+    if let Some(token) = token {
+        let mut inner = lock(&daemon.inner);
+        inner.sessions.remove(&token);
+    }
+    (200, "application/json", json!({"ok": true}).to_string())
+}
+
+/// v0.13: Get current auth settings (password is never returned).
+fn handle_auth_settings_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let auth = &inner.state.web_ui_auth;
+    (
+        200,
+        "application/json",
+        json!({
+            "enabled": auth.enabled,
+            "username": auth.username,
+            "password_set": !auth.password.is_empty(),
+        })
+        .to_string(),
+    )
+}
+
+/// v0.13: Update auth settings (enable/disable, change username/password).
+fn handle_auth_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let mut inner = lock(&daemon.inner);
+    if let Some(enabled) = value.get("enabled").and_then(Value::as_bool) {
+        inner.state.web_ui_auth.enabled = enabled;
+        if !enabled {
+            // Clear all sessions when disabling auth.
+            inner.sessions.clear();
+        }
+    }
+    if let Some(username) = value.get("username").and_then(Value::as_str) {
+        let username = username.trim();
+        if !username.is_empty() {
+            inner.state.web_ui_auth.username = username.to_owned();
+        }
+    }
+    // Password is only updated if the field is present and non-empty.
+    // This prevents accidental password wipe when the UI only sends
+    // enabled/username changes.
+    if let Some(password) = value.get("password").and_then(Value::as_str)
+        && !password.is_empty()
+    {
+        inner.state.web_ui_auth.password = password.to_owned();
+        // Clear sessions on password change — forces re-login.
+        inner.sessions.clear();
+    }
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+    (
+        200,
+        "application/json",
+        json!({
+            "enabled": inner.state.web_ui_auth.enabled,
+            "username": inner.state.web_ui_auth.username,
+            "password_set": !inner.state.web_ui_auth.password.is_empty(),
+        })
+        .to_string(),
+    )
 }
 
 /// Return the persisted connection log (most recent first).
@@ -6638,6 +7035,15 @@ tr.group-row.collapsed{display:none}
 </style>
 </head>
 <body>
+<div id="login-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:9999;align-items:center;justify-content:center">
+  <div style="background:var(--card,#1a1a2e);padding:2em;border-radius:12px;max-width:360px;width:90%">
+    <h2 style="margin-top:0">Login</h2>
+    <div class="field"><label for="login-user">Username</label><input type="text" id="login-user" autocomplete="username"></div>
+    <div class="field"><label for="login-pass">Password</label><input type="password" id="login-pass" autocomplete="current-password"></div>
+    <div class="row" style="margin:.5em 0"><button id="btn-login" class="primary">Login</button></div>
+    <div id="login-error" style="color:#e74c3c;font-size:.85em"></div>
+  </div>
+</div>
 <h1>HincyRay daemon</h1>
 <p class="subtle">Lightweight Keenetic VPN/proxy panel &middot; v0.7 &middot; NAT REDIRECT + TPROXY transparent proxy, Keenetic policy integration, ndm hooks, QUIC toggle, ping, stats, favorites, subscription refresh, port routing, DNS anti-leak, HWID fingerprint, VMess/Trojan/Shadowsocks. Talks to the local JSON API over fetch.</p>
 
@@ -6804,6 +7210,21 @@ tr.group-row.collapsed{display:none}
   </div>
 </div>
 
+<h2>Web UI Auth <span id="auth-toggle" class="toggle">show</span></h2>
+<div id="auth-panel" class="collapsible">
+  <p class="subtle">Protect the web panel with a username and password. Session tokens are in-memory and cleared on restart.</p>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="auth-enabled-chk"> Enable authentication</label>
+    <div class="field"><label for="auth-username">Username</label><input type="text" id="auth-username" value="admin"></div>
+    <div class="field"><label for="auth-password">New password (leave empty to keep current)</label><input type="password" id="auth-password" placeholder="Enter new password"></div>
+  </div>
+  <div class="row" style="margin:.45em 0">
+    <button id="btn-auth-save">Save auth settings</button>
+    <button id="btn-logout" style="display:none">Logout</button>
+    <span class="subtle" id="auth-status"></span>
+  </div>
+</div>
+
 <h2>Mihomo Update <span id="update-toggle" class="toggle">show</span></h2>
 <div id="update-panel" class="collapsible">
   <p class="subtle">Checks GitHub releases for new Mihomo versions. Downloads through the local SOCKS proxy (GitHub is blocked from the router's direct connection). Auto-update checks on a schedule and installs automatically when enabled.</p>
@@ -6840,7 +7261,7 @@ tr.group-row.collapsed{display:none}
   <div class="grid2">
     <div class="field"><label for="devroute-ip">Device IP</label><input type="text" id="devroute-ip" placeholder="192.168.2.35"></div>
     <div class="field"><label for="devroute-name">Name</label><input type="text" id="devroute-name" placeholder="Pixel 6a"></div>
-    <div class="field"><label for="devroute-target">Target</label><select id="devroute-target"><option value="direct">DIRECT (bypass proxy)</option><option value="active">Active proxy</option><option value="best">Best proxy</option></select></div>
+    <div class="field"><label for="devroute-target">Target</label><select id="devroute-target"><option value="direct">DIRECT (bypass proxy)</option><option value="active">Active proxy</option><option value="best">Best proxy</option><option value="reject">Block (reject)</option></select></div>
     <div class="field"><label for="devroute-mac">MAC (optional)</label><input type="text" id="devroute-mac" placeholder="aa:bb:cc:dd:ee:ff"></div>
   </div>
   <div class="row" style="margin:.3em 0">
@@ -6984,6 +7405,8 @@ tr.group-row.collapsed{display:none}
     <button class="danger" id="btn-firewall-stop">Stop firewall</button>
     <span class="subtle" id="routing-status"></span>
   </div>
+  <h3 style="font-size:.95em;margin:.8em 0 .35em">Quick presets</h3>
+  <div id="routing-presets" class="chips" style="margin-bottom:.5em"></div>
   <h3 style="font-size:.95em;margin:.8em 0 .35em">Add rule</h3>
   <div class="grid2">
     <div class="field"><label for="rule-name">Rule name</label><input type="text" id="rule-name" placeholder="YouTube via server A"></div>
@@ -7058,7 +7481,10 @@ function api(method, path, body){
     opts.headers["Content-Type"] = "application/json";
     opts.body = body;
   }
+  var token = localStorage.getItem("hincyray_token");
+  if(token){ opts.headers["Authorization"] = "Bearer " + token; }
   return fetch(path, opts).then(function(resp){
+    if(resp.status === 401){ showLoginOverlay(); throw new Error("Unauthorized"); }
     var ctype = resp.headers.get("Content-Type") || "";
     return resp.text().then(function(text){
       var data = null;
@@ -7395,7 +7821,7 @@ function renderRouting(data, profiles){
   updatePortListsVisibility();
 
   var target = document.getElementById("rule-target");
-  var opts = ['<option value="active">Active server</option>','<option value="direct">Direct</option>','<option value="best">Best server (auto)</option>'];
+  var opts = ['<option value="active">Active server</option>','<option value="direct">Direct</option>','<option value="best">Best server (auto)</option>','<option value="reject">Block (reject)</option>'];
   (profiles || []).forEach(function(p){ opts.push('<option value="profile:' + p.id + '">#' + p.id + ' ' + esc(p.name) + '</option>'); });
   target.innerHTML = opts.join("");
 
@@ -7406,6 +7832,28 @@ function renderRouting(data, profiles){
   }).join("");
 
   renderRoutingRules();
+  loadRoutingPresets();
+}
+
+function loadRoutingPresets(){
+  api("GET", "/api/routing-presets").then(function(data){
+    var container = document.getElementById("routing-presets");
+    if(!container){ return; }
+    var presets = data.presets || [];
+    container.innerHTML = presets.map(function(p){
+      return '<button class="mini" data-preset="' + esc(p.id) + '" title="' + esc(p.description) + '">' + esc(p.name) + '</button>';
+    }).join("");
+    Array.prototype.forEach.call(container.querySelectorAll("[data-preset]"), function(btn){
+      btn.addEventListener("click", function(){
+        var id = btn.getAttribute("data-preset");
+        setMsg("Applying preset: " + id + "…");
+        api("POST", "/api/routing-presets/apply", JSON.stringify({preset: id})).then(function(result){
+          showOk("Preset applied: " + (result.rules_added || 0) + " rule(s) added" + (result.port_mode ? ", port mode: " + result.port_mode : ""));
+          api("GET", "/api/routing").then(function(d){ renderRouting(d, lastProfiles); });
+        }).catch(function(err){ setMsg("Preset error: " + err); });
+      });
+    });
+  });
 }
 
 function updatePortListsVisibility(){
@@ -8543,11 +8991,127 @@ setInterval(function(){
   loadDeviceRoutes();
 }, 5000);
 
-refreshAll();
-loadProxyStatus();
-loadTrafficStats();
-loadConnectionLog();
-loadDeviceRoutes();
+// v0.13: Web UI authentication
+function showLoginOverlay(){
+  var el = document.getElementById("login-overlay");
+  if(el){ el.style.display = "flex"; }
+}
+function hideLoginOverlay(){
+  var el = document.getElementById("login-overlay");
+  if(el){ el.style.display = "none"; }
+}
+function doLogin(){
+  var user = document.getElementById("login-user").value;
+  var pass = document.getElementById("login-pass").value;
+  var errEl = document.getElementById("login-error");
+  if(errEl){ errEl.textContent = ""; }
+  fetch("/api/auth/login", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({username: user, password: pass})
+  }).then(function(resp){
+    return resp.text().then(function(text){
+      var data = text ? JSON.parse(text) : {};
+      if(resp.ok && data.token){
+        localStorage.setItem("hincyray_token", data.token);
+        hideLoginOverlay();
+        refreshAll();
+        loadAuthSettings();
+      } else {
+        if(errEl){ errEl.textContent = (data.error || "Login failed") + (resp.status === 401 ? " — check credentials" : ""); }
+      }
+    });
+  }).catch(function(err){
+    if(errEl){ errEl.textContent = "Network error: " + err.message; }
+  });
+}
+function doLogout(){
+  var token = localStorage.getItem("hincyray_token");
+  if(token){
+    fetch("/api/auth/logout", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({token: token})
+    }).catch(function(){});
+    localStorage.removeItem("hincyray_token");
+  }
+  showLoginOverlay();
+}
+function loadAuthSettings(){
+  api("GET", "/api/auth-settings").then(function(data){
+    var chk = document.getElementById("auth-enabled-chk");
+    if(chk){ chk.checked = !!data.enabled; }
+    var user = document.getElementById("auth-username");
+    if(user){ user.value = data.username || "admin"; }
+    var pass = document.getElementById("auth-password");
+    if(pass){ pass.value = ""; pass.placeholder = data.password_set ? "Enter new password to change" : "Set a password"; }
+    var status = document.getElementById("auth-status");
+    if(status){ status.textContent = data.enabled ? (data.password_set ? "Enabled, password set" : "Enabled, NO password") : "Disabled"; }
+    var btnLogout = document.getElementById("btn-logout");
+    if(btnLogout){ btnLogout.style.display = data.enabled ? "" : "none"; }
+  }).catch(function(){ });
+}
+document.getElementById("btn-login").addEventListener("click", function(e){ e.preventDefault(); doLogin(); });
+document.getElementById("login-pass").addEventListener("keypress", function(e){ if(e.key === "Enter"){ doLogin(); } });
+document.getElementById("btn-logout").addEventListener("click", function(){ doLogout(); });
+document.getElementById("btn-auth-save").addEventListener("click", function(){
+  var body = {
+    enabled: document.getElementById("auth-enabled-chk").checked,
+    username: document.getElementById("auth-username").value,
+    password: document.getElementById("auth-password").value
+  };
+  api("POST", "/api/auth-settings", JSON.stringify(body)).then(function(data){
+    showOk("Auth settings saved. " + (data.enabled ? "Enabled" : "Disabled"));
+    loadAuthSettings();
+    if(!data.enabled){ hideLoginOverlay(); }
+  }).catch(function(err){ setMsg("Auth save error: " + err); });
+});
+document.getElementById("auth-toggle").addEventListener("click", function(){
+  toggleCollapsible("auth-panel", "auth-toggle");
+});
+
+// Check auth on page load
+checkAuthOnLoad();
+function checkAuthOnLoad(){
+  fetch("/api/auth-settings").then(function(resp){
+    return resp.json();
+  }).then(function(data){
+    if(data.enabled){
+      var token = localStorage.getItem("hincyray_token");
+      if(!token){
+        showLoginOverlay();
+        return;
+      }
+      // Token exists — try a real API call to verify it's still valid.
+      fetch("/api/status", {headers: {"Authorization": "Bearer " + token}})
+        .then(function(resp){
+          if(resp.status === 401){
+            localStorage.removeItem("hincyray_token");
+            showLoginOverlay();
+          } else {
+            hideLoginOverlay();
+            initApp();
+          }
+        });
+    } else {
+      hideLoginOverlay();
+      initApp();
+    }
+  }).catch(function(){
+    // If auth-settings fails, just try to load the app anyway.
+    hideLoginOverlay();
+    initApp();
+  });
+}
+
+function initApp(){
+  refreshAll();
+  loadProxyStatus();
+  loadTrafficStats();
+  loadConnectionLog();
+  loadDeviceRoutes();
+  loadAuthSettings();
+}
 })();
 </script>
 </body>
@@ -10308,5 +10872,376 @@ mod tests {
             }),
             "device route SRC-IP-CIDR rule not found in config"
         );
+    }
+
+    #[test]
+    fn routing_rule_reject_target_in_config() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "Block ads".to_owned(),
+                target: "reject".to_owned(),
+                domains: vec!["geosite:category-ads-all".to_owned()],
+                ..Default::default()
+            });
+        }
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let rules = config["rules"].as_array().expect("rules array");
+        assert!(
+            rules.iter().any(|r| {
+                r.as_str()
+                    .is_some_and(|s| s.contains("GEOSITE,category-ads-all") && s.contains("REJECT"))
+            }),
+            "REJECT rule not found in config, rules: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn device_route_reject_target_in_config() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.device_routes.push(DeviceRoute {
+                enabled: true,
+                name: "Blocked device".to_owned(),
+                ip: "192.168.2.99".to_owned(),
+                target: "reject".to_owned(),
+                ..Default::default()
+            });
+        }
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let rules = config["rules"].as_array().expect("rules array");
+        assert!(
+            rules.iter().any(|r| {
+                r.as_str().is_some_and(|s| {
+                    s.contains("SRC-IP-CIDR,192.168.2.99/32") && s.contains("REJECT")
+                })
+            }),
+            "device route REJECT rule not found in config, rules: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn routing_presets_list_returns_presets() {
+        let (status, _, body) = handle_routing_presets_list();
+        assert_eq!(status, 200);
+        let value: Value = serde_json::from_str(&body).expect("parse json");
+        let presets = value["presets"].as_array().expect("presets array");
+        assert!(!presets.is_empty(), "presets should not be empty");
+        let ids: Vec<&str> = presets.iter().filter_map(|p| p["id"].as_str()).collect();
+        assert!(ids.contains(&"ru-direct"), "ru-direct preset missing");
+        assert!(ids.contains(&"ad-block"), "ad-block preset missing");
+        assert!(ids.contains(&"only-web-vpn"), "only-web-vpn preset missing");
+        assert!(ids.contains(&"block-social"), "block-social preset missing");
+        assert!(
+            ids.contains(&"ru-direct-ad-block"),
+            "ru-direct-ad-block preset missing"
+        );
+    }
+
+    #[test]
+    fn routing_preset_apply_adds_rules() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+        }
+        let (status, _, body) = handle_routing_preset_apply(r#"{"preset":"ad-block"}"#, &daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        assert_eq!(result["applied"], json!(true));
+        assert_eq!(result["rules_added"], json!(1));
+
+        // Verify rule was added to state.
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.routing_rules.len(), 1);
+        assert_eq!(inner.state.routing_rules[0].target, "reject");
+        assert_eq!(
+            inner.state.routing_rules[0].domains,
+            vec!["geosite:category-ads-all"]
+        );
+    }
+
+    #[test]
+    fn routing_preset_apply_ru_direct_adds_two_rules() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+        }
+        let (status, _, body) = handle_routing_preset_apply(r#"{"preset":"ru-direct"}"#, &daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        assert_eq!(result["rules_added"], json!(2));
+
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.routing_rules.len(), 2);
+        assert_eq!(inner.state.routing_rules[0].target, "direct");
+        assert_eq!(inner.state.routing_rules[1].target, "direct");
+    }
+
+    #[test]
+    fn routing_preset_apply_deduplicates_by_name() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "Block ads".to_owned(),
+                target: "reject".to_owned(),
+                domains: vec!["geosite:category-ads-all".to_owned()],
+                ..Default::default()
+            });
+        }
+        // Apply ad-block preset — should not duplicate the "Block ads" rule.
+        let (status, _, body) = handle_routing_preset_apply(r#"{"preset":"ad-block"}"#, &daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        assert_eq!(result["rules_added"], json!(1));
+
+        let inner = lock(&daemon.inner);
+        assert_eq!(
+            inner.state.routing_rules.len(),
+            1,
+            "should not duplicate rule with same name"
+        );
+    }
+
+    #[test]
+    fn routing_preset_apply_only_web_vpn_changes_port_mode() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+        }
+        let (status, _, body) =
+            handle_routing_preset_apply(r#"{"preset":"only-web-vpn"}"#, &daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        assert_eq!(result["port_mode"], json!("allow_list"));
+
+        let inner = lock(&daemon.inner);
+        assert!(matches!(
+            inner.state.split_routing.port_mode,
+            PortMode::AllowList
+        ));
+        assert_eq!(inner.state.split_routing.proxy_ports, vec!["80", "443"]);
+    }
+
+    #[test]
+    fn routing_preset_apply_unknown_returns_400() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = handle_routing_preset_apply(r#"{"preset":"nonexistent"}"#, &daemon);
+        assert_eq!(status, 400);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        assert_eq!(result["error"], json!("unknown preset"));
+    }
+
+    #[test]
+    fn check_auth_disabled_allows_all() {
+        let (_dir, daemon) = test_daemon();
+        assert!(check_auth(&daemon, &None, "/api/status", "GET"));
+        assert!(check_auth(&daemon, &None, "/api/profiles", "GET"));
+    }
+
+    #[test]
+    fn check_auth_enabled_blocks_without_token() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.enabled = true;
+            inner.state.web_ui_auth.username = "admin".to_owned();
+            inner.state.web_ui_auth.password = "secret".to_owned();
+        }
+        assert!(!check_auth(&daemon, &None, "/api/status", "GET"));
+        assert!(!check_auth(&daemon, &None, "/api/profiles", "GET"));
+    }
+
+    #[test]
+    fn check_auth_allows_public_paths_when_enabled() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.enabled = true;
+        }
+        assert!(check_auth(&daemon, &None, "/", "GET"));
+        assert!(check_auth(&daemon, &None, "/api/health", "GET"));
+        assert!(check_auth(&daemon, &None, "/api/auth/login", "POST"));
+        assert!(check_auth(&daemon, &None, "/api/auth-settings", "GET"));
+    }
+
+    #[test]
+    fn check_auth_allows_with_valid_token() {
+        let (_dir, daemon) = test_daemon();
+        let token = {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.enabled = true;
+            let t = generate_session_token();
+            inner.sessions.insert(t.clone());
+            t
+        };
+        let auth_header = Some(format!("Bearer {token}"));
+        assert!(check_auth(&daemon, &auth_header, "/api/status", "GET"));
+        assert!(check_auth(&daemon, &auth_header, "/api/profiles", "GET"));
+    }
+
+    #[test]
+    fn check_auth_rejects_invalid_token() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.enabled = true;
+        }
+        let auth_header = Some("Bearer invalidtoken123".to_owned());
+        assert!(!check_auth(&daemon, &auth_header, "/api/status", "GET"));
+    }
+
+    #[test]
+    fn auth_login_returns_token() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.enabled = true;
+            inner.state.web_ui_auth.username = "admin".to_owned();
+            inner.state.web_ui_auth.password = "pass123".to_owned();
+        }
+        let (status, _, body) =
+            handle_auth_login(r#"{"username":"admin","password":"pass123"}"#, &daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        assert_eq!(result["auth_enabled"], json!(true));
+        assert!(result["token"].as_str().is_some_and(|t| !t.is_empty()));
+    }
+
+    #[test]
+    fn auth_login_rejects_wrong_credentials() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.enabled = true;
+            inner.state.web_ui_auth.username = "admin".to_owned();
+            inner.state.web_ui_auth.password = "correct".to_owned();
+        }
+        let (status, _, body) =
+            handle_auth_login(r#"{"username":"admin","password":"wrong"}"#, &daemon);
+        assert_eq!(status, 401);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        assert_eq!(result["error"], json!("invalid credentials"));
+    }
+
+    #[test]
+    fn auth_settings_get_does_not_leak_password() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.enabled = true;
+            inner.state.web_ui_auth.password = "sensitive".to_owned();
+        }
+        let (status, _, body) = handle_auth_settings_get(&daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        assert_eq!(result["enabled"], json!(true));
+        assert_eq!(result["password_set"], json!(true));
+        // Password must NOT appear in the response.
+        assert!(
+            body.as_str()
+                .bytes()
+                .position(|b| b == b's')
+                .map(|pos| { !body.as_str()[pos..].starts_with("sensitive") })
+                .unwrap_or(true)
+        );
+        assert!(!body.contains("sensitive"));
+    }
+
+    #[test]
+    fn auth_settings_set_enables_and_persists() {
+        let (_dir, daemon) = test_daemon();
+        let body = r#"{"enabled":true,"username":"root","password":"hunter2"}"#;
+        let (status, _, response) = handle_auth_settings_set(body, &daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&response).expect("parse json");
+        assert_eq!(result["enabled"], json!(true));
+        assert_eq!(result["username"], json!("root"));
+        assert_eq!(result["password_set"], json!(true));
+
+        // Verify state was persisted.
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.web_ui_auth.enabled);
+        assert_eq!(inner.state.web_ui_auth.username, "root");
+        assert_eq!(inner.state.web_ui_auth.password, "hunter2");
+    }
+
+    #[test]
+    fn auth_settings_set_empty_password_keeps_existing() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.password = "existingpass".to_owned();
+        }
+        // Send only enabled=true, no password field.
+        let body = r#"{"enabled":true}"#;
+        let (status, _, _) = handle_auth_settings_set(body, &daemon);
+        assert_eq!(status, 200);
+        let inner = lock(&daemon.inner);
+        assert_eq!(
+            inner.state.web_ui_auth.password, "existingpass",
+            "empty password should not wipe existing"
+        );
+    }
+
+    #[test]
+    fn auth_logout_clears_session() {
+        let (_dir, daemon) = test_daemon();
+        let token = {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.enabled = true;
+            let t = generate_session_token();
+            inner.sessions.insert(t.clone());
+            t
+        };
+        let body = format!(r#"{{"token":"{token}"}}"#);
+        let (status, _, _) = handle_auth_logout(&body, &daemon);
+        assert_eq!(status, 200);
+        let inner = lock(&daemon.inner);
+        assert!(!inner.sessions.contains(&token));
     }
 }

@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use url::Url;
 
+use crate::mihomo_config::build_mihomo_bench_config;
 use crate::profiles::{Profile, Protocol};
 use crate::scoring::quality_score;
 use crate::xray_config::{build_xray_config, percent_decode, query_value};
@@ -127,11 +128,7 @@ fn benchmark_profile(profile: &Profile, settings: &TestSettings) -> TestResult {
 }
 
 fn run_proxy_test(profile: &Profile, settings: &TestSettings) -> Result<Metrics, String> {
-    if is_xhttp_vless(profile) {
-        run_xray_test(profile, settings)
-    } else {
-        run_sing_box_test(profile, settings)
-    }
+    run_mihomo_test(profile, settings)
 }
 
 struct Metrics {
@@ -141,6 +138,7 @@ struct Metrics {
     loss_percent: f32,
 }
 
+#[allow(dead_code)]
 fn run_xray_test(profile: &Profile, settings: &TestSettings) -> Result<Metrics, String> {
     ensure_xray_available()?;
 
@@ -169,6 +167,7 @@ fn run_xray_test(profile: &Profile, settings: &TestSettings) -> Result<Metrics, 
     result.map_err(|error| append_core_stderr("xray", error, stderr_file.path()))
 }
 
+#[allow(dead_code)]
 fn run_sing_box_test(profile: &Profile, settings: &TestSettings) -> Result<Metrics, String> {
     ensure_sing_box_available()?;
 
@@ -195,6 +194,7 @@ fn run_sing_box_test(profile: &Profile, settings: &TestSettings) -> Result<Metri
     result.map_err(|error| append_core_stderr("sing-box", error, stderr_file.path()))
 }
 
+#[allow(dead_code)]
 fn ensure_sing_box_available() -> Result<(), String> {
     Command::new("sing-box")
         .arg("version")
@@ -207,6 +207,7 @@ fn ensure_sing_box_available() -> Result<(), String> {
         .ok_or_else(|| "sing-box установлен, но команда version завершилась ошибкой".to_owned())
 }
 
+#[allow(dead_code)]
 fn ensure_xray_available() -> Result<(), String> {
     Command::new("xray")
         .arg("version")
@@ -217,6 +218,48 @@ fn ensure_xray_available() -> Result<(), String> {
         .success()
         .then_some(())
         .ok_or_else(|| "xray установлен, но команда version завершилась ошибкой".to_owned())
+}
+
+fn ensure_mihomo_available() -> Result<(), String> {
+    Command::new("mihomo")
+        .arg("v")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| {
+            "mihomo не найден в PATH. Установите: brew install mihomo (macOS) или скачайте с GitHub"
+                .to_owned()
+        })?
+        .success()
+        .then_some(())
+        .ok_or_else(|| "mihomo установлен, но команда -v завершилась ошибкой".to_owned())
+}
+
+fn run_mihomo_test(profile: &Profile, settings: &TestSettings) -> Result<Metrics, String> {
+    ensure_mihomo_available()?;
+
+    let port = reserve_local_port()?;
+    let config_yaml = build_mihomo_bench_config(profile, "127.0.0.1", port)?;
+    let mut config_file = NamedTempFile::with_suffix(".yaml").map_err(|error| error.to_string())?;
+    config_file
+        .write_all(config_yaml.as_bytes())
+        .map_err(|error| error.to_string())?;
+    config_file.flush().map_err(|error| error.to_string())?;
+    let stderr_file = NamedTempFile::new().map_err(|error| error.to_string())?;
+    let stderr_writer = stderr_file.reopen().map_err(|error| error.to_string())?;
+
+    let mut child = Command::new("mihomo")
+        .arg("-f")
+        .arg(config_file.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_writer))
+        .spawn()
+        .map_err(|error| format!("mihomo не запустился: {error}"))?;
+
+    let result = run_proxy_metrics(port, &mut child, settings);
+    stop_child(&mut child);
+
+    result.map_err(|error| append_core_stderr("mihomo", error, stderr_file.path()))
 }
 
 fn reserve_local_port() -> Result<u16, String> {
@@ -736,6 +779,7 @@ fn build_transport(url: &Url, network: &str) -> Value {
     transport
 }
 
+#[allow(dead_code)]
 fn is_xhttp_vless(profile: &Profile) -> bool {
     matches!(profile.protocol, Protocol::Vless)
         && Url::parse(&profile.raw)

@@ -1141,6 +1141,30 @@ pub fn build_mihomo_config(
     serde_yaml::to_string(&config).map_err(|error| error.to_string())
 }
 
+/// Build a minimal Mihomo config for desktop benchmarking.
+/// SOCKS listener + single proxy outbound + MATCH rule. No DNS,
+/// no transparent proxy, no geo files, no features.
+pub fn build_mihomo_bench_config(
+    profile: &Profile,
+    listen_host: &str,
+    socks_port: u16,
+) -> Result<String, String> {
+    let proxy = build_proxy(profile, PROXY_NAME)?;
+    let config = json!({
+        "mode": "rule",
+        "log-level": "silent",
+        "allow-lan": false,
+        "bind-address": bind_address(listen_host),
+        "find-process-mode": "off",
+        "ipv6": false,
+        "geo-auto-update": false,
+        "socks-port": socks_port,
+        "proxies": [proxy],
+        "rules": [format!("MATCH,{}", PROXY_NAME)],
+    });
+    serde_yaml::to_string(&config).map_err(|error| error.to_string())
+}
+
 /// Build the sniffer JSON section with feature-enhanced options.
 ///
 /// Base sniffer: HTTP/TLS/QUIC domain detection on common ports.
@@ -2374,6 +2398,7 @@ fn outbound_tag_to_name(tag: &str) -> String {
     match tag {
         "active" => PROXY_NAME.to_owned(),
         "direct" => DIRECT_NAME.to_owned(),
+        "reject" => REJECT_NAME.to_owned(),
         _ => tag.to_owned(),
     }
 }
@@ -2509,14 +2534,14 @@ mod tests {
         ExternalControllerConfig, FallbackFilter, LoadBalanceStrategy, MihomoFeatures, NtpConfig,
         PROXY_NAME, PerProxyDefaults, ProxyGroupConfig, ProxyGroupType, ProxyProviderConfig,
         REDIR_LISTENER, RuleProviderConfig, SmuxConfig, SubRuleConfig, TPROXY_LISTENER,
-        TunnelConfig, build_hysteria2_proxy, build_mihomo_config, build_mihomo_router_config,
-        build_shadowsocks_proxy, build_trojan_proxy, build_tuic_proxy, build_vless_proxy,
-        build_vmess_proxy, build_wireguard_proxy,
+        TunnelConfig, build_hysteria2_proxy, build_mihomo_bench_config, build_mihomo_config,
+        build_mihomo_router_config, build_shadowsocks_proxy, build_trojan_proxy, build_tuic_proxy,
+        build_vless_proxy, build_vmess_proxy, build_wireguard_proxy,
     };
     use crate::profiles::parse_profiles;
     use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule};
     use base64::Engine as _;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     #[test]
     fn build_vless_proxy_has_correct_fields() {
@@ -5061,5 +5086,126 @@ mod tests {
                 .iter()
                 .any(|r| { r.as_str().is_some_and(|s| s.starts_with("NOT,")) })
         );
+    }
+
+    #[test]
+    fn routing_rule_reject_target_produces_reject() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec!["geosite:category-ads-all".to_owned()],
+            ips: vec![],
+            outbound_tag: "reject".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        assert!(
+            rules.iter().any(|r| {
+                r.as_str()
+                    .is_some_and(|s| s == "GEOSITE,category-ads-all,REJECT")
+            }),
+            "REJECT rule not found, rules: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn bench_config_vless_has_socks_and_match() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=tls&sni=example.com#Test",
+        );
+        let yaml =
+            build_mihomo_bench_config(&profiles[0], "127.0.0.1", 20808).expect("bench config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        assert_eq!(config["socks-port"], json!(20808));
+        assert_eq!(config["log-level"], json!("silent"));
+        assert_eq!(config["allow-lan"], json!(false));
+        assert_eq!(config["geo-auto-update"], json!(false));
+        let rules = config["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].as_str(), Some("MATCH,proxy"));
+        let proxies = config["proxies"].as_array().expect("proxies array");
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0]["type"], json!("vless"));
+    }
+
+    #[test]
+    fn bench_config_vmess_builds_successfully() {
+        let vmess_json = r#"{"v":"2","ps":"Test","add":"example.com","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","net":"ws","type":"none","host":"example.com","path":"/ws","tls":"tls","sni":"example.com"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(vmess_json.as_bytes());
+        let link = format!("vmess://{encoded}#Test");
+        let profiles = parse_profiles(&link);
+        let yaml =
+            build_mihomo_bench_config(&profiles[0], "127.0.0.1", 20809).expect("bench config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let proxies = config["proxies"].as_array().expect("proxies array");
+        assert_eq!(proxies[0]["type"], json!("vmess"));
+    }
+
+    #[test]
+    fn bench_config_hysteria2_builds_successfully() {
+        let profiles = parse_profiles("hysteria2://secret@example.com:443?sni=example.com#Test");
+        let yaml =
+            build_mihomo_bench_config(&profiles[0], "127.0.0.1", 20810).expect("bench config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let proxies = config["proxies"].as_array().expect("proxies array");
+        assert_eq!(proxies[0]["type"], json!("hysteria2"));
+    }
+
+    #[test]
+    fn bench_config_wireguard_builds_successfully() {
+        let profiles = parse_profiles(
+            "wireguard://privkey123@example.com:51820?address=10.0.0.2/32&publickey=pubkey456#Test",
+        );
+        let yaml =
+            build_mihomo_bench_config(&profiles[0], "127.0.0.1", 20811).expect("bench config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let proxies = config["proxies"].as_array().expect("proxies array");
+        assert_eq!(proxies[0]["type"], json!("wireguard"));
+    }
+
+    #[test]
+    fn bench_config_tuic_builds_successfully() {
+        let profiles = parse_profiles(
+            "tuic://11111111-1111-1111-1111-111111111111:password@example.com:443?sni=example.com#Test",
+        );
+        let yaml =
+            build_mihomo_bench_config(&profiles[0], "127.0.0.1", 20812).expect("bench config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let proxies = config["proxies"].as_array().expect("proxies array");
+        assert_eq!(proxies[0]["type"], json!("tuic"));
+    }
+
+    #[test]
+    fn bench_config_no_dns_section() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let yaml =
+            build_mihomo_bench_config(&profiles[0], "127.0.0.1", 20813).expect("bench config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        // Bench config should NOT have a dns section — no DNS needed for benchmarking.
+        assert!(config.get("dns").is_none());
     }
 }
