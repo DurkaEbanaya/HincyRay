@@ -2017,6 +2017,19 @@ fn build_hysteria2_proxy(profile: &Profile, name: &str) -> Result<Value, String>
         );
     }
 
+    // Port hopping: `mport` (standard Hysteria2 share-link param) or
+    // `ports` specifies a port range (e.g. "443-8443"). When present,
+    // Mihomo ignores the `port` field and hops across the range.
+    if let Some(ports) = query_value_multi(&url, &["mport", "ports"]) {
+        proxy["ports"] = json!(ports);
+    }
+
+    // Hop interval in seconds (default 30 in Mihomo). Supports a range
+    // like "15-30" for randomised intervals.
+    if let Some(hop) = query_value_multi(&url, &["hopInterval", "hopinterval", "hop_interval"]) {
+        proxy["hop-interval"] = json!(hop);
+    }
+
     Ok(proxy)
 }
 
@@ -2643,6 +2656,35 @@ mod tests {
 
         assert_eq!(proxy.get("up").and_then(Value::as_str), Some("30 Mbps"));
         assert_eq!(proxy.get("down").and_then(Value::as_str), Some("200 Mbps"));
+    }
+
+    #[test]
+    fn build_hysteria2_proxy_port_hopping() {
+        let profiles =
+            parse_profiles("hysteria2://secret@example.com:443?mport=443-8443&hopInterval=30#Test");
+        let profile = &profiles[0];
+        let proxy = build_hysteria2_proxy(profile, PROXY_NAME).expect("hysteria2 proxy");
+
+        assert_eq!(proxy.get("ports").and_then(Value::as_str), Some("443-8443"));
+        assert_eq!(
+            proxy.get("hop-interval").and_then(Value::as_str),
+            Some("30")
+        );
+    }
+
+    #[test]
+    fn build_hysteria2_proxy_hop_interval_range() {
+        let profiles = parse_profiles(
+            "hysteria2://secret@example.com:443?ports=443-8443&hop_interval=15-30#Test",
+        );
+        let profile = &profiles[0];
+        let proxy = build_hysteria2_proxy(profile, PROXY_NAME).expect("hysteria2 proxy");
+
+        assert_eq!(proxy.get("ports").and_then(Value::as_str), Some("443-8443"));
+        assert_eq!(
+            proxy.get("hop-interval").and_then(Value::as_str),
+            Some("15-30")
+        );
     }
 
     #[test]
@@ -3756,7 +3798,10 @@ mod tests {
             dns_direct_nameserver: vec!["system".to_owned()],
             dns_nameserver_policy: {
                 let mut p = std::collections::HashMap::new();
-                p.insert("+.google.com".to_owned(), vec!["https://dns.google/dns-query".to_owned()]);
+                p.insert(
+                    "+.google.com".to_owned(),
+                    vec!["https://dns.google/dns-query".to_owned()],
+                );
                 p
             },
             dns_fallback_filter: Some(FallbackFilter {

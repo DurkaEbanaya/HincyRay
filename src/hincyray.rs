@@ -46,6 +46,7 @@ use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRoute
 const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_SAMPLES: usize = 1000;
+const MAX_CONNECTION_LOG: usize = 500;
 
 /// Global shutdown flag set by the SIGTERM/SIGINT handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -402,6 +403,29 @@ pub struct HincyrayState {
     /// v0.6: Unix timestamp of the last auto-triggered benchmark.
     #[serde(default)]
     pub last_auto_bench_unix: u64,
+    /// v0.12: Auto-refresh subscriptions from their source URLs
+    /// periodically. Disabled by default.
+    #[serde(default)]
+    pub auto_refresh_enabled: bool,
+    /// v0.12: Auto-refresh interval in hours (0 = disabled).
+    #[serde(default)]
+    pub auto_refresh_interval_hours: u32,
+    /// v0.12: Unix timestamp of the last auto-refresh.
+    #[serde(default)]
+    pub last_auto_refresh_unix: u64,
+    /// v0.12: Cumulative uploaded bytes through the proxy (persisted).
+    #[serde(default)]
+    pub traffic_total_up_bytes: u64,
+    /// v0.12: Cumulative downloaded bytes through the proxy (persisted).
+    #[serde(default)]
+    pub traffic_total_down_bytes: u64,
+    /// v0.12: Persisted connection log (cap MAX_CONNECTION_LOG entries).
+    #[serde(default)]
+    pub connection_log: Vec<ConnectionLogEntry>,
+    /// v0.12: Per-device routing rules. Each sends a specific device's
+    /// traffic to a different target (direct, specific profile, etc.).
+    #[serde(default)]
+    pub device_routes: Vec<DeviceRoute>,
     /// v0.7.1: Mihomo auto-update enabled. When true, the watchdog
     /// periodically checks GitHub for new Mihomo releases through the
     /// local SOCKS proxy and auto-installs them.
@@ -450,6 +474,13 @@ impl Default for HincyrayState {
             hwid_config: HwidConfig::default(),
             auto_bench_interval_hours: 0,
             last_auto_bench_unix: 0,
+            auto_refresh_enabled: false,
+            auto_refresh_interval_hours: 0,
+            last_auto_refresh_unix: 0,
+            traffic_total_up_bytes: 0,
+            traffic_total_down_bytes: 0,
+            connection_log: Vec::new(),
+            device_routes: Vec::new(),
             auto_update_enabled: false,
             auto_update_interval_hours: default_auto_update_interval_hours(),
             last_update_check_unix: 0,
@@ -468,6 +499,37 @@ pub struct MetricSample {
     pub passed: bool,
     pub latency_ms: u32,
     pub download_mbps: f32,
+}
+
+/// v0.12: A single entry in the persisted connection log. Captures
+/// metadata about a connection seen through the Mihomo proxy.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ConnectionLogEntry {
+    pub timestamp: u64,
+    pub host: String,
+    pub source_ip: String,
+    pub destination_ip: String,
+    pub network: String,
+    pub chains: Vec<String>,
+    pub rule: String,
+    pub upload: u64,
+    pub download: u64,
+}
+
+/// v0.12: Per-device routing rule. Sends a specific device's traffic
+/// (identified by IP) to a different target than the default proxy.
+/// Implemented as `SRC-IP-CIDR,<ip>/32,<target>` rules emitted BEFORE
+/// general routing rules in the Mihomo config.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DeviceRoute {
+    pub enabled: bool,
+    pub name: String,
+    pub ip: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// "direct", "active", "best", or "profile:<id>".
+    #[serde(default = "default_routing_target")]
+    pub target: String,
 }
 
 /// v0.2: persisted subscription source plus its last refresh metadata.
@@ -1768,8 +1830,50 @@ fn build_daemon_config(state: &HincyrayState) -> Result<String, String> {
     }
 
     // Split routing: build the full router config.
-    let (extra_profiles, routes, active_block_quic, extra) =
+    let (mut extra_profiles, mut routes, active_block_quic, extra) =
         build_routing_context(state, active_id, active_profile);
+
+    // Prepend per-device routing rules (SRC-IP-CIDR) BEFORE general
+    // routing rules so device-specific rules match first.
+    let mut device_rules: Vec<XrayRouteRule> = Vec::new();
+    for dr in &state.device_routes {
+        if !dr.enabled || dr.ip.trim().is_empty() {
+            continue;
+        }
+        let outbound_tag = match dr.target.as_str() {
+            "direct" => DIRECT_NAME.to_owned(),
+            "active" | "best" | "" => PROXY_NAME.to_owned(),
+            target if target.starts_with("profile:") => {
+                let id = target.trim_start_matches("profile:").parse::<usize>().ok();
+                if let Some(id) = id {
+                    if id == active_id {
+                        PROXY_NAME.to_owned()
+                    } else if let Some(profile) = state.profiles.iter().find(|p| p.id == id) {
+                        let tag = format!("profile-{id}");
+                        if !extra_profiles.iter().any(|(_, existing)| existing == &tag) {
+                            extra_profiles.push((profile, tag.clone()));
+                        }
+                        tag
+                    } else {
+                        PROXY_NAME.to_owned()
+                    }
+                } else {
+                    PROXY_NAME.to_owned()
+                }
+            }
+            _ => PROXY_NAME.to_owned(),
+        };
+        device_rules.push(XrayRouteRule {
+            domains: vec![],
+            ips: vec![format!("src-ip-cidr:{}/32", dr.ip.trim())],
+            outbound_tag,
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        });
+    }
+    // Device rules first, then general rules.
+    routes.splice(0..0, device_rules);
 
     build_mihomo_router_config(
         active_profile,
@@ -2137,6 +2241,9 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
             )
         }
         ("POST", "/api/profiles/import") => handle_import(body, daemon),
+        ("POST", "/api/profiles/add") => handle_profile_add(body, daemon),
+        ("POST", "/api/profiles/delete") => handle_profile_delete(body, daemon),
+        ("POST", "/api/profiles/update") => handle_profile_update(body, daemon),
         ("POST", "/api/profiles/block-quic") => handle_profile_block_quic(body, daemon),
         ("POST", "/api/active-profile") => handle_set_active(body, daemon),
         ("GET", "/api/mihomo-config") => handle_get_mihomo_config(daemon),
@@ -2181,6 +2288,16 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/mihomo-api/proxies") => handle_mihomo_api_proxies(daemon),
         ("GET", "/api/mihomo-api/connections") => handle_mihomo_api_connections(daemon),
         ("POST", "/api/mihomo-api/delay") => handle_mihomo_api_delay(body, daemon),
+        ("GET", "/api/mihomo-api/traffic") => handle_mihomo_api_traffic(daemon),
+        ("GET", "/api/mihomo-api/memory") => handle_mihomo_api_memory(daemon),
+        ("GET", "/api/traffic") => handle_traffic_stats(daemon),
+        ("GET", "/api/connection-log") => handle_connection_log(daemon),
+        ("GET", "/api/device-routes") => handle_device_routes_list(daemon),
+        ("POST", "/api/device-routes") => handle_device_routes_set(body, daemon),
+        ("POST", "/api/device-routes/delete") => handle_device_routes_delete(body, daemon),
+        ("GET", "/api/devices") => handle_devices_scan(daemon),
+        ("POST", "/api/device-routes/apply") => handle_device_routes_apply(daemon),
+        ("POST", "/api/mihomo-api/speed-test") => handle_speed_test(body, daemon),
         _ => (
             404,
             "application/json",
@@ -2819,6 +2936,241 @@ fn handle_profile_block_quic(body: &str, daemon: &Daemon) -> (u16, &'static str,
     )
 }
 
+/// Add a single profile from a raw share link.
+/// Body: `{"raw": "vless://..."}`.
+/// Parses the share link, deduplicates by `raw` string, assigns a new ID.
+fn handle_profile_add(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(raw) = value.get("raw").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing \"raw\" field"}).to_string(),
+        );
+    };
+
+    let parsed = parse_input(raw);
+    if parsed.profiles.is_empty() {
+        return (
+            400,
+            "application/json",
+            json!({"error": "could not parse share link", "candidate_count": parsed.candidates})
+                .to_string(),
+        );
+    }
+
+    let mut inner = lock(&daemon.inner);
+    let profile = parsed.profiles[0].clone();
+    let raw_key = profile.raw.clone();
+
+    // Dedup: check if a profile with the same raw link already exists.
+    if inner.state.profiles.iter().any(|p| p.raw == raw_key) {
+        return (
+            409,
+            "application/json",
+            json!({"error": "profile already exists", "raw": raw_key}).to_string(),
+        );
+    }
+
+    let new_id = inner.state.profiles.len();
+    let mut profile = profile;
+    profile.id = new_id;
+    inner.state.profiles.push(profile);
+
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+
+    (
+        200,
+        "application/json",
+        json!({
+            "profile_id": new_id,
+            "profile_count": inner.state.profiles.len(),
+        })
+        .to_string(),
+    )
+}
+
+/// Delete a single profile by ID.
+/// Body: `{"profile_id": N}`.
+/// Re-indexes remaining profile IDs. If the active profile was deleted,
+/// stops the core and clears `active_profile_id`.
+fn handle_profile_delete(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(id) = value
+        .get("profile_id")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+    else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing profile_id"}).to_string(),
+        );
+    };
+
+    let mut inner = lock(&daemon.inner);
+
+    // Check existence.
+    if !inner.state.profiles.iter().any(|p| p.id == id) {
+        return (
+            404,
+            "application/json",
+            json!({"error": "profile not found", "profile_id": id}).to_string(),
+        );
+    }
+
+    let was_active = inner.state.active_profile_id == Some(id);
+
+    // Remove the profile.
+    inner.state.profiles.retain(|p| p.id != id);
+
+    // Re-index remaining profiles.
+    for (i, p) in inner.state.profiles.iter_mut().enumerate() {
+        p.id = i;
+    }
+
+    if was_active {
+        inner.state.active_profile_id = None;
+        // Stop the core since the active profile no longer exists.
+        let _ = inner.core.stop();
+    } else if let Some(active_id) = inner.state.active_profile_id {
+        // Active profile ID may have shifted due to re-indexing.
+        // Find the profile by its raw link to get the new ID.
+        // Actually, since we re-index sequentially, the active profile
+        // may have shifted. We need to find it by checking if the
+        // active ID is still valid. If the deleted profile was before
+        // the active one, the active ID needs to decrement by 1.
+        if id < active_id {
+            inner.state.active_profile_id = Some(active_id - 1);
+        }
+    }
+
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+
+    (
+        200,
+        "application/json",
+        json!({
+            "deleted_profile_id": id,
+            "profile_count": inner.state.profiles.len(),
+            "was_active": was_active,
+        })
+        .to_string(),
+    )
+}
+
+/// Update a profile's metadata (name and/or block_quic).
+/// Body: `{"profile_id": N, "name": "...", "block_quic": true}`.
+/// If `block_quic` changes on the active profile, regenerates config
+/// and restarts the core.
+fn handle_profile_update(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(id) = value
+        .get("profile_id")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+    else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing profile_id"}).to_string(),
+        );
+    };
+
+    let new_name = value.get("name").and_then(Value::as_str);
+    let new_block_quic = value.get("block_quic").and_then(Value::as_bool);
+
+    if new_name.is_none() && new_block_quic.is_none() {
+        return (
+            400,
+            "application/json",
+            json!({"error": "nothing to update — provide \"name\" or \"block_quic\""}).to_string(),
+        );
+    }
+
+    let mut inner = lock(&daemon.inner);
+    let Some(profile) = inner.state.profiles.iter_mut().find(|p| p.id == id) else {
+        return (
+            404,
+            "application/json",
+            json!({"error": "profile not found", "profile_id": id}).to_string(),
+        );
+    };
+
+    let mut changed_block_quic = false;
+    if let Some(name) = new_name {
+        profile.name = name.to_owned();
+    }
+    if let Some(block) = new_block_quic
+        && profile.block_quic != block
+    {
+        profile.block_quic = block;
+        changed_block_quic = true;
+    }
+
+    let is_active = inner.state.active_profile_id == Some(id);
+
+    // If block_quic changed on the active profile, regenerate config
+    // and restart the core so the change takes effect.
+    if changed_block_quic && is_active {
+        let geo_dir = geo_dir_from_state(&inner.state);
+        if let Ok((binary_path, config_path)) = regenerate_config(&inner.state, daemon) {
+            let _ = inner
+                .core
+                .restart(&binary_path, &config_path, geo_dir.as_deref());
+        }
+    }
+
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+
+    (
+        200,
+        "application/json",
+        json!({
+            "profile_id": id,
+            "name": inner.state.profiles.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default(),
+            "block_quic": inner.state.profiles.iter().find(|p| p.id == id).map(|p| p.block_quic).unwrap_or(false),
+        })
+        .to_string(),
+    )
+}
+
 fn handle_favorites_toggle(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return (
@@ -2982,10 +3334,18 @@ fn purge_subscription(state: &mut HincyrayState, url: &str) -> bool {
     removed_active
 }
 
-fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) {
-    // Read saved subscription sources plus the SOCKS fallback info
-    // under a single short lock; network I/O happens below without
-    // holding the mutex so the API stays responsive.
+/// Result of refreshing all subscriptions.
+struct RefreshResult {
+    refreshed: usize,
+    added: usize,
+    errors: Vec<String>,
+}
+
+/// Core logic for refreshing all saved subscriptions.
+/// Used by both the HTTP handler and the watchdog auto-refresh.
+/// Reads subscription sources, fetches each via network (with SOCKS
+/// fallback), replaces profiles in state, and persists.
+fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
     let (subs, proxy_info, hwid) = {
         let mut inner = lock(&daemon.inner);
         let subs: Vec<SubscriptionSource> = inner
@@ -3002,17 +3362,11 @@ fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) 
     };
 
     if subs.is_empty() {
-        return (
-            200,
-            "application/json",
-            json!({
-                "refreshed": 0,
-                "added": 0,
-                "errors": Vec::<String>::new(),
-                "note": "no saved subscriptions; import a subscription URL first"
-            })
-            .to_string(),
-        );
+        return RefreshResult {
+            refreshed: 0,
+            added: 0,
+            errors: Vec::new(),
+        };
     }
 
     let mut errors: Vec<String> = Vec::new();
@@ -3036,10 +3390,6 @@ fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) 
                     stored.last_error = None;
                     stored.profile_count = count;
                 }
-                // Replace all profiles belonging to this subscription
-                // with the fresh set. This removes stale profiles that
-                // are no longer in the subscription and prevents
-                // duplicates from accumulating across refreshes.
                 let added =
                     replace_subscription_profiles(&mut inner.state, &source.url, report.profiles);
                 added_total += added;
@@ -3056,11 +3406,23 @@ fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) 
         let _ = persist_state(&daemon.state_path, &inner.state);
     }
 
-    let response = json!({
-        "refreshed": refreshed,
-        "added": added_total,
-        "errors": errors,
+    RefreshResult {
+        refreshed,
+        added: added_total,
+        errors,
+    }
+}
+
+fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) {
+    let result = refresh_all_subscriptions(daemon);
+    let mut response = json!({
+        "refreshed": result.refreshed,
+        "added": result.added,
+        "errors": result.errors,
     });
+    if result.refreshed == 0 && result.errors.is_empty() {
+        response["note"] = json!("no saved subscriptions; import a subscription URL first");
+    }
     (200, "application/json", response.to_string())
 }
 
@@ -3828,6 +4190,9 @@ fn handle_auto_settings_get(daemon: &Daemon) -> (u16, &'static str, String) {
             "last_auto_bench_unix": inner.state.last_auto_bench_unix,
             "auto_switch": inner.state.split_routing.auto_switch,
             "failover_fail_count": inner.failover_fail_count,
+            "auto_refresh_enabled": inner.state.auto_refresh_enabled,
+            "auto_refresh_interval_hours": inner.state.auto_refresh_interval_hours,
+            "last_auto_refresh_unix": inner.state.last_auto_refresh_unix,
         })
         .to_string(),
     )
@@ -3855,6 +4220,15 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
     if let Some(v) = value.get("auto_switch").and_then(Value::as_bool) {
         inner.state.split_routing.auto_switch = v;
     }
+    if let Some(v) = value.get("auto_refresh_enabled").and_then(Value::as_bool) {
+        inner.state.auto_refresh_enabled = v;
+    }
+    if let Some(v) = value
+        .get("auto_refresh_interval_hours")
+        .and_then(Value::as_u64)
+    {
+        inner.state.auto_refresh_interval_hours = v as u32;
+    }
     let _ = persist_state(&daemon.state_path, &inner.state);
     (
         200,
@@ -3863,6 +4237,8 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
             "auto_select": inner.state.auto_select,
             "auto_bench_interval_hours": inner.state.auto_bench_interval_hours,
             "auto_switch": inner.state.split_routing.auto_switch,
+            "auto_refresh_enabled": inner.state.auto_refresh_enabled,
+            "auto_refresh_interval_hours": inner.state.auto_refresh_interval_hours,
         })
         .to_string(),
     )
@@ -4002,6 +4378,458 @@ fn handle_mihomo_api_delay(body: &str, daemon: &Daemon) -> (u16, &'static str, S
             502,
             "application/json",
             json!({"error": format!("delay test failed: {e}")}).to_string(),
+        ),
+    }
+}
+
+/// Forward `GET /traffic` to the Mihomo external controller.
+/// Returns real-time upload/download speed in kbps.
+fn handle_mihomo_api_traffic(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (addr, secret) = {
+        let inner = lock(&daemon.inner);
+        match mihomo_controller(&inner.state.mihomo_features) {
+            Some(ec) => ec,
+            None => {
+                return (
+                    400,
+                    "application/json",
+                    json!({"error": "external controller not enabled"}).to_string(),
+                );
+            }
+        }
+    };
+    match mihomo_api_stream_get(&addr, secret.as_deref(), "/traffic") {
+        Ok(body) => (200, "application/json", body),
+        Err(e) => (
+            502,
+            "application/json",
+            json!({"error": format!("Mihomo API: {e}")}).to_string(),
+        ),
+    }
+}
+
+/// Forward `GET /memory` to the Mihomo external controller.
+/// Returns real-time memory usage in kb.
+fn handle_mihomo_api_memory(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (addr, secret) = {
+        let inner = lock(&daemon.inner);
+        match mihomo_controller(&inner.state.mihomo_features) {
+            Some(ec) => ec,
+            None => {
+                return (
+                    400,
+                    "application/json",
+                    json!({"error": "external controller not enabled"}).to_string(),
+                );
+            }
+        }
+    };
+    match mihomo_api_stream_get(&addr, secret.as_deref(), "/memory") {
+        Ok(body) => (200, "application/json", body),
+        Err(e) => (
+            502,
+            "application/json",
+            json!({"error": format!("Mihomo API: {e}")}).to_string(),
+        ),
+    }
+}
+
+/// Return cumulative traffic statistics (persisted totals) plus
+/// real-time speed from Mihomo `/traffic` API (if EC enabled).
+fn handle_traffic_stats(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (total_up, total_down, ec_addr, ec_secret) = {
+        let inner = lock(&daemon.inner);
+        let ec = mihomo_controller(&inner.state.mihomo_features);
+        let (addr, secret) = match ec {
+            Some((a, s)) => (Some(a), s),
+            None => (None, None),
+        };
+        (
+            inner.state.traffic_total_up_bytes,
+            inner.state.traffic_total_down_bytes,
+            addr,
+            secret,
+        )
+    };
+
+    let mut current_up_kbps: u64 = 0;
+    let mut current_down_kbps: u64 = 0;
+    if let Some(addr) = ec_addr
+        && let Ok(traffic) = mihomo_api_stream_get_json(&addr, ec_secret.as_deref(), "/traffic")
+    {
+        current_up_kbps = traffic.get("up").and_then(Value::as_u64).unwrap_or(0);
+        current_down_kbps = traffic.get("down").and_then(Value::as_u64).unwrap_or(0);
+    }
+
+    (
+        200,
+        "application/json",
+        json!({
+            "current_up_kbps": current_up_kbps,
+            "current_down_kbps": current_down_kbps,
+            "total_up_bytes": total_up,
+            "total_down_bytes": total_down,
+        })
+        .to_string(),
+    )
+}
+
+/// Speed test: download a file through the SOCKS proxy and measure
+/// throughput. Body: `{"url": "...", "timeout_secs": 30}`.
+/// Default URL: Cloudflare 10MB download. Requires the core to be
+/// running (SOCKS proxy must be active).
+fn handle_speed_test(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let (socks_url, core_running) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            format!(
+                "socks5h://{}:{}",
+                inner.state.listen_host, inner.state.socks_port
+            ),
+            inner.core.is_running(),
+        )
+    };
+    if !core_running {
+        return (
+            400,
+            "application/json",
+            json!({"error": "core is not running — start the proxy first"}).to_string(),
+        );
+    }
+
+    let (url, timeout_secs) = match serde_json::from_str::<Value>(body) {
+        Ok(v) => (
+            v.get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("https://speed.cloudflare.com/__down?bytes=10485760")
+                .to_owned(),
+            v.get("timeout_secs").and_then(Value::as_u64).unwrap_or(30),
+        ),
+        Err(_) => (
+            "https://speed.cloudflare.com/__down?bytes=10485760".to_owned(),
+            30,
+        ),
+    };
+
+    let client = {
+        let proxy = match reqwest::Proxy::all(&socks_url) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    500,
+                    "application/json",
+                    json!({"error": format!("proxy setup: {e}")}).to_string(),
+                );
+            }
+        };
+        match reqwest::blocking::Client::builder()
+            .proxy(proxy)
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    500,
+                    "application/json",
+                    json!({"error": format!("client build: {e}")}).to_string(),
+                );
+            }
+        }
+    };
+
+    let start = std::time::Instant::now();
+    match client.get(&url).send() {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                return (
+                    502,
+                    "application/json",
+                    json!({"error": format!("HTTP {status}")}).to_string(),
+                );
+            }
+            match resp.bytes() {
+                Ok(bytes) => {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    let bytes_len = bytes.len() as u64;
+                    let mbps = if elapsed_ms > 0 {
+                        (bytes_len as f64 * 8.0 / 1_000_000.0) / (elapsed_ms as f64 / 1000.0)
+                    } else {
+                        0.0
+                    };
+                    (
+                        200,
+                        "application/json",
+                        json!({
+                            "download_mbps": (mbps * 100.0).round() / 100.0,
+                            "elapsed_ms": elapsed_ms,
+                            "bytes": bytes_len,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => (
+                    500,
+                    "application/json",
+                    json!({"error": format!("read body: {e}")}).to_string(),
+                ),
+            }
+        }
+        Err(e) => (
+            502,
+            "application/json",
+            json!({"error": format!("request failed: {e}")}).to_string(),
+        ),
+    }
+}
+
+/// Return the persisted connection log (most recent first).
+fn handle_connection_log(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let entries: Vec<Value> = inner
+        .state
+        .connection_log
+        .iter()
+        .rev()
+        .map(|e| {
+            json!({
+                "timestamp": e.timestamp,
+                "host": e.host,
+                "source_ip": e.source_ip,
+                "destination_ip": e.destination_ip,
+                "network": e.network,
+                "chains": e.chains,
+                "rule": e.rule,
+                "upload": e.upload,
+                "download": e.download,
+            })
+        })
+        .collect();
+    (
+        200,
+        "application/json",
+        json!({"entries": entries, "count": entries.len()}).to_string(),
+    )
+}
+
+/// List all per-device routing rules.
+fn handle_device_routes_list(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let routes: Vec<Value> = inner
+        .state
+        .device_routes
+        .iter()
+        .map(|dr| {
+            json!({
+                "enabled": dr.enabled,
+                "name": dr.name,
+                "ip": dr.ip,
+                "mac": dr.mac,
+                "target": dr.target,
+            })
+        })
+        .collect();
+    (
+        200,
+        "application/json",
+        json!({"routes": routes, "count": routes.len()}).to_string(),
+    )
+}
+
+/// Add or update a per-device routing rule (upsert by IP).
+/// Body: `{"enabled": true, "name": "Pixel 6a", "ip": "192.168.2.35", "mac": "aa:bb:cc:dd:ee:ff", "target": "direct"}`.
+fn handle_device_routes_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(ip) = value.get("ip").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing ip"}).to_string(),
+        );
+    };
+    let ip = ip.trim().to_owned();
+    if ip.is_empty() {
+        return (
+            400,
+            "application/json",
+            json!({"error": "ip cannot be empty"}).to_string(),
+        );
+    }
+
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let target = value
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or("active")
+        .to_owned();
+    let mac = value
+        .get("mac")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let enabled = value
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let mut inner = lock(&daemon.inner);
+    // Upsert: find existing by IP, or push new.
+    if let Some(existing) = inner.state.device_routes.iter_mut().find(|dr| dr.ip == ip) {
+        existing.enabled = enabled;
+        existing.name = name.clone();
+        existing.mac = mac.clone();
+        existing.target = target.clone();
+    } else {
+        inner.state.device_routes.push(DeviceRoute {
+            enabled,
+            name,
+            ip,
+            mac,
+            target,
+        });
+    }
+
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+
+    (
+        200,
+        "application/json",
+        json!({
+            "routes": inner.state.device_routes.iter().map(|dr| {
+                json!({
+                    "enabled": dr.enabled,
+                    "name": dr.name,
+                    "ip": dr.ip,
+                    "mac": dr.mac,
+                    "target": dr.target,
+                })
+            }).collect::<Vec<_>>(),
+            "count": inner.state.device_routes.len(),
+        })
+        .to_string(),
+    )
+}
+
+/// Delete a per-device routing rule by IP.
+/// Body: `{"ip": "192.168.2.35"}`.
+fn handle_device_routes_delete(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(ip) = value.get("ip").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing ip"}).to_string(),
+        );
+    };
+    let ip = ip.trim();
+
+    let mut inner = lock(&daemon.inner);
+    let before = inner.state.device_routes.len();
+    inner.state.device_routes.retain(|dr| dr.ip != ip);
+    let after = inner.state.device_routes.len();
+
+    if before == after {
+        return (
+            404,
+            "application/json",
+            json!({"error": "device route not found", "ip": ip}).to_string(),
+        );
+    }
+
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+
+    (
+        200,
+        "application/json",
+        json!({"deleted_ip": ip, "remaining": after}).to_string(),
+    )
+}
+
+/// Scan for devices on the LAN by reading `/proc/net/arp`.
+/// Returns a list of `{"ip", "mac", "iface"}` for all reachable devices.
+fn handle_devices_scan(_daemon: &Daemon) -> (u16, &'static str, String) {
+    let arp_content = fs::read_to_string("/proc/net/arp").unwrap_or_default();
+    let mut devices: Vec<Value> = Vec::new();
+
+    for line in arp_content.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 6 {
+            let ip = fields[0];
+            let mac = fields[3];
+            let iface = fields[5];
+            // Skip entries with no MAC (incomplete ARP entries).
+            if mac != "00:00:00:00:00:00" && !mac.is_empty() {
+                devices.push(json!({
+                    "ip": ip,
+                    "mac": mac,
+                    "iface": iface,
+                }));
+            }
+        }
+    }
+
+    (
+        200,
+        "application/json",
+        json!({"devices": devices, "count": devices.len()}).to_string(),
+    )
+}
+
+/// Apply device routing changes: regenerate Mihomo config and restart core.
+fn handle_device_routes_apply(daemon: &Daemon) -> (u16, &'static str, String) {
+    let mut inner = lock(&daemon.inner);
+    let geo_dir = geo_dir_from_state(&inner.state);
+    match regenerate_config(&inner.state, daemon) {
+        Ok((binary_path, config_path)) => {
+            match inner
+                .core
+                .restart(&binary_path, &config_path, geo_dir.as_deref())
+            {
+                Ok(()) => (
+                    200,
+                    "application/json",
+                    json!({"status": "applied", "core_status": inner.core.status()}).to_string(),
+                ),
+                Err(e) => (
+                    500,
+                    "application/json",
+                    json!({"error": format!("core restart: {e}")}).to_string(),
+                ),
+            }
+        }
+        Err(e) => (
+            500,
+            "application/json",
+            json!({"error": format!("config regeneration: {e}")}).to_string(),
         ),
     }
 }
@@ -4568,9 +5396,48 @@ fn mihomo_api_get(addr: &str, secret: Option<&str>, path: &str) -> Result<String
     resp.text().map_err(|e| e.to_string())
 }
 
+/// Like `mihomo_api_get` but for streaming endpoints (`/traffic`,
+/// `/memory`) that keep the connection open. Uses `curl` with
+/// `--max-time` to read the first JSON snapshot from the stream.
+fn mihomo_api_stream_get(addr: &str, secret: Option<&str>, path: &str) -> Result<String, String> {
+    let url = format!("http://{addr}{path}");
+    let mut cmd = Command::new("curl");
+    cmd.args(["-s", "--max-time", "2", &url]);
+    if let Some(s) = secret
+        && !s.is_empty()
+    {
+        cmd.args(["-H", &format!("Authorization: Bearer {s}")]);
+    }
+    let output = cmd.output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "Mihomo API {path}: curl exit {:?}",
+            output.status.code()
+        ));
+    }
+    let body = String::from_utf8_lossy(&output.stdout);
+    // The stream may contain multiple JSON objects (one per second).
+    // Take the first non-empty line.
+    let first = body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(body.trim());
+    Ok(first.to_owned())
+}
+
 /// Make a GET request and parse the response as JSON.
 fn mihomo_api_get_json(addr: &str, secret: Option<&str>, path: &str) -> Result<Value, String> {
     let body = mihomo_api_get(addr, secret, path)?;
+    serde_json::from_str(&body).map_err(|e| format!("Mihomo API {path}: parse error: {e}"))
+}
+
+/// Like `mihomo_api_stream_get` but parses the first JSON object.
+fn mihomo_api_stream_get_json(
+    addr: &str,
+    secret: Option<&str>,
+    path: &str,
+) -> Result<Value, String> {
+    let body = mihomo_api_stream_get(addr, secret, path)?;
     serde_json::from_str(&body).map_err(|e| format!("Mihomo API {path}: parse error: {e}"))
 }
 
@@ -4997,9 +5864,11 @@ fn start_watchdog(daemon: Daemon) {
         let mut bench_was_running = false;
         let mut restart_backoff_secs: u64 = 0;
         let mut failover_rejected_profiles = HashSet::new();
+        let mut watchdog_tick: u64 = 0;
 
         loop {
             thread::sleep(Duration::from_secs(10));
+            watchdog_tick += 1;
 
             // --- Read state snapshot (short lock) ---
             let (
@@ -5024,6 +5893,9 @@ fn start_watchdog(daemon: Daemon) {
                 proxy_group_enabled,
                 ec_addr,
                 ec_secret,
+                auto_refresh_enabled,
+                auto_refresh_interval_hours,
+                last_auto_refresh,
             ) = {
                 let mut inner = lock(&daemon.inner);
                 let ec = mihomo_controller(&inner.state.mihomo_features);
@@ -5053,6 +5925,9 @@ fn start_watchdog(daemon: Daemon) {
                     inner.state.mihomo_features.proxy_group.enabled,
                     ec_addr,
                     ec_secret,
+                    inner.state.auto_refresh_enabled,
+                    inner.state.auto_refresh_interval_hours,
+                    inner.state.last_auto_refresh_unix,
                 )
             };
 
@@ -5351,6 +6226,197 @@ fn start_watchdog(daemon: Daemon) {
                             let _ = persist_state(&daemon.state_path, &inner.state);
                         }
                     }
+                }
+            }
+
+            // --- Phase 7: Auto-refresh subscriptions ---
+            if auto_refresh_enabled
+                && auto_refresh_interval_hours > 0
+                && !bench_running
+                && core_running
+            {
+                let now = unix_now();
+                let interval_secs = u64::from(auto_refresh_interval_hours) * 3600;
+                if now.saturating_sub(last_auto_refresh) >= interval_secs {
+                    eprintln!("hincyray: auto-refresh subscriptions triggered");
+                    let _result = refresh_all_subscriptions(&daemon);
+
+                    // After refresh, check if the active profile was
+                    // removed (its raw link no longer exists). If so,
+                    // auto-select the best available profile.
+                    let mut inner = lock(&daemon.inner);
+                    let active_removed = inner
+                        .state
+                        .active_profile_id
+                        .is_some_and(|id| !inner.state.profiles.iter().any(|p| p.id == id));
+
+                    if active_removed || inner.state.active_profile_id.is_none() {
+                        if let Some(best_id) =
+                            find_best_profile_by_score(&inner.state, &HashSet::new())
+                        {
+                            eprintln!(
+                                "hincyray: auto-refresh: active profile removed, switching to best #{best_id}"
+                            );
+                            switch_active_profile(&mut inner, &daemon, best_id);
+                        } else if let Some(first) = inner.state.profiles.first() {
+                            let first_id = first.id;
+                            eprintln!(
+                                "hincyray: auto-refresh: no scored profiles, switching to first #{first_id}"
+                            );
+                            switch_active_profile(&mut inner, &daemon, first_id);
+                        } else {
+                            eprintln!(
+                                "hincyray: auto-refresh: no profiles available after refresh"
+                            );
+                            inner.state.active_profile_id = None;
+                        }
+                    }
+
+                    inner.state.last_auto_refresh_unix = now;
+                    let _ = persist_state(&daemon.state_path, &inner.state);
+                }
+            }
+
+            // --- Phase 8: Traffic statistics ---
+            // Poll Mihomo /traffic every tick (10s) and accumulate
+            // cumulative byte counters. Persist every 6 ticks (60s)
+            // to avoid writing state.json every 10 seconds.
+            if core_running
+                && let Some(ref addr) = ec_addr
+                && let Ok(traffic) =
+                    mihomo_api_stream_get_json(addr, ec_secret.as_deref(), "/traffic")
+            {
+                let up_kbps = traffic.get("up").and_then(Value::as_u64).unwrap_or(0);
+                let down_kbps = traffic.get("down").and_then(Value::as_u64).unwrap_or(0);
+                // kbps * 10s = kb during this interval.
+                // * 1024 = bytes.
+                let up_bytes = up_kbps * 10 * 1024;
+                let down_bytes = down_kbps * 10 * 1024;
+                let mut inner = lock(&daemon.inner);
+                inner.state.traffic_total_up_bytes =
+                    inner.state.traffic_total_up_bytes.saturating_add(up_bytes);
+                inner.state.traffic_total_down_bytes = inner
+                    .state
+                    .traffic_total_down_bytes
+                    .saturating_add(down_bytes);
+                if watchdog_tick.is_multiple_of(6) {
+                    let _ = persist_state(&daemon.state_path, &inner.state);
+                }
+            }
+
+            // --- Phase 9: Connection log ---
+            // Poll Mihomo /connections every 3 ticks (30s) and log
+            // new connections not seen in the previous poll.
+            if core_running
+                && watchdog_tick.is_multiple_of(3)
+                && let Some(ref addr) = ec_addr
+                && let Ok(conns) = mihomo_api_get_json(addr, ec_secret.as_deref(), "/connections")
+            {
+                let now = unix_now();
+                let mut new_entries: Vec<ConnectionLogEntry> = Vec::new();
+                let mut current_ids: HashSet<String> = HashSet::new();
+
+                if let Some(connections) = conns.get("connections").and_then(Value::as_array) {
+                    for conn in connections {
+                        let id = conn
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        if id.is_empty() {
+                            continue;
+                        }
+                        current_ids.insert(id.clone());
+
+                        // Only log connections not already in the
+                        // persisted log (check last 50 entries by
+                        // host+source_ip to avoid duplicates).
+                        let metadata = conn.get("metadata");
+                        let host = metadata
+                            .and_then(|m| m.get("host"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let source_ip = metadata
+                            .and_then(|m| m.get("sourceIP"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let destination_ip = metadata
+                            .and_then(|m| m.get("destinationIP"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        let network = metadata
+                            .and_then(|m| m.get("network"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+
+                        let chains: Vec<String> = conn
+                            .get("chains")
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|c| c.as_str().map(str::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let rule = conn
+                            .get("rule")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+
+                        let upload = conn.get("upload").and_then(Value::as_u64).unwrap_or(0);
+                        let download = conn.get("download").and_then(Value::as_u64).unwrap_or(0);
+
+                        // Skip connections with no host (likely
+                        // internal or DNS traffic).
+                        if host.is_empty() {
+                            continue;
+                        }
+
+                        new_entries.push(ConnectionLogEntry {
+                            timestamp: now,
+                            host,
+                            source_ip,
+                            destination_ip,
+                            network,
+                            chains,
+                            rule,
+                            upload,
+                            download,
+                        });
+                    }
+                }
+
+                if !new_entries.is_empty() {
+                    let mut inner = lock(&daemon.inner);
+                    // Dedup against the last 50 entries by
+                    // host+source_ip to avoid logging the same
+                    // persistent connection every 30s.
+                    let recent: HashSet<(String, String)> = inner
+                        .state
+                        .connection_log
+                        .iter()
+                        .rev()
+                        .take(50)
+                        .map(|e| (e.host.clone(), e.source_ip.clone()))
+                        .collect();
+                    for entry in new_entries {
+                        let key = (entry.host.clone(), entry.source_ip.clone());
+                        if !recent.contains(&key) {
+                            inner.state.connection_log.push(entry);
+                        }
+                    }
+                    // Trim to cap.
+                    if inner.state.connection_log.len() > MAX_CONNECTION_LOG {
+                        let excess = inner.state.connection_log.len() - MAX_CONNECTION_LOG;
+                        inner.state.connection_log.drain(0..excess);
+                    }
+                    let _ = persist_state(&daemon.state_path, &inner.state);
                 }
             }
 
@@ -5726,6 +6792,11 @@ tr.group-row.collapsed{display:none}
     <label class="chip"><input type="checkbox" id="auto-switch-chk"> Auto-switch (failover) on health check failure</label>
     <div class="field"><label for="auto-bench-hours">Auto-benchmark interval (hours, 0 = disabled)</label><input type="number" id="auto-bench-hours" min="0" max="168" value="0"></div>
   </div>
+  <h3>Auto-refresh subscriptions</h3>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="auto-refresh-chk"> Auto-refresh subscriptions periodically</label>
+    <div class="field"><label for="auto-refresh-hours">Refresh interval (hours, 0 = disabled)</label><input type="number" id="auto-refresh-hours" min="0" max="168" value="0"></div>
+  </div>
   <div class="row" style="margin:.45em 0">
     <button id="btn-auto-save">Save auto settings</button>
     <span class="subtle">Failover failures: <span id="auto-failover-count">0</span>/3</span>
@@ -5754,6 +6825,29 @@ tr.group-row.collapsed{display:none}
   <div class="row" style="margin:.3em 0">
     <button id="btn-update-save">Save update settings</button>
   </div>
+</div>
+
+<h2>Per-Device Routing <span id="devroute-toggle" class="toggle">show</span></h2>
+<div id="devroute-panel" class="collapsible">
+  <p class="subtle">Route specific devices (by IP) to a different target than the default proxy. Rules are emitted as <code>SRC-IP-CIDR</code> before general routing rules. Only works for devices assigned to the Keenetic <code>HincyRay</code> traffic policy.</p>
+  <div class="row" style="margin:.45em 0">
+    <button id="btn-devices-scan">Scan devices (ARP)</button>
+    <button class="primary" id="btn-devroute-apply">Apply Mihomo config</button>
+    <span class="subtle" id="devroute-status"></span>
+  </div>
+  <div id="devices-list" style="margin:.5em 0"></div>
+  <h3 style="font-size:.95em;margin:.8em 0 .35em">Add device route</h3>
+  <div class="grid2">
+    <div class="field"><label for="devroute-ip">Device IP</label><input type="text" id="devroute-ip" placeholder="192.168.2.35"></div>
+    <div class="field"><label for="devroute-name">Name</label><input type="text" id="devroute-name" placeholder="Pixel 6a"></div>
+    <div class="field"><label for="devroute-target">Target</label><select id="devroute-target"><option value="direct">DIRECT (bypass proxy)</option><option value="active">Active proxy</option><option value="best">Best proxy</option></select></div>
+    <div class="field"><label for="devroute-mac">MAC (optional)</label><input type="text" id="devroute-mac" placeholder="aa:bb:cc:dd:ee:ff"></div>
+  </div>
+  <div class="row" style="margin:.3em 0">
+    <label class="chip"><input type="checkbox" id="devroute-enabled" checked> Enabled</label>
+    <button id="btn-devroute-add">Add / update route</button>
+  </div>
+  <div id="devroute-list" style="margin:.5em 0"></div>
 </div>
 
 <h2>Mihomo Features <span id="features-toggle" class="toggle">show</span></h2>
@@ -5837,6 +6931,23 @@ tr.group-row.collapsed{display:none}
   </div>
   <h3 class="subtle">Active Connections</h3>
   <div id="ps-connections" style="max-height:300px;overflow:auto"></div>
+</div>
+
+<h2>Traffic &amp; Connections <span id="traffic-toggle" class="toggle">show</span></h2>
+<div id="traffic-panel" class="collapsible">
+  <p class="subtle">Real-time traffic through the proxy and recent connection log. Auto-refreshed every 5s.</p>
+  <div class="cards">
+    <div class="card"><div class="label">Upload speed</div><div class="value" id="traffic-up">—</div></div>
+    <div class="card"><div class="label">Download speed</div><div class="value" id="traffic-down">—</div></div>
+    <div class="card"><div class="label">Total uploaded</div><div class="value" id="traffic-total-up">—</div></div>
+    <div class="card"><div class="label">Total downloaded</div><div class="value" id="traffic-total-down">—</div></div>
+  </div>
+  <div class="row" style="margin:.45em 0">
+    <button id="btn-speed-test">Speed test (10MB via Cloudflare)</button>
+    <span class="subtle" id="speed-test-result"></span>
+  </div>
+  <h3 class="subtle">Connection Log (recent)</h3>
+  <div id="conn-log" style="max-height:300px;overflow:auto"></div>
 </div>
 
 <h2>Logs <span id="logs-toggle" class="toggle">show</span></h2>
@@ -6776,6 +7887,8 @@ function loadAutoSettings(){
     document.getElementById("auto-select-chk").checked = !!data.auto_select;
     document.getElementById("auto-switch-chk").checked = !!data.auto_switch;
     document.getElementById("auto-bench-hours").value = data.auto_bench_interval_hours || 0;
+    document.getElementById("auto-refresh-chk").checked = !!data.auto_refresh_enabled;
+    document.getElementById("auto-refresh-hours").value = data.auto_refresh_interval_hours || 0;
     document.getElementById("auto-failover-count").textContent = data.failover_fail_count || 0;
     if(data.last_auto_bench_unix){
       var ago = Math.round((Date.now()/1000 - data.last_auto_bench_unix) / 3600);
@@ -6794,16 +7907,19 @@ function syncAutoSettingsFromStatus(s){
   document.getElementById("auto-bench-hours").value = s.auto_bench_interval_hours || 0;
 }
 
-["auto-select-chk", "auto-switch-chk"].forEach(function(id){
+["auto-select-chk", "auto-switch-chk", "auto-refresh-chk"].forEach(function(id){
   document.getElementById(id).addEventListener("change", function(){ autoSettingsDirty = true; });
 });
 document.getElementById("auto-bench-hours").addEventListener("input", function(){ autoSettingsDirty = true; });
+document.getElementById("auto-refresh-hours").addEventListener("input", function(){ autoSettingsDirty = true; });
 
 document.getElementById("btn-auto-save").addEventListener("click", function(){
   var body = JSON.stringify({
     auto_select: document.getElementById("auto-select-chk").checked,
     auto_switch: document.getElementById("auto-switch-chk").checked,
     auto_bench_interval_hours: Number(document.getElementById("auto-bench-hours").value) || 0,
+    auto_refresh_enabled: document.getElementById("auto-refresh-chk").checked,
+    auto_refresh_interval_hours: Number(document.getElementById("auto-refresh-hours").value) || 0,
   });
   api("POST", "/api/auto-settings", body).then(function(){
     autoSettingsDirty = false;
@@ -6875,6 +7991,120 @@ document.getElementById("btn-ps-delay").addEventListener("click", function(){
     loadProxyStatus();
   }).catch(function(e){
     document.getElementById("ps-status").textContent = "Delay test failed: " + e;
+  });
+});
+
+// ── Traffic & Connections ────────────────────────────────────────
+
+function fmtBytes(n){
+  if(n >= 1073741824) return (n/1073741824).toFixed(2) + " GB";
+  if(n >= 1048576) return (n/1048576).toFixed(1) + " MB";
+  if(n >= 1024) return (n/1024).toFixed(0) + " KB";
+  return n + " B";
+}
+
+function loadTrafficStats(){
+  api("GET", "/api/traffic").then(function(d){
+    document.getElementById("traffic-up").textContent = (d.current_up_kbps || 0) + " kbps";
+    document.getElementById("traffic-down").textContent = (d.current_down_kbps || 0) + " kbps";
+    document.getElementById("traffic-total-up").textContent = fmtBytes(d.total_up_bytes || 0);
+    document.getElementById("traffic-total-down").textContent = fmtBytes(d.total_down_bytes || 0);
+  }).catch(function(){ /* silent */ });
+}
+
+function loadConnectionLog(){
+  api("GET", "/api/connection-log").then(function(d){
+    var box = document.getElementById("conn-log");
+    var entries = d.entries || [];
+    if(entries.length === 0){ box.innerHTML = "<p class='subtle'>No connections logged yet</p>"; return; }
+    var rows = entries.slice(0, 50).map(function(e){
+      var chains = e.chains && e.chains.join(" → ") || "?";
+      return "<div class='mono subtle' style='padding:2px 0'>" +
+        e.host + " [" + e.network + "] " + e.source_ip + " → " + e.destination_ip +
+        " [" + chains + "] " + (e.rule || "") +
+        " ↓" + fmtBytes(e.download) + " ↑" + fmtBytes(e.upload) + "</div>";
+    });
+    box.innerHTML = rows.join("");
+  }).catch(function(){ /* silent */ });
+}
+
+document.getElementById("btn-speed-test").addEventListener("click", function(){
+  document.getElementById("speed-test-result").textContent = "Testing...";
+  api("POST", "/api/mihomo-api/speed-test", "{}").then(function(r){
+    document.getElementById("speed-test-result").textContent =
+      r.download_mbps + " Mbps (" + r.elapsed_ms + "ms, " + fmtBytes(r.bytes) + ")";
+  }).catch(function(e){
+    document.getElementById("speed-test-result").textContent = "Failed: " + e.message;
+  });
+});
+
+// ── Per-Device Routing ───────────────────────────────────────────
+
+function loadDeviceRoutes(){
+  api("GET", "/api/device-routes").then(function(d){
+    var box = document.getElementById("devroute-list");
+    var routes = d.routes || [];
+    if(routes.length === 0){ box.innerHTML = "<p class='subtle'>No device routes configured</p>"; return; }
+    var rows = routes.map(function(r){
+      var del = "<button class='danger' onclick=\"deleteDeviceRoute('" + r.ip + "')\" style='font-size:.8em;padding:2px 8px'>Delete</button>";
+      return "<div class='mono' style='padding:3px 0'>" +
+        (r.enabled ? "✓" : "✗") + " " + (r.name || "?") + " " + r.ip +
+        " → " + r.target + " " + del + "</div>";
+    });
+    box.innerHTML = rows.join("");
+  }).catch(function(){ /* silent */ });
+}
+
+function deleteDeviceRoute(ip){
+  api("POST", "/api/device-routes/delete", JSON.stringify({ip: ip})).then(function(){
+    loadDeviceRoutes();
+    showOk("Device route deleted.");
+  }).catch(function(e){ setMsg("Delete failed: " + e.message); });
+}
+
+document.getElementById("btn-devroute-add").addEventListener("click", function(){
+  var body = JSON.stringify({
+    enabled: document.getElementById("devroute-enabled").checked,
+    ip: document.getElementById("devroute-ip").value,
+    name: document.getElementById("devroute-name").value,
+    target: document.getElementById("devroute-target").value,
+    mac: document.getElementById("devroute-mac").value,
+  });
+  api("POST", "/api/device-routes", body).then(function(){
+    loadDeviceRoutes();
+    showOk("Device route saved. Click 'Apply Mihomo config' to activate.");
+  }).catch(function(e){ setMsg("Save failed: " + e.message); });
+});
+
+document.getElementById("btn-devices-scan").addEventListener("click", function(){
+  document.getElementById("devroute-status").textContent = "Scanning...";
+  api("GET", "/api/devices").then(function(d){
+    var box = document.getElementById("devices-list");
+    var devs = d.devices || [];
+    if(devs.length === 0){ box.innerHTML = "<p class='subtle'>No devices found</p>"; return; }
+    var rows = devs.map(function(dev){
+      return "<div class='mono subtle' style='padding:2px 0'>" +
+        dev.ip + " " + (dev.mac || "") + " [" + dev.iface + "] " +
+        "<button onclick=\"addDeviceFromScan('" + dev.ip + "','" + (dev.mac||"") + "')\" style='font-size:.8em;padding:2px 8px'>Add</button></div>";
+    });
+    box.innerHTML = rows.join("");
+    document.getElementById("devroute-status").textContent = devs.length + " devices found";
+  }).catch(function(e){
+    document.getElementById("devroute-status").textContent = "Scan failed: " + e.message;
+  });
+});
+
+function addDeviceFromScan(ip, mac){
+  document.getElementById("devroute-ip").value = ip;
+  document.getElementById("devroute-mac").value = mac;
+}
+
+document.getElementById("btn-devroute-apply").addEventListener("click", function(){
+  document.getElementById("devroute-status").textContent = "Applying...";
+  api("POST", "/api/device-routes/apply", "{}").then(function(r){
+    document.getElementById("devroute-status").textContent = "Applied: " + r.status;
+  }).catch(function(e){
+    document.getElementById("devroute-status").textContent = "Apply failed: " + e.message;
   });
 });
 
@@ -7307,10 +8537,17 @@ setInterval(function(){
   }).catch(function(){ /* transient */ });
   // Proxy status (Mihomo external controller API)
   loadProxyStatus();
+  // Traffic stats and connection log
+  loadTrafficStats();
+  loadConnectionLog();
+  loadDeviceRoutes();
 }, 5000);
 
 refreshAll();
 loadProxyStatus();
+loadTrafficStats();
+loadConnectionLog();
+loadDeviceRoutes();
 })();
 </script>
 </body>
@@ -7677,6 +8914,81 @@ mod tests {
         let inner = lock(&daemon.inner);
         assert!(inner.state.profiles[0].block_quic);
         assert!(inner.state.profiles[1].block_quic);
+    }
+
+    #[test]
+    fn profile_add_parses_share_link() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#First",
+            &daemon,
+        );
+
+        // Add a second profile via the CRUD endpoint.
+        let (status, _, body) = handle_profile_add(
+            r#"{"raw":"vless://22222222-2222-2222-2222-222222222222@example.org:443#Second"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 200);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert_eq!(resp["profile_id"], 1);
+
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 2);
+        assert_eq!(inner.state.profiles[1].name, "Second");
+    }
+
+    #[test]
+    fn profile_add_rejects_duplicate() {
+        let (_dir, daemon) = test_daemon();
+        let raw = "vless://11111111-1111-1111-1111-111111111111@example.com:443#First";
+        handle_import(raw, &daemon);
+
+        let (status, _, _) = handle_profile_add(&format!(r#"{{"raw":"{raw}"}}"#), &daemon);
+        assert_eq!(status, 409);
+    }
+
+    #[test]
+    fn profile_delete_removes_and_reindexes() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@a.com:443#A\n\
+             vless://22222222-2222-2222-2222-222222222222@b.com:443#B\n\
+             vless://33333333-3333-3333-3333-333333333333@c.com:443#C",
+            &daemon,
+        );
+
+        // Delete profile id=1 (B). Remaining: A(0), C(1).
+        let (status, _, body) = handle_profile_delete(r#"{"profile_id":1}"#, &daemon);
+        assert_eq!(status, 200);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert_eq!(resp["profile_count"], 2);
+
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 2);
+        assert_eq!(inner.state.profiles[0].name, "A");
+        assert_eq!(inner.state.profiles[1].name, "C");
+        // IDs re-indexed.
+        assert_eq!(inner.state.profiles[0].id, 0);
+        assert_eq!(inner.state.profiles[1].id, 1);
+    }
+
+    #[test]
+    fn profile_update_changes_name() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#OldName",
+            &daemon,
+        );
+
+        let (status, _, body) =
+            handle_profile_update(r#"{"profile_id":0,"name":"NewName"}"#, &daemon);
+        assert_eq!(status, 200);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert_eq!(resp["name"], "NewName");
+
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles[0].name, "NewName");
     }
 
     #[test]
@@ -8843,5 +10155,158 @@ mod tests {
         let json: Value = serde_json::from_str(&body).expect("parse status");
         assert!(json.get("proxy_group_enabled").is_some());
         assert!(json.get("ec_enabled").is_some());
+    }
+
+    #[test]
+    fn auto_settings_include_refresh_fields() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = handle_auto_settings_get(&daemon);
+        assert_eq!(status, 200);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert_eq!(resp["auto_refresh_enabled"], false);
+        assert_eq!(resp["auto_refresh_interval_hours"], 0);
+    }
+
+    #[test]
+    fn auto_settings_set_refresh_persists() {
+        let (_dir, daemon) = test_daemon();
+        let body = r#"{"auto_refresh_enabled":true,"auto_refresh_interval_hours":6}"#;
+        let (status, _, resp) = handle_auto_settings_set(body, &daemon);
+        assert_eq!(status, 200);
+        assert!(resp.contains("\"auto_refresh_enabled\":true"));
+        assert!(resp.contains("\"auto_refresh_interval_hours\":6"));
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.auto_refresh_enabled);
+        assert_eq!(inner.state.auto_refresh_interval_hours, 6);
+    }
+
+    #[test]
+    fn traffic_stats_returns_defaults() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = handle_traffic_stats(&daemon);
+        assert_eq!(status, 200);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert_eq!(resp["total_up_bytes"], 0);
+        assert_eq!(resp["total_down_bytes"], 0);
+    }
+
+    #[test]
+    fn traffic_stats_accumulate_persists() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.traffic_total_up_bytes = 1_000_000;
+            inner.state.traffic_total_down_bytes = 5_000_000;
+        }
+        let (_, _, body) = handle_traffic_stats(&daemon);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert_eq!(resp["total_up_bytes"], 1_000_000);
+        assert_eq!(resp["total_down_bytes"], 5_000_000);
+    }
+
+    #[test]
+    fn speed_test_returns_400_when_core_stopped() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = handle_speed_test("{}", &daemon);
+        assert_eq!(status, 400);
+        assert!(body.contains("core is not running"));
+    }
+
+    #[test]
+    fn connection_log_returns_empty_by_default() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = handle_connection_log(&daemon);
+        assert_eq!(status, 200);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert_eq!(resp["count"], 0);
+    }
+
+    #[test]
+    fn connection_log_returns_entries() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.connection_log.push(ConnectionLogEntry {
+                timestamp: 1234567890,
+                host: "example.com".to_owned(),
+                source_ip: "192.168.2.35".to_owned(),
+                destination_ip: "1.2.3.4".to_owned(),
+                network: "tcp".to_owned(),
+                chains: vec!["proxy-active".to_owned()],
+                rule: "DOMAIN-SUFFIX".to_owned(),
+                upload: 1024,
+                download: 4096,
+            });
+        }
+        let (_, _, body) = handle_connection_log(&daemon);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert_eq!(resp["count"], 1);
+        let entries = resp["entries"].as_array().expect("entries array");
+        assert_eq!(entries[0]["host"], "example.com");
+        assert_eq!(entries[0]["source_ip"], "192.168.2.35");
+    }
+
+    #[test]
+    fn device_routes_add_and_list() {
+        let (_dir, daemon) = test_daemon();
+        let body = r#"{"enabled":true,"name":"Pixel 6a","ip":"192.168.2.35","mac":"aa:bb:cc:dd:ee:ff","target":"direct"}"#;
+        let (status, _, resp) = handle_device_routes_set(body, &daemon);
+        assert_eq!(status, 200);
+        let resp: Value = serde_json::from_str(&resp).expect("parse response");
+        assert_eq!(resp["count"], 1);
+
+        let (status, _, body) = handle_device_routes_list(&daemon);
+        assert_eq!(status, 200);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert_eq!(resp["count"], 1);
+        let routes = resp["routes"].as_array().expect("routes array");
+        assert_eq!(routes[0]["ip"], "192.168.2.35");
+        assert_eq!(routes[0]["target"], "direct");
+    }
+
+    #[test]
+    fn device_routes_delete() {
+        let (_dir, daemon) = test_daemon();
+        handle_device_routes_set(
+            r#"{"ip":"192.168.2.35","target":"direct","name":"Test"}"#,
+            &daemon,
+        );
+        let (status, _, body) = handle_device_routes_delete(r#"{"ip":"192.168.2.35"}"#, &daemon);
+        assert_eq!(status, 200);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert_eq!(resp["remaining"], 0);
+    }
+
+    #[test]
+    fn device_routes_appear_in_config() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.device_routes.push(DeviceRoute {
+                enabled: true,
+                name: "Pixel".to_owned(),
+                ip: "192.168.2.35".to_owned(),
+                target: "direct".to_owned(),
+                ..Default::default()
+            });
+        }
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let rules = config["rules"].as_array().expect("rules array");
+        assert!(
+            rules.iter().any(|r| {
+                r.as_str().is_some_and(|s| {
+                    s.contains("SRC-IP-CIDR") && s.contains("192.168.2.35") && s.contains("DIRECT")
+                })
+            }),
+            "device route SRC-IP-CIDR rule not found in config"
+        );
     }
 }
