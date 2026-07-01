@@ -102,6 +102,14 @@ pub fn build_mihomo_router_config(
     }
 
     let redirect_port = redirect_port.unwrap_or(10810);
+    // TPROXY listener uses a separate port (redirect_port + 1) to
+    // avoid a TCP bind conflict with the redir listener.  Both
+    // listener types try to bind TCP on their port — if they share
+    // the same port, whichever binds first wins and the other fails.
+    // When tproxy wins, TCP REDIRECT connections are not handled by
+    // the redir listener, SO_ORIGINAL_DST is not set, and traffic
+    // loops back to the router instead of being proxied.
+    let tproxy_port = redirect_port + 1;
     let mut listeners = vec![json!({
         "name": REDIR_LISTENER,
         "type": "redir",
@@ -112,7 +120,7 @@ pub fn build_mihomo_router_config(
         listeners.push(json!({
             "name": TPROXY_LISTENER,
             "type": "tproxy",
-            "port": redirect_port,
+            "port": tproxy_port,
             "listen": "0.0.0.0",
             "udp": true,
         }));
@@ -125,6 +133,11 @@ pub fn build_mihomo_router_config(
         "bind-address": bind_address(listen_host),
         "find-process-mode": "off",
         "ipv6": false,
+        // Prevent Mihomo from trying to auto-download geoip.metadb
+        // on startup — GitHub is blocked from the router, and the
+        // download hangs indefinitely, blocking all listeners.  The
+        // local geoip.dat/geosite.dat files are used instead.
+        "geo-auto-update": false,
         "socks-port": socks_port,
         "listeners": listeners,
         "proxies": proxies,
@@ -149,30 +162,44 @@ pub fn build_mihomo_router_config(
         },
     });
 
-    if let Some(dns) = &extra.dns
-        && dns.enabled
-    {
+    // The transparent proxy (NAT REDIRECT + TPROXY) requires a DNS
+    // listener on the DNS_INBOUND_PORT (1053) — the firewall
+    // unconditionally DNATs DNS queries to that port.  The
+    // `dns.enabled` flag is a desktop-Xray concept that does not
+    // apply here: there is no valid "transparent proxy without DNS"
+    // mode.  Always include the DNS section so the listener matches
+    // the firewall DNAT rules.
+    if let Some(dns) = &extra.dns {
         config["dns"] = build_dns_config(dns);
     }
 
     serde_yaml::to_string(&config).map_err(|error| error.to_string())
 }
 
-/// Build the DNS anti-leak section when enabled.
+/// Build the DNS section for the transparent proxy.
+///
+/// Uses `fake-ip` enhanced mode so clients get fake IPs (198.18.x.x)
+/// and Mihomo can sniff the real domain from the TLS/HTTP SNI.  All
+/// DNS queries go through the remote (proxied) servers — no
+/// `nameserver-policy` with `geosite:cn` is used because:
+///   1. It triggers MMDB (geoip.metadb) loading which blocks startup
+///      when the file is missing and GitHub is unreachable.
+///   2. Splitting DNS by geosite is unnecessary on a censorship-bypass
+///      router where all traffic should go through the proxy.
+///
+/// `fake-ip-filter` is set to an empty array to prevent Mihomo from
+/// using its default filter (which references `geosite:cn` and
+/// requires the MMDB database).
 fn build_dns_config(dns: &crate::xray_config::DnsSettings) -> Value {
     let mut dns_config = json!({
         "enable": true,
         "listen": format!("0.0.0.0:{}", DNS_INBOUND_PORT),
         "enhanced-mode": "fake-ip",
         "fake-ip-range": "198.18.0.1/16",
+        "fake-ip-filter": [],
         "nameserver": dns.remote_servers,
         "fallback": dns.remote_servers,
     });
-    if !dns.local_servers.is_empty() {
-        dns_config["nameserver-policy"] = json!({
-            "geosite:cn": dns.local_servers,
-        });
-    }
     if dns.query_strategy == "UseIPv6" || dns.query_strategy == "UseIP" {
         dns_config["ipv6"] = json!(true);
     }
@@ -884,6 +911,18 @@ mod tests {
         assert_eq!(
             dns_section.get("listen").and_then(Value::as_str),
             Some("0.0.0.0:1053")
+        );
+        // fake-ip-filter must be empty to avoid MMDB dependency.
+        assert_eq!(
+            dns_section.get("fake-ip-filter").and_then(Value::as_array),
+            Some(&vec![])
+        );
+        // No nameserver-policy — it triggers MMDB loading.
+        assert!(dns_section.get("nameserver-policy").is_none());
+        // geo-auto-update must be false to prevent GitHub download.
+        assert_eq!(
+            config.get("geo-auto-update").and_then(Value::as_bool),
+            Some(false)
         );
     }
 

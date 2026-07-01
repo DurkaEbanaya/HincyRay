@@ -722,7 +722,12 @@ impl CoreManager {
         if let Some(dir) = geo_dir.filter(|d| !d.is_empty()) {
             cmd.arg("-d").arg(dir);
         }
-        cmd.stdout(Stdio::null()).stderr(stderr);
+        // Redirect both stdout and stderr to the log file — Mihomo
+        // writes log messages to stdout (not stderr), so sending
+        // stdout to /dev/null hides all diagnostic output and may
+        // interfere with the process's initialisation.
+        let stdout = open_log_file("mihomo.log").unwrap_or(Stdio::null());
+        cmd.stdout(stdout).stderr(stderr);
         let child = cmd
             .spawn()
             .map_err(|error| format!("mihomo spawn: {error}"))?;
@@ -1032,6 +1037,10 @@ fn install_firewall_rules(
     tproxy_available: bool,
 ) -> Result<(), String> {
     let port_str = redirect_port.to_string();
+    // TPROXY listener is on redirect_port + 1 (see mihomo_config.rs
+    // for the rationale — redir and tproxy cannot share the same
+    // TCP port).
+    let tproxy_port_str = (redirect_port + 1).to_string();
     let comment = "-m comment --comment hincyray";
 
     // ── nat table: TCP REDIRECT ──
@@ -1340,7 +1349,7 @@ fn install_firewall_rules(
                 "--on-ip",
                 "127.0.0.1",
                 "--on-port",
-                &port_str,
+                &tproxy_port_str,
                 "--tproxy-mark",
                 "0x111",
             ])
@@ -1489,6 +1498,7 @@ fn generate_ndm_hook_script(
     tproxy_available: bool,
 ) -> String {
     let port_str = redirect_port.to_string();
+    let tproxy_port_str = (redirect_port + 1).to_string();
     let tproxy_section = if tproxy_available {
         format!(
             r##"# ── mangle table: UDP TPROXY ──
@@ -1498,11 +1508,11 @@ iptables -t mangle -A HINCYRAY_UDP -m conntrack --ctstate DNAT -m comment --comm
 iptables -t mangle -A HINCYRAY_UDP -d 192.168.0.0/16 -m comment --comment hincyray -j RETURN
 iptables -t mangle -A HINCYRAY_UDP -d 224.0.0.0/4 -m comment --comment hincyray -j RETURN
 iptables -t mangle -A HINCYRAY_UDP -p udp -m socket --transparent -m comment --comment hincyray -j MARK --set-mark 0x111
-iptables -t mangle -A HINCYRAY_UDP -p udp -m comment --comment hincyray -j TPROXY --on-ip 127.0.0.1 --on-port {port} --tproxy-mark 0x111
+iptables -t mangle -A HINCYRAY_UDP -p udp -m comment --comment hincyray -j TPROXY --on-ip 127.0.0.1 --on-port {tproxy_port} --tproxy-mark 0x111
 iptables -t mangle -D PREROUTING -m connmark --mark {mark} -p udp -m comment --comment hincyray -j HINCYRAY_UDP 2>/dev/null
 iptables -t mangle -A PREROUTING -m connmark --mark {mark} -p udp -m comment --comment hincyray -j HINCYRAY_UDP
 "##,
-            port = port_str,
+            tproxy_port = tproxy_port_str,
             mark = mark
         )
     } else {
@@ -1685,7 +1695,7 @@ fn load_state(state_path: &Path) -> HincyrayState {
     let Ok(text) = fs::read_to_string(state_path) else {
         return HincyrayState::default();
     };
-    match serde_json::from_str(&text) {
+    let mut state = match serde_json::from_str(&text) {
         Ok(state) => state,
         Err(error) => {
             eprintln!(
@@ -1698,7 +1708,13 @@ fn load_state(state_path: &Path) -> HincyrayState {
             eprintln!("hincyray: corrupted state saved to {}", backup.display());
             HincyrayState::default()
         }
+    };
+    // The transparent proxy requires DNS — force enabled when split
+    // routing is on so the state matches the firewall DNAT rules.
+    if state.split_routing.enabled {
+        state.dns_settings.enabled = true;
     }
+    state
 }
 
 fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String> {
@@ -1864,8 +1880,17 @@ fn geo_dir_from_state(state: &HincyrayState) -> Option<String> {
     if path.is_empty() {
         return None;
     }
+    // `geo_asset_path` is the directory that contains geoip.dat,
+    // geosite.dat, and geoip.metadb — e.g. "/opt/etc/hincyray".
+    // Mihomo's `-d` flag expects exactly this directory, not its
+    // parent.  If the path points to a file (not a directory), fall
+    // back to its parent.
     let p = Path::new(path);
-    p.parent().map(|p| p.to_string_lossy().into_owned())
+    if p.is_dir() {
+        Some(path.to_owned())
+    } else {
+        p.parent().map(|p| p.to_string_lossy().into_owned())
+    }
 }
 
 fn normalize_route_items(items: &[String]) -> Vec<String> {
@@ -3226,6 +3251,11 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
     let mut inner = lock(&daemon.inner);
     if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
         inner.state.split_routing.enabled = v;
+        // Transparent proxy requires DNS — force enabled alongside
+        // split routing so the state matches the firewall DNAT rules.
+        if v {
+            inner.state.dns_settings.enabled = true;
+        }
     }
     if let Some(v) = value.get("auto_switch").and_then(Value::as_bool) {
         inner.state.split_routing.auto_switch = v;
@@ -7725,6 +7755,67 @@ mod tests {
         assert_eq!(status, 200);
         let config: Value = serde_yaml::from_str(&body).expect("parse config");
         assert!(config.get("dns").is_some());
+    }
+
+    #[test]
+    fn split_routing_config_always_includes_dns_even_when_disabled() {
+        // The transparent proxy requires DNS — the firewall DNATs DNS
+        // to port 1053 unconditionally, so the Mihomo config must always
+        // include the DNS listener, regardless of `dns.enabled`.
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.dns_settings.enabled = false; // explicitly disabled
+        }
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let dns = config
+            .get("dns")
+            .expect("dns section must always be present in router config");
+        assert_eq!(
+            dns.get("enable").and_then(Value::as_bool),
+            Some(true),
+            "dns.enable must be true in generated config"
+        );
+        assert_eq!(
+            dns.get("listen").and_then(Value::as_str),
+            Some("0.0.0.0:1053"),
+            "dns listener must be on port 1053 to match firewall DNAT"
+        );
+    }
+
+    #[test]
+    fn load_state_forces_dns_enabled_when_split_routing_on() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let state = HincyrayState {
+            split_routing: SplitRoutingSettings {
+                enabled: true,
+                ..Default::default()
+            },
+            dns_settings: DnsSettings {
+                enabled: false, // explicitly disabled
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        fs::write(
+            &state_path,
+            serde_json::to_string(&state).expect("serialize"),
+        )
+        .expect("write");
+        let loaded = load_state(&state_path);
+        assert!(
+            loaded.dns_settings.enabled,
+            "load_state must force dns_settings.enabled=true when split routing is on"
+        );
     }
 
     // ── Subscription replace / delete tests ───────────────────────────
