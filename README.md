@@ -1,4 +1,4 @@
-# HincyRay v0.12.0
+# HincyRay v0.14.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,25 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.14.0
+
+- **Rule Trace**: `POST /api/routing/trace` explains local routing decisions for host/IP/port/protocol/source IP requests. Runtime-owned `geosite:*`, `geoip:*`, and `rule-set:*` matches are reported as Mihomo evaluation candidates instead of being guessed locally.
+- **Sub-Store Lite**: lightweight parsed-profile cleanup with include/exclude filters, rename rules, dedup by protocol/address/port, sorting by name/group/protocol/address/score/latency, and backup-before-apply. `GET/POST /api/substore-lite`, `POST /api/substore-lite/apply`.
+- **Smart Auto-Select 2.0**: EWMA score/latency/download metrics, minimum-success gating, failure penalty, and cooldown for failing profiles. Configured through `/api/auto-settings`.
+- **Backups and WebDAV**: local state backups with create/list/restore/delete plus WebDAV upload/download. Restore validates state JSON, creates a pre-restore backup, then regenerates runtime config safely.
+- **Diagnostics & Recovery**: web panel section for rule trace, DNS diagnostics, unlock checks, Sub-Store Lite, backups, WebDAV, and connection closing.
+- **Unlock checker + DNS diagnostics**: `POST /api/unlock-check` probes common services; `GET /api/dns/diagnostics` checks local resolver behavior and Mihomo DNS/API availability.
+- **Scheduled maintenance**: watchdog can periodically create backups, refresh subscriptions, restart Mihomo, and close connections.
+- **Connection control**: `POST /api/mihomo-api/connections/close` closes all connections or filters by connection id, host, or source IP.
+- **External Controller wildcard fix**: daemon dials loopback for wildcard EC binds (`0.0.0.0`, `[::]`, `:port`). RU Direct presets now use `geoip:RU` only to avoid missing `geosite:ru` datasets.
+
+### v0.13.0
+
+- **REJECT routing target**: block matching domains, IPs, ports, or device routes with Mihomo `REJECT`.
+- **Routing presets**: RU Direct, Ad Block, Only Web VPN, Block Social, RU Direct + Ad Block. `GET /api/routing-presets`, `POST /api/routing-presets/apply`.
+- **Web UI authentication**: login/password settings with in-memory session tokens and Bearer auth support.
+- **Mihomo desktop benchmark backend**: desktop diagnostics use Mihomo for all supported protocols, including WireGuard and TUIC.
 
 ### v0.12.0
 
@@ -122,7 +141,7 @@ Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN eve
 
 ### Desktop (macOS)
 
-- `sing-box` and `xray` in `PATH` (`brew install sing-box xray`)
+- `mihomo` in `PATH` for desktop benchmarking.
 
 ## Build
 
@@ -143,8 +162,9 @@ cargo build --release --bin xray-vpn-test
 ### Quality gates
 
 ```bash
-cargo fmt
-cargo test          # 254 tests
+cargo fmt --all
+cargo check --all-targets --all-features
+cargo test --all-targets --all-features   # 288 tests
 cargo clippy --all-targets --all-features   # 0 warnings
 ```
 
@@ -166,7 +186,7 @@ See [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md) for m
 http://<router-ip>:8088/
 ```
 
-Status, profiles, benchmark, import, subscriptions, routing rules, per-device routing, firewall controls, DNS, HWID, system monitor, Mihomo update, Mihomo features, proxy status, traffic & connections, logs — all in one page. Auto-refreshes every 5 seconds. No external CDN or build step.
+Status, profiles, benchmark, import, subscriptions, routing rules, per-device routing, firewall controls, DNS, diagnostics, backups, HWID, system monitor, Mihomo update, Mihomo features, proxy status, traffic & connections, logs — all in one page. Auto-refreshes every 5 seconds. No external CDN or build step.
 
 ### Environment overrides
 
@@ -208,6 +228,9 @@ Status, profiles, benchmark, import, subscriptions, routing rules, per-device ro
 | `POST` | `/api/routing/settings` | Save routing settings |
 | `POST` | `/api/routing/rules` | Save routing rules |
 | `POST` | `/api/routing/apply` | Regenerate config + restart core + restart firewall |
+| `GET` | `/api/routing-presets` | Built-in routing presets |
+| `POST` | `/api/routing-presets/apply` | Apply a routing preset |
+| `POST` | `/api/routing/trace` | Explain local routing decision for a host/IP/port/source request |
 | `GET` | `/api/routing/firewall-status` | Firewall/iptables/ndm-hook health check |
 | `POST` | `/api/routing/firewall-start` | Start firewall |
 | `POST` | `/api/routing/firewall-stop` | Stop firewall |
@@ -219,6 +242,7 @@ Status, profiles, benchmark, import, subscriptions, routing rules, per-device ro
 | `GET` | `/api/dns` | DNS anti-leak settings |
 | `POST` | `/api/dns` | Save DNS settings |
 | `GET` | `/api/dns/leak-test` | DNS leak test |
+| `GET` | `/api/dns/diagnostics` | Resolver + Mihomo DNS diagnostics |
 | `GET` | `/api/logs` | Mihomo log tail (last 200 lines) |
 | `GET` | `/api/system` | CPU/RAM/temp/load/uptime |
 | `GET` | `/api/auto-settings` | Auto-select, auto-switch, auto-benchmark, auto-refresh settings |
@@ -233,10 +257,25 @@ Status, profiles, benchmark, import, subscriptions, routing rules, per-device ro
 | `POST` | `/api/mihomo-features` | Save MihomoFeatures config |
 | `GET` | `/api/mihomo-api/proxies` | Forward `GET /proxies` to Mihomo REST API |
 | `GET` | `/api/mihomo-api/connections` | Forward `GET /connections` to Mihomo REST API |
+| `POST` | `/api/mihomo-api/connections/close` | Close all/filter-matched Mihomo connections |
 | `POST` | `/api/mihomo-api/delay` | Test proxy delay via Mihomo API |
 | `GET` | `/api/mihomo-api/traffic` | Forward `GET /traffic` to Mihomo REST API |
 | `GET` | `/api/mihomo-api/memory` | Forward `GET /memory` to Mihomo REST API |
 | `POST` | `/api/mihomo-api/speed-test` | Download 10MB through SOCKS proxy, return Mbps |
+| `POST` | `/api/unlock-check` | Probe common service unlock/connectivity through proxy path |
+| `GET` | `/api/substore-lite` | Sub-Store Lite settings |
+| `POST` | `/api/substore-lite` | Save Sub-Store Lite settings |
+| `POST` | `/api/substore-lite/apply` | Apply Sub-Store Lite cleanup with backup |
+| `GET` | `/api/backups` | List state backups |
+| `POST` | `/api/backups/create` | Create state backup |
+| `POST` | `/api/backups/restore` | Restore a state backup |
+| `POST` | `/api/backups/delete` | Delete a state backup |
+| `POST` | `/api/backups/webdav-upload` | Upload backup to WebDAV |
+| `POST` | `/api/backups/webdav-download` | Download and restore backup from WebDAV |
+| `POST` | `/api/auth/login` | Create Web UI session token |
+| `POST` | `/api/auth/logout` | Destroy Web UI session token |
+| `GET` | `/api/auth-settings` | Web UI authentication settings |
+| `POST` | `/api/auth-settings` | Save Web UI authentication settings |
 | `GET` | `/api/traffic` | Cumulative + real-time traffic statistics |
 | `GET` | `/api/connection-log` | Persisted connection log (cap 500 entries) |
 
@@ -276,6 +315,8 @@ Existing `state.json` from any prior version is automatically migrated:
 - v0.9→v0.10: No state changes (new protocol support only).
 - v0.10→v0.11: `dns_nameserver_policy`, `raw_rules` added to MihomoFeatures.
 - v0.11→v0.12: `auto_refresh_enabled`, `auto_refresh_interval_hours`, `last_auto_refresh_unix`, `traffic_total_up_bytes`, `traffic_total_down_bytes`, `connection_log`, `device_routes` added with defaults.
+- v0.12→v0.13: `web_ui_auth` added with disabled default; routing targets accept `reject`.
+- v0.13→v0.14: `sub_store_lite`, `smart_select`, `maintenance`, and EWMA/cooldown profile stats added with defaults.
 
 No manual intervention required.
 

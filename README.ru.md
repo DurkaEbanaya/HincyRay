@@ -1,4 +1,4 @@
-# HincyRay v0.12.0
+# HincyRay v0.14.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,25 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 Демон `ndm` в Keenetic пересоздаёт все iptables chains при изменениях конфигурации, событиях WAN и обновлении DHCP. HincyRay устанавливает hook-скрипт в `/opt/etc/ndm/netfilter.d/hincyray.sh`, который **ndm вызывает сам** после каждой перезагрузки firewall, переустанавливая все правила атомарно. Watchdog каждые 10 секунд — запасная страховка.
 
 ## Возможности
+
+### v0.14.0
+
+- **Rule Trace**: `POST /api/routing/trace` объясняет локальное решение роутинга для host/IP/port/protocol/source IP. Runtime-матчи `geosite:*`, `geoip:*` и `rule-set:*` помечаются как кандидаты для оценки Mihomo, а не угадываются локально.
+- **Sub-Store Lite**: лёгкая чистка уже распарсенных профилей — include/exclude-фильтры, правила переименования, дедуп по protocol/address/port, сортировка по name/group/protocol/address/score/latency и backup-before-apply. `GET/POST /api/substore-lite`, `POST /api/substore-lite/apply`.
+- **Smart Auto-Select 2.0**: EWMA score/latency/download, минимальное число успешных проверок, штраф за ошибки и cooldown для падающих профилей. Настраивается через `/api/auto-settings`.
+- **Бэкапы и WebDAV**: локальные state-бэкапы create/list/restore/delete плюс WebDAV upload/download. Restore валидирует JSON состояния, создаёт pre-restore backup и безопасно регенерирует runtime-конфиг.
+- **Diagnostics & Recovery**: секция веб-панели для rule trace, DNS diagnostics, unlock checks, Sub-Store Lite, бэкапов, WebDAV и закрытия соединений.
+- **Unlock checker + DNS diagnostics**: `POST /api/unlock-check` проверяет популярные сервисы; `GET /api/dns/diagnostics` проверяет локальный resolver и доступность Mihomo DNS/API.
+- **Scheduled maintenance**: watchdog может периодически создавать backup, обновлять подписки, перезапускать Mihomo и закрывать соединения.
+- **Connection control**: `POST /api/mihomo-api/connections/close` закрывает все соединения или фильтрует по id, host, source IP.
+- **Фикс wildcard External Controller**: демон ходит на loopback при wildcard bind (`0.0.0.0`, `[::]`, `:port`). RU Direct presets теперь используют только `geoip:RU`, чтобы не зависеть от отсутствующего `geosite:ru`.
+
+### v0.13.0
+
+- **REJECT target**: блокировка совпавших доменов, IP, портов или per-device routes через Mihomo `REJECT`.
+- **Routing presets**: RU Direct, Ad Block, Only Web VPN, Block Social, RU Direct + Ad Block. `GET /api/routing-presets`, `POST /api/routing-presets/apply`.
+- **Web UI authentication**: настройки логина/пароля, in-memory session tokens и Bearer auth.
+- **Mihomo backend для desktop benchmark**: десктопная диагностика использует Mihomo для всех поддержанных протоколов, включая WireGuard и TUIC.
 
 ### v0.12.0
 
@@ -122,7 +141,7 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 
 ### Десктоп (macOS)
 
-- `sing-box` и `xray` в `PATH` (`brew install sing-box xray`)
+- `mihomo` в `PATH` для desktop benchmark.
 
 ## Сборка
 
@@ -143,8 +162,9 @@ cargo build --release --bin xray-vpn-test
 ### Проверка качества
 
 ```bash
-cargo fmt
-cargo test          # 254 теста
+cargo fmt --all
+cargo check --all-targets --all-features
+cargo test --all-targets --all-features   # 288 тестов
 cargo clippy --all-targets --all-features   # 0 предупреждений
 ```
 
@@ -166,7 +186,7 @@ sh scripts/hincyray-install.sh
 http://<ip-роутера>:8088/
 ```
 
-Статус, профили, бенчмарк, импорт, подписки, правила роутинга, per-device routing, управление firewall, DNS, HWID, системный монитор, обновление Mihomo, возможности Mihomo, статус прокси, трафик и соединения, логи — всё на одной странице. Автообновление каждые 5 секунд. Без внешних CDN и сборки.
+Статус, профили, бенчмарк, импорт, подписки, правила роутинга, per-device routing, управление firewall, DNS, диагностика, бэкапы, HWID, системный монитор, обновление Mihomo, возможности Mihomo, статус прокси, трафик и соединения, логи — всё на одной странице. Автообновление каждые 5 секунд. Без внешних CDN и сборки.
 
 ### Переменные окружения
 
@@ -208,6 +228,9 @@ http://<ip-роутера>:8088/
 | `POST` | `/api/routing/settings` | Сохранить настройки роутинга |
 | `POST` | `/api/routing/rules` | Сохранить правила роутинга |
 | `POST` | `/api/routing/apply` | Перегенерировать конфиг + перезапуск ядра + перезапуск firewall |
+| `GET` | `/api/routing-presets` | Встроенные routing presets |
+| `POST` | `/api/routing-presets/apply` | Применить routing preset |
+| `POST` | `/api/routing/trace` | Объяснить локальное решение роутинга для host/IP/port/source запроса |
 | `GET` | `/api/routing/firewall-status` | Проверка здоровья firewall/iptables/ndm-hook |
 | `POST` | `/api/routing/firewall-start` | Запустить firewall |
 | `POST` | `/api/routing/firewall-stop` | Остановить firewall |
@@ -219,6 +242,7 @@ http://<ip-роутера>:8088/
 | `GET` | `/api/dns` | Настройки DNS anti-leak |
 | `POST` | `/api/dns` | Сохранить DNS-настройки |
 | `GET` | `/api/dns/leak-test` | Тест на утечку DNS |
+| `GET` | `/api/dns/diagnostics` | Диагностика resolver + Mihomo DNS |
 | `GET` | `/api/logs` | Хвост логов Mihomo (последние 200 строк) |
 | `GET` | `/api/system` | CPU/RAM/temp/load/uptime |
 | `GET` | `/api/auto-settings` | Auto-select, auto-switch, auto-benchmark, auto-refresh настройки |
@@ -233,10 +257,25 @@ http://<ip-роутера>:8088/
 | `POST` | `/api/mihomo-features` | Сохранить конфиг MihomoFeatures |
 | `GET` | `/api/mihomo-api/proxies` | Проксирование `GET /proxies` на Mihomo REST API |
 | `GET` | `/api/mihomo-api/connections` | Проксирование `GET /connections` на Mihomo REST API |
+| `POST` | `/api/mihomo-api/connections/close` | Закрыть все/отфильтрованные соединения Mihomo |
 | `POST` | `/api/mihomo-api/delay` | Тест delay прокси через Mihomo API |
 | `GET` | `/api/mihomo-api/traffic` | Проксирование `GET /traffic` на Mihomo REST API |
 | `GET` | `/api/mihomo-api/memory` | Проксирование `GET /memory` на Mihomo REST API |
 | `POST` | `/api/mihomo-api/speed-test` | Скачать 10 МБ через SOCKS-прокси, вернуть Mbps |
+| `POST` | `/api/unlock-check` | Проверить доступность популярных сервисов через proxy path |
+| `GET` | `/api/substore-lite` | Настройки Sub-Store Lite |
+| `POST` | `/api/substore-lite` | Сохранить настройки Sub-Store Lite |
+| `POST` | `/api/substore-lite/apply` | Применить Sub-Store Lite cleanup с backup |
+| `GET` | `/api/backups` | Список state-бэкапов |
+| `POST` | `/api/backups/create` | Создать state backup |
+| `POST` | `/api/backups/restore` | Восстановить state backup |
+| `POST` | `/api/backups/delete` | Удалить state backup |
+| `POST` | `/api/backups/webdav-upload` | Загрузить backup в WebDAV |
+| `POST` | `/api/backups/webdav-download` | Скачать и восстановить backup из WebDAV |
+| `POST` | `/api/auth/login` | Создать session token веб-панели |
+| `POST` | `/api/auth/logout` | Удалить session token веб-панели |
+| `GET` | `/api/auth-settings` | Настройки Web UI authentication |
+| `POST` | `/api/auth-settings` | Сохранить настройки Web UI authentication |
 | `GET` | `/api/traffic` | Накопительная + realtime статистика трафика |
 | `GET` | `/api/connection-log` | Сохраняемый лог соединений (лимит 500 записей) |
 
@@ -276,6 +315,8 @@ http://<ip-роутера>:8088/
 - v0.9→v0.10: изменений state нет (только поддержка новых протоколов).
 - v0.10→v0.11: `dns_nameserver_policy`, `raw_rules` добавлены в MihomoFeatures.
 - v0.11→v0.12: `auto_refresh_enabled`, `auto_refresh_interval_hours`, `last_auto_refresh_unix`, `traffic_total_up_bytes`, `traffic_total_down_bytes`, `connection_log`, `device_routes` добавлены со значениями по умолчанию.
+- v0.12→v0.13: добавлен `web_ui_auth` с disabled default; routing targets принимают `reject`.
+- v0.13→v0.14: добавлены `sub_store_lite`, `smart_select`, `maintenance` и EWMA/cooldown profile stats со значениями по умолчанию.
 
 Ручное вмешательство не требуется.
 

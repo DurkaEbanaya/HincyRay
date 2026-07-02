@@ -10,7 +10,7 @@
 //! Mihomo config path: alongside state. Override with `HINCYRAY_MIHOMO_CONFIG`.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
@@ -48,6 +48,7 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_SAMPLES: usize = 1000;
 const MAX_CONNECTION_LOG: usize = 500;
+const MAX_BACKUPS: usize = 20;
 
 /// Global shutdown flag set by the SIGTERM/SIGINT handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -477,6 +478,15 @@ pub struct HincyrayState {
     /// v0.13: Web UI authentication (login/password).
     #[serde(default)]
     pub web_ui_auth: WebUiAuth,
+    /// v0.14: Sub-Store Lite profile cleanup pipeline.
+    #[serde(default)]
+    pub sub_store_lite: SubStoreLiteSettings,
+    /// v0.14: rolling health based auto-selection settings.
+    #[serde(default)]
+    pub smart_select: SmartSelectSettings,
+    /// v0.14: scheduled maintenance window settings.
+    #[serde(default)]
+    pub maintenance: MaintenanceSettings,
 }
 
 impl Default for HincyrayState {
@@ -513,8 +523,131 @@ impl Default for HincyrayState {
             mihomo_version: None,
             mihomo_features: MihomoFeatures::default(),
             web_ui_auth: WebUiAuth::default(),
+            sub_store_lite: SubStoreLiteSettings::default(),
+            smart_select: SmartSelectSettings::default(),
+            maintenance: MaintenanceSettings::default(),
         }
     }
+}
+
+/// v0.14: lightweight subscription cleanup inspired by Sub-Store.
+/// This intentionally works on already parsed profiles: it never rewrites
+/// share-link internals, so protocol-specific builders keep their existing
+/// contract and cannot drift from profile parsing.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SubStoreLiteSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Case-insensitive contains filters separated by `|`. Empty = keep all.
+    #[serde(default)]
+    pub include_filter: String,
+    /// Case-insensitive contains filters separated by `|`. Empty = exclude none.
+    #[serde(default)]
+    pub exclude_filter: String,
+    #[serde(default)]
+    pub rename_rules: Vec<SubStoreRenameRule>,
+    #[serde(default = "default_true")]
+    pub deduplicate: bool,
+    /// `name`, `group`, `protocol`, `address`, `score`, or `latency`.
+    #[serde(default = "default_substore_sort")]
+    pub sort_by: String,
+    #[serde(default)]
+    pub last_applied_unix: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_substore_sort() -> String {
+    "name".to_owned()
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SubStoreRenameRule {
+    pub from: String,
+    pub to: String,
+}
+
+/// v0.14: rolling health state added to `ProfileStats`. The old fields
+/// remain the source of truth for legacy score tables; these fields provide
+/// a smoothed selector that resists one-off fast/failed probes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SmartSelectSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_smart_min_successes")]
+    pub min_successes: u32,
+    #[serde(default = "default_smart_cooldown_secs")]
+    pub cooldown_secs: u64,
+    #[serde(default = "default_smart_failure_penalty")]
+    pub failure_penalty: f32,
+}
+
+impl Default for SmartSelectSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_successes: default_smart_min_successes(),
+            cooldown_secs: default_smart_cooldown_secs(),
+            failure_penalty: default_smart_failure_penalty(),
+        }
+    }
+}
+
+fn default_smart_min_successes() -> u32 {
+    1
+}
+
+fn default_smart_cooldown_secs() -> u64 {
+    300
+}
+
+fn default_smart_failure_penalty() -> f32 {
+    25.0
+}
+
+/// v0.14: daily/periodic maintenance actions performed by the watchdog.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MaintenanceSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub hour_utc: u8,
+    #[serde(default)]
+    pub minute_utc: u8,
+    #[serde(default = "default_maintenance_interval_days")]
+    pub interval_days: u32,
+    #[serde(default = "default_true")]
+    pub create_backup: bool,
+    #[serde(default)]
+    pub refresh_subscriptions: bool,
+    #[serde(default = "default_true")]
+    pub restart_core: bool,
+    #[serde(default)]
+    pub close_connections: bool,
+    #[serde(default)]
+    pub last_run_unix: u64,
+}
+
+impl Default for MaintenanceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hour_utc: 4,
+            minute_utc: 0,
+            interval_days: default_maintenance_interval_days(),
+            create_backup: true,
+            refresh_subscriptions: false,
+            restart_core: true,
+            close_connections: false,
+            last_run_unix: 0,
+        }
+    }
+}
+
+fn default_maintenance_interval_days() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -578,23 +711,14 @@ fn routing_presets() -> Vec<RoutingPreset> {
         RoutingPreset {
             id: "ru-direct",
             name: "RU Direct",
-            description: "Russian traffic goes direct, rest through VPN",
-            rules: vec![
-                RoutingRule {
-                    enabled: true,
-                    name: "RU domains direct".to_owned(),
-                    target: "direct".to_owned(),
-                    domains: vec!["geosite:ru".to_owned()],
-                    ..Default::default()
-                },
-                RoutingRule {
-                    enabled: true,
-                    name: "RU IPs direct".to_owned(),
-                    target: "direct".to_owned(),
-                    ips: vec!["geoip:RU".to_owned()],
-                    ..Default::default()
-                },
-            ],
+            description: "Russian destination IPs go direct, rest through VPN",
+            rules: vec![RoutingRule {
+                enabled: true,
+                name: "RU IPs direct".to_owned(),
+                target: "direct".to_owned(),
+                ips: vec!["geoip:RU".to_owned()],
+                ..Default::default()
+            }],
             port_mode: None,
             proxy_ports: vec![],
         },
@@ -641,15 +765,8 @@ fn routing_presets() -> Vec<RoutingPreset> {
         RoutingPreset {
             id: "ru-direct-ad-block",
             name: "RU Direct + Ad Block",
-            description: "Russian traffic direct + block ads",
+            description: "Russian destination IPs direct + block ads",
             rules: vec![
-                RoutingRule {
-                    enabled: true,
-                    name: "RU domains direct".to_owned(),
-                    target: "direct".to_owned(),
-                    domains: vec!["geosite:ru".to_owned()],
-                    ..Default::default()
-                },
                 RoutingRule {
                     enabled: true,
                     name: "RU IPs direct".to_owned(),
@@ -706,6 +823,16 @@ pub struct ProfileStats {
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_checked_unix: u64,
+    #[serde(default)]
+    pub ewma_score: f32,
+    #[serde(default)]
+    pub ewma_latency_ms: f32,
+    #[serde(default)]
+    pub ewma_download_mbps: f32,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub cooldown_until_unix: u64,
 }
 
 /// WiFi split-routing controls. Traffic from devices assigned to the
@@ -2392,6 +2519,8 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
                 "hwid": inner.state.hwid_config.hwid,
                 "proxy_group_enabled": inner.state.mihomo_features.proxy_group.enabled,
                 "ec_enabled": inner.state.mihomo_features.external_controller.enabled,
+                "smart_select": inner.state.smart_select,
+                "maintenance": inner.state.maintenance,
             });
             (200, "application/json", response.to_string())
         }
@@ -2451,12 +2580,14 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/routing/apply") => handle_routing_apply(daemon),
         ("GET", "/api/routing-presets") => handle_routing_presets_list(),
         ("POST", "/api/routing-presets/apply") => handle_routing_preset_apply(body, daemon),
+        ("POST", "/api/routing/trace") => handle_routing_trace(body, daemon),
         ("GET", "/api/routing/firewall-status") => handle_firewall_status(daemon),
         ("POST", "/api/routing/firewall-start") => handle_firewall_start(daemon),
         ("POST", "/api/routing/firewall-stop") => handle_firewall_stop(daemon),
         ("GET", "/api/dns") => handle_dns_get(daemon),
         ("POST", "/api/dns") => handle_dns_set(body, daemon),
         ("GET", "/api/dns/leak-test") => handle_dns_leak_test(daemon),
+        ("GET", "/api/dns/diagnostics") => handle_dns_diagnostics(daemon),
         ("GET", "/api/logs") => handle_logs(daemon),
         ("GET", "/api/system") => handle_system(daemon),
         ("GET", "/api/auto-settings") => handle_auto_settings_get(daemon),
@@ -2471,6 +2602,9 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/mihomo-features") => handle_mihomo_features_set(body, daemon),
         ("GET", "/api/mihomo-api/proxies") => handle_mihomo_api_proxies(daemon),
         ("GET", "/api/mihomo-api/connections") => handle_mihomo_api_connections(daemon),
+        ("POST", "/api/mihomo-api/connections/close") => {
+            handle_mihomo_api_connections_close(body, daemon)
+        }
         ("POST", "/api/mihomo-api/delay") => handle_mihomo_api_delay(body, daemon),
         ("GET", "/api/mihomo-api/traffic") => handle_mihomo_api_traffic(daemon),
         ("GET", "/api/mihomo-api/memory") => handle_mihomo_api_memory(daemon),
@@ -2482,6 +2616,16 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/devices") => handle_devices_scan(daemon),
         ("POST", "/api/device-routes/apply") => handle_device_routes_apply(daemon),
         ("POST", "/api/mihomo-api/speed-test") => handle_speed_test(body, daemon),
+        ("POST", "/api/unlock-check") => handle_unlock_check(body, daemon),
+        ("GET", "/api/substore-lite") => handle_substore_lite_get(daemon),
+        ("POST", "/api/substore-lite") => handle_substore_lite_set(body, daemon),
+        ("POST", "/api/substore-lite/apply") => handle_substore_lite_apply(daemon),
+        ("GET", "/api/backups") => handle_backups_list(daemon),
+        ("POST", "/api/backups/create") => handle_backup_create(daemon),
+        ("POST", "/api/backups/restore") => handle_backup_restore(body, daemon),
+        ("POST", "/api/backups/delete") => handle_backup_delete(body, daemon),
+        ("POST", "/api/backups/webdav-upload") => handle_backup_webdav_upload(body, daemon),
+        ("POST", "/api/backups/webdav-download") => handle_backup_webdav_download(body, daemon),
         ("POST", "/api/auth/login") => handle_auth_login(body, daemon),
         ("POST", "/api/auth/logout") => handle_auth_logout(body, daemon),
         ("GET", "/api/auth-settings") => handle_auth_settings_get(daemon),
@@ -2993,6 +3137,8 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
     };
 
     {
+        let smart_failure_penalty = inner.state.smart_select.failure_penalty;
+        let smart_cooldown_secs = inner.state.smart_select.cooldown_secs;
         let stats_entry = &mut inner.state.stats[stats_idx];
         if result.success {
             stats_entry.last_latency_ms = result.latency_ms;
@@ -3002,8 +3148,14 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
             stats_entry.last_score = result.score;
             stats_entry.last_error = None;
             stats_entry.success_count = stats_entry.success_count.saturating_add(1);
+            stats_entry.consecutive_failures = 0;
+            stats_entry.cooldown_until_unix = 0;
+            update_smart_ewma(stats_entry, &result);
         } else {
             stats_entry.failure_count = stats_entry.failure_count.saturating_add(1);
+            stats_entry.consecutive_failures = stats_entry.consecutive_failures.saturating_add(1);
+            stats_entry.ewma_score = (stats_entry.ewma_score - smart_failure_penalty).max(0.0);
+            stats_entry.cooldown_until_unix = now.saturating_add(smart_cooldown_secs);
             stats_entry.last_error = result.error.clone();
         }
         stats_entry.last_checked_unix = now;
@@ -3056,6 +3208,11 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
                 "failure_count": stat.map(|s| s.failure_count).unwrap_or(0),
                 "last_error": stat.and_then(|s| s.last_error.clone()),
                 "last_checked": stat.map(|s| s.last_checked_unix).unwrap_or(0),
+                "ewma_score": stat.map(|s| s.ewma_score).unwrap_or(0.0),
+                "ewma_latency_ms": stat.map(|s| s.ewma_latency_ms).unwrap_or(0.0),
+                "ewma_download_mbps": stat.map(|s| s.ewma_download_mbps).unwrap_or(0.0),
+                "consecutive_failures": stat.map(|s| s.consecutive_failures).unwrap_or(0),
+                "cooldown_until_unix": stat.map(|s| s.cooldown_until_unix).unwrap_or(0),
             })
         })
         .collect();
@@ -3072,6 +3229,21 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
         "profiles_count": profiles.len(),
     });
     (200, "application/json", response.to_string())
+}
+
+fn update_smart_ewma(stats: &mut ProfileStats, result: &BenchResult) {
+    const ALPHA: f32 = 0.35;
+    stats.ewma_score = ewma(stats.ewma_score, result.score as f32, ALPHA);
+    stats.ewma_latency_ms = ewma(stats.ewma_latency_ms, result.latency_ms as f32, ALPHA);
+    stats.ewma_download_mbps = ewma(stats.ewma_download_mbps, result.download_mbps, ALPHA);
+}
+
+fn ewma(previous: f32, sample: f32, alpha: f32) -> f32 {
+    if previous <= 0.0 {
+        sample
+    } else {
+        previous.mul_add(1.0 - alpha, sample * alpha)
+    }
 }
 
 fn handle_profile_block_quic(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
@@ -4135,6 +4307,268 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
     )
 }
 
+fn handle_routing_trace(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let request = TraceRequest {
+        host: value
+            .get("host")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase(),
+        ip: value
+            .get("ip")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned(),
+        source_ip: value
+            .get("source_ip")
+            .or_else(|| value.get("src_ip"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned(),
+        port: value.get("port").and_then(Value::as_u64).map(|p| p as u16),
+        network: value
+            .get("network")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase(),
+    };
+    let inner = lock(&daemon.inner);
+    let trace = trace_routing_decision(&inner.state, &request);
+    (200, "application/json", trace.to_string())
+}
+
+#[derive(Clone, Debug)]
+struct TraceRequest {
+    host: String,
+    ip: String,
+    source_ip: String,
+    port: Option<u16>,
+    network: String,
+}
+
+fn trace_routing_decision(state: &HincyrayState, request: &TraceRequest) -> Value {
+    let mut candidates: Vec<Value> = Vec::new();
+
+    for route in state.device_routes.iter().filter(|route| route.enabled) {
+        if !route.ip.trim().is_empty() && route.ip.trim() == request.source_ip {
+            return json!({
+                "decision": "matched",
+                "source": "device_route",
+                "name": route.name,
+                "target": route.target,
+                "reason": format!("source IP {} matches device route", request.source_ip),
+                "candidates": candidates,
+            });
+        }
+    }
+
+    for (idx, rule) in state
+        .routing_rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.enabled)
+    {
+        let port_ok = trace_ports_match(rule, request.port);
+        let network_ok = trace_network_matches(rule, &request.network);
+        if !port_ok || !network_ok {
+            continue;
+        }
+
+        let domain_match = trace_domain_match(rule, &request.host);
+        let ip_match = trace_ip_match(rule, &request.ip, &request.source_ip);
+        if domain_match.exact || ip_match.exact {
+            return json!({
+                "decision": "matched",
+                "source": "routing_rule",
+                "rule_index": idx,
+                "name": rule.name,
+                "target": rule.target,
+                "reason": domain_match.reason.or(ip_match.reason).unwrap_or_else(|| "rule matched".to_owned()),
+                "candidates": candidates,
+            });
+        }
+        if domain_match.possible || ip_match.possible {
+            candidates.push(json!({
+                "rule_index": idx,
+                "name": rule.name,
+                "target": rule.target,
+                "reason": domain_match.reason.or(ip_match.reason).unwrap_or_else(|| "requires Mihomo geo/rule-set evaluation".to_owned()),
+            }));
+        }
+    }
+
+    json!({
+        "decision": if candidates.is_empty() { "default" } else { "requires_mihomo_geo_eval" },
+        "target": "active",
+        "reason": if candidates.is_empty() {
+            "no exact local rule matched"
+        } else {
+            "candidate geosite/geoip/rule-set rules require Mihomo runtime assets"
+        },
+        "candidates": candidates,
+    })
+}
+
+#[derive(Default)]
+struct TraceMatch {
+    exact: bool,
+    possible: bool,
+    reason: Option<String>,
+}
+
+fn trace_ports_match(rule: &RoutingRule, port: Option<u16>) -> bool {
+    if rule.ports.is_empty() {
+        return true;
+    }
+    let Some(port) = port else {
+        return false;
+    };
+    rule.ports.iter().any(|spec| port_matches_spec(port, spec))
+}
+
+fn port_matches_spec(port: u16, spec: &str) -> bool {
+    let spec = spec.trim();
+    if let Some((start, end)) = spec.split_once('-') {
+        let Ok(start) = start.trim().parse::<u16>() else {
+            return false;
+        };
+        let Ok(end) = end.trim().parse::<u16>() else {
+            return false;
+        };
+        return start <= port && port <= end;
+    }
+    spec.parse::<u16>().map(|p| p == port).unwrap_or(false)
+}
+
+fn trace_network_matches(rule: &RoutingRule, network: &str) -> bool {
+    let wanted = rule.network.trim().to_ascii_lowercase();
+    wanted.is_empty() || network.is_empty() || wanted == network
+}
+
+fn trace_domain_match(rule: &RoutingRule, host: &str) -> TraceMatch {
+    let mut items = normalize_route_items(&rule.domains);
+    for service in &rule.services {
+        let service = service.trim().trim_start_matches("geosite:");
+        if !service.is_empty() {
+            items.push(format!("geosite:{service}"));
+        }
+    }
+    if items.is_empty() && !rule.pattern.trim().is_empty() && rule.kind != "ip" {
+        items.push(rule.pattern.trim().to_owned());
+    }
+    for item in items {
+        let low = item.to_ascii_lowercase();
+        if low.starts_with("geosite:") || low.starts_with("rule-set:") {
+            return TraceMatch {
+                possible: true,
+                reason: Some(format!("{item} requires Mihomo runtime rule assets")),
+                ..Default::default()
+            };
+        }
+        let needle = low
+            .trim_start_matches("domain:")
+            .trim_start_matches("suffix:")
+            .trim_start_matches("keyword:")
+            .trim_start_matches("wildcard:")
+            .trim_start_matches("regex:")
+            .trim_start_matches('.')
+            .to_owned();
+        if host == needle || host.ends_with(&format!(".{needle}")) || host.contains(&needle) {
+            return TraceMatch {
+                exact: true,
+                reason: Some(format!("host {host} matches {item}")),
+                ..Default::default()
+            };
+        }
+    }
+    TraceMatch::default()
+}
+
+fn trace_ip_match(rule: &RoutingRule, ip: &str, source_ip: &str) -> TraceMatch {
+    let mut items = normalize_route_items(&rule.ips);
+    if items.is_empty()
+        && !rule.pattern.trim().is_empty()
+        && (rule.kind == "ip" || rule.kind == "geoip")
+    {
+        items.push(rule.pattern.trim().to_owned());
+    }
+    for item in items {
+        let low = item.to_ascii_lowercase();
+        if low.starts_with("geoip:") || low.starts_with("ip-asn:") || low.starts_with("src-geoip:")
+        {
+            return TraceMatch {
+                possible: true,
+                reason: Some(format!("{item} requires Mihomo geo database")),
+                ..Default::default()
+            };
+        }
+        let is_src = low.starts_with("src-ip-cidr:");
+        let target_ip = if is_src { source_ip } else { ip };
+        let cidr = low
+            .trim_start_matches("src-ip-cidr:")
+            .trim_start_matches("ip-cidr:")
+            .trim_start_matches("ip:");
+        if !target_ip.is_empty() && ip_matches_cidr_text(target_ip, cidr) {
+            return TraceMatch {
+                exact: true,
+                reason: Some(format!("IP {target_ip} matches {item}")),
+                ..Default::default()
+            };
+        }
+    }
+    TraceMatch::default()
+}
+
+fn ip_matches_cidr_text(ip: &str, cidr: &str) -> bool {
+    if let Some((base, prefix)) = cidr.split_once('/') {
+        let Ok(prefix) = prefix.parse::<u8>() else {
+            return false;
+        };
+        return ipv4_in_cidr(ip, base, prefix);
+    }
+    ip == cidr
+}
+
+fn ipv4_in_cidr(ip: &str, base: &str, prefix: u8) -> bool {
+    let Some(ip_num) = ipv4_to_u32(ip) else {
+        return false;
+    };
+    let Some(base_num) = ipv4_to_u32(base) else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (ip_num & mask) == (base_num & mask)
+}
+
+fn ipv4_to_u32(ip: &str) -> Option<u32> {
+    let mut out = 0u32;
+    let mut count = 0u8;
+    for part in ip.split('.') {
+        let octet = part.parse::<u8>().ok()?;
+        out = (out << 8) | u32::from(octet);
+        count += 1;
+    }
+    (count == 4).then_some(out)
+}
+
 fn handle_firewall_status(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
     let fw_active = inner.firewall.is_running();
@@ -4461,6 +4895,8 @@ fn handle_auto_settings_get(daemon: &Daemon) -> (u16, &'static str, String) {
             "auto_refresh_enabled": inner.state.auto_refresh_enabled,
             "auto_refresh_interval_hours": inner.state.auto_refresh_interval_hours,
             "last_auto_refresh_unix": inner.state.last_auto_refresh_unix,
+            "smart_select": inner.state.smart_select,
+            "maintenance": inner.state.maintenance,
         })
         .to_string(),
     )
@@ -4497,6 +4933,12 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
     {
         inner.state.auto_refresh_interval_hours = v as u32;
     }
+    if let Some(smart) = value.get("smart_select") {
+        apply_smart_settings(&mut inner.state.smart_select, smart);
+    }
+    if let Some(maintenance) = value.get("maintenance") {
+        apply_maintenance_settings(&mut inner.state.maintenance, maintenance);
+    }
     let _ = persist_state(&daemon.state_path, &inner.state);
     (
         200,
@@ -4507,9 +4949,53 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
             "auto_switch": inner.state.split_routing.auto_switch,
             "auto_refresh_enabled": inner.state.auto_refresh_enabled,
             "auto_refresh_interval_hours": inner.state.auto_refresh_interval_hours,
+            "smart_select": inner.state.smart_select,
+            "maintenance": inner.state.maintenance,
         })
         .to_string(),
     )
+}
+
+fn apply_smart_settings(settings: &mut SmartSelectSettings, value: &Value) {
+    if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
+        settings.enabled = v;
+    }
+    if let Some(v) = value.get("min_successes").and_then(Value::as_u64) {
+        settings.min_successes = (v as u32).max(1);
+    }
+    if let Some(v) = value.get("cooldown_secs").and_then(Value::as_u64) {
+        settings.cooldown_secs = v;
+    }
+    if let Some(v) = value.get("failure_penalty").and_then(Value::as_f64) {
+        settings.failure_penalty = (v as f32).clamp(0.0, 1000.0);
+    }
+}
+
+fn apply_maintenance_settings(settings: &mut MaintenanceSettings, value: &Value) {
+    if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
+        settings.enabled = v;
+    }
+    if let Some(v) = value.get("hour_utc").and_then(Value::as_u64) {
+        settings.hour_utc = (v as u8).min(23);
+    }
+    if let Some(v) = value.get("minute_utc").and_then(Value::as_u64) {
+        settings.minute_utc = (v as u8).min(59);
+    }
+    if let Some(v) = value.get("interval_days").and_then(Value::as_u64) {
+        settings.interval_days = (v as u32).max(1);
+    }
+    if let Some(v) = value.get("create_backup").and_then(Value::as_bool) {
+        settings.create_backup = v;
+    }
+    if let Some(v) = value.get("refresh_subscriptions").and_then(Value::as_bool) {
+        settings.refresh_subscriptions = v;
+    }
+    if let Some(v) = value.get("restart_core").and_then(Value::as_bool) {
+        settings.restart_core = v;
+    }
+    if let Some(v) = value.get("close_connections").and_then(Value::as_bool) {
+        settings.close_connections = v;
+    }
 }
 
 /// Return the current MihomoFeatures configuration.
@@ -4602,6 +5088,117 @@ fn handle_mihomo_api_connections(daemon: &Daemon) -> (u16, &'static str, String)
             json!({"error": format!("Mihomo API: {e}")}).to_string(),
         ),
     }
+}
+
+/// Close Mihomo connections. Body:
+/// - `{ "scope": "all" }` closes all connections via verified `DELETE /connections`.
+/// - `{ "id": "..." }` closes one observed connection id.
+/// - `{ "host": "example.com" }` or `{ "source_ip": "192.168.2.35" }`
+///   first reads `/connections`, filters by observed metadata, then closes
+///   matching ids. The UI never has to predict connection ids for grouped
+///   operations.
+fn handle_mihomo_api_connections_close(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let (addr, secret) = match mihomo_controller_for_daemon(daemon) {
+        Ok(ec) => ec,
+        Err(response) => return response,
+    };
+    let value = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({"scope":"all"}));
+    let scope = value.get("scope").and_then(Value::as_str).unwrap_or("");
+    if scope == "all" || value == json!({}) {
+        return match mihomo_api_delete(&addr, secret.as_deref(), "/connections") {
+            Ok(status) => (
+                200,
+                "application/json",
+                json!({"closed": "all", "mihomo_status": status}).to_string(),
+            ),
+            Err(error) => (
+                502,
+                "application/json",
+                json!({"error": format!("Mihomo API: {error}")}).to_string(),
+            ),
+        };
+    }
+
+    let ids = if let Some(id) = value.get("id").and_then(Value::as_str) {
+        vec![id.to_owned()]
+    } else {
+        let Ok(conns) = mihomo_api_get_json(&addr, secret.as_deref(), "/connections") else {
+            return (
+                502,
+                "application/json",
+                json!({"error": "could not read Mihomo connections"}).to_string(),
+            );
+        };
+        filter_connection_ids(
+            &conns,
+            value.get("host").and_then(Value::as_str),
+            value.get("source_ip").and_then(Value::as_str),
+        )
+    };
+
+    let mut closed = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for id in ids {
+        let path = format!(
+            "/connections/{}",
+            utf8_percent_encode(&id, NON_ALPHANUMERIC)
+        );
+        match mihomo_api_delete(&addr, secret.as_deref(), &path) {
+            Ok(_) => closed += 1,
+            Err(error) => errors.push(format!("{id}: {error}")),
+        }
+    }
+    (
+        if errors.is_empty() { 200 } else { 207 },
+        "application/json",
+        json!({"closed": closed, "errors": errors}).to_string(),
+    )
+}
+
+fn mihomo_controller_for_daemon(
+    daemon: &Daemon,
+) -> Result<(String, Option<String>), (u16, &'static str, String)> {
+    let inner = lock(&daemon.inner);
+    mihomo_controller(&inner.state.mihomo_features).ok_or_else(|| {
+        (
+            400,
+            "application/json",
+            json!({"error": "external controller not enabled"}).to_string(),
+        )
+    })
+}
+
+fn filter_connection_ids(
+    conns: &Value,
+    host: Option<&str>,
+    source_ip: Option<&str>,
+) -> Vec<String> {
+    let host = host.unwrap_or("").to_ascii_lowercase();
+    let source_ip = source_ip.unwrap_or("");
+    conns
+        .get("connections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|conn| {
+            let metadata = conn.get("metadata")?;
+            let conn_host = metadata
+                .get("host")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let conn_source = metadata
+                .get("sourceIP")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let host_ok =
+                host.is_empty() || conn_host == host || conn_host.ends_with(&format!(".{host}"));
+            let source_ok = source_ip.is_empty() || conn_source == source_ip;
+            (host_ok && source_ok)
+                .then(|| conn.get("id").and_then(Value::as_str).map(str::to_owned))
+                .flatten()
+        })
+        .collect()
 }
 
 /// Forward `GET /proxies/{name}/delay` to the Mihomo external controller.
@@ -4850,6 +5447,723 @@ fn handle_speed_test(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
             json!({"error": format!("request failed: {e}")}).to_string(),
         ),
     }
+}
+
+fn handle_unlock_check(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let (socks_url, core_running) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            format!(
+                "socks5h://{}:{}",
+                inner.state.listen_host, inner.state.socks_port
+            ),
+            inner.core.is_running(),
+        )
+    };
+    if !core_running {
+        return (
+            400,
+            "application/json",
+            json!({"error": "core is not running — start the proxy first"}).to_string(),
+        );
+    }
+    let requested: HashSet<String> = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("services").and_then(Value::as_array).cloned())
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let client = match socks_client(&socks_url, Duration::from_secs(10)) {
+        Ok(client) => client,
+        Err(error) => {
+            return (500, "application/json", json!({"error": error}).to_string());
+        }
+    };
+    let mut results = Vec::new();
+    for probe in unlock_probes() {
+        if !requested.is_empty() && !requested.contains(probe.id) {
+            continue;
+        }
+        let start = std::time::Instant::now();
+        let result = match client.get(probe.url).send() {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let ok = probe.ok_statuses.contains(&status);
+                json!({
+                    "id": probe.id,
+                    "name": probe.name,
+                    "url": probe.url,
+                    "reachable": ok,
+                    "http_status": status,
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                })
+            }
+            Err(error) => json!({
+                "id": probe.id,
+                "name": probe.name,
+                "url": probe.url,
+                "reachable": false,
+                "error": error.to_string(),
+                "elapsed_ms": start.elapsed().as_millis() as u64,
+            }),
+        };
+        results.push(result);
+    }
+    (
+        200,
+        "application/json",
+        json!({"results": results}).to_string(),
+    )
+}
+
+struct UnlockProbe {
+    id: &'static str,
+    name: &'static str,
+    url: &'static str,
+    ok_statuses: &'static [u16],
+}
+
+fn unlock_probes() -> Vec<UnlockProbe> {
+    vec![
+        UnlockProbe {
+            id: "cloudflare",
+            name: "Cloudflare Trace",
+            url: "https://1.1.1.1/cdn-cgi/trace",
+            ok_statuses: &[200],
+        },
+        UnlockProbe {
+            id: "youtube",
+            name: "YouTube",
+            url: "https://www.youtube.com/generate_204",
+            ok_statuses: &[200, 204],
+        },
+        UnlockProbe {
+            id: "netflix",
+            name: "Netflix",
+            url: "https://www.netflix.com/title/80018499",
+            ok_statuses: &[200, 301, 302],
+        },
+        UnlockProbe {
+            id: "openai",
+            name: "OpenAI",
+            url: "https://chat.openai.com/cdn-cgi/trace",
+            ok_statuses: &[200, 403],
+        },
+        UnlockProbe {
+            id: "spotify",
+            name: "Spotify",
+            url: "https://open.spotify.com/",
+            ok_statuses: &[200, 301, 302],
+        },
+    ]
+}
+
+fn socks_client(socks_url: &str, timeout: Duration) -> Result<reqwest::blocking::Client, String> {
+    let proxy = reqwest::Proxy::all(socks_url).map_err(|e| format!("proxy setup: {e}"))?;
+    reqwest::blocking::Client::builder()
+        .proxy(proxy)
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|e| format!("client build: {e}"))
+}
+
+fn handle_substore_lite_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    (
+        200,
+        "application/json",
+        json!({"settings": inner.state.sub_store_lite}).to_string(),
+    )
+}
+
+fn handle_substore_lite_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(settings) = serde_json::from_str::<SubStoreLiteSettings>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid SubStoreLiteSettings JSON"}).to_string(),
+        );
+    };
+    let mut inner = lock(&daemon.inner);
+    inner.state.sub_store_lite = settings;
+    let _ = persist_state(&daemon.state_path, &inner.state);
+    (
+        200,
+        "application/json",
+        json!({"settings": inner.state.sub_store_lite}).to_string(),
+    )
+}
+
+fn handle_substore_lite_apply(daemon: &Daemon) -> (u16, &'static str, String) {
+    let mut inner = lock(&daemon.inner);
+    let _ = create_state_backup(&daemon.state_path, &inner.state, "pre-substore");
+    let before = inner.state.profiles.len();
+    let report = apply_substore_lite(&mut inner.state);
+    reassign_profile_ids(&mut inner.state.profiles);
+    let after = inner.state.profiles.len();
+    inner.state.sub_store_lite.last_applied_unix = unix_now();
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+    (
+        200,
+        "application/json",
+        json!({"before": before, "after": after, "report": report}).to_string(),
+    )
+}
+
+fn apply_substore_lite(state: &mut HincyrayState) -> Value {
+    let settings = state.sub_store_lite.clone();
+    let mut renamed = 0usize;
+    let mut filtered = 0usize;
+    let mut deduped = 0usize;
+
+    for profile in &mut state.profiles {
+        for rule in &settings.rename_rules {
+            if !rule.from.is_empty() && profile.name.contains(&rule.from) {
+                profile.name = profile.name.replace(&rule.from, &rule.to);
+                renamed += 1;
+            }
+        }
+    }
+
+    let include_filter = settings.include_filter.clone();
+    let exclude_filter = settings.exclude_filter.clone();
+    state.profiles.retain(|profile| {
+        let text = profile_search_text(profile);
+        let include_ok =
+            filter_is_empty(&include_filter) || text_matches_filter(&text, &include_filter);
+        let exclude_ok =
+            filter_is_empty(&exclude_filter) || !text_matches_filter(&text, &exclude_filter);
+        let keep = include_ok && exclude_ok;
+        if !keep {
+            filtered += 1;
+        }
+        keep
+    });
+
+    if settings.deduplicate {
+        let mut seen = HashSet::new();
+        state.profiles.retain(|profile| {
+            let key = profile_identity(profile);
+            let keep = seen.insert(key);
+            if !keep {
+                deduped += 1;
+            }
+            keep
+        });
+    }
+
+    sort_profiles_for_substore(&mut state.profiles, &state.stats, &settings.sort_by);
+    json!({"renamed": renamed, "filtered": filtered, "deduplicated": deduped, "sort_by": settings.sort_by})
+}
+
+fn profile_search_text(profile: &Profile) -> String {
+    format!(
+        "{} {} {} {} {}",
+        profile.name,
+        profile.protocol,
+        profile.address,
+        profile.port.map(|p| p.to_string()).unwrap_or_default(),
+        profile.group.clone().unwrap_or_default()
+    )
+    .to_ascii_lowercase()
+}
+
+fn filter_is_empty(filter: &str) -> bool {
+    filter.split('|').all(|part| part.trim().is_empty())
+}
+
+fn text_matches_filter(text: &str, filter: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    filter
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .any(|part| low.contains(&part.to_ascii_lowercase()))
+}
+
+fn profile_identity(profile: &Profile) -> String {
+    format!(
+        "{}|{}|{}",
+        profile.protocol,
+        profile.address,
+        profile.port.unwrap_or(0)
+    )
+}
+
+fn sort_profiles_for_substore(profiles: &mut [Profile], stats: &[ProfileStats], sort_by: &str) {
+    let stat_map: HashMap<String, ProfileStats> = stats
+        .iter()
+        .map(|stat| (stat.profile_raw.clone(), stat.clone()))
+        .collect();
+    match sort_by {
+        "score" => profiles.sort_by(|a, b| {
+            let sa = stat_map.get(&a.raw).map(|s| s.last_score).unwrap_or(0);
+            let sb = stat_map.get(&b.raw).map(|s| s.last_score).unwrap_or(0);
+            sb.cmp(&sa).then_with(|| a.name.cmp(&b.name))
+        }),
+        "latency" => profiles.sort_by(|a, b| {
+            let la = stat_map
+                .get(&a.raw)
+                .map(|s| s.last_latency_ms)
+                .unwrap_or(u32::MAX);
+            let lb = stat_map
+                .get(&b.raw)
+                .map(|s| s.last_latency_ms)
+                .unwrap_or(u32::MAX);
+            la.cmp(&lb).then_with(|| a.name.cmp(&b.name))
+        }),
+        "group" => profiles.sort_by(|a, b| a.group.cmp(&b.group).then_with(|| a.name.cmp(&b.name))),
+        "protocol" => profiles.sort_by(|a, b| {
+            a.protocol
+                .to_string()
+                .cmp(&b.protocol.to_string())
+                .then_with(|| a.name.cmp(&b.name))
+        }),
+        "address" => {
+            profiles.sort_by(|a, b| a.address.cmp(&b.address).then_with(|| a.name.cmp(&b.name)))
+        }
+        _ => profiles.sort_by(|a, b| a.name.cmp(&b.name)),
+    }
+}
+
+fn reassign_profile_ids(profiles: &mut [Profile]) {
+    for (idx, profile) in profiles.iter_mut().enumerate() {
+        profile.id = idx;
+    }
+}
+
+fn handle_dns_diagnostics(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (split_enabled, dns_port, ec, socks_port, core_running) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            inner.state.split_routing.enabled,
+            1053u16,
+            mihomo_controller(&inner.state.mihomo_features),
+            inner.state.socks_port,
+            inner.core.is_running(),
+        )
+    };
+    let local_dns = run_nslookup("example.com", Some(("127.0.0.1", dns_port)));
+    let direct_dns = run_nslookup("example.com", None);
+    let mihomo_query = ec.as_ref().map(|(addr, secret)| {
+        mihomo_api_get_json(
+            addr,
+            secret.as_deref(),
+            "/dns/query?name=example.com&type=A",
+        )
+    });
+    let proxy_trace = if core_running {
+        Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "8",
+                "--socks5-hostname",
+                &format!("127.0.0.1:{socks_port}"),
+                "https://1.1.1.1/cdn-cgi/trace",
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    (
+        200,
+        "application/json",
+        json!({
+            "split_routing_enabled": split_enabled,
+            "dns_listener_port": dns_port,
+            "local_dns": local_dns,
+            "direct_dns": direct_dns,
+            "mihomo_dns_query": match mihomo_query {
+                Some(Ok(v)) => json!({"ok": true, "response": v}),
+                Some(Err(e)) => json!({"ok": false, "error": e}),
+                None => json!({"ok": false, "error": "external controller disabled"}),
+            },
+            "proxy_trace_sample": proxy_trace.lines().take(12).collect::<Vec<_>>(),
+        })
+        .to_string(),
+    )
+}
+
+fn run_nslookup(host: &str, server: Option<(&str, u16)>) -> Value {
+    let mut cmd = Command::new("nslookup");
+    cmd.arg(host);
+    if let Some((addr, port)) = server {
+        cmd.arg(format!("{addr}#{port}"));
+    }
+    match cmd.output() {
+        Ok(output) => json!({
+            "ok": output.status.success(),
+            "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+            "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+        }),
+        Err(error) => json!({"ok": false, "error": error.to_string()}),
+    }
+}
+
+fn handle_backups_list(daemon: &Daemon) -> (u16, &'static str, String) {
+    match list_state_backups(&daemon.state_path) {
+        Ok(backups) => (
+            200,
+            "application/json",
+            json!({"backups": backups}).to_string(),
+        ),
+        Err(error) => (500, "application/json", json!({"error": error}).to_string()),
+    }
+}
+
+fn handle_backup_create(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    match create_state_backup(&daemon.state_path, &inner.state, "manual") {
+        Ok(path) => (
+            200,
+            "application/json",
+            json!({"created": path.file_name().and_then(|s| s.to_str()).unwrap_or("")}).to_string(),
+        ),
+        Err(error) => (500, "application/json", json!({"error": error}).to_string()),
+    }
+}
+
+fn handle_backup_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(file) = value.get("file").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing file"}).to_string(),
+        );
+    };
+    let backup = match backup_path_by_name(&daemon.state_path, file) {
+        Ok(path) => path,
+        Err(error) => return (400, "application/json", json!({"error": error}).to_string()),
+    };
+    let text = match fs::read_to_string(&backup) {
+        Ok(text) => text,
+        Err(error) => {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("read backup: {error}")}).to_string(),
+            );
+        }
+    };
+    let mut restored: HincyrayState = match serde_json::from_str(&text) {
+        Ok(state) => state,
+        Err(error) => {
+            return (
+                400,
+                "application/json",
+                json!({"error": format!("invalid backup state: {error}")}).to_string(),
+            );
+        }
+    };
+    if restored.split_routing.enabled {
+        restored.dns_settings.enabled = true;
+    }
+    let mut inner = lock(&daemon.inner);
+    let was_running = inner.core.is_running();
+    let _ = create_state_backup(&daemon.state_path, &inner.state, "pre-restore");
+    inner.state = restored;
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist restored state: {error}")}).to_string(),
+        );
+    }
+    let restart = if was_running {
+        restart_core_locked(&mut inner, daemon).map(|()| inner.core.status().to_owned())
+    } else {
+        regenerate_config(&inner.state, daemon).map(|_| inner.core.status().to_owned())
+    };
+    match restart {
+        Ok(core_status) => (
+            200,
+            "application/json",
+            json!({"restored": file, "core_status": core_status}).to_string(),
+        ),
+        Err(error) => (
+            500,
+            "application/json",
+            json!({"restored": file, "error": error}).to_string(),
+        ),
+    }
+}
+
+fn handle_backup_delete(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let file = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("file").and_then(Value::as_str).map(str::to_owned));
+    let Some(file) = file else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing file"}).to_string(),
+        );
+    };
+    let path = match backup_path_by_name(&daemon.state_path, &file) {
+        Ok(path) => path,
+        Err(error) => return (400, "application/json", json!({"error": error}).to_string()),
+    };
+    match fs::remove_file(&path) {
+        Ok(()) => (
+            200,
+            "application/json",
+            json!({"deleted": file}).to_string(),
+        ),
+        Err(error) => (
+            500,
+            "application/json",
+            json!({"error": error.to_string()}).to_string(),
+        ),
+    }
+}
+
+fn handle_backup_webdav_upload(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(url) = value.get("url").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing url"}).to_string(),
+        );
+    };
+    let inner = lock(&daemon.inner);
+    let state_json = match serde_json::to_string_pretty(&inner.state) {
+        Ok(text) => text,
+        Err(error) => {
+            return (
+                500,
+                "application/json",
+                json!({"error": error.to_string()}).to_string(),
+            );
+        }
+    };
+    drop(inner);
+    match webdav_put(
+        url,
+        value.get("username").and_then(Value::as_str),
+        value.get("password").and_then(Value::as_str),
+        state_json,
+    ) {
+        Ok(status) => (
+            200,
+            "application/json",
+            json!({"uploaded": true, "status": status}).to_string(),
+        ),
+        Err(error) => (502, "application/json", json!({"error": error}).to_string()),
+    }
+}
+
+fn handle_backup_webdav_download(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(url) = value.get("url").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing url"}).to_string(),
+        );
+    };
+    match webdav_get(
+        url,
+        value.get("username").and_then(Value::as_str),
+        value.get("password").and_then(Value::as_str),
+    ) {
+        Ok(text) => {
+            let mut restored: HincyrayState = match serde_json::from_str(&text) {
+                Ok(state) => state,
+                Err(error) => {
+                    return (
+                        400,
+                        "application/json",
+                        json!({"error": format!("invalid downloaded state: {error}")}).to_string(),
+                    );
+                }
+            };
+            if restored.split_routing.enabled {
+                restored.dns_settings.enabled = true;
+            }
+            let mut inner = lock(&daemon.inner);
+            let was_running = inner.core.is_running();
+            let _ = create_state_backup(&daemon.state_path, &inner.state, "pre-webdav-restore");
+            inner.state = restored;
+            let _ = persist_state(&daemon.state_path, &inner.state);
+            if was_running {
+                let _ = restart_core_locked(&mut inner, daemon);
+            } else {
+                let _ = regenerate_config(&inner.state, daemon);
+            }
+            (
+                200,
+                "application/json",
+                json!({"downloaded": true}).to_string(),
+            )
+        }
+        Err(error) => (502, "application/json", json!({"error": error}).to_string()),
+    }
+}
+
+fn backup_dir(state_path: &Path) -> PathBuf {
+    state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("backups")
+}
+
+fn create_state_backup(
+    state_path: &Path,
+    state: &HincyrayState,
+    reason: &str,
+) -> Result<PathBuf, String> {
+    let dir = backup_dir(state_path);
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let safe_reason: String = reason
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("state-{}-{safe_reason}.json", unix_now()));
+    let text = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
+    fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+    prune_state_backups(state_path, MAX_BACKUPS)?;
+    Ok(path)
+}
+
+fn list_state_backups(state_path: &Path) -> Result<Vec<Value>, String> {
+    let dir = backup_dir(state_path);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let meta = entry.metadata().map_err(|e| e.to_string())?;
+        entries.push(json!({
+            "file": path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            "bytes": meta.len(),
+            "modified_unix": meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0),
+        }));
+    }
+    entries.sort_by(|a, b| {
+        b.get("modified_unix")
+            .and_then(Value::as_u64)
+            .cmp(&a.get("modified_unix").and_then(Value::as_u64))
+    });
+    Ok(entries)
+}
+
+fn prune_state_backups(state_path: &Path, keep: usize) -> Result<(), String> {
+    let backups = list_state_backups(state_path)?;
+    for backup in backups.into_iter().skip(keep) {
+        if let Some(file) = backup.get("file").and_then(Value::as_str)
+            && let Ok(path) = backup_path_by_name(state_path, file)
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn backup_path_by_name(state_path: &Path, file: &str) -> Result<PathBuf, String> {
+    if file.contains('/') || file.contains('\\') || file == "." || file == ".." {
+        return Err("invalid backup file name".to_owned());
+    }
+    let path = backup_dir(state_path).join(file);
+    if path.extension().and_then(|s| s.to_str()) != Some("json") {
+        return Err("backup file must be .json".to_owned());
+    }
+    Ok(path)
+}
+
+fn webdav_put(
+    url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    body: String,
+) -> Result<u16, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.put(url).body(body);
+    if let Some(user) = username
+        && !user.is_empty()
+    {
+        req = req.basic_auth(user, password.map(str::to_owned));
+    }
+    let resp = req.send().map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    if resp.status().is_success() {
+        Ok(status)
+    } else {
+        Err(format!("WebDAV PUT HTTP {status}"))
+    }
+}
+
+fn webdav_get(url: &str, username: Option<&str>, password: Option<&str>) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.get(url);
+    if let Some(user) = username
+        && !user.is_empty()
+    {
+        req = req.basic_auth(user, password.map(str::to_owned));
+    }
+    let resp = req.send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("WebDAV GET HTTP {}", resp.status()));
+    }
+    resp.text().map_err(|e| e.to_string())
+}
+
+fn restart_core_locked(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon) -> Result<(), String> {
+    let geo_dir = geo_dir_from_state(&inner.state);
+    let (binary_path, config_path) = regenerate_config(&inner.state, daemon)?;
+    inner
+        .core
+        .restart(&binary_path, &config_path, geo_dir.as_deref())
 }
 
 /// Generate a pseudo-random session token. Uses nanosecond timestamp
@@ -5761,12 +7075,28 @@ fn mihomo_controller(
 ) -> Option<(String, Option<String>)> {
     if features.external_controller.enabled {
         Some((
-            features.external_controller.address.clone(),
+            controller_dial_address(&features.external_controller.address),
             features.external_controller.secret.clone(),
         ))
     } else {
         None
     }
+}
+
+fn controller_dial_address(bind_address: &str) -> String {
+    if let Some(port) = bind_address.strip_prefix("0.0.0.0:") {
+        return format!("127.0.0.1:{port}");
+    }
+    if let Some(port) = bind_address.strip_prefix("[::]:") {
+        return format!("127.0.0.1:{port}");
+    }
+    if let Some(port) = bind_address.strip_prefix(":::") {
+        return format!("127.0.0.1:{port}");
+    }
+    if bind_address.starts_with(':') {
+        return format!("127.0.0.1{bind_address}");
+    }
+    bind_address.to_owned()
 }
 
 /// Make a GET request to the Mihomo external-controller REST API.
@@ -5791,6 +7121,27 @@ fn mihomo_api_get(addr: &str, secret: Option<&str>, path: &str) -> Result<String
         return Err(format!("Mihomo API {path}: HTTP {}", resp.status()));
     }
     resp.text().map_err(|e| e.to_string())
+}
+
+fn mihomo_api_delete(addr: &str, secret: Option<&str>, path: &str) -> Result<u16, String> {
+    let url = format!("http://{addr}{path}");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.delete(&url);
+    if let Some(s) = secret
+        && !s.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {s}"));
+    }
+    let resp = req.send().map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        return Err(format!("Mihomo API {path}: HTTP {}", resp.status()));
+    }
+    Ok(status)
 }
 
 /// Like `mihomo_api_get` but for streaming endpoints (`/traffic`,
@@ -5877,6 +7228,9 @@ fn find_best_profile_by_score(
     state: &HincyrayState,
     excluded_profiles: &HashSet<usize>,
 ) -> Option<usize> {
+    if state.smart_select.enabled {
+        return find_best_profile_by_smart_score(state, excluded_profiles);
+    }
     let mut best: Option<(usize, u32)> = None;
     for profile in &state.profiles {
         if excluded_profiles.contains(&profile.id) {
@@ -5893,6 +7247,34 @@ fn find_best_profile_by_score(
             .unwrap_or(true)
         {
             best = Some((profile.id, stat.last_score));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+fn find_best_profile_by_smart_score(
+    state: &HincyrayState,
+    excluded_profiles: &HashSet<usize>,
+) -> Option<usize> {
+    let now = unix_now();
+    let mut best: Option<(usize, f32)> = None;
+    for profile in &state.profiles {
+        if excluded_profiles.contains(&profile.id) {
+            continue;
+        }
+        let Some(stat) = state.stats.iter().find(|s| s.profile_raw == profile.raw) else {
+            continue;
+        };
+        if stat.success_count < state.smart_select.min_successes {
+            continue;
+        }
+        if stat.cooldown_until_unix > now {
+            continue;
+        }
+        let failure_penalty = stat.consecutive_failures as f32 * state.smart_select.failure_penalty;
+        let effective = (stat.ewma_score - failure_penalty).max(0.0);
+        if best.map(|(_, score)| effective > score).unwrap_or(true) {
+            best = Some((profile.id, effective));
         }
     }
     best.map(|(id, _)| id)
@@ -6293,6 +7675,7 @@ fn start_watchdog(daemon: Daemon) {
                 auto_refresh_enabled,
                 auto_refresh_interval_hours,
                 last_auto_refresh,
+                maintenance,
             ) = {
                 let mut inner = lock(&daemon.inner);
                 let ec = mihomo_controller(&inner.state.mihomo_features);
@@ -6325,6 +7708,7 @@ fn start_watchdog(daemon: Daemon) {
                     inner.state.auto_refresh_enabled,
                     inner.state.auto_refresh_interval_hours,
                     inner.state.last_auto_refresh_unix,
+                    inner.state.maintenance.clone(),
                 )
             };
 
@@ -6817,9 +8201,68 @@ fn start_watchdog(daemon: Daemon) {
                 }
             }
 
+            // --- Phase 10: Scheduled maintenance ---
+            if maintenance_due(&maintenance, unix_now()) && !bench_running {
+                eprintln!("hincyray: scheduled maintenance triggered");
+                run_scheduled_maintenance(
+                    &daemon,
+                    &maintenance,
+                    ec_addr.as_deref(),
+                    ec_secret.as_deref(),
+                );
+            }
+
             bench_was_running = bench_running;
         }
     });
+}
+
+fn maintenance_due(settings: &MaintenanceSettings, now: u64) -> bool {
+    if !settings.enabled {
+        return false;
+    }
+    let interval = u64::from(settings.interval_days.max(1)) * 86_400;
+    if settings.last_run_unix > 0 && now.saturating_sub(settings.last_run_unix) < interval {
+        return false;
+    }
+    let target =
+        u64::from(settings.hour_utc.min(23)) * 3600 + u64::from(settings.minute_utc.min(59)) * 60;
+    let seconds_today = now % 86_400;
+    seconds_today >= target && seconds_today < target + 600
+}
+
+fn run_scheduled_maintenance(
+    daemon: &Daemon,
+    settings: &MaintenanceSettings,
+    ec_addr: Option<&str>,
+    ec_secret: Option<&str>,
+) {
+    if settings.create_backup {
+        let inner = lock(&daemon.inner);
+        if let Err(error) = create_state_backup(&daemon.state_path, &inner.state, "maintenance") {
+            eprintln!("hincyray: maintenance backup failed: {error}");
+        }
+    }
+    if settings.refresh_subscriptions {
+        let _ = refresh_all_subscriptions(daemon);
+    }
+    if settings.close_connections
+        && let Some(addr) = ec_addr
+        && let Err(error) = mihomo_api_delete(addr, ec_secret, "/connections")
+    {
+        eprintln!("hincyray: maintenance connection close failed: {error}");
+    }
+    {
+        let mut inner = lock(&daemon.inner);
+        if settings.restart_core
+            && inner.core.is_running()
+            && let Err(error) = restart_core_locked(&mut inner, daemon)
+        {
+            eprintln!("hincyray: maintenance core restart failed: {error}");
+        }
+        inner.state.maintenance.last_run_unix = unix_now();
+        let _ = persist_state(&daemon.state_path, &inner.state);
+    }
 }
 
 fn rule_sources() -> Vec<Value> {
@@ -7198,10 +8641,28 @@ tr.group-row.collapsed{display:none}
     <label class="chip"><input type="checkbox" id="auto-switch-chk"> Auto-switch (failover) on health check failure</label>
     <div class="field"><label for="auto-bench-hours">Auto-benchmark interval (hours, 0 = disabled)</label><input type="number" id="auto-bench-hours" min="0" max="168" value="0"></div>
   </div>
+  <h3>Smart Auto-Select 2.0</h3>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="smart-enabled"> Use rolling EWMA score and cooldowns</label>
+    <div class="field"><label for="smart-min-successes">Min successes</label><input type="number" id="smart-min-successes" min="1" max="100" value="1"></div>
+    <div class="field"><label for="smart-cooldown">Cooldown after failure (sec)</label><input type="number" id="smart-cooldown" min="0" max="86400" value="300"></div>
+    <div class="field"><label for="smart-penalty">Failure penalty</label><input type="number" id="smart-penalty" min="0" max="1000" value="25"></div>
+  </div>
   <h3>Auto-refresh subscriptions</h3>
   <div class="grid2">
     <label class="chip"><input type="checkbox" id="auto-refresh-chk"> Auto-refresh subscriptions periodically</label>
     <div class="field"><label for="auto-refresh-hours">Refresh interval (hours, 0 = disabled)</label><input type="number" id="auto-refresh-hours" min="0" max="168" value="0"></div>
+  </div>
+  <h3>Scheduled maintenance</h3>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="maint-enabled"> Enable maintenance window</label>
+    <div class="field"><label for="maint-hour">Hour UTC</label><input type="number" id="maint-hour" min="0" max="23" value="4"></div>
+    <div class="field"><label for="maint-minute">Minute UTC</label><input type="number" id="maint-minute" min="0" max="59" value="0"></div>
+    <div class="field"><label for="maint-days">Interval days</label><input type="number" id="maint-days" min="1" max="30" value="1"></div>
+    <label class="chip"><input type="checkbox" id="maint-backup" checked> Backup state</label>
+    <label class="chip"><input type="checkbox" id="maint-refresh"> Refresh subscriptions</label>
+    <label class="chip"><input type="checkbox" id="maint-restart" checked> Restart core</label>
+    <label class="chip"><input type="checkbox" id="maint-close"> Close connections</label>
   </div>
   <div class="row" style="margin:.45em 0">
     <button id="btn-auto-save">Save auto settings</button>
@@ -7369,6 +8830,37 @@ tr.group-row.collapsed{display:none}
   </div>
   <h3 class="subtle">Connection Log (recent)</h3>
   <div id="conn-log" style="max-height:300px;overflow:auto"></div>
+</div>
+
+<h2>Diagnostics &amp; Recovery <span id="diag-toggle" class="toggle">show</span></h2>
+<div id="diag-panel" class="collapsible">
+  <p class="subtle">Rule trace, Sub-Store Lite cleanup, unlock checks, DNS diagnostics, backups, and connection control.</p>
+  <div class="grid2">
+    <div class="field"><label for="trace-host">Trace host</label><input type="text" id="trace-host" placeholder="www.youtube.com"></div>
+    <div class="field"><label for="trace-src">Source IP</label><input type="text" id="trace-src" placeholder="192.168.2.35"></div>
+    <div class="field"><label for="trace-ip">Destination IP (optional)</label><input type="text" id="trace-ip" placeholder="142.250.0.0"></div>
+    <div class="field"><label for="trace-port">Port</label><input type="number" id="trace-port" value="443"></div>
+  </div>
+  <div class="row" style="margin:.45em 0">
+    <button id="btn-trace-rule">Trace rule</button>
+    <button id="btn-dns-diag">DNS diagnostics</button>
+    <button id="btn-unlock-check">Unlock check</button>
+    <button class="danger" id="btn-close-connections">Close all connections</button>
+    <span class="subtle" id="diag-status"></span>
+  </div>
+  <h3>Sub-Store Lite</h3>
+  <div class="grid2">
+    <label class="chip"><input type="checkbox" id="substore-enabled"> Enable cleanup preset</label>
+    <div class="field"><label for="substore-include">Include contains (pipe-separated)</label><input type="text" id="substore-include" placeholder="hk|singapore"></div>
+    <div class="field"><label for="substore-exclude">Exclude contains (pipe-separated)</label><input type="text" id="substore-exclude" placeholder="test|expired"></div>
+    <div class="field"><label for="substore-sort">Sort by</label><select id="substore-sort"><option value="name">name</option><option value="group">group</option><option value="protocol">protocol</option><option value="address">address</option><option value="score">score</option><option value="latency">latency</option></select></div>
+  </div>
+  <div class="field"><label for="substore-rename">Rename rules (one per line: from =&gt; to)</label><textarea id="substore-rename" rows="3" placeholder="HK =&gt; Hong Kong&#10;🇭🇰 =&gt; HK"></textarea></div>
+  <div class="row" style="margin:.45em 0"><button id="btn-substore-save">Save Sub-Store settings</button><button class="primary" id="btn-substore-apply">Apply cleanup (creates backup)</button></div>
+  <h3>Backups</h3>
+  <div class="row" style="margin:.45em 0"><button id="btn-backup-create">Create backup</button><button id="btn-backups-refresh">Refresh backups</button></div>
+  <div id="backups-list" style="max-height:180px;overflow:auto"></div>
+  <pre id="diag-output" class="log-box" style="max-height:360px"></pre>
 </div>
 
 <h2>Logs <span id="logs-toggle" class="toggle">show</span></h2>
@@ -8337,6 +9829,20 @@ function loadAutoSettings(){
     document.getElementById("auto-bench-hours").value = data.auto_bench_interval_hours || 0;
     document.getElementById("auto-refresh-chk").checked = !!data.auto_refresh_enabled;
     document.getElementById("auto-refresh-hours").value = data.auto_refresh_interval_hours || 0;
+    var smart = data.smart_select || {};
+    document.getElementById("smart-enabled").checked = !!smart.enabled;
+    document.getElementById("smart-min-successes").value = smart.min_successes || 1;
+    document.getElementById("smart-cooldown").value = smart.cooldown_secs || 300;
+    document.getElementById("smart-penalty").value = smart.failure_penalty || 25;
+    var maint = data.maintenance || {};
+    document.getElementById("maint-enabled").checked = !!maint.enabled;
+    document.getElementById("maint-hour").value = maint.hour_utc || 0;
+    document.getElementById("maint-minute").value = maint.minute_utc || 0;
+    document.getElementById("maint-days").value = maint.interval_days || 1;
+    document.getElementById("maint-backup").checked = maint.create_backup !== false;
+    document.getElementById("maint-refresh").checked = !!maint.refresh_subscriptions;
+    document.getElementById("maint-restart").checked = maint.restart_core !== false;
+    document.getElementById("maint-close").checked = !!maint.close_connections;
     document.getElementById("auto-failover-count").textContent = data.failover_fail_count || 0;
     if(data.last_auto_bench_unix){
       var ago = Math.round((Date.now()/1000 - data.last_auto_bench_unix) / 3600);
@@ -8355,11 +9861,12 @@ function syncAutoSettingsFromStatus(s){
   document.getElementById("auto-bench-hours").value = s.auto_bench_interval_hours || 0;
 }
 
-["auto-select-chk", "auto-switch-chk", "auto-refresh-chk"].forEach(function(id){
+["auto-select-chk", "auto-switch-chk", "auto-refresh-chk", "smart-enabled", "maint-enabled", "maint-backup", "maint-refresh", "maint-restart", "maint-close"].forEach(function(id){
   document.getElementById(id).addEventListener("change", function(){ autoSettingsDirty = true; });
 });
-document.getElementById("auto-bench-hours").addEventListener("input", function(){ autoSettingsDirty = true; });
-document.getElementById("auto-refresh-hours").addEventListener("input", function(){ autoSettingsDirty = true; });
+["auto-bench-hours", "auto-refresh-hours", "smart-min-successes", "smart-cooldown", "smart-penalty", "maint-hour", "maint-minute", "maint-days"].forEach(function(id){
+  document.getElementById(id).addEventListener("input", function(){ autoSettingsDirty = true; });
+});
 
 document.getElementById("btn-auto-save").addEventListener("click", function(){
   var body = JSON.stringify({
@@ -8368,6 +9875,22 @@ document.getElementById("btn-auto-save").addEventListener("click", function(){
     auto_bench_interval_hours: Number(document.getElementById("auto-bench-hours").value) || 0,
     auto_refresh_enabled: document.getElementById("auto-refresh-chk").checked,
     auto_refresh_interval_hours: Number(document.getElementById("auto-refresh-hours").value) || 0,
+    smart_select: {
+      enabled: document.getElementById("smart-enabled").checked,
+      min_successes: Number(document.getElementById("smart-min-successes").value) || 1,
+      cooldown_secs: Number(document.getElementById("smart-cooldown").value) || 0,
+      failure_penalty: Number(document.getElementById("smart-penalty").value) || 0
+    },
+    maintenance: {
+      enabled: document.getElementById("maint-enabled").checked,
+      hour_utc: Number(document.getElementById("maint-hour").value) || 0,
+      minute_utc: Number(document.getElementById("maint-minute").value) || 0,
+      interval_days: Number(document.getElementById("maint-days").value) || 1,
+      create_backup: document.getElementById("maint-backup").checked,
+      refresh_subscriptions: document.getElementById("maint-refresh").checked,
+      restart_core: document.getElementById("maint-restart").checked,
+      close_connections: document.getElementById("maint-close").checked
+    }
   });
   api("POST", "/api/auto-settings", body).then(function(){
     autoSettingsDirty = false;
@@ -8485,6 +10008,99 @@ document.getElementById("btn-speed-test").addEventListener("click", function(){
     document.getElementById("speed-test-result").textContent = "Failed: " + e.message;
   });
 });
+
+// ── Diagnostics & Recovery ───────────────────────────────────────
+function diagOut(data){
+  document.getElementById("diag-output").textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+}
+function diagStatus(text){ document.getElementById("diag-status").textContent = text || ""; }
+function loadSubstoreLite(){
+  api("GET", "/api/substore-lite").then(function(data){
+    var s = data.settings || {};
+    document.getElementById("substore-enabled").checked = !!s.enabled;
+    document.getElementById("substore-include").value = s.include_filter || "";
+    document.getElementById("substore-exclude").value = s.exclude_filter || "";
+    document.getElementById("substore-sort").value = s.sort_by || "name";
+    document.getElementById("substore-rename").value = (s.rename_rules || []).map(function(r){ return (r.from || "") + " => " + (r.to || ""); }).join("\n");
+  }).catch(function(){ /* optional */ });
+}
+function parseRenameRules(){
+  var text = document.getElementById("substore-rename").value || "";
+  return text.split("\n").map(function(line){
+    var idx = line.indexOf("=>");
+    if(idx < 0){ return null; }
+    return {from: line.slice(0, idx).trim(), to: line.slice(idx + 2).trim()};
+  }).filter(function(r){ return r && r.from; });
+}
+function loadBackups(){
+  api("GET", "/api/backups").then(function(data){
+    var list = document.getElementById("backups-list");
+    var backups = data.backups || [];
+    if(!backups.length){ list.innerHTML = "<p class='subtle'>No backups yet</p>"; return; }
+    list.innerHTML = backups.map(function(b){
+      return "<div class='mono subtle' style='padding:3px 0'>" + esc(b.file) + " (" + fmtBytes(b.bytes || 0) + ") "
+        + "<button data-restore='" + esc(b.file) + "'>restore</button> "
+        + "<button data-delete='" + esc(b.file) + "'>delete</button></div>";
+    }).join("");
+    list.querySelectorAll("button[data-restore]").forEach(function(btn){
+      btn.addEventListener("click", function(){
+        var file = btn.getAttribute("data-restore");
+        if(!confirm("Restore backup " + file + "? Current state will be backed up first.")){ return; }
+        api("POST", "/api/backups/restore", JSON.stringify({file:file})).then(function(r){ diagOut(r); refreshAll(); loadBackups(); });
+      });
+    });
+    list.querySelectorAll("button[data-delete]").forEach(function(btn){
+      btn.addEventListener("click", function(){
+        var file = btn.getAttribute("data-delete");
+        api("POST", "/api/backups/delete", JSON.stringify({file:file})).then(function(r){ diagOut(r); loadBackups(); });
+      });
+    });
+  }).catch(function(err){ diagStatus("Backups failed: " + err.message); });
+}
+document.getElementById("diag-toggle").addEventListener("click", function(){ toggleCollapsible("diag-toggle", "diag-panel"); });
+document.getElementById("btn-trace-rule").addEventListener("click", function(){
+  var body = {
+    host: document.getElementById("trace-host").value,
+    source_ip: document.getElementById("trace-src").value,
+    ip: document.getElementById("trace-ip").value,
+    port: Number(document.getElementById("trace-port").value) || 0,
+    network: "tcp"
+  };
+  api("POST", "/api/routing/trace", JSON.stringify(body)).then(diagOut).catch(function(e){ diagStatus(e.message); });
+});
+document.getElementById("btn-dns-diag").addEventListener("click", function(){
+  diagStatus("Running DNS diagnostics...");
+  api("GET", "/api/dns/diagnostics").then(function(r){ diagStatus("DNS diagnostics done"); diagOut(r); }).catch(function(e){ diagStatus(e.message); });
+});
+document.getElementById("btn-unlock-check").addEventListener("click", function(){
+  diagStatus("Checking unlock/reachability...");
+  api("POST", "/api/unlock-check", "{}").then(function(r){ diagStatus("Unlock check done"); diagOut(r); }).catch(function(e){ diagStatus(e.message); });
+});
+document.getElementById("btn-close-connections").addEventListener("click", function(){
+  if(!confirm("Close all active Mihomo connections?")){ return; }
+  api("POST", "/api/mihomo-api/connections/close", JSON.stringify({scope:"all"})).then(function(r){ diagOut(r); loadProxyStatus(); }).catch(function(e){ diagStatus(e.message); });
+});
+document.getElementById("btn-substore-save").addEventListener("click", function(){
+  var body = {
+    enabled: document.getElementById("substore-enabled").checked,
+    include_filter: document.getElementById("substore-include").value,
+    exclude_filter: document.getElementById("substore-exclude").value,
+    sort_by: document.getElementById("substore-sort").value,
+    deduplicate: true,
+    rename_rules: parseRenameRules()
+  };
+  api("POST", "/api/substore-lite", JSON.stringify(body)).then(function(r){ diagOut(r); showOk("Sub-Store Lite settings saved"); }).catch(function(e){ diagStatus(e.message); });
+});
+document.getElementById("btn-substore-apply").addEventListener("click", function(){
+  if(!confirm("Apply Sub-Store Lite cleanup to current profiles? A backup will be created first.")){ return; }
+  api("POST", "/api/substore-lite/apply", "{}").then(function(r){ diagOut(r); refreshAll(); loadBackups(); }).catch(function(e){ diagStatus(e.message); });
+});
+document.getElementById("btn-backup-create").addEventListener("click", function(){
+  api("POST", "/api/backups/create", "{}").then(function(r){ diagOut(r); loadBackups(); }).catch(function(e){ diagStatus(e.message); });
+});
+document.getElementById("btn-backups-refresh").addEventListener("click", loadBackups);
+loadSubstoreLite();
+loadBackups();
 
 // ── Per-Device Routing ───────────────────────────────────────────
 
@@ -10986,7 +12602,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_preset_apply_ru_direct_adds_two_rules() {
+    fn routing_preset_apply_ru_direct_adds_geoip_rule() {
         let (_dir, daemon) = test_daemon();
         handle_import(
             "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
@@ -11000,12 +12616,12 @@ mod tests {
         let (status, _, body) = handle_routing_preset_apply(r#"{"preset":"ru-direct"}"#, &daemon);
         assert_eq!(status, 200);
         let result: Value = serde_json::from_str(&body).expect("parse json");
-        assert_eq!(result["rules_added"], json!(2));
+        assert_eq!(result["rules_added"], json!(1));
 
         let inner = lock(&daemon.inner);
-        assert_eq!(inner.state.routing_rules.len(), 2);
+        assert_eq!(inner.state.routing_rules.len(), 1);
         assert_eq!(inner.state.routing_rules[0].target, "direct");
-        assert_eq!(inner.state.routing_rules[1].target, "direct");
+        assert_eq!(inner.state.routing_rules[0].ips, vec!["geoip:RU"]);
     }
 
     #[test]
@@ -11243,5 +12859,180 @@ mod tests {
         assert_eq!(status, 200);
         let inner = lock(&daemon.inner);
         assert!(!inner.sessions.contains(&token));
+    }
+
+    fn sample_profile(id: usize, name: &str, address: &str) -> Profile {
+        Profile {
+            id,
+            name: name.to_owned(),
+            protocol: crate::profiles::Protocol::Vless,
+            address: address.to_owned(),
+            port: Some(443),
+            raw: format!("vless://11111111-1111-1111-1111-111111111111@{address}:443#{name}"),
+            selected: true,
+            block_quic: false,
+            group: Some("sub".to_owned()),
+        }
+    }
+
+    #[test]
+    fn routing_trace_matches_device_route_before_general_rules() {
+        let mut state = HincyrayState::default();
+        state.device_routes.push(DeviceRoute {
+            enabled: true,
+            name: "TV".to_owned(),
+            ip: "192.168.2.10".to_owned(),
+            mac: None,
+            target: "reject".to_owned(),
+        });
+        state.routing_rules.push(RoutingRule {
+            enabled: true,
+            name: "All domains direct".to_owned(),
+            domains: vec!["example.com".to_owned()],
+            target: "direct".to_owned(),
+            ..Default::default()
+        });
+        let trace = trace_routing_decision(
+            &state,
+            &TraceRequest {
+                host: "www.example.com".to_owned(),
+                ip: "93.184.216.34".to_owned(),
+                source_ip: "192.168.2.10".to_owned(),
+                port: Some(443),
+                network: "tcp".to_owned(),
+            },
+        );
+        assert_eq!(trace["source"], json!("device_route"));
+        assert_eq!(trace["target"], json!("reject"));
+    }
+
+    #[test]
+    fn routing_trace_marks_geosite_as_runtime_candidate() {
+        let mut state = HincyrayState::default();
+        state.routing_rules.push(RoutingRule {
+            enabled: true,
+            name: "RU direct".to_owned(),
+            domains: vec!["geosite:ru".to_owned()],
+            target: "direct".to_owned(),
+            ..Default::default()
+        });
+        let trace = trace_routing_decision(
+            &state,
+            &TraceRequest {
+                host: "ya.ru".to_owned(),
+                ip: String::new(),
+                source_ip: String::new(),
+                port: Some(443),
+                network: "tcp".to_owned(),
+            },
+        );
+        assert_eq!(trace["decision"], json!("requires_mihomo_geo_eval"));
+        assert_eq!(trace["candidates"].as_array().expect("candidates").len(), 1);
+    }
+
+    #[test]
+    fn substore_lite_filters_renames_deduplicates_and_sorts() {
+        let mut state = HincyrayState {
+            profiles: vec![
+                sample_profile(0, "HK 01", "hk.example"),
+                sample_profile(1, "US 01", "us.example"),
+                sample_profile(2, "HK 01 dup", "hk.example"),
+            ],
+            sub_store_lite: SubStoreLiteSettings {
+                include_filter: "hk".to_owned(),
+                rename_rules: vec![SubStoreRenameRule {
+                    from: "HK".to_owned(),
+                    to: "Hong Kong".to_owned(),
+                }],
+                deduplicate: true,
+                sort_by: "name".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let report = apply_substore_lite(&mut state);
+        assert_eq!(state.profiles.len(), 1);
+        assert_eq!(state.profiles[0].name, "Hong Kong 01");
+        assert_eq!(report["filtered"], json!(1));
+        assert_eq!(report["deduplicated"], json!(1));
+    }
+
+    #[test]
+    fn smart_selector_uses_ewma_and_skips_cooldown() {
+        let mut state = HincyrayState::default();
+        state.smart_select.enabled = true;
+        state.profiles = vec![
+            sample_profile(1, "cooldown", "a.example"),
+            sample_profile(2, "stable", "b.example"),
+        ];
+        state.stats = vec![
+            ProfileStats {
+                profile_raw: state.profiles[0].raw.clone(),
+                success_count: 5,
+                ewma_score: 99.0,
+                cooldown_until_unix: unix_now() + 60,
+                ..Default::default()
+            },
+            ProfileStats {
+                profile_raw: state.profiles[1].raw.clone(),
+                success_count: 2,
+                ewma_score: 50.0,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(find_best_profile_by_score(&state, &HashSet::new()), Some(2));
+    }
+
+    #[test]
+    fn maintenance_due_respects_window_and_interval() {
+        let settings = MaintenanceSettings {
+            enabled: true,
+            hour_utc: 1,
+            minute_utc: 0,
+            interval_days: 1,
+            last_run_unix: 0,
+            ..Default::default()
+        };
+        assert!(maintenance_due(&settings, 3600));
+        assert!(!maintenance_due(&settings, 7200));
+        let recently_run = MaintenanceSettings {
+            last_run_unix: 3500,
+            ..settings
+        };
+        assert!(!maintenance_due(&recently_run, 3600));
+    }
+
+    #[test]
+    fn backup_path_rejects_traversal() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        assert!(backup_path_by_name(&state_path, "../state.json").is_err());
+        assert!(backup_path_by_name(&state_path, "state-1-manual.json").is_ok());
+    }
+
+    #[test]
+    fn filter_connection_ids_matches_host_and_source() {
+        let conns = json!({
+            "connections": [
+                {"id":"a", "metadata":{"host":"api.example.com", "sourceIP":"192.168.2.2"}},
+                {"id":"b", "metadata":{"host":"other.test", "sourceIP":"192.168.2.3"}}
+            ]
+        });
+        assert_eq!(
+            filter_connection_ids(&conns, Some("example.com"), None),
+            vec!["a"]
+        );
+        assert_eq!(
+            filter_connection_ids(&conns, None, Some("192.168.2.3")),
+            vec!["b"]
+        );
+    }
+
+    #[test]
+    fn controller_dial_address_maps_wildcard_bind_to_loopback() {
+        assert_eq!(controller_dial_address("0.0.0.0:9090"), "127.0.0.1:9090");
+        assert_eq!(controller_dial_address("[::]:9090"), "127.0.0.1:9090");
+        assert_eq!(controller_dial_address(":9090"), "127.0.0.1:9090");
+        assert_eq!(controller_dial_address("127.0.0.1:9090"), "127.0.0.1:9090");
     }
 }
