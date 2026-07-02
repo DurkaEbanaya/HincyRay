@@ -12,9 +12,19 @@ pub enum Protocol {
     VMess,
     Trojan,
     Shadowsocks,
+    ShadowsocksR,
+    Snell,
+    Http,
+    Socks,
+    AnyTls,
+    Hysteria,
     Hysteria2,
     WireGuard,
     Tuic,
+    Ssh,
+    Masque,
+    OpenVpn,
+    Tailscale,
     Unknown(String),
 }
 
@@ -25,9 +35,22 @@ impl Protocol {
             "vmess" => Self::VMess,
             "trojan" => Self::Trojan,
             "ss" | "shadowsocks" => Self::Shadowsocks,
-            "hysteria" | "hysteria2" | "hy2" => Self::Hysteria2,
+            "ssr" | "shadowsocksr" => Self::ShadowsocksR,
+            "snell" => Self::Snell,
+            // Plain http(s) URLs remain subscription URLs. HTTP proxy
+            // profiles use an explicit Mihomo namespace to avoid changing
+            // the subscription/import contract.
+            "mihomo+http" | "mihomo+https" | "http-proxy" | "https-proxy" => Self::Http,
+            "socks" | "socks4" | "socks5" => Self::Socks,
+            "anytls" => Self::AnyTls,
+            "hysteria" | "hy" => Self::Hysteria,
+            "hysteria2" | "hy2" => Self::Hysteria2,
             "wireguard" | "wg" => Self::WireGuard,
             "tuic" => Self::Tuic,
+            "ssh" => Self::Ssh,
+            "masque" => Self::Masque,
+            "openvpn" => Self::OpenVpn,
+            "tailscale" | "ts" => Self::Tailscale,
             other => Self::Unknown(other.to_owned()),
         }
     }
@@ -40,9 +63,19 @@ impl fmt::Display for Protocol {
             Self::VMess => f.write_str("VMess"),
             Self::Trojan => f.write_str("Trojan"),
             Self::Shadowsocks => f.write_str("Shadowsocks"),
+            Self::ShadowsocksR => f.write_str("ShadowsocksR"),
+            Self::Snell => f.write_str("Snell"),
+            Self::Http => f.write_str("HTTP"),
+            Self::Socks => f.write_str("SOCKS"),
+            Self::AnyTls => f.write_str("AnyTLS"),
+            Self::Hysteria => f.write_str("Hysteria"),
             Self::Hysteria2 => f.write_str("Hysteria2"),
             Self::WireGuard => f.write_str("WireGuard"),
             Self::Tuic => f.write_str("TUIC"),
+            Self::Ssh => f.write_str("SSH"),
+            Self::Masque => f.write_str("MASQUE"),
+            Self::OpenVpn => f.write_str("OpenVPN"),
+            Self::Tailscale => f.write_str("Tailscale"),
             Self::Unknown(value) => f.write_str(value),
         }
     }

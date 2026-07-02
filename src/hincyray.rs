@@ -2602,6 +2602,27 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/mihomo-features") => handle_mihomo_features_set(body, daemon),
         ("GET", "/api/mihomo-api/proxies") => handle_mihomo_api_proxies(daemon),
         ("GET", "/api/mihomo-api/connections") => handle_mihomo_api_connections(daemon),
+        ("GET", "/api/mihomo-api/version") => handle_mihomo_api_forward_get("/version", daemon),
+        ("GET", "/api/mihomo-api/configs") => handle_mihomo_api_forward_get("/configs", daemon),
+        ("GET", "/api/mihomo-api/configs/geo") => {
+            handle_mihomo_api_forward_get("/configs/geo", daemon)
+        }
+        ("GET", "/api/mihomo-api/rules") => handle_mihomo_api_forward_get("/rules", daemon),
+        ("GET", "/api/mihomo-api/providers/proxies") => {
+            handle_mihomo_api_forward_get("/providers/proxies", daemon)
+        }
+        ("GET", "/api/mihomo-api/providers/rules") => {
+            handle_mihomo_api_forward_get("/providers/rules", daemon)
+        }
+        ("POST", "/api/mihomo-api/cache/fakeip/flush") => {
+            handle_mihomo_api_forward_post("/cache/fakeip/flush", "", daemon)
+        }
+        ("POST", "/api/mihomo-api/cache/dns/flush") => {
+            handle_mihomo_api_forward_post("/cache/dns/flush", "", daemon)
+        }
+        ("POST", "/api/mihomo-api/rules/disable") => {
+            handle_mihomo_api_forward_post("/rules/disable", body, daemon)
+        }
         ("POST", "/api/mihomo-api/connections/close") => {
             handle_mihomo_api_connections_close(body, daemon)
         }
@@ -5090,6 +5111,47 @@ fn handle_mihomo_api_connections(daemon: &Daemon) -> (u16, &'static str, String)
     }
 }
 
+fn handle_mihomo_api_forward_get(path: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let (addr, secret) = match mihomo_controller_for_daemon(daemon) {
+        Ok(ec) => ec,
+        Err(response) => return response,
+    };
+    match mihomo_api_get(&addr, secret.as_deref(), path) {
+        Ok(body) => (200, "application/json", body),
+        Err(error) => (
+            502,
+            "application/json",
+            json!({"error": format!("Mihomo API: {error}")}).to_string(),
+        ),
+    }
+}
+
+fn handle_mihomo_api_forward_post(
+    path: &str,
+    body: &str,
+    daemon: &Daemon,
+) -> (u16, &'static str, String) {
+    let (addr, secret) = match mihomo_controller_for_daemon(daemon) {
+        Ok(ec) => ec,
+        Err(response) => return response,
+    };
+    match mihomo_api_post(&addr, secret.as_deref(), path, body) {
+        Ok(response) => {
+            let body_out = if response.trim().is_empty() {
+                json!({"ok": true}).to_string()
+            } else {
+                response
+            };
+            (200, "application/json", body_out)
+        }
+        Err(error) => (
+            502,
+            "application/json",
+            json!({"error": format!("Mihomo API: {error}")}).to_string(),
+        ),
+    }
+}
+
 /// Close Mihomo connections. Body:
 /// - `{ "scope": "all" }` closes all connections via verified `DELETE /connections`.
 /// - `{ "id": "..." }` closes one observed connection id.
@@ -7142,6 +7204,36 @@ fn mihomo_api_delete(addr: &str, secret: Option<&str>, path: &str) -> Result<u16
         return Err(format!("Mihomo API {path}: HTTP {}", resp.status()));
     }
     Ok(status)
+}
+
+fn mihomo_api_post(
+    addr: &str,
+    secret: Option<&str>,
+    path: &str,
+    body: &str,
+) -> Result<String, String> {
+    let url = format!("http://{addr}{path}");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.post(&url);
+    if let Some(s) = secret
+        && !s.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {s}"));
+    }
+    if !body.trim().is_empty() {
+        req = req
+            .header("Content-Type", "application/json")
+            .body(body.to_owned());
+    }
+    let resp = req.send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Mihomo API {path}: HTTP {}", resp.status()));
+    }
+    resp.text().map_err(|e| e.to_string())
 }
 
 /// Like `mihomo_api_get` but for streaming endpoints (`/traffic`,

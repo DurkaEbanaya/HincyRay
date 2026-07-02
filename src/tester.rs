@@ -499,6 +499,21 @@ fn build_sing_box_config(profile: &Profile, port: u16) -> Result<Value, String> 
         Protocol::Trojan => build_trojan_outbound(profile)?,
         Protocol::Shadowsocks => build_shadowsocks_outbound(profile)?,
         Protocol::Hysteria2 => build_hysteria2_outbound(profile)?,
+        Protocol::ShadowsocksR
+        | Protocol::Snell
+        | Protocol::Http
+        | Protocol::Socks
+        | Protocol::AnyTls
+        | Protocol::Hysteria
+        | Protocol::Ssh
+        | Protocol::Masque
+        | Protocol::OpenVpn
+        | Protocol::Tailscale => {
+            return Err(format!(
+                "{} бенчмарк через legacy sing-box builder не поддерживается; используйте Mihomo backend",
+                profile.protocol
+            ));
+        }
         Protocol::WireGuard => {
             return Err(
                 "WireGuard бенчмарк не поддерживается в desktop; используйте роутер".to_owned(),

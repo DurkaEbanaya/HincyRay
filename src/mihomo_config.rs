@@ -87,6 +87,9 @@ pub enum ProxyGroupType {
     Fallback,
     /// Distribute traffic across proxies by strategy.
     LoadBalance,
+    /// Chain proxies in order. Deprecated by upstream in favour of
+    /// per-proxy `dialer-proxy`, but still supported for config parity.
+    Relay,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -547,6 +550,32 @@ pub struct MihomoFeatures {
     /// references (e.g. `geosite:cn`). Values are DNS server URLs.
     #[serde(default)]
     pub dns_nameserver_policy: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub dns_default_nameserver: Vec<String>,
+    #[serde(default)]
+    pub dns_proxy_server_nameserver_policy: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_direct_nameserver_follow_policy: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_fake_ip_filter_mode: Option<String>,
+    #[serde(default)]
+    pub dns_fake_ip_filter: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_fake_ip_ttl: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_use_hosts: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_use_system_hosts: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_ecs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_ecs_override: Option<bool>,
+    #[serde(default)]
+    pub dns_disable_ipv4: bool,
+    #[serde(default)]
+    pub dns_disable_ipv6: bool,
+    #[serde(default)]
+    pub dns_disable_qtypes: Vec<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_fallback_filter: Option<FallbackFilter>,
 
@@ -565,6 +594,17 @@ pub struct MihomoFeatures {
     /// logic rules that can't be expressed via the domain/ip/port model).
     #[serde(default)]
     pub raw_rules: Vec<String>,
+    #[serde(default)]
+    pub typed_rules: Vec<MihomoRuleConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MihomoRuleConfig {
+    pub rule_type: String,
+    pub value: String,
+    pub target: String,
+    #[serde(default)]
+    pub options: Vec<String>,
 }
 
 impl Default for MihomoFeatures {
@@ -597,12 +637,26 @@ impl Default for MihomoFeatures {
             dns_proxy_server_nameserver: Vec::new(),
             dns_direct_nameserver: Vec::new(),
             dns_nameserver_policy: HashMap::new(),
+            dns_default_nameserver: Vec::new(),
+            dns_proxy_server_nameserver_policy: HashMap::new(),
+            dns_direct_nameserver_follow_policy: None,
+            dns_fake_ip_filter_mode: None,
+            dns_fake_ip_filter: Vec::new(),
+            dns_fake_ip_ttl: None,
+            dns_use_hosts: None,
+            dns_use_system_hosts: None,
+            dns_ecs: None,
+            dns_ecs_override: None,
+            dns_disable_ipv4: false,
+            dns_disable_ipv6: false,
+            dns_disable_qtypes: Vec::new(),
             dns_fallback_filter: None,
             sniffer_force_domain: Vec::new(),
             sniffer_skip_domain: Vec::new(),
             sniffer_skip_src_address: Vec::new(),
             sniffer_skip_dst_address: Vec::new(),
             raw_rules: Vec::new(),
+            typed_rules: Vec::new(),
         }
     }
 }
@@ -1031,6 +1085,7 @@ fn build_proxy_groups_json(
         ProxyGroupType::UrlTest => "url-test",
         ProxyGroupType::Fallback => "fallback",
         ProxyGroupType::LoadBalance => "load-balance",
+        ProxyGroupType::Relay => "relay",
     };
     group["type"] = json!(group_type_str);
 
@@ -1111,11 +1166,11 @@ pub fn build_mihomo_config(
     let mut proxy = build_proxy(profile, PROXY_NAME)?;
     apply_per_proxy_fields(&mut proxy, features);
     let mut rules: Vec<String> = features
-        .raw_rules
+        .typed_rules
         .iter()
-        .filter(|r| !r.is_empty())
-        .cloned()
+        .filter_map(mihomo_typed_rule_to_string)
         .collect();
+    rules.extend(features.raw_rules.iter().filter(|r| !r.is_empty()).cloned());
     rules.push(format!("MATCH,{}", PROXY_NAME));
     let mut config = json!({
         "mode": "rule",
@@ -1251,8 +1306,14 @@ pub fn build_mihomo_router_config(
         ));
     }
 
-    // User-defined raw Mihomo rules (AND/OR/NOT/SUB-RULE logic, etc.)
+    // First-class extra Mihomo rules and user-defined raw Mihomo rules
     // inserted before port-mode fallbacks and MATCH.
+    rules.extend(
+        features
+            .typed_rules
+            .iter()
+            .filter_map(mihomo_typed_rule_to_string),
+    );
     rules.extend(features.raw_rules.iter().filter(|r| !r.is_empty()).cloned());
 
     match extra.port_mode {
@@ -1386,7 +1447,7 @@ fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeat
         "listen": format!("0.0.0.0:{}", DNS_INBOUND_PORT),
         "enhanced-mode": "fake-ip",
         "fake-ip-range": "198.18.0.1/16",
-        "fake-ip-filter": [],
+        "fake-ip-filter": features.dns_fake_ip_filter,
         "cache-algorithm": features.dns_cache_algorithm,
         "nameserver": dns.remote_servers,
         "fallback": dns.remote_servers,
@@ -1397,6 +1458,23 @@ fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeat
     if features.dns_prefer_h3 {
         dns_config["prefer-h3"] = json!(true);
     }
+    if !features.dns_default_nameserver.is_empty() {
+        dns_config["default-nameserver"] = json!(features.dns_default_nameserver);
+    }
+    if let Some(mode) = &features.dns_fake_ip_filter_mode
+        && !mode.is_empty()
+    {
+        dns_config["fake-ip-filter-mode"] = json!(mode);
+    }
+    if let Some(ttl) = features.dns_fake_ip_ttl {
+        dns_config["fake-ip-ttl"] = json!(ttl);
+    }
+    if let Some(use_hosts) = features.dns_use_hosts {
+        dns_config["use-hosts"] = json!(use_hosts);
+    }
+    if let Some(use_system_hosts) = features.dns_use_system_hosts {
+        dns_config["use-system-hosts"] = json!(use_system_hosts);
+    }
     if features.dns_respect_rules {
         dns_config["respect-rules"] = json!(true);
     }
@@ -1405,6 +1483,9 @@ fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeat
     }
     if !features.dns_direct_nameserver.is_empty() {
         dns_config["direct-nameserver"] = json!(features.dns_direct_nameserver);
+    }
+    if let Some(follow) = features.dns_direct_nameserver_follow_policy {
+        dns_config["direct-nameserver-follow-policy"] = json!(follow);
     }
     if !features.dns_nameserver_policy.is_empty() {
         let mut policy = json!({});
@@ -1416,6 +1497,34 @@ fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeat
         if policy.as_object().is_some_and(|m| !m.is_empty()) {
             dns_config["nameserver-policy"] = policy;
         }
+    }
+    if !features.dns_proxy_server_nameserver_policy.is_empty() {
+        let mut policy = json!({});
+        for (domain, servers) in &features.dns_proxy_server_nameserver_policy {
+            if !servers.is_empty() {
+                policy[domain] = json!(servers);
+            }
+        }
+        if policy.as_object().is_some_and(|m| !m.is_empty()) {
+            dns_config["proxy-server-nameserver-policy"] = policy;
+        }
+    }
+    if let Some(ecs) = &features.dns_ecs
+        && !ecs.is_empty()
+    {
+        dns_config["ecs"] = json!(ecs);
+    }
+    if let Some(override_ecs) = features.dns_ecs_override {
+        dns_config["ecs-override"] = json!(override_ecs);
+    }
+    if features.dns_disable_ipv4 {
+        dns_config["disable-ipv4"] = json!(true);
+    }
+    if features.dns_disable_ipv6 {
+        dns_config["disable-ipv6"] = json!(true);
+    }
+    for qtype in &features.dns_disable_qtypes {
+        dns_config[format!("disable-qtype-{qtype}")] = json!(true);
     }
     if let Some(filter) = &features.dns_fallback_filter {
         let mut ff = json!({});
@@ -1454,9 +1563,19 @@ fn build_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         Protocol::VMess => build_vmess_proxy(profile, name),
         Protocol::Trojan => build_trojan_proxy(profile, name),
         Protocol::Shadowsocks => build_shadowsocks_proxy(profile, name),
+        Protocol::ShadowsocksR => build_shadowsocksr_proxy(profile, name),
+        Protocol::Snell => build_snell_proxy(profile, name),
+        Protocol::Http => build_http_proxy(profile, name),
+        Protocol::Socks => build_socks_proxy(profile, name),
+        Protocol::AnyTls => build_anytls_proxy(profile, name),
+        Protocol::Hysteria => build_hysteria_proxy(profile, name),
         Protocol::Hysteria2 => build_hysteria2_proxy(profile, name),
         Protocol::WireGuard => build_wireguard_proxy(profile, name),
         Protocol::Tuic => build_tuic_proxy(profile, name),
+        Protocol::Ssh => build_ssh_proxy(profile, name),
+        Protocol::Masque => build_masque_proxy(profile, name),
+        Protocol::OpenVpn => build_openvpn_proxy(profile, name),
+        Protocol::Tailscale => build_tailscale_proxy(profile, name),
         Protocol::Unknown(ref scheme) => Err(format!("Mihomo не поддерживает протокол {scheme}")),
     }
 }
@@ -1988,6 +2107,171 @@ fn build_shadowsocks_proxy(profile: &Profile, name: &str) -> Result<Value, Strin
     }))
 }
 
+fn build_shadowsocksr_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let password = url_password_or_query(&url, "password");
+    let cipher = required_query(&url, "cipher", "ShadowsocksR ссылка без cipher")?;
+    let obfs = required_query(&url, "obfs", "ShadowsocksR ссылка без obfs")?;
+    let protocol = required_query(&url, "protocol", "ShadowsocksR ссылка без protocol")?;
+    let mut proxy = json!({
+        "name": name,
+        "type": "ssr",
+        "server": profile.address,
+        "port": profile.port.unwrap_or(443),
+        "cipher": cipher,
+        "password": password,
+        "obfs": obfs,
+        "protocol": protocol,
+    });
+    copy_optional_string(
+        &mut proxy,
+        &url,
+        "obfs-param",
+        &["obfs-param", "obfs_param"],
+    );
+    copy_optional_string(
+        &mut proxy,
+        &url,
+        "protocol-param",
+        &["protocol-param", "protocol_param"],
+    );
+    Ok(proxy)
+}
+
+fn build_snell_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let psk = if url.username().is_empty() {
+        required_query(&url, "psk", "Snell ссылка без psk")?
+    } else {
+        percent_decode(url.username())
+    };
+    let mut proxy = json!({
+        "name": name,
+        "type": "snell",
+        "server": profile.address,
+        "port": profile.port.unwrap_or(44046),
+        "psk": psk,
+    });
+    copy_optional_u32(&mut proxy, &url, "version", &["version"]);
+    copy_optional_bool(&mut proxy, &url, "reuse", &["reuse"]);
+    if let Some(mode) = query_value_multi(&url, &["obfs", "obfs-mode", "obfs_mode"])
+        && !mode.is_empty()
+    {
+        let mut obfs_opts = json!({ "mode": mode });
+        if let Some(host) = query_value_multi(&url, &["obfs-host", "obfs_host", "host"]) {
+            obfs_opts["host"] = json!(host);
+        }
+        proxy["obfs-opts"] = obfs_opts;
+    }
+    Ok(proxy)
+}
+
+fn build_http_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let mut proxy = json!({
+        "name": name,
+        "type": "http",
+        "server": profile.address,
+        "port": profile.port.unwrap_or(80),
+    });
+    apply_user_password(&mut proxy, &url);
+    apply_tls_common(&mut proxy, &url);
+    Ok(proxy)
+}
+
+fn build_socks_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let scheme_type = match url.scheme() {
+        "socks4" => "socks4",
+        _ => "socks5",
+    };
+    let mut proxy = json!({
+        "name": name,
+        "type": scheme_type,
+        "server": profile.address,
+        "port": profile.port.unwrap_or(1080),
+    });
+    apply_user_password(&mut proxy, &url);
+    apply_tls_common(&mut proxy, &url);
+    Ok(proxy)
+}
+
+fn build_anytls_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let password = url_password_or_query(&url, "password");
+    if password.is_empty() {
+        return Err("AnyTLS ссылка без password".to_owned());
+    }
+    let mut proxy = json!({
+        "name": name,
+        "type": "anytls",
+        "server": profile.address,
+        "port": profile.port.unwrap_or(443),
+        "password": password,
+    });
+    apply_tls_common(&mut proxy, &url);
+    copy_optional_u32(
+        &mut proxy,
+        &url,
+        "idle-session-check-interval",
+        &["idle-session-check-interval", "idle_session_check_interval"],
+    );
+    copy_optional_u32(
+        &mut proxy,
+        &url,
+        "idle-session-timeout",
+        &["idle-session-timeout", "idle_session_timeout"],
+    );
+    copy_optional_u32(
+        &mut proxy,
+        &url,
+        "min-idle-session",
+        &["min-idle-session", "min_idle_session"],
+    );
+    Ok(proxy)
+}
+
+fn build_hysteria_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let auth_str = url_password_or_query(&url, "auth-str");
+    if auth_str.is_empty() {
+        return Err("Hysteria ссылка без auth-str".to_owned());
+    }
+    let mut proxy = json!({
+        "name": name,
+        "type": "hysteria",
+        "server": profile.address,
+        "port": profile.port.unwrap_or(443),
+        "auth-str": auth_str,
+    });
+    copy_optional_string(&mut proxy, &url, "ports", &["ports"]);
+    copy_optional_string(&mut proxy, &url, "obfs", &["obfs"]);
+    copy_optional_string(&mut proxy, &url, "protocol", &["protocol"]);
+    copy_optional_bandwidth(&mut proxy, &url, "up", &["up", "upmbps"]);
+    copy_optional_bandwidth(&mut proxy, &url, "down", &["down", "downmbps"]);
+    apply_tls_common(&mut proxy, &url);
+    copy_optional_u32(
+        &mut proxy,
+        &url,
+        "recv-window-conn",
+        &["recv-window-conn", "recv_window_conn"],
+    );
+    copy_optional_u32(
+        &mut proxy,
+        &url,
+        "recv-window",
+        &["recv-window", "recv_window"],
+    );
+    copy_optional_bool(
+        &mut proxy,
+        &url,
+        "disable_mtu_discovery",
+        &["disable_mtu_discovery", "disable-mtu-discovery"],
+    );
+    copy_optional_bool(&mut proxy, &url, "fast-open", &["fast-open", "fast_open"]);
+    Ok(proxy)
+}
+
 /// Build a Hysteria2 proxy for Mihomo.
 fn build_hysteria2_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
     let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
@@ -2292,6 +2576,162 @@ fn build_tuic_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
     Ok(proxy)
 }
 
+fn build_ssh_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let username = if url.username().is_empty() {
+        required_query(&url, "username", "SSH ссылка без username")?
+    } else {
+        percent_decode(url.username())
+    };
+    let mut proxy = json!({
+        "name": name,
+        "type": "ssh",
+        "server": profile.address,
+        "port": profile.port.unwrap_or(22),
+        "username": username,
+    });
+    if let Some(password) = url
+        .password()
+        .map(percent_decode)
+        .or_else(|| query_value(&url, "password"))
+        && !password.is_empty()
+    {
+        proxy["password"] = json!(password);
+    }
+    copy_optional_string(
+        &mut proxy,
+        &url,
+        "private-key",
+        &["private-key", "private_key"],
+    );
+    copy_optional_string(
+        &mut proxy,
+        &url,
+        "private-key-passphrase",
+        &["private-key-passphrase", "private_key_passphrase"],
+    );
+    copy_optional_string_list(&mut proxy, &url, "host-key", &["host-key", "host_key"]);
+    copy_optional_string_list(
+        &mut proxy,
+        &url,
+        "host-key-algorithms",
+        &["host-key-algorithms", "host_key_algorithms"],
+    );
+    Ok(proxy)
+}
+
+fn build_masque_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let private_key = required_query(&url, "private-key", "MASQUE ссылка без private-key")?;
+    let public_key = required_query(&url, "public-key", "MASQUE ссылка без public-key")?;
+    let mut proxy = json!({
+        "name": name,
+        "type": "masque",
+        "server": profile.address,
+        "port": profile.port.unwrap_or(443),
+        "private-key": private_key,
+        "public-key": public_key,
+    });
+    copy_optional_string(&mut proxy, &url, "ip", &["ip"]);
+    copy_optional_string(&mut proxy, &url, "ipv6", &["ipv6"]);
+    copy_optional_u32(&mut proxy, &url, "mtu", &["mtu"]);
+    copy_optional_bool(
+        &mut proxy,
+        &url,
+        "remote-dns-resolve",
+        &["remote-dns-resolve", "remote_dns_resolve"],
+    );
+    copy_optional_string_list(&mut proxy, &url, "dns", &["dns"]);
+    copy_optional_string(
+        &mut proxy,
+        &url,
+        "congestion-controller",
+        &["congestion-controller", "congestion_controller"],
+    );
+    copy_optional_string(
+        &mut proxy,
+        &url,
+        "bbr-profile",
+        &["bbr-profile", "bbr_profile"],
+    );
+    copy_optional_string(&mut proxy, &url, "network", &["network"]);
+    Ok(proxy)
+}
+
+fn build_openvpn_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let ca = required_query(&url, "ca", "OpenVPN ссылка без ca")?;
+    let mut proxy = json!({
+        "name": name,
+        "type": "openvpn",
+        "server": profile.address,
+        "port": profile.port.unwrap_or(1194),
+        "ca": ca,
+    });
+    apply_user_password(&mut proxy, &url);
+    copy_optional_string(&mut proxy, &url, "proto", &["proto"]);
+    copy_optional_string(&mut proxy, &url, "cert", &["cert"]);
+    copy_optional_string(&mut proxy, &url, "key", &["key"]);
+    copy_optional_string(&mut proxy, &url, "tls-crypt", &["tls-crypt", "tls_crypt"]);
+    copy_optional_u32(&mut proxy, &url, "ping", &["ping"]);
+    copy_optional_u32(
+        &mut proxy,
+        &url,
+        "ping-restart",
+        &["ping-restart", "ping_restart"],
+    );
+    copy_optional_string(&mut proxy, &url, "dev", &["dev"]);
+    copy_optional_string(&mut proxy, &url, "cipher", &["cipher"]);
+    copy_optional_string(&mut proxy, &url, "auth", &["auth"]);
+    copy_optional_string(&mut proxy, &url, "comp-lzo", &["comp-lzo", "comp_lzo"]);
+    copy_optional_u32(&mut proxy, &url, "mtu", &["mtu"]);
+    copy_optional_bool(&mut proxy, &url, "udp", &["udp"]);
+    copy_optional_bool(
+        &mut proxy,
+        &url,
+        "remote-dns-resolve",
+        &["remote-dns-resolve", "remote_dns_resolve"],
+    );
+    copy_optional_string_list(&mut proxy, &url, "dns", &["dns"]);
+    Ok(proxy)
+}
+
+fn build_tailscale_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
+    let url = Url::parse(&profile.raw).map_err(|error| error.to_string())?;
+    let mut proxy = json!({
+        "name": name,
+        "type": "tailscale",
+    });
+    let hostname = query_value(&url, "hostname").unwrap_or_else(|| profile.address.clone());
+    if !hostname.is_empty() {
+        proxy["hostname"] = json!(hostname);
+    }
+    copy_optional_string(&mut proxy, &url, "auth-key", &["auth-key", "auth_key"]);
+    copy_optional_string(
+        &mut proxy,
+        &url,
+        "control-url",
+        &["control-url", "control_url"],
+    );
+    copy_optional_string(&mut proxy, &url, "state-dir", &["state-dir", "state_dir"]);
+    copy_optional_bool(&mut proxy, &url, "ephemeral", &["ephemeral"]);
+    copy_optional_bool(&mut proxy, &url, "udp", &["udp"]);
+    copy_optional_bool(
+        &mut proxy,
+        &url,
+        "accept-routes",
+        &["accept-routes", "accept_routes"],
+    );
+    copy_optional_string(&mut proxy, &url, "exit-node", &["exit-node", "exit_node"]);
+    copy_optional_bool(
+        &mut proxy,
+        &url,
+        "exit-node-allow-lan-access",
+        &["exit-node-allow-lan-access", "exit_node_allow_lan_access"],
+    );
+    Ok(proxy)
+}
+
 /// Convert a daemon-level route rule into Mihomo rule strings.
 fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
     let target = outbound_tag_to_name(&rule.outbound_tag);
@@ -2403,6 +2843,18 @@ fn outbound_tag_to_name(tag: &str) -> String {
     }
 }
 
+fn mihomo_typed_rule_to_string(rule: &MihomoRuleConfig) -> Option<String> {
+    let rule_type = rule.rule_type.trim().to_ascii_uppercase();
+    let value = rule.value.trim();
+    let target = outbound_tag_to_name(rule.target.trim());
+    if rule_type.is_empty() || value.is_empty() || target.is_empty() {
+        return None;
+    }
+    let mut parts = vec![rule_type, value.to_owned(), target];
+    parts.extend(rule.options.iter().filter(|item| !item.is_empty()).cloned());
+    Some(parts.join(","))
+}
+
 /// Check whether a query parameter value is truthy (1 or true).
 fn is_truthy_option(value: Option<&str>) -> bool {
     value.is_some_and(|text| text == "1" || text.eq_ignore_ascii_case("true"))
@@ -2417,6 +2869,101 @@ fn query_value_multi(url: &Url, names: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+fn required_query(url: &Url, name: &str, message: &str) -> Result<String, String> {
+    query_value_multi(url, &[name, &name.replace('-', "_")])
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| message.to_owned())
+}
+
+fn url_password_or_query(url: &Url, query_name: &str) -> String {
+    if !url.username().is_empty() {
+        percent_decode(url.username())
+    } else {
+        query_value_multi(url, &[query_name, &query_name.replace('-', "_")]).unwrap_or_default()
+    }
+}
+
+fn apply_user_password(proxy: &mut Value, url: &Url) {
+    if !url.username().is_empty() {
+        proxy["username"] = json!(percent_decode(url.username()));
+    } else if let Some(username) = query_value(url, "username").filter(|value| !value.is_empty()) {
+        proxy["username"] = json!(username);
+    }
+    if let Some(password) = url
+        .password()
+        .map(percent_decode)
+        .or_else(|| query_value(url, "password"))
+        .filter(|value| !value.is_empty())
+    {
+        proxy["password"] = json!(password);
+    }
+}
+
+fn apply_tls_common(proxy: &mut Value, url: &Url) {
+    if is_truthy_option(query_value(url, "tls").as_deref())
+        || matches!(url.scheme(), "mihomo+https" | "https-proxy")
+    {
+        proxy["tls"] = json!(true);
+    }
+    copy_optional_string(proxy, url, "sni", &["sni", "servername"]);
+    copy_optional_string(proxy, url, "fingerprint", &["fingerprint"]);
+    if let Some(fp) = query_value(url, "fp").filter(|value| !value.is_empty()) {
+        proxy["client-fingerprint"] = json!(fp);
+    }
+    if is_truthy_option(
+        query_value_multi(url, &["skip-cert-verify", "skip_cert_verify", "insecure"]).as_deref(),
+    ) {
+        proxy["skip-cert-verify"] = json!(true);
+    }
+    if let Some(alpn) = query_value(url, "alpn").filter(|value| !value.is_empty()) {
+        proxy["alpn"] = json!(split_csv(&alpn));
+    }
+}
+
+fn copy_optional_string(proxy: &mut Value, url: &Url, field: &str, names: &[&str]) {
+    if let Some(value) = query_value_multi(url, names).filter(|value| !value.is_empty()) {
+        proxy[field] = json!(value);
+    }
+}
+
+fn copy_optional_string_list(proxy: &mut Value, url: &Url, field: &str, names: &[&str]) {
+    if let Some(value) = query_value_multi(url, names).filter(|value| !value.is_empty()) {
+        proxy[field] = json!(split_csv(&value));
+    }
+}
+
+fn copy_optional_u32(proxy: &mut Value, url: &Url, field: &str, names: &[&str]) {
+    if let Some(value) = query_value_multi(url, names).and_then(|value| value.parse::<u32>().ok()) {
+        proxy[field] = json!(value);
+    }
+}
+
+fn copy_optional_bool(proxy: &mut Value, url: &Url, field: &str, names: &[&str]) {
+    if let Some(value) = query_value_multi(url, names) {
+        proxy[field] = json!(is_truthy_option(Some(&value)));
+    }
+}
+
+fn copy_optional_bandwidth(proxy: &mut Value, url: &Url, field: &str, names: &[&str]) {
+    if let Some(value) = query_value_multi(url, names).filter(|value| !value.is_empty()) {
+        let text = if value.chars().all(|ch| ch.is_ascii_digit()) {
+            format!("{value} Mbps")
+        } else {
+            value
+        };
+        proxy[field] = json!(text);
+    }
+}
+
+fn split_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// Build ECH options JSON from a share link's `ech` query parameter.
@@ -2534,9 +3081,12 @@ mod tests {
         ExternalControllerConfig, FallbackFilter, LoadBalanceStrategy, MihomoFeatures, NtpConfig,
         PROXY_NAME, PerProxyDefaults, ProxyGroupConfig, ProxyGroupType, ProxyProviderConfig,
         REDIR_LISTENER, RuleProviderConfig, SmuxConfig, SubRuleConfig, TPROXY_LISTENER,
-        TunnelConfig, build_hysteria2_proxy, build_mihomo_bench_config, build_mihomo_config,
-        build_mihomo_router_config, build_shadowsocks_proxy, build_trojan_proxy, build_tuic_proxy,
-        build_vless_proxy, build_vmess_proxy, build_wireguard_proxy,
+        TunnelConfig, build_anytls_proxy, build_http_proxy, build_hysteria_proxy,
+        build_hysteria2_proxy, build_masque_proxy, build_mihomo_bench_config, build_mihomo_config,
+        build_mihomo_router_config, build_openvpn_proxy, build_shadowsocks_proxy,
+        build_shadowsocksr_proxy, build_snell_proxy, build_socks_proxy, build_ssh_proxy,
+        build_tailscale_proxy, build_trojan_proxy, build_tuic_proxy, build_vless_proxy,
+        build_vmess_proxy, build_wireguard_proxy,
     };
     use crate::profiles::parse_profiles;
     use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule};
@@ -2652,6 +3202,68 @@ mod tests {
             proxy.get("password").and_then(Value::as_str),
             Some("password")
         );
+    }
+
+    #[test]
+    fn build_new_outbound_protocols_have_mihomo_types() {
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                "ssr://pass@example.com:443?cipher=chacha20-ietf&obfs=tls1.2_ticket_auth&protocol=auth_sha1_v4#SSR",
+                "ssr",
+            ),
+            (
+                "snell://psk@example.com:44046?version=4&obfs=http&obfs-host=bing.com#Snell",
+                "snell",
+            ),
+            (
+                "mihomo+https://user:pass@example.com:443?sni=example.com#HTTP",
+                "http",
+            ),
+            ("socks5://user:pass@example.com:1080?udp=1#SOCKS", "socks5"),
+            (
+                "anytls://secret@example.com:443?sni=example.com#AnyTLS",
+                "anytls",
+            ),
+            (
+                "hysteria://secret@example.com:443?upmbps=30&downmbps=200#Hysteria",
+                "hysteria",
+            ),
+            ("ssh://root:pass@example.com:22#SSH", "ssh"),
+            (
+                "masque://example.com:443?private-key=priv&public-key=pub&ip=172.16.0.2/32#MASQUE",
+                "masque",
+            ),
+            (
+                "openvpn://user:pass@example.com:1194?ca=CA#OpenVPN",
+                "openvpn",
+            ),
+            (
+                "tailscale://hincyray?auth-key=tskey-auth-example#Tailscale",
+                "tailscale",
+            ),
+        ];
+
+        for (link, expected_type) in cases {
+            let profile = parse_profiles(link).pop().expect("profile");
+            let proxy = match expected_type {
+                "ssr" => build_shadowsocksr_proxy(&profile, PROXY_NAME),
+                "snell" => build_snell_proxy(&profile, PROXY_NAME),
+                "http" => build_http_proxy(&profile, PROXY_NAME),
+                "socks5" => build_socks_proxy(&profile, PROXY_NAME),
+                "anytls" => build_anytls_proxy(&profile, PROXY_NAME),
+                "hysteria" => build_hysteria_proxy(&profile, PROXY_NAME),
+                "ssh" => build_ssh_proxy(&profile, PROXY_NAME),
+                "masque" => build_masque_proxy(&profile, PROXY_NAME),
+                "openvpn" => build_openvpn_proxy(&profile, PROXY_NAME),
+                "tailscale" => build_tailscale_proxy(&profile, PROXY_NAME),
+                other => panic!("unexpected type {other}"),
+            }
+            .expect("proxy");
+            assert_eq!(
+                proxy.get("type").and_then(Value::as_str),
+                Some(expected_type)
+            );
+        }
     }
 
     #[test]
@@ -3585,6 +4197,23 @@ mod tests {
     }
 
     #[test]
+    fn proxy_group_relay_emits_relay_type() {
+        let mut features = default_features();
+        features.proxy_group = ProxyGroupConfig {
+            enabled: true,
+            group_type: ProxyGroupType::Relay,
+            ..ProxyGroupConfig::default()
+        };
+        let config = build_test_router_config(&features);
+        let groups = config
+            .get("proxy-groups")
+            .and_then(Value::as_array)
+            .expect("proxy-groups");
+        assert_eq!(groups[0].get("type").and_then(Value::as_str), Some("relay"));
+        assert!(groups[0].get("proxies").is_some());
+    }
+
+    #[test]
     fn proxy_group_disabled_uses_single_proxy_name() {
         let config = build_test_router_config(&default_features());
         // When proxy groups disabled, active proxy is named "proxy"
@@ -3841,6 +4470,7 @@ mod tests {
             sniffer_skip_src_address: vec!["192.168.1.0/24".to_owned()],
             sniffer_skip_dst_address: vec!["10.0.0.0/8".to_owned()],
             raw_rules: vec!["AND,((DOMAIN,test.com),(NETWORK,udp)),DIRECT".to_owned()],
+            ..MihomoFeatures::default()
         };
         let json = serde_json::to_string(&features).expect("serialize");
         let deserialized: MihomoFeatures = serde_json::from_str(&json).expect("deserialize");
@@ -5003,6 +5633,51 @@ mod tests {
         assert!(dns.get("nameserver-policy").is_none());
     }
 
+    #[test]
+    fn dns_parity_fields_are_emitted_when_configured() {
+        let mut features = default_features();
+        features.dns_fake_ip_filter_mode = Some("rule".to_owned());
+        features.dns_fake_ip_filter = vec!["MATCH,fake-ip".to_owned()];
+        features.dns_fake_ip_ttl = Some(60);
+        features.dns_use_hosts = Some(false);
+        features.dns_use_system_hosts = Some(false);
+        features.dns_default_nameserver = vec!["1.1.1.1".to_owned()];
+        features.dns_direct_nameserver_follow_policy = Some(true);
+        features.dns_ecs = Some("1.2.3.0/24".to_owned());
+        features.dns_ecs_override = Some(true);
+        features.dns_disable_ipv4 = true;
+        features.dns_disable_qtypes = vec![65];
+        let mut proxy_policy = std::collections::HashMap::new();
+        proxy_policy.insert("node.example.com".to_owned(), vec!["8.8.8.8".to_owned()]);
+        features.dns_proxy_server_nameserver_policy = proxy_policy;
+
+        let config = build_test_router_config(&features);
+        let dns = config.get("dns").expect("dns");
+        assert_eq!(
+            dns.get("fake-ip-filter-mode").and_then(Value::as_str),
+            Some("rule")
+        );
+        assert_eq!(dns.get("fake-ip-ttl").and_then(Value::as_u64), Some(60));
+        assert_eq!(dns.get("use-hosts").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            dns.get("use-system-hosts").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            dns.get("direct-nameserver-follow-policy")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(dns.get("ecs").and_then(Value::as_str), Some("1.2.3.0/24"));
+        assert_eq!(dns.get("ecs-override").and_then(Value::as_bool), Some(true));
+        assert_eq!(dns.get("disable-ipv4").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            dns.get("disable-qtype-65").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(dns.get("proxy-server-nameserver-policy").is_some());
+    }
+
     // ── v0.11.0: Proxy group include-all / include-all-proxies ────
 
     #[test]
@@ -5086,6 +5761,32 @@ mod tests {
                 .iter()
                 .any(|r| { r.as_str().is_some_and(|s| s.starts_with("NOT,")) })
         );
+    }
+
+    #[test]
+    fn typed_rules_emitted_before_raw_rules() {
+        let mut features = default_features();
+        features.typed_rules = vec![super::MihomoRuleConfig {
+            rule_type: "IN-NAME".to_owned(),
+            value: REDIR_LISTENER.to_owned(),
+            target: "active".to_owned(),
+            options: Vec::new(),
+        }];
+        features.raw_rules = vec!["DSCP,4,DIRECT".to_owned()];
+        let config = build_test_router_config(&features);
+        let rules = config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules");
+        let typed_idx = rules
+            .iter()
+            .position(|r| r.as_str() == Some("IN-NAME,redir-in,proxy"))
+            .expect("typed rule");
+        let raw_idx = rules
+            .iter()
+            .position(|r| r.as_str() == Some("DSCP,4,DIRECT"))
+            .expect("raw rule");
+        assert!(typed_idx < raw_idx);
     }
 
     #[test]

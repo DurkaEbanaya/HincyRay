@@ -164,7 +164,7 @@ cargo build --release --bin xray-vpn-test
 ```bash
 cargo fmt --all
 cargo check --all-targets --all-features
-cargo test --all-targets --all-features   # 288 tests
+cargo test --all-targets --all-features   # 292 tests
 cargo clippy --all-targets --all-features   # 0 warnings
 ```
 
@@ -261,6 +261,15 @@ Status, profiles, benchmark, import, subscriptions, routing rules, per-device ro
 | `POST` | `/api/mihomo-api/delay` | Test proxy delay via Mihomo API |
 | `GET` | `/api/mihomo-api/traffic` | Forward `GET /traffic` to Mihomo REST API |
 | `GET` | `/api/mihomo-api/memory` | Forward `GET /memory` to Mihomo REST API |
+| `GET` | `/api/mihomo-api/version` | Forward `GET /version` to Mihomo REST API |
+| `GET` | `/api/mihomo-api/configs` | Forward `GET /configs` to Mihomo REST API |
+| `GET` | `/api/mihomo-api/configs/geo` | Forward `GET /configs/geo` to Mihomo REST API |
+| `GET` | `/api/mihomo-api/rules` | Forward `GET /rules` to Mihomo REST API |
+| `GET` | `/api/mihomo-api/providers/proxies` | Forward `GET /providers/proxies` to Mihomo REST API |
+| `GET` | `/api/mihomo-api/providers/rules` | Forward `GET /providers/rules` to Mihomo REST API |
+| `POST` | `/api/mihomo-api/cache/fakeip/flush` | Flush Mihomo fake-ip cache |
+| `POST` | `/api/mihomo-api/cache/dns/flush` | Flush Mihomo DNS cache |
+| `POST` | `/api/mihomo-api/rules/disable` | Disable a Mihomo rule by index |
 | `POST` | `/api/mihomo-api/speed-test` | Download 10MB through SOCKS proxy, return Mbps |
 | `POST` | `/api/unlock-check` | Probe common service unlock/connectivity through proxy path |
 | `GET` | `/api/substore-lite` | Sub-Store Lite settings |
@@ -317,6 +326,7 @@ Existing `state.json` from any prior version is automatically migrated:
 - v0.11→v0.12: `auto_refresh_enabled`, `auto_refresh_interval_hours`, `last_auto_refresh_unix`, `traffic_total_up_bytes`, `traffic_total_down_bytes`, `connection_log`, `device_routes` added with defaults.
 - v0.12→v0.13: `web_ui_auth` added with disabled default; routing targets accept `reject`.
 - v0.13→v0.14: `sub_store_lite`, `smart_select`, `maintenance`, and EWMA/cooldown profile stats added with defaults.
+- v0.14→v0.15: New `Protocol` variants (ShadowsocksR, Snell, Http, Socks, AnyTls, Hysteria, Ssh, Masque, OpenVpn, Tailscale), `ProxyGroupType::Relay`, DNS parity fields (`dns_fake_ip_filter_mode`, `dns_fake_ip_ttl`, `dns_use_hosts`, `dns_use_system_hosts`, `dns_default_nameserver`, `dns_proxy_server_nameserver_policy`, `dns_direct_nameserver_follow_policy`, `dns_ecs`, `dns_ecs_override`, `dns_disable_ipv4`, `dns_disable_ipv6`, `dns_disable_qtypes`), `typed_rules` (Vec<MihomoRuleConfig>) added to MihomoFeatures with defaults.
 
 No manual intervention required.
 

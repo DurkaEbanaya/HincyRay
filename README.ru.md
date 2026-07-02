@@ -1,4 +1,4 @@
-# HincyRay v0.14.0
+# HincyRay v0.15.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -6,7 +6,7 @@
 
 HincyRay — лёгкий VPN/proxy-клиент для роутеров Keenetic. Поставляет роутер-демон (`hincyray`), который переиспользует парсер и формулу оценки качества из десктопного инструмента `XrayVpnTest`, и предоставляет встроенную веб-панель в локальной сети роутера.
 
-Демон использует **Mihomo (Clash.Meta)** как единое прокси-ядро, поддерживая VLESS (Reality/xhttp), VMess, Trojan, Shadowsocks, Hysteria2 (port hopping), WireGuard и TUIC. Transparent proxying через iptables NAT REDIRECT (TCP) + TPROXY (UDP) — без tun2socks, без TUN-устройства.
+Демон использует **Mihomo (Clash.Meta)** как единое прокси-ядро, поддерживая VLESS (Reality/xhttp), VMess, Trojan, Shadowsocks, ShadowsocksR, Snell, HTTP, SOCKS, AnyTLS, Hysteria v1/v2 (port hopping), WireGuard, TUIC, SSH, MASQUE, OpenVPN и Tailscale. Transparent proxying через iptables NAT REDIRECT (TCP) + TPROXY (UDP) — без tun2socks, без TUN-устройства.
 
 ## Как это работает
 
@@ -261,6 +261,15 @@ http://<ip-роутера>:8088/
 | `POST` | `/api/mihomo-api/delay` | Тест delay прокси через Mihomo API |
 | `GET` | `/api/mihomo-api/traffic` | Проксирование `GET /traffic` на Mihomo REST API |
 | `GET` | `/api/mihomo-api/memory` | Проксирование `GET /memory` на Mihomo REST API |
+| `GET` | `/api/mihomo-api/version` | Проксирование `GET /version` на Mihomo REST API |
+| `GET` | `/api/mihomo-api/configs` | Проксирование `GET /configs` на Mihomo REST API |
+| `GET` | `/api/mihomo-api/configs/geo` | Проксирование `GET /configs/geo` на Mihomo REST API |
+| `GET` | `/api/mihomo-api/rules` | Проксирование `GET /rules` на Mihomo REST API |
+| `GET` | `/api/mihomo-api/providers/proxies` | Проксирование `GET /providers/proxies` на Mihomo REST API |
+| `GET` | `/api/mihomo-api/providers/rules` | Проксирование `GET /providers/rules` на Mihomo REST API |
+| `POST` | `/api/mihomo-api/cache/fakeip/flush` | Очистка fake-ip кэша Mihomo |
+| `POST` | `/api/mihomo-api/cache/dns/flush` | Очистка DNS кэша Mihomo |
+| `POST` | `/api/mihomo-api/rules/disable` | Отключение правила Mihomo по индексу |
 | `POST` | `/api/mihomo-api/speed-test` | Скачать 10 МБ через SOCKS-прокси, вернуть Mbps |
 | `POST` | `/api/unlock-check` | Проверить доступность популярных сервисов через proxy path |
 | `GET` | `/api/substore-lite` | Настройки Sub-Store Lite |

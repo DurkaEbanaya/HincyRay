@@ -393,6 +393,19 @@ fn build_profile_outbound(profile: &Profile, tag: &str) -> Result<Value, String>
         Protocol::VMess => build_vmess_outbound(profile, tag),
         Protocol::Trojan => build_trojan_outbound(profile, tag),
         Protocol::Shadowsocks => build_shadowsocks_outbound(profile, tag),
+        Protocol::ShadowsocksR
+        | Protocol::Snell
+        | Protocol::Http
+        | Protocol::Socks
+        | Protocol::AnyTls
+        | Protocol::Hysteria
+        | Protocol::Ssh
+        | Protocol::Masque
+        | Protocol::OpenVpn
+        | Protocol::Tailscale => Err(format!(
+            "Xray не поддерживает {}; используйте Mihomo",
+            profile.protocol
+        )),
         Protocol::Hysteria2 => {
             Err("Xray не поддерживает Hysteria2; используйте sing-box или mihomo".to_owned())
         }
