@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.15.2 - 2026-07-03
+
+### Added
+
+- **Profile sorting by column click**: 13 sortable columns (Имя, Протокол, Балл, Задержка, Скорость, EWMA, Джиттер, Потери, Ошибки, Cooldown, Транспорт, Адрес). First click — ascending (▲), second — descending (▼). Arrow indicator shown in active header. Null/zero values sorted to end on ascending. Dropdown sort selector delegates to same logic. `getSortValue()` handles `cooldown_until_unix=0` as "no cooldown" (sent to end on ascending).
+- **Collapsed group persistence**: profile group collapse state saved to `localStorage` (`hr_collapsed_groups`) — survives page reload. `loadCollapsedGroups()` / `saveCollapsedGroups()` helpers. `collapsedGroups` Set loaded on startup.
+- **Favorites table**: replaced text-only favorite list with full `tbl-compact` table matching main profiles table (16 columns: ★, ID, Имя, Протокол, Балл, Действия, Задержка, Скорость, EWMA, Джиттер, Потери, Ошибки, Cooldown, QUIC, Транспорт, Адрес). Select/✎/✕ buttons inline. Removed debug "GET /api/favorites" button.
+- **`normalizeProfiles()` merge**: profiles endpoint (has `id`, `block_quic`, friendly group name) merged with stats overlay (latency, score, ewma, failures). Previously preferred stats only, causing `id` to show as `undefined` and group to show raw subscription URL instead of friendly name. `shortGroupName()` shows domain for URL-based groups.
+- **Compact profile table CSS**: `.tbl-compact` class with `padding:4px 8px`, `font:12px` (was `padding:8px 12px`, `font:14px`).
+- **Traffic/memory live updates**: `loadTrafficMemory()` fetches `/api/traffic` + `/api/mihomo-api/memory` on every 5s refresh, updates 7 DOM elements (`tUp`, `tDown`, `tUpTotal`, `tDownTotal`, `psUp`, `psDown`, `psMem`). Previously cards showed static "12 kbps", "34 kbps", "12 MB".
+- **Delay test fix**: `handle_mihomo_api_delay` empty body → `{}` fallback (was "invalid JSON: EOF"). `delayTest()` in UI sends `{}` and shows toast with result.
+- **WebDAV wiring**: WebDAV upload/download buttons now read from input fields (`webdavUrl`, `webdavUser`, `webdavPass`) and send JSON body. Previously sent empty POST → "invalid JSON body".
+- **`fmtKbps()` helper**: formats kbps → "N kbps" or "N.N Mbps".
+- 1 new test: `api_delay_empty_body_uses_defaults`.
+- Removed `max-width:1200px` from `.main-content` — table uses full available width.
+
+### Changed
+
+- Profile table column order: ★, ID, Имя, Протокол, **Балл**, **Действия**, Задержка, Скорость, EWMA, Джиттер, Потери, Ошибки, Cooldown, QUIC, Транспорт, **Адрес** (last). Score and action buttons moved near the start so they're visible without horizontal scrolling.
+- `.main` restored to `overflow-y:auto` (app-shell layout with internal scroll). `.app` stays `height:100vh;overflow:hidden`.
+- Profile group headers show shortened domain name for URL-based groups.
+
+### Verified
+
+- Local gates: `cargo fmt --all`, `cargo check --all-targets --all-features`, `cargo clippy --all-targets --all-features`, `cargo test --all-targets --all-features` (295 tests, 0 clippy warnings).
+- Router E2E on Keenetic Giga KN-1012: health, profiles (id/group correct), traffic (live kbps), memory, delay test (50-69ms), collapse persists across page reload, column sort ascending/descending, favorites table with inline select.
+
 ## v0.15.1 - 2026-07-03
 
 ### Added

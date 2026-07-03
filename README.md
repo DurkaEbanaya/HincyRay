@@ -1,4 +1,4 @@
-# HincyRay v0.15.1
+# HincyRay v0.15.2
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,17 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.15.2
+
+- **Profile sorting by column click**: click any sortable header (Балл, Задержка, Скорость, EWMA, etc.) to sort ascending ▲, click again for descending ▼. State persists across 5s refresh.
+- **Collapsed group persistence**: profile group collapse state saved to `localStorage` — survives page reload.
+- **Favorites table**: full compact table with all metrics and inline Select/Rename/Delete buttons, replacing the old text-only list.
+- **Profile ID/group fix**: `normalizeProfiles` merges profiles + stats endpoints — IDs show correctly (0, 1, 2…) and group names show friendly names instead of raw subscription URLs.
+- **Compact profile table**: reduced padding and font size; column reordered (Балл and action buttons near start, Адрес at end).
+- **Traffic/memory live updates**: proxy status cards now fetch real data from `/api/traffic` and `/api/mihomo-api/memory` every 5s.
+- **Delay test fix**: empty POST body no longer causes "invalid JSON" error — daemon falls back to defaults.
+- **WebDAV wiring**: upload/download buttons now read from input fields and send JSON body.
 
 ### v0.15.1
 
@@ -180,7 +191,7 @@ cargo build --release --bin xray-vpn-test
 ```bash
 cargo fmt --all
 cargo check --all-targets --all-features
-cargo test --all-targets --all-features   # 294 tests
+cargo test --all-targets --all-features   # 295 tests
 cargo clippy --all-targets --all-features   # 0 warnings
 ```
 
