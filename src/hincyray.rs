@@ -9323,34 +9323,51 @@ fn rule_sources() -> Vec<Value> {
 }
 
 fn popular_service_catalog() -> Vec<Value> {
-    let services = [
+    let services: &[(&str, &str, &[&str], &str)] = &[
+        // ── Services (geosite: prefix) ──
         (
             "youtube",
             "YouTube",
-            ["youtube", "googlevideo", "ytimg"].as_slice(),
+            &["youtube", "googlevideo", "ytimg"],
+            "service",
         ),
+        ("netflix", "Netflix", &["netflix"], "service"),
+        ("twitch", "Twitch", &["twitch"], "service"),
+        ("spotify", "Spotify", &["spotify"], "service"),
+        ("telegram", "Telegram", &["telegram"], "service"),
+        ("discord", "Discord", &["discord"], "service"),
+        ("openai", "OpenAI", &["openai"], "service"),
+        ("google", "Google", &["google"], "service"),
+        ("apple", "Apple", &["apple"], "service"),
+        ("microsoft", "Microsoft", &["microsoft"], "service"),
+        ("steam", "Steam", &["steam"], "service"),
+        ("reddit", "Reddit", &["reddit"], "service"),
+        ("twitter", "Twitter/X", &["twitter"], "service"),
+        ("facebook", "Facebook", &["facebook"], "service"),
+        ("instagram", "Instagram", &["instagram"], "service"),
+        ("tiktok", "TikTok", &["tiktok"], "service"),
+        ("disney", "Disney+", &["disney"], "service"),
+        ("hbo", "HBO Max", &["hbo"], "service"),
+        ("amazon", "Amazon", &["amazon"], "service"),
+        ("github", "GitHub", &["github"], "service"),
+        ("cloudflare", "Cloudflare", &["cloudflare"], "service"),
+        ("vk", "VK", &["vk"], "service"),
+        ("yandex", "Yandex", &["yandex"], "service"),
+        // ── Domain zones (bare suffix, no geosite: prefix) ──
+        ("ru", ".ru", &["ru"], "zone"),
+        ("rf", ".рф", &["xn--p1ai"], "zone"),
         (
-            "instagram",
-            "Instagram",
-            ["instagram", "facebook", "fbcdn"].as_slice(),
+            "category-ru",
+            "RU все (GEOSITE)",
+            &["category-ru"],
+            "geosite-zone",
         ),
-        ("telegram", "Telegram", ["telegram"].as_slice()),
-        ("discord", "Discord", ["discord"].as_slice()),
-        ("tiktok", "TikTok", ["tiktok"].as_slice()),
-        ("netflix", "Netflix", ["netflix"].as_slice()),
-        ("twitch", "Twitch", ["twitch"].as_slice()),
-        ("spotify", "Spotify", ["spotify"].as_slice()),
-        ("steam", "Steam", ["steam"].as_slice()),
-        ("google", "Google", ["google"].as_slice()),
-        ("apple", "Apple", ["apple"].as_slice()),
-        ("microsoft", "Microsoft", ["microsoft"].as_slice()),
-        ("openai", "OpenAI", ["openai"].as_slice()),
-        ("cloudflare", "Cloudflare", ["cloudflare"].as_slice()),
-        ("ru", "Russia / RU", ["ru"].as_slice()),
     ];
     services
-        .into_iter()
-        .map(|(id, name, geosite)| json!({"id": id, "name": name, "geosite": geosite}))
+        .iter()
+        .map(|&(id, name, geosite, group)| {
+            json!({"id": id, "name": name, "geosite": geosite, "group": group})
+        })
         .collect()
 }
 

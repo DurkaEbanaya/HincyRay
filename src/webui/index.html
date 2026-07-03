@@ -1009,11 +1009,6 @@ https://sub.example.com/…"></textarea>
               <div class="field" id="proxyPortsField" style="display:none"><label style="font-size:var(--fs-sm);color:var(--muted)">Proxy ports</label><textarea id="rProxyPorts" class="mono" rows="2" placeholder="80,443,8080"></textarea></div>
               <div class="field" id="bypassPortsField" style="display:none"><label style="font-size:var(--fs-sm);color:var(--muted)">Bypass ports</label><textarea id="rBypassPorts" class="mono" rows="2" placeholder="22,53"></textarea></div>
             </div>
-            <div class="feature-card">
-              <h4>RU Direct</h4>
-              <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Режим</label><select id="rRuDirectMode"><option value="off">Выключено</option><option value="tld">.ru и .рф (TLD)</option><option value="geosite">Все русские сайты (GEOSITE)</option></select></div>
-              <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Исключения (через VPN, по одному на строку)</label><textarea id="rRuDirectExceptions" class="mono" rows="3" placeholder="2ip.ru&#10;blocked-site.ru"></textarea></div>
-            </div>
           </div>
           <div style="display:flex;gap:8px;margin:12px 0">
             <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить настройки</button>
@@ -1028,9 +1023,19 @@ https://sub.example.com/…"></textarea>
             <span class="chip" onclick="applyPreset('ru-direct-ad-block')">RU + AdBlock</span>
             <button class="btn btn-sm" onclick="apiAction('POST','/api/routing/catalog/refresh',null,t('Каталог обновляется'))">↻ Обновить каталог</button>
           </div>
+          <div class="feature-card" style="margin-bottom:16px">
+            <h4>RU Direct — русские сайты напрямую</h4>
+            <div class="form-row">
+              <div class="form-group"><label>Режим</label><select id="rRuDirectMode"><option value="off">Выключено</option><option value="tld">.ru и .рф (TLD)</option><option value="geosite">Все русские сайты (GEOSITE)</option></select></div>
+            </div>
+            <div class="form-row">
+              <div class="form-group" style="flex:1"><label>Исключения (через VPN, по одному на строку)</label><textarea id="rRuDirectExceptions" class="mono" rows="3" placeholder="2ip.ru&#10;blocked-site.ru"></textarea></div>
+            </div>
+            <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить</button>
+          </div>
           <h3 style="margin:20px 0 8px;font-size:var(--fs-h3)">Правила маршрутизации</h3>
           <div class="feature-card" style="margin-bottom:16px">
-            <h4>Добавить правило</h4>
+            <h4 id="ruleFormTitle">Добавить правило</h4>
             <div class="form-row">
               <div class="form-group"><label>Имя</label><input id="ruleName" placeholder="YouTube via proxy"></div>
               <div class="form-group"><label>Цель</label><select id="ruleTarget"><option value="active">active</option><option value="direct">direct</option><option value="best">best</option><option value="reject">reject</option><option value="profile:0">profile:0</option></select></div>
@@ -1038,17 +1043,13 @@ https://sub.example.com/…"></textarea>
               <div class="form-group"><label>Порты</label><input id="rulePorts" class="mono" placeholder="80,443"></div>
             </div>
             <div class="form-row">
-              <div class="form-group" style="flex:1"><label>Домены</label><textarea id="ruleDomains" class="mono" rows="3" placeholder="geosite:youtube&#10;domain:googlevideo.com"></textarea></div>
-              <div class="form-group" style="flex:1"><label>IPs</label><textarea id="ruleIps" class="mono" rows="3" placeholder="geoip:us&#10;ip-asn:15169"></textarea></div>
+              <div class="form-group" style="flex:1"><label>Домены, доменные зоны и IP <span style="font-size:var(--fs-sm);color:var(--muted)">(по одному на строку)</span></label><textarea id="ruleEntries" class="mono" rows="5" placeholder="geosite:youtube&#10;googlevideo.com&#10;geoip:us&#10;ip-asn:15169&#10;ru&#10;xn--p1ai"></textarea></div>
             </div>
-            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
-              <span class="chip" data-service="youtube" onclick="toggleRuleService(this)">YouTube</span>
-              <span class="chip" data-service="netflix" onclick="toggleRuleService(this)">Netflix</span>
-              <span class="chip" data-service="openai" onclick="toggleRuleService(this)">OpenAI</span>
-              <span class="chip" data-service="spotify" onclick="toggleRuleService(this)">Spotify</span>
-              <span class="chip" data-service="telegram" onclick="toggleRuleService(this)">Telegram</span>
+            <div id="ruleChips" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px"></div>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-accent" id="ruleSubmitBtn" onclick="submitRoutingRule()">+ Добавить правило</button>
+              <button class="btn" id="ruleCancelEditBtn" style="display:none" onclick="cancelEditRule()">Отмена</button>
             </div>
-            <button class="btn btn-accent" onclick="addRoutingRuleFromForm()">+ Добавить правило</button>
           </div>
           <div class="routing-rules">
             <table class="tbl" id="routingRulesTable">
@@ -1057,7 +1058,6 @@ https://sub.example.com/…"></textarea>
             </table>
           </div>
           <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
-            <button class="btn" onclick="addRoutingRule()">+ Быстрая строка</button>
             <button class="btn btn-accent" onclick="apiAction('POST','/api/routing/apply',null,t('Маршруты применены'),refreshDashboard)">⬆ Применить</button>
           </div>
           <h3 style="margin:20px 0 8px;font-size:var(--fs-h3)">Файрвол</h3>
@@ -2356,7 +2356,7 @@ const I18N = {
   'Прозрачность':'Opacity','Размытие':'Blur','Насыщенность':'Saturation','Шум':'Noise','Блик':'Gloss',
   'Группы прокси':'Proxy Groups','Лог подключений':'Connection Log',
   'Добавить один профиль':'Add single profile','Добавить профиль':'Add profile','Share link':'Share link','Группа':'Group','Без группы':'No group','Переименовать':'Rename','Refresh':'Refresh','Избранные профили':'Favorite profiles','Нет избранных профилей':'No favorite profiles',
-  'Geo asset path':'Geo asset path','Обновить каталог':'Refresh catalog','Добавить правило':'Add rule','Быстрая строка':'Quick row','Домены':'Domains','IPs':'IPs','Порты':'Ports','Популярные сервисы':'Popular services',
+  'Geo asset path':'Geo asset path','Обновить каталог':'Refresh catalog','Добавить правило':'Add rule','Быстрая строка':'Quick row','Домены':'Domains','IPs':'IPs','Порты':'Ports','Популярные сервисы':'Popular services',  'Редактировать':'Edit','Удалить':'Delete','Правила сохранены':'Rules saved','Отмена':'Cancel','Редактировать правило':'Edit rule','Сохранить':'Save',
   'Активные соединения (max 50)':'Active connections (max 50)','Disable rules':'Disable rules','Auto-refresh subscriptions':'Auto-refresh subscriptions','Auto-refresh interval (ч)':'Auto-refresh interval (h)',
   'Health-check enabled':'Health-check enabled','Health-check interval (s)':'Health-check interval (s)','Health-check timeout (ms)':'Health-check timeout (ms)','Health-check lazy':'Health-check lazy','Health-check expected status':'Health-check expected status','Age secret key':'Age secret key','Path in bundle':'Path in bundle','Size limit (bytes)':'Size limit (bytes)','Payload':'Payload','Header':'Header','Exclude type':'Exclude type','Proxy':'Proxy',
   'Введите данные для доступа к панели':'Enter credentials to access the panel',
@@ -2971,50 +2971,163 @@ function renderSubs(data) {
 }
 
 // ─── ROUTING RULES ───────────────────────────────────────────────────
+let editingRuleIndex = null;
+let serviceCatalog = [];
+
+function renderRuleChips(catalog) {
+  serviceCatalog = catalog || [];
+  const container = document.getElementById('ruleChips');
+  if (!container) return;
+  const services = serviceCatalog.filter(s => s.group === 'service');
+  const zones = serviceCatalog.filter(s => s.group === 'zone' || s.group === 'geosite-zone');
+  let html = '';
+  if (services.length) {
+    html += '<div style="width:100%;font-size:var(--fs-sm);color:var(--muted);margin-bottom:2px">Сервисы:</div>';
+    html += services.map(s => `<span class="chip" data-catalog-id="${s.id}" onclick="appendCatalogEntry(this)">${s.name}</span>`).join('');
+  }
+  if (zones.length) {
+    html += '<div style="width:100%;font-size:var(--fs-sm);color:var(--muted);margin-top:6px;margin-bottom:2px">Доменные зоны:</div>';
+    html += zones.map(s => `<span class="chip" data-catalog-id="${s.id}" onclick="appendCatalogEntry(this)">${s.name}</span>`).join('');
+  }
+  container.innerHTML = html;
+}
+
+function appendCatalogEntry(el) {
+  const id = el.dataset.catalogId;
+  const entry = serviceCatalog.find(s => s.id === id);
+  if (!entry) return;
+  const ta = document.getElementById('ruleEntries');
+  if (!ta) return;
+  const geositeNames = entry.geosite || [];
+  const prefix = entry.group === 'zone' ? '' : 'geosite:';
+  const lines = geositeNames.map(g => `${prefix}${g}`);
+  const current = ta.value.trim();
+  ta.value = current ? current + '\n' + lines.join('\n') : lines.join('\n');
+  el.classList.add('active');
+  setTimeout(() => el.classList.remove('active'), 300);
+}
+
+function classifyEntry(entry) {
+  const low = entry.trim().toLowerCase();
+  if (low.startsWith('geoip:') || low.startsWith('geoip-asn:') || low.startsWith('ip-asn:') ||
+      low.startsWith('src-geoip:') || low.startsWith('src-ip-asn:') ||
+      low.startsWith('ip-suffix:') || low.startsWith('src-ip-cidr:') || low.startsWith('src-ip-suffix:'))
+    return 'ip';
+  // Bare IP or CIDR
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(\/\d+)?$/.test(entry.trim())) return 'ip';
+  if (/^[0-9a-fA-F:]+(\/\d+)?$/.test(entry.trim()) && entry.trim().includes(':')) return 'ip';
+  return 'domain';
+}
+
+function collectRuleFromForm() {
+  const entries = (document.getElementById('ruleEntries')?.value || '')
+    .split(/\n|,/).map(s => s.trim()).filter(Boolean);
+  const domains = entries.filter(e => classifyEntry(e) === 'domain');
+  const ips = entries.filter(e => classifyEntry(e) === 'ip');
+  return {
+    enabled: true,
+    name: document.getElementById('ruleName')?.value || 'Custom rule',
+    target: document.getElementById('ruleTarget')?.value || 'active',
+    domains,
+    ips,
+    services: [],
+    ports: (document.getElementById('rulePorts')?.value || '').split(',').map(s=>s.trim()).filter(Boolean),
+    network: document.getElementById('ruleNetwork')?.value || 'any'
+  };
+}
+
+function populateFormFromRule(rule) {
+  safeValue('ruleName', rule.name || '');
+  safeValue('ruleTarget', rule.target || 'active');
+  safeValue('ruleNetwork', rule.network || 'any');
+  safeValue('rulePorts', (rule.ports || []).join(','));
+  const entries = (rule.domains || []).concat(rule.ips || []);
+  safeValue('ruleEntries', entries.join('\n'));
+}
+
+function submitRoutingRule() {
+  const rule = collectRuleFromForm();
+  if (editingRuleIndex !== null) {
+    rule.enabled = MOCK.routing_rules[editingRuleIndex].enabled;
+    MOCK.routing_rules[editingRuleIndex] = rule;
+    editingRuleIndex = null;
+  } else {
+    MOCK.routing_rules.push(rule);
+  }
+  saveRoutingRulesToBackend(() => {
+    resetRuleForm();
+    loadRouting();
+  });
+}
+
+function editRoutingRule(idx) {
+  if (idx < 0 || idx >= MOCK.routing_rules.length) return;
+  editingRuleIndex = idx;
+  const rule = MOCK.routing_rules[idx];
+  populateFormFromRule(rule);
+  document.getElementById('ruleFormTitle').textContent = t('Редактировать правило');
+  document.getElementById('ruleSubmitBtn').textContent = '💾 ' + t('Сохранить');
+  document.getElementById('ruleCancelEditBtn').style.display = '';
+  document.getElementById('ruleFormTitle').scrollIntoView({behavior:'smooth', block:'center'});
+}
+
+function cancelEditRule() {
+  editingRuleIndex = null;
+  resetRuleForm();
+}
+
+function resetRuleForm() {
+  editingRuleIndex = null;
+  safeValue('ruleName', '');
+  safeValue('ruleTarget', 'active');
+  safeValue('ruleNetwork', 'any');
+  safeValue('rulePorts', '');
+  safeValue('ruleEntries', '');
+  document.getElementById('ruleFormTitle').textContent = t('Добавить правило');
+  document.getElementById('ruleSubmitBtn').textContent = '+ ' + t('Добавить правило');
+  document.getElementById('ruleCancelEditBtn').style.display = 'none';
+}
+
+function toggleRoutingRule(idx, enabled) {
+  if (idx < 0 || idx >= MOCK.routing_rules.length) return;
+  MOCK.routing_rules[idx].enabled = enabled;
+  saveRoutingRulesToBackend(() => loadRouting());
+}
+
+function deleteRoutingRule(idx) {
+  if (idx < 0 || idx >= MOCK.routing_rules.length) return;
+  MOCK.routing_rules.splice(idx, 1);
+  if (editingRuleIndex === idx) { cancelEditRule(); }
+  saveRoutingRulesToBackend(() => loadRouting());
+}
+
+function saveRoutingRulesToBackend(afterFn) {
+  api('POST','/api/routing/rules',{rules:MOCK.routing_rules}).then(()=>{
+    showToast('success', t('Правила сохранены'));
+    if (afterFn) afterFn();
+  });
+}
+
 function renderRoutingRules(data) {
   const body = document.getElementById('routingRulesBody');
   if(!body) return;
-  body.innerHTML = data.map((r,i) => `<tr>
-    <td><label class="toggle"><input type="checkbox" ${r.enabled?'checked':''}><span class="slider"></span></label></td>
-    <td>${r.name}</td>
-    <td>${(r.domains||[]).concat(r.ips||[]).concat(r.services||[]).slice(0,3).join(', ')}${(r.domains||[]).length+(r.ips||[]).length>3?'…':''}</td>
+  body.innerHTML = (data||[]).map((r,i) => `<tr>
+    <td><label class="toggle"><input type="checkbox" ${r.enabled?'checked':''} onchange="toggleRoutingRule(${i},this.checked)"><span class="slider"></span></label></td>
+    <td>${r.name||'—'}</td>
+    <td class="mono" style="font-size:12px">${(r.domains||[]).concat(r.ips||[]).concat((r.services||[]).map(s=>'geosite:'+s)).slice(0,4).join(', ')}${(r.domains||[]).length+(r.ips||[]).length+(r.services||[]).length>4?'…':''}</td>
     <td><span class="badge badge-${r.target==='reject'?'danger':r.target==='direct'?'success':'info'}">${r.target}</span></td>
-    <td><button class="btn-icon btn-sm" onclick="this.closest('tr').remove()">✕</button></td>
+    <td style="white-space:nowrap">
+      <button class="btn-icon btn-sm" onclick="editRoutingRule(${i})" title="${t('Редактировать')}">✎</button>
+      <button class="btn-icon btn-sm" onclick="deleteRoutingRule(${i})" title="${t('Удалить')}">✕</button>
+    </td>
   </tr>`).join('');
 }
-function toggleRuleService(el) {
-  el.classList.toggle('active');
-}
-function addRoutingRuleFromForm() {
-  const services = [...document.querySelectorAll('[data-service].active')].map(el => el.dataset.service);
-  const rule = {
-    enabled:true,
-    name:document.getElementById('ruleName').value || 'Custom rule',
-    target:document.getElementById('ruleTarget').value,
-    domains:document.getElementById('ruleDomains').value.split(/\n|,/).map(s=>s.trim()).filter(Boolean),
-    ips:document.getElementById('ruleIps').value.split(/\n|,/).map(s=>s.trim()).filter(Boolean),
-    services,
-    ports:document.getElementById('rulePorts').value.split(',').map(s=>s.trim()).filter(Boolean),
-    network:document.getElementById('ruleNetwork').value
-  };
-  MOCK.routing_rules.push(rule);
-  api('POST','/api/routing/rules',{rules:MOCK.routing_rules}).then(()=>showToast('success',t('Правило добавлено')));
-  renderRoutingRules(MOCK.routing_rules);
-}
-function addRoutingRule() {
-  const body = document.getElementById('routingRulesBody');
-  const row = document.createElement('tr');
-  row.innerHTML = `<td><label class="toggle"><input type="checkbox"><span class="slider"></span></label></td>
-    <td><input style="width:120px" placeholder="Имя правила"></td>
-    <td><input class="mono" style="width:200px" placeholder="geosite:xx, geoip:xx"></td>
-    <td><select><option value="active">active</option><option value="direct">direct</option><option value="best">best</option><option value="reject">reject</option></select></td>
-    <td><button class="btn-icon btn-sm" onclick="this.closest('tr').remove()">✕</button></td>`;
-  body.appendChild(row);
-}
+
 function applyPreset(id) {
-  api('POST','/api/routing-presets/apply',{preset:id}).then(()=>showToast('success',t('Пресет')+' '+id+' '+t('применён')));
-  document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
-  event.target.classList.add('active');
+  api('POST','/api/routing-presets/apply',{preset:id}).then(()=>{
+    showToast('success', t('Пресет')+' '+id+' '+t('применён'));
+    loadRouting();
+  });
 }
 
 // ─── TYPED RULES / PROVIDERS / TUNNELS (Features) ────────────────────
@@ -3734,6 +3847,10 @@ const TOOLTIPS = {
   'rPortMode': 'All — проксировать все порты. AllowList — только указанные. DenyList — всё кроме указанных',
   'rRuDirectMode': 'Выключено — RU Direct не действует. .ru и .рф — DOMAIN-SUFFIX для российских TLD. GEOSITE — category-ru из geosite.dat (включает vk.com, yandex.com и др.)',
   'rRuDirectExceptions': 'Домены, которые пойдут через VPN несмотря на RU Direct. Один на строку. Например: 2ip.ru',
+  'ruleEntries': 'Домены, доменные зоны и IP-адреса. Примеры: geosite:youtube, googlevideo.com, geoip:us, ip-asn:15169, ru (DOMAIN-SUFFIX .ru), xn--p1ai (.рф)',
+  'ruleName': 'Название правила для отображения в таблице',
+  'ruleTarget': 'active — через активный профиль, direct — напрямую, reject — блокировать, best — через лучший',
+  'ruleNetwork': 'any — TCP и UDP, tcp — только TCP, udp — только UDP',
   // DNS
   'dnsEnabled': 'Включить DNS anti-leak. В режиме split routing всегда включён (firewall DNATит DNS на 127.0.0.1:1053)',
   'dnsStrategy': 'UseIPv4 — только A-записи. UseIPv6 — только AAAA. UseIP — и A, и AAAA',
@@ -3934,7 +4051,7 @@ function normalizeConnections(data) {
   return Array.isArray(list) ? list.slice(0,50).map(c => ({host:c.metadata && c.metadata.host || c.host || c.metadata && c.metadata.destinationIP || '', source_ip:c.metadata && c.metadata.sourceIP || c.source_ip || '', destination_ip:c.metadata && c.metadata.destinationIP || c.destination_ip || '', country:c.metadata && (c.metadata.destinationGeoIP || c.metadata.destinationCountry || c.metadata.country) || c.country || c.country_code || '', network:c.metadata && c.metadata.network || c.network || '', chains:Array.isArray(c.chains) ? c.chains.join(' → ') : (c.chains || ''), rule:c.rule || '', upload:c.upload || 0, download:c.download || 0})) : [];
 }
 function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>null), api('GET','/api/profiles').catch(()=>null)]).then(([stats,profiles]) => { MOCK.profiles = normalizeProfiles(stats, profiles); renderProfiles(MOCK.profiles); }); }
-function loadRouting() { return api('GET','/api/routing').then(d => { MOCK.routing_rules = d.rules || d.routing_rules || []; renderRoutingRules(MOCK.routing_rules); if (d.settings || d.split_routing) updateRoutingForm(d.settings || d.split_routing); }); }
+function loadRouting() { return api('GET','/api/routing').then(d => { MOCK.routing_rules = d.rules || d.routing_rules || []; renderRoutingRules(MOCK.routing_rules); renderRuleChips(d.catalog || []); if (d.settings || d.split_routing) updateRoutingForm(d.settings || d.split_routing); }); }
 function loadSubscriptions() { return api('GET','/api/subscriptions').then(d => { MOCK.subscriptions = d.subscriptions || []; renderSubs(MOCK.subscriptions); renderProfiles(MOCK.profiles || []); }); }
 function loadDeviceRoutes() { return api('GET','/api/device-routes').then(d => renderDeviceRoutes(d.device_routes || d.routes || [])); }
 function loadBackups() { return api('GET','/api/backups').then(d => renderBackups(d.backups || [])); }
