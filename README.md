@@ -6,7 +6,7 @@
 
 HincyRay is a lightweight VPN/proxy client for Keenetic routers. It ships a router daemon (`hincyray`) that reuses the parser and quality scoring from the `XrayVpnTest` desktop tool, and exposes an embedded web panel on the router LAN.
 
-The daemon uses **Mihomo (Clash.Meta)** as the single proxy core, supporting VLESS (Reality/xhttp), VMess, Trojan, Shadowsocks, Hysteria2 (port hopping), WireGuard, and TUIC. Transparent proxying via iptables NAT REDIRECT (TCP) + TPROXY (UDP) — no tun2socks, no TUN device.
+The daemon uses **Mihomo (Clash.Meta)** as the single proxy core, supporting VLESS (Reality/xhttp), VMess, Trojan, Shadowsocks, ShadowsocksR, Snell, HTTP, SOCKS, AnyTLS, Hysteria v1/v2 (port hopping), WireGuard, TUIC, SSH, MASQUE, OpenVPN, and Tailscale. Transparent proxying via iptables NAT REDIRECT (TCP) + TPROXY (UDP) — no tun2socks, no TUN device.
 
 ## How it works
 
@@ -42,6 +42,22 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.15.1
+
+- **Fluent/Acrylic Web UI**: new embedded web panel (`src/webui/index.html`) compiled via `include_str!`. 7 navigation groups, 24 sidebar items, 16 Mihomo Features sub-sections, custom Acrylic dropdowns, RU/EN i18n (~180 pairs), light/dark theme with brightness slider, tooltips, login overlay, confirm modal, toast notifications, responsive bottom-nav for mobile, real `fetch()` API helper with Bearer-token auth, production data loaders for all 87 daemon endpoints, data-URI logo (no external asset dependency).
+- **EC streaming fix**: `first_stream_json()` parses the first JSON snapshot from Mihomo infinite-stream endpoints (`/traffic`, `/memory`), succeeding even when `curl --max-time` exits with code 28 (timeout on infinite stream).
+- **Optional EC endpoints**: `/api/mihomo-api/configs/geo` and `/api/mihomo-api/rules/disable` now return `{"supported":false}` (200) when Mihomo EC responds 405, instead of 502 transport error.
+- **UI flicker fix**: `updateStatusUI` split into `updateStatusCards` (core/profile/version cards) and `updateRoutingForm` (routing form fields) — prevents `loadRouting()` from overwriting status cards with partial data.
+
+### v0.15.0
+
+- **10 new outbound protocols**: ShadowsocksR, Snell, HTTP proxy, SOCKS, AnyTLS, Hysteria v1, SSH, MASQUE, OpenVPN, Tailscale. Share-link parsing in `profiles.rs` + Mihomo YAML builders in `mihomo_config.rs`.
+- **Relay proxy groups**: `ProxyGroupType::Relay` for chain proxy groups.
+- **DNS parity fields**: `fake-ip-filter-mode`, `fake-ip-ttl`, `use-hosts`, `use-system-hosts`, `default-nameserver`, `proxy-server-nameserver-policy`, `direct-nameserver-follow-policy`, `ecs`, `ecs-override`, `disable-ipv4/6`, `disable-qtype-N`.
+- **Typed rules**: `MihomoRuleConfig` struct for `IN-NAME`, `IN-USER`, `PROCESS-*`, `UID`, `DSCP`, `RULE-SET` and other Mihomo rule types — emitted before raw rules.
+- **EC API parity endpoints**: `GET /api/mihomo-api/version`, `/configs`, `/configs/geo`, `/rules`, `/providers/proxies`, `/providers/rules`; `POST /api/mihomo-api/cache/fakeip/flush`, `/cache/dns/flush`, `/rules/disable`.
+- **Hysteria v1 mapping**: `hysteria://` / `hy://` now maps to `Protocol::Hysteria` (v1); `hysteria2://` / `hy2://` remains `Protocol::Hysteria2`.
 
 ### v0.14.0
 
@@ -164,7 +180,7 @@ cargo build --release --bin xray-vpn-test
 ```bash
 cargo fmt --all
 cargo check --all-targets --all-features
-cargo test --all-targets --all-features   # 292 tests
+cargo test --all-targets --all-features   # 294 tests
 cargo clippy --all-targets --all-features   # 0 warnings
 ```
 
@@ -186,7 +202,7 @@ See [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md) for m
 http://<router-ip>:8088/
 ```
 
-Status, profiles, benchmark, import, subscriptions, routing rules, per-device routing, firewall controls, DNS, diagnostics, backups, HWID, system monitor, Mihomo update, Mihomo features, proxy status, traffic & connections, logs — all in one page. Auto-refreshes every 5 seconds. No external CDN or build step.
+Fluent/Acrylic design with 7 navigation groups, 24 sidebar items, RU/EN i18n, light/dark theme. Status, profiles, benchmark, import, subscriptions, routing rules, per-device routing, firewall controls, DNS, diagnostics, backups, HWID, system monitor, Mihomo update, Mihomo features, proxy status, traffic & connections, logs — all in one page. Auto-refreshes every 5 seconds. No external CDN or build step.
 
 ### Environment overrides
 

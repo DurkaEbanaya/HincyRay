@@ -43,6 +43,22 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 
 ## Возможности
 
+### v0.15.1
+
+- **Fluent/Acrylic веб-панель**: новая встроенная веб-панель (`src/webui/index.html`), встраивается через `include_str!`. 7 групп навигации, 24 пункта сайдбара, 16 подсекций Mihomo Features, кастомные Acrylic-дропдауны, RU/EN i18n (~180 пар), светлая/тёмная тема со слайдером яркости, тултипы, login-оверлей, confirm-модалка, toast-уведомления, адаптивная нижняя навигация для мобильных, real `fetch()` API-хелпер с Bearer-авторизацией, production data-лоадеры для всех 87 эндпоинтов демона, data-URI лого (без внешних ассетов).
+- **Фикс EC-стриминга**: `first_stream_json()` парсит первый JSON-снапшот из бесконечных стрим-эндпоинтов Mihomo (`/traffic`, `/memory`), успешен даже когда `curl --max-time` завершается с кодом 28 (таймаут на бесконечном стриме).
+- **Опциональные EC-эндпоинты**: `/api/mihomo-api/configs/geo` и `/api/mihomo-api/rules/disable` теперь возвращают `{"supported":false}` (200) при ответе 405 от Mihomo EC, вместо 502 транспортной ошибки.
+- **Фикс мерцания UI**: `updateStatusUI` разделён на `updateStatusCards` (карточки ядра/профиля/версии) и `updateRoutingForm` (поля формы роутинга) — предотвращает перезапись карточек частичными данными при `loadRouting()`.
+
+### v0.15.0
+
+- **10 новых outbound-протоколов**: ShadowsocksR, Snell, HTTP proxy, SOCKS, AnyTLS, Hysteria v1, SSH, MASQUE, OpenVPN, Tailscale. Парсинг share-ссылок в `profiles.rs` + Mihomo YAML-билдеры в `mihomo_config.rs`.
+- **Relay proxy groups**: `ProxyGroupType::Relay` для цепочечных proxy-групп.
+- **DNS parity-поля**: `fake-ip-filter-mode`, `fake-ip-ttl`, `use-hosts`, `use-system-hosts`, `default-nameserver`, `proxy-server-nameserver-policy`, `direct-nameserver-follow-policy`, `ecs`, `ecs-override`, `disable-ipv4/6`, `disable-qtype-N`.
+- **Типизированные правила**: `MihomoRuleConfig` для `IN-NAME`, `IN-USER`, `PROCESS-*`, `UID`, `DSCP`, `RULE-SET` и других типов правил Mihomo — добавляются перед raw-правилами.
+- **EC API parity-эндпоинты**: `GET /api/mihomo-api/version`, `/configs`, `/configs/geo`, `/rules`, `/providers/proxies`, `/providers/rules`; `POST /api/mihomo-api/cache/fakeip/flush`, `/cache/dns/flush`, `/rules/disable`.
+- **Маппинг Hysteria v1**: `hysteria://` / `hy://` теперь маппится на `Protocol::Hysteria` (v1); `hysteria2://` / `hy2://` остаётся `Protocol::Hysteria2`.
+
 ### v0.14.0
 
 - **Rule Trace**: `POST /api/routing/trace` объясняет локальное решение роутинга для host/IP/port/protocol/source IP. Runtime-матчи `geosite:*`, `geoip:*` и `rule-set:*` помечаются как кандидаты для оценки Mihomo, а не угадываются локально.
@@ -164,7 +180,7 @@ cargo build --release --bin xray-vpn-test
 ```bash
 cargo fmt --all
 cargo check --all-targets --all-features
-cargo test --all-targets --all-features   # 288 тестов
+cargo test --all-targets --all-features   # 294 теста
 cargo clippy --all-targets --all-features   # 0 предупреждений
 ```
 
@@ -186,7 +202,7 @@ sh scripts/hincyray-install.sh
 http://<ip-роутера>:8088/
 ```
 
-Статус, профили, бенчмарк, импорт, подписки, правила роутинга, per-device routing, управление firewall, DNS, диагностика, бэкапы, HWID, системный монитор, обновление Mihomo, возможности Mihomo, статус прокси, трафик и соединения, логи — всё на одной странице. Автообновление каждые 5 секунд. Без внешних CDN и сборки.
+Fluent/Acrylic-дизайн с 7 группами навигации, 24 пунктами сайдбара, RU/EN i18n, светлой/тёмной темой. Статус, профили, бенчмарк, импорт, подписки, правила роутинга, per-device routing, управление firewall, DNS, диагностика, бэкапы, HWID, системный монитор, обновление Mihomo, возможности Mihomo, статус прокси, трафик и соединения, логи — всё на одной странице. Автообновление каждые 5 секунд. Без внешних CDN и сборки.
 
 ### Переменные окружения
 
@@ -326,6 +342,7 @@ http://<ip-роутера>:8088/
 - v0.11→v0.12: `auto_refresh_enabled`, `auto_refresh_interval_hours`, `last_auto_refresh_unix`, `traffic_total_up_bytes`, `traffic_total_down_bytes`, `connection_log`, `device_routes` добавлены со значениями по умолчанию.
 - v0.12→v0.13: добавлен `web_ui_auth` с disabled default; routing targets принимают `reject`.
 - v0.13→v0.14: добавлены `sub_store_lite`, `smart_select`, `maintenance` и EWMA/cooldown profile stats со значениями по умолчанию.
+- v0.14→v0.15: новые варианты `Protocol` (ShadowsocksR, Snell, Http, Socks, AnyTls, Hysteria, Ssh, Masque, OpenVpn, Tailscale), `ProxyGroupType::Relay`, DNS parity-поля (`dns_fake_ip_filter_mode`, `dns_fake_ip_ttl`, `dns_use_hosts`, `dns_use_system_hosts`, `dns_default_nameserver`, `dns_proxy_server_nameserver_policy`, `dns_direct_nameserver_follow_policy`, `dns_ecs`, `dns_ecs_override`, `dns_disable_ipv4`, `dns_disable_ipv6`, `dns_disable_qtypes`), `typed_rules` (Vec<MihomoRuleConfig>) добавлены в MihomoFeatures со значениями по умолчанию.
 
 Ручное вмешательство не требуется.
 
