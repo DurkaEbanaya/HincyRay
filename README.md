@@ -1,4 +1,4 @@
-# HincyRay v0.15.5
+# HincyRay v0.15.6
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,15 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.15.6
+
+- **RU Direct**: route Russian domains direct before `MATCH,proxy`. Two modes: `.ru`/`.рф` TLD suffixes or `GEOSITE,category-ru` (includes `vk.com`, `yandex.com`). Exceptions list for domains that should go through VPN anyway (e.g. `2ip.ru`). Rule order: user rules > QUIC block > RU Direct exceptions (→proxy) > RU Direct main (→DIRECT) > port-mode > MATCH.
+- **Unified rules UI**: merged Domains + IPs into single textarea with auto-classification. Expanded service catalog to 23 services + 3 domain zones. Click-to-append chips. Edit (✎) button for inline rule editing.
+- **Chain-check `info` status**: informational nodes (GEOIP runtime, no active connection) are `info` not `warn`; overall status is `ok` when only info nodes exist.
+- **Routing rules CRUD fixed**: delete/toggle/add/preset-apply all call API then reload from server. Custom select sync fixed (initCustomSelects before refreshDashboard).
+- **`network=any` fix**: no longer emits `NETWORK,any` which crashes Mihomo. Two-layer normalization at daemon + config generator.
+- 313 tests, 0 clippy warnings.
 
 ### v0.15.5
 

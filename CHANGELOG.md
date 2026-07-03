@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.15.6 - 2026-07-03
+
+### Added
+
+- **RU Direct**: route Russian domains direct before `MATCH,proxy`. Two modes: `tld` (`DOMAIN-SUFFIX,ru,DIRECT` + `.рф`/`xn--p1ai`) and `geosite` (`GEOSITE,category-ru,DIRECT` from `geosite.dat` — includes `vk.com`, `yandex.com` and other Russian services on foreign TLDs). Exceptions list sends specified domains through VPN despite RU Direct. State: `SplitRoutingSettings.ru_direct_mode` + `ru_direct_exceptions`. API: `POST /api/routing/settings` accepts both fields. Web UI: RU Direct card in rules section with mode select + exceptions textarea.
+- **Unified rules UI**: merged separate "Домены" and "IPs" textareas into a single field with auto-classification (`geoip:`/`ip-asn:`/bare IP → IP, rest → domain). Rich placeholder showing domain, zone, and IP examples.
+- **Expanded service catalog**: 23 services (YouTube, Netflix, Twitch, Spotify, Telegram, Discord, OpenAI, Google, Apple, Microsoft, Steam, Reddit, Twitter/X, Facebook, Instagram, TikTok, Disney+, HBO Max, Amazon, GitHub, Cloudflare, VK, Yandex) + 3 domain zones (`.ru`, `.рф`, `RU все GEOSITE`). Chips rendered dynamically from `/api/routing` catalog, grouped "Сервисы" and "Доменные зоны". Click chip → appends entry to textarea.
+- **Rule editing**: pencil (✎) button on each routing rule — populates form for inline edit with "Save" and "Cancel" buttons.
+- **Chain-check `info` status**: GEOIP/GEOSITE runtime rules and "no active connection" nodes are now `info` (blue/accent), not `warn`. Summary counts `info` separately; overall status is `ok` when only `info` nodes exist.
+
+### Fixed
+
+- **Routing rules CRUD**: delete was DOM-only (rule reappeared on refresh); now calls API + reloads from server. Toggle (enable/disable) was visual-only; now persists via API. Preset apply now reloads rules after applying. Removed dead "Быстрая строка" button that never persisted anything.
+- **`network=any` normalization**: `any`/`all`/`*`/`tcp,udp`/empty in routing rules no longer emits `NETWORK,any` (which crashes Mihomo with "unsupported network type"). Two-layer defense: `normalize_route_network()` at daemon level, `normalize_mihomo_network()` at config generator level.
+- **Chain-check russified**: all node labels and details now in Russian. "External controller unavailable or core stopped" split into 3 specific causes: core stopped, EC disabled, EC unreachable.
+- **Custom select sync**: `initCustomSelects()` now runs before `refreshDashboard()` so Acrylic dropdowns are enhanced before async API data arrives. Explicit `syncCustomSelect` after `updateRoutingForm` ensures RU Direct mode dropdown reflects server state.
+
+### Verified
+
+- Local gates: 313 tests, 0 clippy warnings.
+- Router E2E on Keenetic Giga: core running, active profile id 80, `ru_direct_mode=geosite` with `2ip.ru` exception, config contains `DOMAIN-SUFFIX,2ip.ru,proxy` before `GEOSITE,category-ru,DIRECT`, catalog returns 26 entries, rules CRUD verified, chain-check `bad=0 info=2 status=ok`.
+
 ## v0.15.5 - 2026-07-03
 
 ### Added
