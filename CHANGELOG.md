@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.15.5 - 2026-07-03
+
+### Added
+
+- **Routing chain diagnostics**: `GET/POST /api/routing/chain-check` plus Web UI metro-line visualization for common and per-device transparent routing chains.
+- **All VPN preset**: “Без пресетов / Всё VPN” clears split routing rules and uses final `MATCH,proxy` for intercepted traffic.
+- **Local GeoIP enrichment**: `/api/mihomo-api/connections` adds `metadata.destinationCountry` from local `geoip.metadb`, supporting both MaxMind GeoIP2 Country records and Mihomo Meta-geoip0 scalar/array records.
+
+### Fixed
+
+- Subscription group refresh now sends the saved subscription URL to `/api/subscriptions/refresh-one`; group delete buttons are only shown for real subscription groups.
+- Unlock checks now return a direct/proxy matrix for each service and accept both `service` and `services` request fields.
+- Proxy/rule provider cancel buttons remove the whole provider card instead of a wrong parent element.
+- Mihomo memory and connections handling now tolerate EC-disabled/fallback states without toast spam.
+
+### Safety
+
+- Router routing rules and preset apply reject known OOM-heavy `geosite:category-ads-all` before Mihomo config generation, preventing Keenetic out-of-memory crashes.
+
+### Verified
+
+- Local gates: 306 tests, 0 clippy warnings.
+- Router E2E on Keenetic Giga: core running, active profile id 80, EC enabled, Cloudflare direct blocked/proxy OK, unsafe ad-block preset rejected with HTTP 400, routing chain has `bad=0`, connection metadata enriched with `destinationCountry`.
+
 ## v0.15.4 - 2026-07-03
 
 ### Fixed

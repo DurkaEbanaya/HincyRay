@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{IpAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -704,10 +704,26 @@ pub struct RoutingPreset {
     /// Proxy ports for allow_list mode.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proxy_ports: Vec<&'static str>,
+    /// Clear existing custom routing rules before applying this preset.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_existing: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn routing_presets() -> Vec<RoutingPreset> {
     vec![
+        RoutingPreset {
+            id: "all-vpn",
+            name: "No presets / All VPN",
+            description: "Clear custom routing rules; all intercepted policy traffic falls through to MATCH,proxy",
+            rules: vec![],
+            port_mode: Some("all".to_owned()),
+            proxy_ports: vec![],
+            clear_existing: true,
+        },
         RoutingPreset {
             id: "ru-direct",
             name: "RU Direct",
@@ -721,6 +737,7 @@ fn routing_presets() -> Vec<RoutingPreset> {
             }],
             port_mode: None,
             proxy_ports: vec![],
+            clear_existing: false,
         },
         RoutingPreset {
             id: "ad-block",
@@ -735,6 +752,7 @@ fn routing_presets() -> Vec<RoutingPreset> {
             }],
             port_mode: None,
             proxy_ports: vec![],
+            clear_existing: false,
         },
         RoutingPreset {
             id: "only-web-vpn",
@@ -743,6 +761,7 @@ fn routing_presets() -> Vec<RoutingPreset> {
             rules: vec![],
             port_mode: Some("allow_list".to_owned()),
             proxy_ports: vec!["80", "443"],
+            clear_existing: false,
         },
         RoutingPreset {
             id: "block-social",
@@ -761,6 +780,7 @@ fn routing_presets() -> Vec<RoutingPreset> {
             }],
             port_mode: None,
             proxy_ports: vec![],
+            clear_existing: false,
         },
         RoutingPreset {
             id: "ru-direct-ad-block",
@@ -784,6 +804,7 @@ fn routing_presets() -> Vec<RoutingPreset> {
             ],
             port_mode: None,
             proxy_ports: vec![],
+            clear_existing: false,
         },
     ]
 }
@@ -962,6 +983,31 @@ pub struct RoutingRule {
 
 fn default_routing_target() -> String {
     "active".to_owned()
+}
+
+fn unsafe_router_geosite_ref(value: &str) -> Option<&'static str> {
+    let low = value.trim().to_ascii_lowercase();
+    let name = low.strip_prefix("geosite:").unwrap_or(&low);
+    match name {
+        "category-ads-all" => Some(
+            "geosite:category-ads-all exhausts memory on Keenetic/Mihomo during matcher construction",
+        ),
+        _ => None,
+    }
+}
+
+fn validate_router_routing_rules(rules: &[RoutingRule]) -> Result<(), String> {
+    for rule in rules.iter().filter(|rule| rule.enabled) {
+        for item in rule.domains.iter().chain(rule.services.iter()) {
+            if let Some(reason) = unsafe_router_geosite_ref(item) {
+                return Err(format!("routing rule '{}' is unsafe: {reason}", rule.name));
+            }
+        }
+        if let Some(reason) = unsafe_router_geosite_ref(&rule.pattern) {
+            return Err(format!("routing rule '{}' is unsafe: {reason}", rule.name));
+        }
+    }
+    Ok(())
 }
 
 fn default_listen_host() -> String {
@@ -2581,6 +2627,8 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/routing-presets") => handle_routing_presets_list(),
         ("POST", "/api/routing-presets/apply") => handle_routing_preset_apply(body, daemon),
         ("POST", "/api/routing/trace") => handle_routing_trace(body, daemon),
+        ("GET", "/api/routing/chain-check") => handle_routing_chain_check("", daemon),
+        ("POST", "/api/routing/chain-check") => handle_routing_chain_check(body, daemon),
         ("GET", "/api/routing/firewall-status") => handle_firewall_status(daemon),
         ("POST", "/api/routing/firewall-start") => handle_firewall_start(daemon),
         ("POST", "/api/routing/firewall-stop") => handle_firewall_stop(daemon),
@@ -4122,6 +4170,9 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         rule.ports = normalize_route_items(&rule.ports);
         rule.network = rule.network.trim().to_owned();
     }
+    if let Err(error) = validate_router_routing_rules(&rules) {
+        return (400, "application/json", json!({"error": error}).to_string());
+    }
     let mut inner = lock(&daemon.inner);
     inner.state.routing_rules = rules;
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
@@ -4279,11 +4330,25 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
             json!({"error": "unknown preset", "preset": preset_id}).to_string(),
         );
     };
+    if let Err(error) = validate_router_routing_rules(&preset.rules) {
+        return (
+            400,
+            "application/json",
+            json!({"error": error, "preset": preset_id}).to_string(),
+        );
+    }
 
     let mut inner = lock(&daemon.inner);
 
-    // Add preset rules to existing rules, deduplicating by name.
-    let mut existing = inner.state.routing_rules.clone();
+    // Add preset rules to existing rules, deduplicating by name. Some
+    // presets intentionally reset the rule list first (for example
+    // "All VPN", where an empty rule list is the actual desired state
+    // before the final MATCH,proxy fallback).
+    let mut existing = if preset.clear_existing {
+        Vec::new()
+    } else {
+        inner.state.routing_rules.clone()
+    };
     for rule in &preset.rules {
         if !existing.iter().any(|r| r.name == rule.name) {
             existing.push(rule.clone());
@@ -4322,6 +4387,7 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
             "applied": true,
             "preset": preset.id,
             "rules_added": preset.rules.len(),
+            "rules_cleared": preset.clear_existing,
             "port_mode": preset.port_mode,
         })
         .to_string(),
@@ -4367,6 +4433,420 @@ fn handle_routing_trace(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
     let inner = lock(&daemon.inner);
     let trace = trace_routing_decision(&inner.state, &request);
     (200, "application/json", trace.to_string())
+}
+
+fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let source_ip = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("source_ip")
+                .or_else(|| value.get("src_ip"))
+                .or_else(|| value.get("ip"))
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_owned())
+        })
+        .filter(|s| !s.is_empty());
+
+    let (
+        split,
+        core_running,
+        firewall_active,
+        tproxy_available,
+        active_profile_name,
+        active_profile_id,
+        device_route,
+        routing_rules,
+        ec,
+    ) = {
+        let mut inner = lock(&daemon.inner);
+        let source = source_ip.as_deref().unwrap_or("");
+        let route = inner
+            .state
+            .device_routes
+            .iter()
+            .find(|route| route.enabled && route.ip.trim() == source)
+            .cloned();
+        let active_profile_id = inner.state.active_profile_id;
+        let active_profile_name = active_profile_id
+            .and_then(|id| inner.state.profiles.iter().find(|p| p.id == id))
+            .map(|p| p.name.clone());
+        (
+            inner.state.split_routing.clone(),
+            inner.core.is_running(),
+            inner.firewall.is_running(),
+            inner.firewall.tproxy_available,
+            active_profile_name,
+            active_profile_id,
+            route,
+            inner.state.routing_rules.clone(),
+            mihomo_controller(&inner.state.mihomo_features),
+        )
+    };
+
+    let nat_ok =
+        shell_status("iptables -t nat -S PREROUTING 2>/dev/null | grep -q 'hincyray.*HINCYRAY'");
+    let dns_ok =
+        shell_status("iptables -t nat -S PREROUTING 2>/dev/null | grep -q 'hincyray.*DNAT'");
+    let tproxy_ok = tproxy_available
+        && shell_status(
+            "iptables -t mangle -S PREROUTING 2>/dev/null | grep -q 'hincyray.*HINCYRAY_UDP'",
+        );
+    let route_ok = shell_status("ip rule show 2>/dev/null | grep -q 'fwmark 0x111'");
+    let geo_dir = Path::new(split.geo_asset_path.trim());
+    let geoip_metadb = geo_dir.join("geoip.metadb").exists();
+    let geosite_dat = geo_dir.join("geosite.dat").exists();
+    let uses_geo_assets = routing_rules.iter().any(rule_uses_runtime_geo_assets);
+    let arp_device = source_ip.as_deref().and_then(find_arp_device);
+    let source_seen = match (&ec, source_ip.as_deref()) {
+        (Some((addr, secret)), Some(ip)) if core_running => {
+            mihomo_source_seen(addr, secret.as_deref(), ip).ok()
+        }
+        _ => None,
+    };
+
+    let transparent_ready = split.enabled && firewall_active && nat_ok && core_running;
+    let mut overall = Vec::new();
+    overall.push(chain_node(
+        "split",
+        "Split routing",
+        if split.enabled { "ok" } else { "bad" },
+        if split.enabled {
+            "transparent routing enabled".to_owned()
+        } else {
+            "disabled: policy traffic goes DIRECT through Keenetic".to_owned()
+        },
+    ));
+    overall.push(chain_node(
+        "policy",
+        "Keenetic policy",
+        if split.policy_mark.as_deref().is_some_and(|m| !m.is_empty()) {
+            "ok"
+        } else if split.enabled {
+            "warn"
+        } else {
+            "neutral"
+        },
+        format!(
+            "policy={} mark={}",
+            split.policy_name,
+            split
+                .policy_mark
+                .as_deref()
+                .unwrap_or("unknown until firewall apply")
+        ),
+    ));
+    overall.push(chain_node(
+        "firewall",
+        "Firewall rules",
+        if !split.enabled {
+            "neutral"
+        } else if firewall_active && nat_ok && dns_ok && (!tproxy_available || tproxy_ok) {
+            "ok"
+        } else {
+            "bad"
+        },
+        format!(
+            "state={} nat={} dns={} tproxy={} route={}",
+            if firewall_active {
+                "running"
+            } else {
+                "stopped"
+            },
+            ok_fail(nat_ok),
+            ok_fail(dns_ok),
+            if tproxy_available {
+                ok_fail(tproxy_ok)
+            } else {
+                "unavailable"
+            },
+            ok_fail(route_ok)
+        ),
+    ));
+    overall.push(chain_node(
+        "dns",
+        "DNS redirect",
+        if !split.enabled {
+            "neutral"
+        } else if dns_ok && core_running {
+            "ok"
+        } else {
+            "bad"
+        },
+        format!(
+            "DNAT={} Mihomo core={}",
+            ok_fail(dns_ok),
+            if core_running { "running" } else { "stopped" }
+        ),
+    ));
+    overall.push(chain_node(
+        "tcp",
+        "TCP REDIRECT",
+        if !split.enabled {
+            "neutral"
+        } else if nat_ok && core_running {
+            "ok"
+        } else {
+            "bad"
+        },
+        format!(
+            "NAT={} redirect-port={} Mihomo core={}",
+            ok_fail(nat_ok),
+            split.redirect_port,
+            if core_running { "running" } else { "stopped" }
+        ),
+    ));
+    overall.push(chain_node(
+        "udp",
+        "UDP TPROXY",
+        if !split.enabled {
+            "neutral"
+        } else if tproxy_available && tproxy_ok && route_ok {
+            "ok"
+        } else if !tproxy_available {
+            "warn"
+        } else {
+            "bad"
+        },
+        if tproxy_available {
+            format!(
+                "TPROXY={} policy-route={}",
+                ok_fail(tproxy_ok),
+                ok_fail(route_ok)
+            )
+        } else {
+            "TPROXY unavailable: UDP/QUIC is limited or blocked".to_owned()
+        },
+    ));
+    overall.push(chain_node(
+        "mihomo",
+        "Mihomo core",
+        if core_running { "ok" } else { "bad" },
+        if core_running { "running" } else { "stopped" }.to_owned(),
+    ));
+    overall.push(chain_node(
+        "proxy",
+        "Active proxy",
+        if active_profile_id.is_some() {
+            "ok"
+        } else {
+            "bad"
+        },
+        active_profile_name.unwrap_or_else(|| "no active profile".to_owned()),
+    ));
+    overall.push(chain_node(
+        "geo",
+        "Geo assets",
+        if !uses_geo_assets {
+            "neutral"
+        } else if geoip_metadb && geosite_dat {
+            "ok"
+        } else {
+            "bad"
+        },
+        if uses_geo_assets {
+            format!(
+                "{} geoip.metadb={} geosite.dat={}",
+                split.geo_asset_path,
+                ok_fail(geoip_metadb),
+                ok_fail(geosite_dat)
+            )
+        } else {
+            "routing rules do not require GEOIP/GEOSITE/RULE-SET assets".to_owned()
+        },
+    ));
+
+    let mut device = Vec::new();
+    if let Some(ip) = source_ip.as_deref() {
+        let in_subnet = ip_matches_cidr_text(ip, &split.vpn_subnet);
+        device.push(chain_node(
+            "device",
+            "Selected device",
+            if arp_device.is_some() { "ok" } else { "warn" },
+            arp_device.unwrap_or_else(|| format!("{ip}: not present in /proc/net/arp now")),
+        ));
+        device.push(chain_node(
+            "subnet",
+            "VPN subnet",
+            if in_subnet { "ok" } else { "warn" },
+            format!(
+                "{ip} {} {}",
+                if in_subnet {
+                    "belongs to"
+                } else {
+                    "is outside"
+                },
+                split.vpn_subnet
+            ),
+        ));
+        device.push(chain_node(
+            "override",
+            "Device override",
+            match device_route.as_ref().map(|r| r.target.as_str()) {
+                Some("direct") | Some("reject") => "bad",
+                Some(_) => "warn",
+                None => "ok",
+            },
+            match device_route {
+                Some(route) => format!(
+                    "{} -> {} (overrides all routing rules)",
+                    route.ip, route.target
+                ),
+                None => "none: general routing rules will decide".to_owned(),
+            },
+        ));
+        device.push(chain_node(
+            "port_mode",
+            "Port mode",
+            "ok",
+            match split.port_mode {
+                PortMode::All => "All: every port continues to routing rules".to_owned(),
+                PortMode::AllowList => format!(
+                    "AllowList: only {:?} continue to proxy rules",
+                    split.proxy_ports
+                ),
+                PortMode::DenyList => {
+                    format!("DenyList: {:?} bypass proxy rules", split.bypass_ports)
+                }
+            },
+        ));
+        device.push(chain_node(
+            "rules",
+            "Routing rules",
+            if routing_rules.is_empty() {
+                "ok"
+            } else if uses_geo_assets {
+                "warn"
+            } else {
+                "ok"
+            },
+            if routing_rules.is_empty() {
+                "no custom rules: final MATCH,proxy sends traffic to VPN".to_owned()
+            } else if uses_geo_assets {
+                format!(
+                    "{} rule(s); GEOIP/GEOSITE/RULE-SET are evaluated by Mihomo runtime",
+                    routing_rules.len()
+                )
+            } else {
+                format!("{} rule(s) before final MATCH,proxy", routing_rules.len())
+            },
+        ));
+        device.push(chain_node(
+            "observed",
+            "Observed in Mihomo",
+            match source_seen {
+                Some(true) => "ok",
+                Some(false) => "warn",
+                None => "neutral",
+            },
+            match source_seen {
+                Some(true) => format!("active connection from {ip} is visible in Mihomo"),
+                Some(false) => format!("no active Mihomo connection from {ip} at this moment"),
+                None => "external controller unavailable or core stopped".to_owned(),
+            },
+        ));
+        device.push(chain_node(
+            "result",
+            "Expected result",
+            if transparent_ready { "ok" } else { "bad" },
+            expected_chain_result(transparent_ready, routing_rules.is_empty(), uses_geo_assets),
+        ));
+    }
+
+    (
+        200,
+        "application/json",
+        json!({
+            "overall": overall,
+            "device": device,
+            "source_ip": source_ip,
+            "summary": chain_summary(&overall, &device),
+        })
+        .to_string(),
+    )
+}
+
+fn chain_node(id: &str, label: &str, status: &str, detail: String) -> Value {
+    json!({"id": id, "label": label, "status": status, "detail": detail})
+}
+
+fn ok_fail(ok: bool) -> &'static str {
+    if ok { "OK" } else { "FAIL" }
+}
+
+fn rule_uses_runtime_geo_assets(rule: &RoutingRule) -> bool {
+    rule.enabled
+        && rule
+            .domains
+            .iter()
+            .chain(rule.ips.iter())
+            .chain(rule.services.iter())
+            .any(|item| {
+                let low = item.trim().to_ascii_lowercase();
+                low.starts_with("geoip:")
+                    || low.starts_with("geosite:")
+                    || low.starts_with("rule-set:")
+                    || low.starts_with("src-geoip:")
+                    || low.starts_with("ip-asn:")
+            })
+}
+
+fn find_arp_device(ip: &str) -> Option<String> {
+    let arp = fs::read_to_string("/proc/net/arp").ok()?;
+    for line in arp.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 6 && fields[0] == ip && fields[3] != "00:00:00:00:00:00" {
+            return Some(format!("{} on {} ({})", fields[0], fields[5], fields[3]));
+        }
+    }
+    None
+}
+
+fn mihomo_source_seen(addr: &str, secret: Option<&str>, source_ip: &str) -> Result<bool, String> {
+    let value = mihomo_api_get_json(addr, secret, "/connections")?;
+    let Some(connections) = value.get("connections").and_then(Value::as_array) else {
+        return Ok(false);
+    };
+    Ok(connections.iter().any(|conn| {
+        conn.get("metadata")
+            .and_then(|meta| meta.get("sourceIP"))
+            .and_then(Value::as_str)
+            == Some(source_ip)
+    }))
+}
+
+fn expected_chain_result(
+    transparent_ready: bool,
+    rules_empty: bool,
+    uses_geo_assets: bool,
+) -> String {
+    if !transparent_ready {
+        return "transparent VPN chain is broken; traffic will be DIRECT or connectivity may fail depending on the broken stage".to_owned();
+    }
+    if rules_empty {
+        "all intercepted traffic reaches final MATCH,proxy: VPN".to_owned()
+    } else if uses_geo_assets {
+        "rules include runtime GEOIP/GEOSITE/RULE-SET; Mihomo will decide, then final MATCH,proxy sends non-matching traffic to VPN".to_owned()
+    } else {
+        "first matching routing rule wins; non-matching traffic reaches MATCH,proxy: VPN".to_owned()
+    }
+}
+
+fn chain_summary(overall: &[Value], device: &[Value]) -> Value {
+    let mut bad = 0usize;
+    let mut warn = 0usize;
+    for node in overall.iter().chain(device.iter()) {
+        match node.get("status").and_then(Value::as_str) {
+            Some("bad") => bad += 1,
+            Some("warn") => warn += 1,
+            _ => {}
+        }
+    }
+    json!({
+        "status": if bad > 0 { "bad" } else if warn > 0 { "warn" } else { "ok" },
+        "bad": bad,
+        "warn": warn,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -5088,9 +5568,9 @@ fn handle_mihomo_api_proxies(daemon: &Daemon) -> (u16, &'static str, String) {
 /// Returns real-time connection list with traffic stats. Used by the
 /// Web UI to display active connections.
 fn handle_mihomo_api_connections(daemon: &Daemon) -> (u16, &'static str, String) {
-    let (addr, secret) = {
+    let (addr, secret, geo_dir) = {
         let inner = lock(&daemon.inner);
-        match mihomo_controller(&inner.state.mihomo_features) {
+        let ec = match mihomo_controller(&inner.state.mihomo_features) {
             Some(ec) => ec,
             None => {
                 return (
@@ -5099,15 +5579,87 @@ fn handle_mihomo_api_connections(daemon: &Daemon) -> (u16, &'static str, String)
                     json!({"error": "external controller not enabled"}).to_string(),
                 );
             }
-        }
+        };
+        (ec.0, ec.1, geo_dir_from_state(&inner.state))
     };
     match mihomo_api_get(&addr, secret.as_deref(), "/connections") {
-        Ok(body) => (200, "application/json", body),
+        Ok(body) => (
+            200,
+            "application/json",
+            enrich_connections_with_geoip(&body, geo_dir.as_deref().map(Path::new)).unwrap_or(body),
+        ),
         Err(e) => (
             502,
             "application/json",
             json!({"error": format!("Mihomo API: {e}")}).to_string(),
         ),
+    }
+}
+
+fn enrich_connections_with_geoip(body: &str, geo_dir: Option<&Path>) -> Option<String> {
+    let mut value = serde_json::from_str::<Value>(body).ok()?;
+    let db_path = geo_dir?.join("geoip.metadb");
+    let reader = maxminddb::Reader::open_readfile(db_path).ok()?;
+    let connections = value.get_mut("connections")?.as_array_mut()?;
+    for conn in connections {
+        let Some(metadata) = conn.get_mut("metadata").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if metadata
+            .get("destinationCountry")
+            .and_then(Value::as_str)
+            .is_some_and(|country| iso_country_code(country).is_some())
+        {
+            continue;
+        }
+        let Some(ip) = ["destinationIP", "remoteDestination"]
+            .into_iter()
+            .filter_map(|key| metadata.get(key).and_then(Value::as_str))
+            .find_map(|ip| ip.trim().parse::<IpAddr>().ok())
+        else {
+            continue;
+        };
+        if let Some(country) = geoip_country_code(&reader, ip) {
+            metadata.insert("destinationCountry".to_owned(), json!(country));
+        }
+    }
+    Some(value.to_string())
+}
+
+fn geoip_country_code(reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> Option<String> {
+    if let Some(code) = reader
+        .lookup::<maxminddb::geoip2::Country<'_>>(ip)
+        .ok()
+        .flatten()
+        .and_then(|country| country.country?.iso_code.map(str::to_owned))
+    {
+        return Some(code);
+    }
+    let raw = reader.lookup::<Value>(ip).ok()??;
+    match raw {
+        Value::String(code) => iso_country_code(&code),
+        Value::Array(values) => values
+            .iter()
+            .filter_map(Value::as_str)
+            .find_map(iso_country_code),
+        Value::Object(map) => map
+            .get("country")
+            .and_then(|country| country.get("iso_code"))
+            .or_else(|| map.get("iso_code"))
+            .or_else(|| map.get("code"))
+            .or_else(|| map.get("country_code"))
+            .and_then(Value::as_str)
+            .and_then(iso_country_code),
+        _ => None,
+    }
+}
+
+fn iso_country_code(value: &str) -> Option<String> {
+    let code = value.trim();
+    if code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic()) {
+        Some(code.to_ascii_uppercase())
+    } else {
+        None
     }
 }
 
@@ -5653,15 +6205,28 @@ fn handle_unlock_check(body: &str, daemon: &Daemon) -> (u16, &'static str, Strin
     }
     let requested: HashSet<String> = serde_json::from_str::<Value>(body)
         .ok()
-        .and_then(|v| v.get("services").and_then(Value::as_array).cloned())
-        .map(|arr| {
-            arr.into_iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
-                .collect()
+        .map(|v| {
+            if let Some(service) = v.get("service").and_then(Value::as_str) {
+                [service.to_ascii_lowercase()].into_iter().collect()
+            } else {
+                v.get("services")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
+                    .collect()
+            }
         })
         .unwrap_or_default();
 
-    let client = match socks_client(&socks_url, Duration::from_secs(10)) {
+    let proxy_client = match socks_client(&socks_url, Duration::from_secs(10)) {
+        Ok(client) => client,
+        Err(error) => {
+            return (500, "application/json", json!({"error": error}).to_string());
+        }
+    };
+    let direct_client = match direct_http_client(Duration::from_secs(10)) {
         Ok(client) => client,
         Err(error) => {
             return (500, "application/json", json!({"error": error}).to_string());
@@ -5672,30 +6237,16 @@ fn handle_unlock_check(body: &str, daemon: &Daemon) -> (u16, &'static str, Strin
         if !requested.is_empty() && !requested.contains(probe.id) {
             continue;
         }
-        let start = std::time::Instant::now();
-        let result = match client.get(probe.url).send() {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let ok = probe.ok_statuses.contains(&status);
-                json!({
-                    "id": probe.id,
-                    "name": probe.name,
-                    "url": probe.url,
-                    "reachable": ok,
-                    "http_status": status,
-                    "elapsed_ms": start.elapsed().as_millis() as u64,
-                })
-            }
-            Err(error) => json!({
-                "id": probe.id,
-                "name": probe.name,
-                "url": probe.url,
-                "reachable": false,
-                "error": error.to_string(),
-                "elapsed_ms": start.elapsed().as_millis() as u64,
-            }),
-        };
-        results.push(result);
+        let direct = run_unlock_probe(&direct_client, &probe);
+        let proxy = run_unlock_probe(&proxy_client, &probe);
+        results.push(json!({
+            "id": probe.id,
+            "name": probe.name,
+            "url": probe.url,
+            "direct": direct,
+            "proxy": proxy,
+            "unlocked": proxy.get("reachable").and_then(Value::as_bool).unwrap_or(false),
+        }));
     }
     (
         200,
@@ -5716,7 +6267,7 @@ fn unlock_probes() -> Vec<UnlockProbe> {
         UnlockProbe {
             id: "cloudflare",
             name: "Cloudflare Trace",
-            url: "https://1.1.1.1/cdn-cgi/trace",
+            url: "https://www.cloudflare.com/cdn-cgi/trace",
             ok_statuses: &[200],
         },
         UnlockProbe {
@@ -5744,6 +6295,35 @@ fn unlock_probes() -> Vec<UnlockProbe> {
             ok_statuses: &[200, 301, 302],
         },
     ]
+}
+
+fn run_unlock_probe(client: &reqwest::blocking::Client, probe: &UnlockProbe) -> Value {
+    let start = std::time::Instant::now();
+    match client.get(probe.url).send() {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let ok = probe.ok_statuses.contains(&status);
+            json!({
+                "reachable": ok,
+                "http_status": status,
+                "elapsed_ms": start.elapsed().as_millis() as u64,
+            })
+        }
+        Err(error) => json!({
+            "reachable": false,
+            "error": error.to_string(),
+            "elapsed_ms": start.elapsed().as_millis() as u64,
+        }),
+    }
+}
+
+fn direct_http_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|e| format!("client build: {e}"))
 }
 
 fn socks_client(socks_url: &str, timeout: Duration) -> Result<reqwest::blocking::Client, String> {
@@ -8808,6 +9388,14 @@ mod tests {
     }
 
     #[test]
+    fn iso_country_code_accepts_only_two_letter_codes() {
+        assert_eq!(iso_country_code("ru"), Some("RU".to_owned()));
+        assert_eq!(iso_country_code(" NL "), Some("NL".to_owned()));
+        assert_eq!(iso_country_code("telegram"), None);
+        assert_eq!(iso_country_code("r1"), None);
+    }
+
+    #[test]
     fn format_error_combines_direct_and_proxy_messages() {
         let direct = "https://provider.example/sub/x: connection refused";
         let proxy = "socks5h://127.0.0.1:10808: connect error";
@@ -10720,6 +11308,7 @@ mod tests {
         assert!(!presets.is_empty(), "presets should not be empty");
         let ids: Vec<&str> = presets.iter().filter_map(|p| p["id"].as_str()).collect();
         assert!(ids.contains(&"ru-direct"), "ru-direct preset missing");
+        assert!(ids.contains(&"all-vpn"), "all-vpn preset missing");
         assert!(ids.contains(&"ad-block"), "ad-block preset missing");
         assert!(ids.contains(&"only-web-vpn"), "only-web-vpn preset missing");
         assert!(ids.contains(&"block-social"), "block-social preset missing");
@@ -10730,31 +11319,12 @@ mod tests {
     }
 
     #[test]
-    fn routing_preset_apply_adds_rules() {
+    fn routing_preset_ad_block_is_rejected_as_router_unsafe() {
         let (_dir, daemon) = test_daemon();
-        handle_import(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
-            &daemon,
-        );
-        {
-            let mut inner = lock(&daemon.inner);
-            inner.state.active_profile_id = Some(0);
-            inner.state.split_routing.enabled = true;
-        }
         let (status, _, body) = handle_routing_preset_apply(r#"{"preset":"ad-block"}"#, &daemon);
-        assert_eq!(status, 200);
+        assert_eq!(status, 400);
         let result: Value = serde_json::from_str(&body).expect("parse json");
-        assert_eq!(result["applied"], json!(true));
-        assert_eq!(result["rules_added"], json!(1));
-
-        // Verify rule was added to state.
-        let inner = lock(&daemon.inner);
-        assert_eq!(inner.state.routing_rules.len(), 1);
-        assert_eq!(inner.state.routing_rules[0].target, "reject");
-        assert_eq!(
-            inner.state.routing_rules[0].domains,
-            vec!["geosite:category-ads-all"]
-        );
+        assert!(result["error"].as_str().expect("error").contains("unsafe"));
     }
 
     #[test]
@@ -10799,11 +11369,12 @@ mod tests {
                 ..Default::default()
             });
         }
-        // Apply ad-block preset — should not duplicate the "Block ads" rule.
+        // Apply ad-block preset — should be rejected before it can duplicate
+        // or persist a known router-OOM GEOSITE rule.
         let (status, _, body) = handle_routing_preset_apply(r#"{"preset":"ad-block"}"#, &daemon);
-        assert_eq!(status, 200);
+        assert_eq!(status, 400);
         let result: Value = serde_json::from_str(&body).expect("parse json");
-        assert_eq!(result["rules_added"], json!(1));
+        assert!(result["error"].as_str().expect("error").contains("unsafe"));
 
         let inner = lock(&daemon.inner);
         assert_eq!(
@@ -10840,12 +11411,50 @@ mod tests {
     }
 
     #[test]
+    fn routing_preset_all_vpn_clears_rules_and_sets_all_ports() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "RU direct".to_owned(),
+                target: "direct".to_owned(),
+                ips: vec!["geoip:RU".to_owned()],
+                ..Default::default()
+            });
+            inner.state.split_routing.port_mode = PortMode::AllowList;
+            inner.state.split_routing.proxy_ports = vec!["80".to_owned(), "443".to_owned()];
+        }
+
+        let (status, _, body) = handle_routing_preset_apply(r#"{"preset":"all-vpn"}"#, &daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        assert_eq!(result["rules_cleared"], json!(true));
+
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.routing_rules.is_empty());
+        assert!(matches!(inner.state.split_routing.port_mode, PortMode::All));
+    }
+
+    #[test]
     fn routing_preset_apply_unknown_returns_400() {
         let (_dir, daemon) = test_daemon();
         let (status, _, body) = handle_routing_preset_apply(r#"{"preset":"nonexistent"}"#, &daemon);
         assert_eq!(status, 400);
         let result: Value = serde_json::from_str(&body).expect("parse json");
         assert_eq!(result["error"], json!("unknown preset"));
+    }
+
+    #[test]
+    fn routing_rules_reject_known_oom_geosite() {
+        let (_dir, daemon) = test_daemon();
+        let body = r#"{"rules":[{"enabled":true,"name":"Ads","target":"reject","domains":["geosite:category-ads-all"]}]}"#;
+        let (status, _, response) = handle_routing_rules(body, &daemon);
+        assert_eq!(status, 400);
+        assert!(response.contains("unsafe"));
+
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.routing_rules.is_empty());
     }
 
     #[test]
@@ -11084,6 +11693,61 @@ mod tests {
         );
         assert_eq!(trace["decision"], json!("requires_mihomo_geo_eval"));
         assert_eq!(trace["candidates"].as_array().expect("candidates").len(), 1);
+    }
+
+    #[test]
+    fn routing_chain_check_reports_split_routing_disabled_as_bad() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("GET", "/api/routing/chain-check", "", &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("json");
+        let split = response["overall"]
+            .as_array()
+            .expect("overall")
+            .iter()
+            .find(|node| node["id"] == json!("split"))
+            .expect("split node");
+        assert_eq!(split["status"], json!("bad"));
+        assert!(split["detail"].as_str().expect("detail").contains("DIRECT"));
+    }
+
+    #[test]
+    fn routing_chain_check_accepts_device_source_ip() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.split_routing.enabled = true;
+            inner.state.split_routing.vpn_subnet = "192.168.2.0/24".to_owned();
+            inner.state.device_routes.push(DeviceRoute {
+                enabled: true,
+                name: "Pixel".to_owned(),
+                ip: "192.168.2.35".to_owned(),
+                mac: None,
+                target: "direct".to_owned(),
+            });
+        }
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/routing/chain-check",
+            r#"{"source_ip":"192.168.2.35"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(response["source_ip"], json!("192.168.2.35"));
+        let override_node = response["device"]
+            .as_array()
+            .expect("device")
+            .iter()
+            .find(|node| node["id"] == json!("override"))
+            .expect("override node");
+        assert_eq!(override_node["status"], json!("bad"));
+        assert!(
+            override_node["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("overrides all routing rules")
+        );
     }
 
     #[test]

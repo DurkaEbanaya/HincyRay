@@ -1,4 +1,4 @@
-# HincyRay v0.15.4
+# HincyRay v0.15.5
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,15 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.15.5
+
+- **Routing chain diagnostics**: new `/api/routing/chain-check` endpoint and Web UI metro-line visualization for split routing, policy marks, firewall/DNS/TCP/UDP interception, Mihomo core, active proxy, geo assets, device overrides, port mode, routing rules, and observed Mihomo connections.
+- **Safer routing presets on Keenetic**: router rejects known OOM-heavy `geosite:category-ads-all` rules before applying config, preventing Mihomo from crashing during matcher construction.
+- **Unlock checks improved**: backend accepts both `service` and `services`; each result now includes direct and proxy probes so the UI can show whether VPN actually unlocks the target.
+- **Local connection country flags**: `/api/mihomo-api/connections` enriches Mihomo connection metadata from local `geoip.metadb`, including Meta-geoip0 databases used by Mihomo.
+- **Subscription/profile UI fixes**: refresh/delete group actions use saved subscription URLs; provider card cancel buttons remove the correct card; added “Без пресетов / Всё VPN” preset.
+- 306 tests, 0 clippy warnings.
 
 ### v0.15.4
 
