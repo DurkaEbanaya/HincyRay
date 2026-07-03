@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.15.4 - 2026-07-03
+
+### Fixed
+
+- **Systematic Web UI button audit (~40 buttons)**: every action button now has a proper handler. Previously many buttons called `api()` without success toast, error handling, or reload — clicking them appeared to do nothing.
+  - `apiAction(method, path, body, successMsg, reloadFn)` wrapper standardises all action calls: toast on success, reload section if provided.
+  - `api(method, path, body, silent)` — `silent=true` suppresses error toasts. Used for background polling (EC endpoints `/proxies`, `/connections`, `/memory`, `/traffic` every 5s) — no more spam when External Controller is disabled.
+  - Error toasts auto-hide after 5s (was infinite, requiring manual close).
+  - Human-readable EC error: "External Controller is disabled. Enable it in Mihomo → Settings…" instead of raw 502 JSON.
+- **Save/load functions**: `saveAutoSettings()` (15 fields: auto_select, auto_bench_interval, auto_switch, failover_fail_count, smart_select, maintenance, auto_refresh, etc.), `saveSubStore()` (enabled, include/exclude filter, sort, rename_rules, deduplicate), `saveRoutingSettings()` (12 split routing fields), `saveAuth()` — all with success toasts.
+- **`saveFeatures()` GET→merge→POST→apply**: previously POST clobbered all features not represented in the UI form. Now does GET first, merges form fields into the existing object, POSTs the merged result, then calls `/api/routing/apply` automatically.
+- **Result modals**: `showConfig()` (YAML config in wide modal), `checkUpdate()` (version info modal), `loadLogs()` (log viewer with toast), `doTrace()` (decision/name/reason/source/target/candidates in `#diagOutput`).
+- **Speed test UI**: `speedTest()` modal shows Mbps, bytes, elapsed. Service selector (Cloudflare/OVH/Google/Custom URL) via `applySpeedService()`. Mode and timeout selectors. Upload/jitter/packet-loss honestly omitted — no compatible upload endpoint exists.
+- **Delay test**: "running…" toast instead of silent hang.
+- ID attributes added to ~50 form fields (Auto-Select, Maintenance, Sub-Store, Features, EC sections) — enables proper `document.getElementById()` access.
+- ~40 new i18n entries (RU/EN).
+
+### Added
+
+- **Benchmark details**: collapsible `<details>` with per-server results table (ID, profile, status, latency, jitter, speed, packet loss, error). `renderBenchResults(results)` populates both `#benchResultsBody` (benchmark section) and `#testsBenchBody` (overview Tests section).
+- **Overview "Tests" section** (`ov-tests`): new sidebar nav item with cards (`testsUp`, `testsDown`, `testsMem`), quick buttons (speed test, delay test, benchmark, proxy status, traffic), compact top-20 bench results table.
+- **Mihomo memory procfs fallback**: `read_process_rss_kb(pid)` reads `VmRSS` from `/proc/<pid>/status` when EC is disabled or returns `inuse:0`. Response includes `"source":"procfs"` field. Verified: `{"inuse":35724,"oslimit":0,"source":"procfs"}`.
+- **Device routing UI clarity**: split into two tables — "Detected LAN devices" (shows all scanned devices from `/api/devices`, including those without override) and "Individual override routes" (only explicit per-device rules from `/api/device-routes`). Warning text: override routes have priority above domain/GEO rules. Default target changed from `direct` to `active`. `loadDevices()` auto-loads on page init (silent, no toast spam).
+
+### Verified
+
+- Local gates: 301 tests, 0 clippy warnings.
+- Router E2E on Keenetic Giga: all save/load buttons functional, EC endpoints silent when disabled, speed test returns Cloudflare download speed, benchmark details populated, device scan shows Pixel 6a (192.168.2.35) in LAN table without needing override, memory procfs fallback returns 35724 KB.
+
 ## v0.15.3 - 2026-07-03
 
 ### Fixed

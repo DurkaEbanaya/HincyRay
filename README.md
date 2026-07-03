@@ -1,4 +1,4 @@
-# HincyRay v0.15.3
+# HincyRay v0.15.4
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,20 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.15.4
+
+- **Systematic Web UI button audit (~40 buttons fixed)**: every action button now has a proper handler with success toast and optional auto-reload. `apiAction(method, path, body, successMsg, reloadFn)` wrapper standardises all action calls. Background polling uses `api(silent=true)` — no more error toast spam every 5 seconds when External Controller is disabled. Error toasts auto-hide after 5s.
+  - **Save/load functions**: `saveAutoSettings()` (15 fields), `saveSubStore()`, `saveFeatures()` (GET→merge→POST→apply — doesn't clobber unexposed fields), `saveRoutingSettings()` (12 fields), `saveAuth()` — all with success toasts.
+  - **Result modals**: `showConfig()` (YAML config), `checkUpdate()` (version info), `speedTest()` (Mbps/bytes/elapsed), `doTrace()` (decision/name/reason/source/target/candidates), `loadLogs()` (log viewer).
+  - **Speed test UI**: service selector (Cloudflare/OVH/Google/Custom URL), mode selector, timeout input. Shows download speed, bytes, elapsed time. Upload/jitter/packet-loss honestly omitted (no compatible upload endpoint).
+  - **Human-readable EC error**: "External Controller is disabled. Enable it in Mihomo → Settings…" instead of raw 502 JSON.
+  - ID attributes added to ~50 form fields. ~40 new i18n entries (RU/EN).
+- **Benchmark details**: collapsible `<details>` with per-server results table (ID, profile, status, latency, jitter, speed, packet loss, error). `renderBenchResults()` populates both the benchmark section and the overview Tests section.
+- **Overview "Tests" section**: new sidebar nav item with speed/delay/benchmark quick buttons, traffic/memory cards, compact top-20 bench results table.
+- **Mihomo memory procfs fallback**: `read_process_rss_kb(pid)` reads `VmRSS` from `/proc/<pid>/status` when EC is disabled or returns `inuse:0`. Verified: `{"inuse":35724,"oslimit":0,"source":"procfs"}`.
+- **Device routing UI clarity**: split into two tables — "Detected LAN devices" (shows all scanned devices including those without override) and "Individual override routes" (only explicit per-device rules). Warning text: override routes have priority above domain/GEO rules. Default target changed from `direct` to `active`. `loadDevices()` auto-loads on page init (silent, no toast).
+- 301 tests, 0 clippy warnings.
 
 ### v0.15.3
 

@@ -5420,27 +5420,67 @@ fn handle_mihomo_api_traffic(daemon: &Daemon) -> (u16, &'static str, String) {
 /// Forward `GET /memory` to the Mihomo external controller.
 /// Returns real-time memory usage in kb.
 fn handle_mihomo_api_memory(daemon: &Daemon) -> (u16, &'static str, String) {
-    let (addr, secret) = {
+    let (addr, secret, pid) = {
         let inner = lock(&daemon.inner);
+        let pid = inner.core.child.as_ref().map(Child::id);
         match mihomo_controller(&inner.state.mihomo_features) {
-            Some(ec) => ec,
+            Some((addr, secret)) => (Some(addr), secret, pid),
             None => {
-                return (
-                    400,
-                    "application/json",
-                    json!({"error": "external controller not enabled"}).to_string(),
-                );
+                return match pid.and_then(read_process_rss_kb) {
+                    Some(kb) => (
+                        200,
+                        "application/json",
+                        json!({"inuse": kb, "oslimit": 0, "source": "procfs"}).to_string(),
+                    ),
+                    None => (
+                        400,
+                        "application/json",
+                        json!({"error": "external controller not enabled"}).to_string(),
+                    ),
+                };
             }
         }
     };
+    let Some(addr) = addr else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "external controller not enabled"}).to_string(),
+        );
+    };
     match mihomo_api_stream_get(&addr, secret.as_deref(), "/memory") {
-        Ok(body) => (200, "application/json", body),
+        Ok(body) => {
+            let ec_inuse = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("inuse").and_then(Value::as_u64))
+                .unwrap_or(0);
+            if ec_inuse == 0
+                && let Some(kb) = pid.and_then(read_process_rss_kb)
+            {
+                return (
+                    200,
+                    "application/json",
+                    json!({"inuse": kb, "oslimit": 0, "source": "procfs"}).to_string(),
+                );
+            }
+            (200, "application/json", body)
+        }
         Err(e) => (
             502,
             "application/json",
             json!({"error": format!("Mihomo API: {e}")}).to_string(),
         ),
     }
+}
+
+fn read_process_rss_kb(pid: u32) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.split_whitespace().next()?.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 /// Return cumulative traffic statistics (persisted totals) plus
