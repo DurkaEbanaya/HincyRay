@@ -49,6 +49,7 @@ Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN eve
 - **Safer routing presets on Keenetic**: router rejects known OOM-heavy `geosite:category-ads-all` rules before applying config, preventing Mihomo from crashing during matcher construction.
 - **Unlock checks improved**: backend accepts both `service` and `services`; each result now includes direct and proxy probes so the UI can show whether VPN actually unlocks the target.
 - **Local connection country flags**: `/api/mihomo-api/connections` enriches Mihomo connection metadata from local `geoip.metadb`, including Meta-geoip0 databases used by Mihomo.
+- **UDP TPROXY capability restored**: firewall startup now loads `xt_TPROXY`/`xt_socket` before capability detection and the ndm hook reloads them before reinstalling UDP rules. Verified on Keenetic Giga: `tproxy_available=true`, `tproxy-in` listener on 10811, `HINCYRAY_UDP` mangle rules installed, chain-check UDP node OK.
 - **Subscription/profile UI fixes**: refresh/delete group actions use saved subscription URLs; provider card cancel buttons remove the correct card; added “Без пресетов / Всё VPN” preset.
 - 306 tests, 0 clippy warnings.
 

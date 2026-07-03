@@ -1179,7 +1179,16 @@ impl FirewallManager {
             return Ok(());
         }
 
-        // 1. Detect TPROXY capability.
+        // 1. Load kernel modules required by the transparent firewall path.
+        // Keenetic 4.9 does not reliably auto-load x_tables extensions when
+        // an iptables rule first references them. Capability detection must
+        // therefore make the receiving side (kernel/iptables) ready before it
+        // asks whether the TPROXY contract is supported.
+        load_kernel_module("xt_comment");
+        load_kernel_module("xt_TPROXY");
+        load_kernel_module("xt_socket");
+
+        // 2. Detect TPROXY capability after module loading.
         self.tproxy_available = detect_tproxy();
         if !self.tproxy_available {
             eprintln!(
@@ -1187,16 +1196,7 @@ impl FirewallManager {
             );
         }
 
-        // 1b. Load xt_comment kernel module (needed for iptables -m comment
-        // used in rule tagging/cleanup). Not auto-loaded on Keenetic 4.9.
-        load_kernel_module("xt_comment");
-        // Also ensure TPROXY modules are loaded (they may already be).
-        if self.tproxy_available {
-            load_kernel_module("xt_TPROXY");
-            load_kernel_module("xt_socket");
-        }
-
-        // 2. Query or create Keenetic policy and get connmark.
+        // 3. Query or create Keenetic policy and get connmark.
         let mark = if let Some(m) = cached_mark.filter(|m| !m.is_empty()) {
             m.to_owned()
         } else {
@@ -1233,18 +1233,18 @@ impl FirewallManager {
         };
         self.policy_mark = Some(mark.clone());
 
-        // 3. Install iptables rules.
+        // 4. Install iptables rules.
         install_firewall_rules(&mark, redirect_port, vpn_subnet, self.tproxy_available)?;
 
-        // 4. Install TPROXY policy routing (ip rule + ip route).
+        // 5. Install TPROXY policy routing (ip rule + ip route).
         if self.tproxy_available {
             install_tproxy_route();
         }
 
-        // 5. Generate and install ndm hook script.
+        // 6. Generate and install ndm hook script.
         install_ndm_hook(&mark, redirect_port, vpn_subnet, self.tproxy_available);
 
-        // 6. Create ready marker.
+        // 7. Create ready marker.
         let _ = fs::write("/tmp/hincyray_ready", b"1");
 
         self.active = true;
@@ -1282,13 +1282,41 @@ impl FirewallManager {
 }
 
 /// Load a kernel module by name. Tries `/lib/modules/$(uname -r)/<name>.ko`
-/// then `/opt/lib/modules/<name>.ko` via `insmod`. Silently succeeds if
-/// the module is already loaded.
-fn load_kernel_module(name: &str) {
+/// then `/opt/lib/modules/<name>.ko` via `insmod`. Returns true if the module
+/// is visible in `/proc/modules` after the attempt. Built-in kernel support is
+/// still accepted later by `detect_tproxy()` even when no module row appears.
+fn load_kernel_module(name: &str) -> bool {
+    if kernel_module_loaded(name) {
+        return true;
+    }
     let module_path = format!("/lib/modules/{}/{}.ko", unsafe_kernver(), name);
     let alt_path = format!("/opt/lib/modules/{}.ko", name);
-    let _ = Command::new("insmod").arg(&module_path).status();
-    let _ = Command::new("insmod").arg(&alt_path).status();
+    for path in [&module_path, &alt_path] {
+        if !Path::new(path).exists() {
+            continue;
+        }
+        match Command::new("insmod").arg(path).output() {
+            Ok(output) if output.status.success() || kernel_module_loaded(name) => return true,
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.trim().is_empty() {
+                    eprintln!("hincyray: insmod {path} failed: {}", stderr.trim());
+                }
+            }
+            Err(e) => eprintln!("hincyray: cannot run insmod {path}: {e}"),
+        }
+    }
+    kernel_module_loaded(name)
+}
+
+fn kernel_module_loaded(name: &str) -> bool {
+    fs::read_to_string("/proc/modules")
+        .map(|modules| {
+            modules
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(name))
+        })
+        .unwrap_or(false)
 }
 
 /// Get the kernel version string for module path construction.
@@ -1305,17 +1333,18 @@ fn unsafe_kernver() -> String {
 /// test TPROXY rule. Returns true if both `xt_TPROXY` and `xt_socket`
 /// modules are loaded and the iptables target/match work.
 fn detect_tproxy() -> bool {
+    cleanup_tproxy_test_chain();
+
     // Try creating a TPROXY rule in a test chain.
-    let ok = Command::new("iptables")
-        .args(["-t", "mangle", "-N", "HINCYRAY_TEST_TP"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let ok = iptables_ok(
+        &["-t", "mangle", "-N", "HINCYRAY_TEST_TP"],
+        "create TPROXY test chain",
+    );
     if !ok {
         return false;
     }
-    let tproxy_ok = Command::new("iptables")
-        .args([
+    let tproxy_ok = iptables_ok(
+        &[
             "-t",
             "mangle",
             "-A",
@@ -1330,12 +1359,11 @@ fn detect_tproxy() -> bool {
             "10810",
             "--tproxy-mark",
             "0x111",
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    let socket_ok = Command::new("iptables")
-        .args([
+        ],
+        "append TPROXY target test rule",
+    );
+    let socket_ok = iptables_ok(
+        &[
             "-t",
             "mangle",
             "-A",
@@ -1349,18 +1377,36 @@ fn detect_tproxy() -> bool {
             "MARK",
             "--set-mark",
             "0x111",
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        ],
+        "append socket transparent match test rule",
+    );
     // Cleanup test chain.
+    cleanup_tproxy_test_chain();
+    tproxy_ok && socket_ok
+}
+
+fn cleanup_tproxy_test_chain() {
     let _ = Command::new("iptables")
         .args(["-t", "mangle", "-F", "HINCYRAY_TEST_TP"])
         .status();
     let _ = Command::new("iptables")
         .args(["-t", "mangle", "-X", "HINCYRAY_TEST_TP"])
         .status();
-    tproxy_ok && socket_ok
+}
+
+fn iptables_ok(args: &[&str], context: &str) -> bool {
+    match Command::new("iptables").args(args).output() {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("hincyray: iptables {context} failed: {}", stderr.trim());
+            false
+        }
+        Err(e) => {
+            eprintln!("hincyray: cannot run iptables for {context}: {e}");
+            false
+        }
+    }
 }
 
 /// Query the Keenetic RCI API for a traffic policy's connmark.
@@ -1886,6 +1932,8 @@ fn generate_ndm_hook_script(
     let tproxy_section = if tproxy_available {
         format!(
             r##"# ── mangle table: UDP TPROXY ──
+insmod /lib/modules/$(uname -r)/xt_TPROXY.ko 2>/dev/null
+insmod /lib/modules/$(uname -r)/xt_socket.ko 2>/dev/null
 iptables -t mangle -N HINCYRAY_UDP 2>/dev/null
 iptables -t mangle -F HINCYRAY_UDP
 iptables -t mangle -A HINCYRAY_UDP -m conntrack --ctstate DNAT -m comment --comment hincyray -j RETURN
@@ -1895,6 +1943,12 @@ iptables -t mangle -A HINCYRAY_UDP -p udp -m socket --transparent -m comment --c
 iptables -t mangle -A HINCYRAY_UDP -p udp -m comment --comment hincyray -j TPROXY --on-ip 127.0.0.1 --on-port {tproxy_port} --tproxy-mark 0x111
 iptables -t mangle -D PREROUTING -m connmark --mark {mark} -p udp -m comment --comment hincyray -j HINCYRAY_UDP 2>/dev/null
 iptables -t mangle -A PREROUTING -m connmark --mark {mark} -p udp -m comment --comment hincyray -j HINCYRAY_UDP
+
+# ── TPROXY policy routing ──
+ip rule del fwmark 0x111 lookup 111 2>/dev/null
+ip rule add fwmark 0x111 lookup 111 2>/dev/null
+ip route flush table 111 2>/dev/null
+ip route add local default dev lo table 111 2>/dev/null
 "##,
             tproxy_port = tproxy_port_str,
             mark = mark
@@ -1933,12 +1987,6 @@ iptables -t nat -I PREROUTING 1 -m connmark --mark $MARK -p udp --dport 53 -m co
 iptables -t nat -I PREROUTING 2 -m connmark --mark $MARK -p tcp --dport 53 -m comment --comment hincyray -j DNAT --to-destination $DNS_DST
 
 {tproxy}
-
-# ── TPROXY policy routing ──
-ip rule del fwmark 0x111 lookup 111 2>/dev/null
-ip rule add fwmark 0x111 lookup 111 2>/dev/null
-ip route flush table 111 2>/dev/null
-ip route add local default dev lo table 111 2>/dev/null
 "##,
         mark = mark,
         port = port_str,

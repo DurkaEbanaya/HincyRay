@@ -14,6 +14,7 @@
 - Unlock checks now return a direct/proxy matrix for each service and accept both `service` and `services` request fields.
 - Proxy/rule provider cancel buttons remove the whole provider card instead of a wrong parent element.
 - Mihomo memory and connections handling now tolerate EC-disabled/fallback states without toast spam.
+- UDP TPROXY detection now loads `xt_TPROXY` and `xt_socket` before probing iptables target/match support. Previously detection ran before module loading, so Keenetic stayed in TCP-only REDIRECT mode even though the required modules existed.
 
 ### Safety
 
@@ -22,7 +23,7 @@
 ### Verified
 
 - Local gates: 306 tests, 0 clippy warnings.
-- Router E2E on Keenetic Giga: core running, active profile id 80, EC enabled, Cloudflare direct blocked/proxy OK, unsafe ad-block preset rejected with HTTP 400, routing chain has `bad=0`, connection metadata enriched with `destinationCountry`.
+- Router E2E on Keenetic Giga: core running, active profile id 80, EC enabled, Cloudflare direct blocked/proxy OK, unsafe ad-block preset rejected with HTTP 400, routing chain has `bad=0`, connection metadata enriched with `destinationCountry`, UDP TPROXY modules/listener/mangle rules present and chain UDP node OK.
 
 ## v0.15.4 - 2026-07-03
 
