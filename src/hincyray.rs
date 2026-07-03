@@ -909,6 +909,11 @@ pub struct SplitRoutingSettings {
     /// One domain per line in the UI; stored as a Vec.
     #[serde(default)]
     pub ru_direct_exceptions: Vec<String>,
+    /// v0.16: Controls the final MATCH rule target.
+    /// `"proxy"` = everything through VPN, `"direct"` = everything direct.
+    /// Empty string (old state) is migrated in `load_state()`.
+    #[serde(default)]
+    pub match_target: String,
 }
 
 impl Default for SplitRoutingSettings {
@@ -930,6 +935,7 @@ impl Default for SplitRoutingSettings {
             geo_asset_path: default_geo_asset_path(),
             ru_direct_mode: String::new(),
             ru_direct_exceptions: Vec::new(),
+            match_target: String::new(),
         }
     }
 }
@@ -989,10 +995,19 @@ pub struct RoutingRule {
     /// v0.5: Network type filter: "tcp", "udp", or empty for both.
     #[serde(default)]
     pub network: String,
+    /// v0.16: Port matching mode.
+    /// `"include"` (default) — rule applies only to listed ports.
+    /// `"exclude"` — rule applies to all ports except listed ones.
+    #[serde(default = "default_rule_port_mode")]
+    pub port_mode: String,
 }
 
 fn default_routing_target() -> String {
     "active".to_owned()
+}
+
+fn default_rule_port_mode() -> String {
+    "include".to_owned()
 }
 
 fn unsafe_router_geosite_ref(value: &str) -> Option<&'static str> {
@@ -2156,6 +2171,46 @@ fn load_state(state_path: &Path) -> HincyrayState {
     if state.split_routing.enabled {
         state.dns_settings.enabled = true;
     }
+
+    // v0.16 migration: match_target. Old state files don't have this
+    // field (empty string). Preserve old MATCH behaviour:
+    //   AllowList → MATCH,direct (only listed ports proxied)
+    //   All/DenyList → MATCH,proxy (everything through VPN)
+    if state.split_routing.match_target.is_empty() {
+        state.split_routing.match_target = match &state.split_routing.port_mode {
+            PortMode::AllowList if !state.split_routing.proxy_ports.is_empty() => {
+                "direct".to_owned()
+            }
+            _ => "proxy".to_owned(),
+        };
+    }
+
+    // v0.16 migration: QUIC block. Convert block_quic_global / quic_mode
+    // into a regular routing rule so the user can see and edit it in the
+    // rules table. Per-profile block_quic and !tproxy_available remain
+    // system-level automatic rules in the config generator.
+    let needs_quic_rule =
+        state.split_routing.block_quic_global || state.split_routing.quic_mode == QuicMode::Block;
+    let has_quic_rule = state.routing_rules.iter().any(|r| r.name == "QUIC Block");
+    if needs_quic_rule && !has_quic_rule {
+        state.routing_rules.insert(
+            0,
+            RoutingRule {
+                enabled: true,
+                name: "QUIC Block".to_owned(),
+                kind: String::new(),
+                pattern: String::new(),
+                target: "reject".to_owned(),
+                domains: Vec::new(),
+                ips: Vec::new(),
+                services: Vec::new(),
+                ports: vec!["443".to_owned()],
+                network: "udp".to_owned(),
+                port_mode: "include".to_owned(),
+            },
+        );
+    }
+
     state
 }
 
@@ -2242,6 +2297,7 @@ fn build_daemon_config(state: &HincyrayState) -> Result<String, String> {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         });
     }
     // Device rules first, then general rules.
@@ -2343,10 +2399,14 @@ fn build_routing_context<'a>(
             block_quic: state.split_routing.block_quic_global || profile_quic,
             ports,
             network,
+            port_mode: rule.port_mode.clone(),
         });
     }
 
-    let active_block_quic = state.split_routing.block_quic_global || active_profile.block_quic;
+    // v0.16: block_quic_global is now handled by a migrated routing rule
+    // ("QUIC Block"). active_block_quic only reflects per-profile QUIC
+    // capability, which is a system-level automatic rule.
+    let active_block_quic = active_profile.block_quic;
     let extra = RouterExtra {
         dns: Some(state.dns_settings.clone()),
         port_mode: state.split_routing.port_mode.clone(),
@@ -2359,6 +2419,7 @@ fn build_routing_context<'a>(
         },
         ru_direct_mode: state.split_routing.ru_direct_mode.clone(),
         ru_direct_exceptions: normalize_route_items(&state.split_routing.ru_direct_exceptions),
+        match_target: state.split_routing.match_target.clone(),
     };
     (extra_profiles, routes, active_block_quic, extra)
 }
@@ -2691,6 +2752,9 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/routing/apply") => handle_routing_apply(daemon),
         ("GET", "/api/routing-presets") => handle_routing_presets_list(),
         ("POST", "/api/routing-presets/apply") => handle_routing_preset_apply(body, daemon),
+        ("GET", "/api/geo/providers") => handle_geo_providers(),
+        ("POST", "/api/geo/download") => handle_geo_download(body, daemon),
+        ("GET", "/api/geo/status") => handle_geo_status(daemon),
         ("POST", "/api/routing/trace") => handle_routing_trace(body, daemon),
         ("GET", "/api/routing/chain-check") => handle_routing_chain_check("", daemon),
         ("POST", "/api/routing/chain-check") => handle_routing_chain_check(body, daemon),
@@ -4109,13 +4173,80 @@ fn handle_subscriptions_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
 
 fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
+    let conflicts = detect_routing_conflicts(&inner.state);
     let response = json!({
         "settings": inner.state.split_routing,
         "rules": inner.state.routing_rules,
         "catalog": popular_service_catalog(),
         "sources": rule_sources(),
+        "conflicts": conflicts,
     });
     (200, "application/json", response.to_string())
+}
+
+/// Detect conflicts between per-rule ports and global PortMode.
+/// Returns a list of warning strings (empty if no conflicts).
+fn detect_routing_conflicts(state: &HincyrayState) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let split = &state.split_routing;
+
+    match split.port_mode {
+        PortMode::AllowList if !split.proxy_ports.is_empty() => {
+            let allowed: Vec<&str> = split
+                .proxy_ports
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for rule in state.routing_rules.iter().filter(|r| r.enabled) {
+                for port in rule
+                    .ports
+                    .iter()
+                    .map(|p| p.trim())
+                    .filter(|p| !p.is_empty())
+                {
+                    if !allowed.contains(&port) {
+                        warnings.push(format!(
+                            "правило «{}»: порт {} не входит в AllowList ({}) — \
+                             глобальный PortMode может перехватить трафик раньше",
+                            rule.name,
+                            port,
+                            allowed.join(",")
+                        ));
+                    }
+                }
+            }
+        }
+        PortMode::DenyList if !split.bypass_ports.is_empty() => {
+            let bypassed: Vec<&str> = split
+                .bypass_ports
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for rule in state.routing_rules.iter().filter(|r| r.enabled) {
+                for port in rule
+                    .ports
+                    .iter()
+                    .map(|p| p.trim())
+                    .filter(|p| !p.is_empty())
+                {
+                    if bypassed.contains(&port) {
+                        warnings.push(format!(
+                            "правило «{}»: порт {} входит в DenyList bypass ({}) — \
+                             глобальный PortMode направит его напрямую",
+                            rule.name,
+                            port,
+                            bypassed.join(",")
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    warnings
 }
 
 fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
@@ -4200,6 +4331,23 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
             .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
             .filter(|s| !s.is_empty())
             .collect();
+    }
+    if let Some(v) = value.get("match_target").and_then(Value::as_str) {
+        let target = v.trim().to_ascii_lowercase();
+        // Validate: when no routing rules exist, can't set to "direct"
+        // (would leave router with no VPN routing at all).
+        if target == "direct" && inner.state.routing_rules.is_empty() {
+            return (
+                400,
+                "application/json",
+                json!({"error": "нельзя установить MATCH,direct когда нет правил маршрутизации — весь трафик пойдёт напрямую"}).to_string(),
+            );
+        }
+        inner.state.split_routing.match_target = if target == "direct" {
+            "direct".to_owned()
+        } else {
+            "proxy".to_owned()
+        };
     }
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         return (
@@ -4415,6 +4563,18 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
 
     let mut inner = lock(&daemon.inner);
 
+    // v0.16: optional target override. If the request includes a "target"
+    // field, all preset rules get this target instead of their hardcoded
+    // default. This lets the user apply e.g. "ru-direct" with target
+    // "active" (route Russian IPs through VPN) instead of "direct".
+    let target_override = value.get("target").and_then(Value::as_str).map(|s| {
+        let t = s.trim().to_ascii_lowercase();
+        match t.as_str() {
+            "direct" | "reject" => t,
+            _ => "active".to_owned(),
+        }
+    });
+
     // Add preset rules to existing rules, deduplicating by name. Some
     // presets intentionally reset the rule list first (for example
     // "All VPN", where an empty rule list is the actual desired state
@@ -4426,7 +4586,11 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
     };
     for rule in &preset.rules {
         if !existing.iter().any(|r| r.name == rule.name) {
-            existing.push(rule.clone());
+            let mut rule = rule.clone();
+            if let Some(ref target) = target_override {
+                rule.target = target.clone();
+            }
+            existing.push(rule);
         }
     }
     inner.state.routing_rules = existing;
@@ -4464,6 +4628,294 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
             "rules_added": preset.rules.len(),
             "rules_cleared": preset.clear_existing,
             "port_mode": preset.port_mode,
+            "target_override": target_override,
+        })
+        .to_string(),
+    )
+}
+
+/// Geo database providers for geosite.dat / geoip.metadb download.
+fn geo_providers() -> Vec<Value> {
+    vec![
+        json!({
+            "id": "metacubex-lite",
+            "name": "MetaCubeX meta-rules-dat",
+            "repo": "MetaCubeX/meta-rules-dat",
+            "files": ["geosite.dat", "geoip.metadb"],
+            "recommended": true,
+        }),
+        json!({
+            "id": "loyalsoldier",
+            "name": "Loyalsoldier v2ray-rules-dat",
+            "repo": "Loyalsoldier/v2ray-rules-dat",
+            "files": ["geosite.dat", "geoip.dat"],
+            "note": "geoip.dat (не .metadb) — может не работать с Mihomo",
+        }),
+        json!({
+            "id": "v2fly",
+            "name": "v2fly domain-list-community",
+            "repo": "v2fly/domain-list-community",
+            "files": ["dlc.dat"],
+            "note": "только geosite (dlc.dat), без geoip",
+        }),
+    ]
+}
+
+fn handle_geo_providers() -> (u16, &'static str, String) {
+    (
+        200,
+        "application/json",
+        json!({"providers": geo_providers()}).to_string(),
+    )
+}
+
+fn handle_geo_status(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let geo_dir = Path::new(inner.state.split_routing.geo_asset_path.trim());
+    let geoip_path = geo_dir.join("geoip.metadb");
+    let geosite_path = geo_dir.join("geosite.dat");
+
+    let geoip_info = if geoip_path.exists() {
+        let size = fs::metadata(&geoip_path).map(|m| m.len()).unwrap_or(0);
+        json!({"exists": true, "size": size, "path": geoip_path.display().to_string()})
+    } else {
+        json!({"exists": false, "path": geoip_path.display().to_string()})
+    };
+
+    let geosite_info = if geosite_path.exists() {
+        let size = fs::metadata(&geosite_path).map(|m| m.len()).unwrap_or(0);
+        json!({"exists": true, "size": size, "path": geosite_path.display().to_string()})
+    } else {
+        json!({"exists": false, "path": geosite_path.display().to_string()})
+    };
+
+    (
+        200,
+        "application/json",
+        json!({
+            "geoip": geoip_info,
+            "geosite": geosite_info,
+            "geo_asset_path": inner.state.split_routing.geo_asset_path,
+        })
+        .to_string(),
+    )
+}
+
+fn handle_geo_download(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(provider_id) = value.get("provider").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing \"provider\" field"}).to_string(),
+        );
+    };
+
+    let providers = geo_providers();
+    let Some(provider) = providers
+        .iter()
+        .find(|p| p.get("id").and_then(Value::as_str) == Some(provider_id))
+    else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "unknown provider", "provider": provider_id}).to_string(),
+        );
+    };
+
+    let repo = provider.get("repo").and_then(Value::as_str).unwrap_or("");
+    let files = provider
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let inner = lock(&daemon.inner);
+    let geo_dir = Path::new(inner.state.split_routing.geo_asset_path.trim()).to_owned();
+    let socks_port = inner.state.socks_port;
+
+    // Ensure geo directory exists.
+    if let Err(e) = fs::create_dir_all(&geo_dir) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("create geo dir: {e}")}).to_string(),
+        );
+    }
+
+    // Query GitHub API for latest release assets.
+    let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let curl_output = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "30",
+            "--socks5-hostname",
+            &format!("127.0.0.1:{socks_port}"),
+            "-H",
+            "User-Agent: hincyray",
+            &api_url,
+        ])
+        .output();
+
+    let Ok(curl_out) = curl_output else {
+        return (
+            502,
+            "application/json",
+            json!({"error": "curl spawn failed"}).to_string(),
+        );
+    };
+    if !curl_out.status.success() {
+        return (
+            502,
+            "application/json",
+            json!({"error": format!("curl exited: {}", curl_out.status.code().unwrap_or(-1))})
+                .to_string(),
+        );
+    }
+
+    let api_text = String::from_utf8_lossy(&curl_out.stdout);
+    let Ok(api_json) = serde_json::from_str::<Value>(&api_text) else {
+        return (
+            502,
+            "application/json",
+            json!({"error": "failed to parse GitHub API response"}).to_string(),
+        );
+    };
+
+    let tag = api_json
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let assets = api_json
+        .get("assets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut downloaded = Vec::new();
+    let mut errors = Vec::new();
+
+    for file_val in &files {
+        let Some(file_name) = file_val.as_str() else {
+            continue;
+        };
+        // Find matching asset in the release.
+        let asset = assets.iter().find(|a| {
+            a.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n == file_name)
+        });
+        let Some(asset) = asset else {
+            errors.push(format!("{file_name}: asset not found in release {tag}"));
+            continue;
+        };
+        let download_url = asset
+            .get("browser_download_url")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if download_url.is_empty() {
+            errors.push(format!("{file_name}: no download URL"));
+            continue;
+        }
+
+        let dest = geo_dir.join(file_name);
+        let backup = geo_dir.join(format!("{file_name}.bak"));
+
+        // Back up existing file.
+        if dest.exists() {
+            let _ = fs::copy(&dest, &backup);
+        }
+
+        // Download through SOCKS proxy.
+        let dl_output = Command::new("curl")
+            .args([
+                "-s",
+                "-L",
+                "--max-time",
+                "120",
+                "--socks5-hostname",
+                &format!("127.0.0.1:{socks_port}"),
+                "-H",
+                "User-Agent: hincyray",
+                "-o",
+                &dest.display().to_string(),
+                download_url,
+            ])
+            .output();
+
+        match dl_output {
+            Ok(out) if out.status.success() => {
+                let size = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                if size < 1000 {
+                    errors.push(format!(
+                        "{file_name}: downloaded file too small ({size} bytes)"
+                    ));
+                    // Restore backup.
+                    if backup.exists() {
+                        let _ = fs::copy(&backup, &dest);
+                    }
+                } else {
+                    downloaded.push(json!({
+                        "file": file_name,
+                        "size": size,
+                        "tag": tag,
+                    }));
+                }
+            }
+            Ok(out) => {
+                errors.push(format!(
+                    "{file_name}: curl exited {}",
+                    out.status.code().unwrap_or(-1)
+                ));
+                // Restore backup.
+                if backup.exists() {
+                    let _ = fs::copy(&backup, &dest);
+                }
+            }
+            Err(e) => {
+                errors.push(format!("{file_name}: curl spawn: {e}"));
+            }
+        }
+    }
+
+    // Drop the lock before regenerating config.
+    drop(inner);
+
+    // Regenerate config with new geo files.
+    let inner = lock(&daemon.inner);
+    if let Err(e) = regenerate_config(&inner.state, daemon) {
+        eprintln!("hincyray: config regen after geo download: {e}");
+    }
+    drop(inner);
+
+    if downloaded.is_empty() {
+        return (
+            500,
+            "application/json",
+            json!({
+                "error": "no files downloaded",
+                "errors": errors,
+                "tag": tag,
+            })
+            .to_string(),
+        );
+    }
+
+    (
+        200,
+        "application/json",
+        json!({
+            "downloaded": downloaded,
+            "errors": errors,
+            "tag": tag,
+            "provider": provider_id,
         })
         .to_string(),
     )
@@ -10704,15 +11156,12 @@ mod tests {
         assert_eq!(status, 200);
         let config: Value = serde_yaml::from_str(&body).expect("parse config");
         let rules = config["rules"].as_array().expect("rules");
+        // v0.16: ports + network without domains are ANDed together:
+        // "UDP traffic on ports 27000-27050 → DIRECT"
         assert!(
-            rules
-                .iter()
-                .any(|r| { r.as_str() == Some("DST-PORT,27000-27050,DIRECT") })
-        );
-        assert!(
-            rules
-                .iter()
-                .any(|r| { r.as_str() == Some("NETWORK,udp,DIRECT") })
+            rules.iter().any(|r| {
+                r.as_str() == Some("AND,((NETWORK,udp),(DST-PORT,27000-27050)),DIRECT")
+            })
         );
     }
 
@@ -12081,5 +12530,165 @@ mod tests {
         assert_eq!(controller_dial_address("[::]:9090"), "127.0.0.1:9090");
         assert_eq!(controller_dial_address(":9090"), "127.0.0.1:9090");
         assert_eq!(controller_dial_address("127.0.0.1:9090"), "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn match_target_proxy_generates_match_proxy() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.split_routing.match_target = "proxy".to_owned();
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "YT".to_owned(),
+                target: "active".to_owned(),
+                domains: vec!["geosite:youtube".to_owned()],
+                ..Default::default()
+            });
+        }
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let rules = config["rules"].as_array().expect("rules");
+        let last = rules.last().and_then(Value::as_str).expect("last rule");
+        assert_eq!(last, "MATCH,proxy");
+    }
+
+    #[test]
+    fn match_target_direct_generates_match_direct() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.split_routing.match_target = "direct".to_owned();
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "YT".to_owned(),
+                target: "active".to_owned(),
+                domains: vec!["geosite:youtube".to_owned()],
+                ..Default::default()
+            });
+        }
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let rules = config["rules"].as_array().expect("rules");
+        let last = rules.last().and_then(Value::as_str).expect("last rule");
+        assert_eq!(last, "MATCH,DIRECT");
+    }
+
+    #[test]
+    fn match_target_direct_rejected_when_no_rules() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+        }
+        let (status, _, _body) = handle_routing_settings(r#"{"match_target":"direct"}"#, &daemon);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn preset_apply_with_target_override() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+        }
+        let (status, _, body) =
+            handle_routing_preset_apply(r#"{"preset":"ru-direct","target":"active"}"#, &daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        assert_eq!(result["target_override"], json!("active"));
+
+        let inner = lock(&daemon.inner);
+        let ru_rule = inner
+            .state
+            .routing_rules
+            .iter()
+            .find(|r| r.name == "RU IPs direct")
+            .expect("ru-direct rule");
+        assert_eq!(ru_rule.target, "active");
+    }
+
+    #[test]
+    fn geo_providers_list_returns_providers() {
+        let (status, _, body) = handle_geo_providers();
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        let providers = result["providers"].as_array().expect("providers");
+        assert!(!providers.is_empty());
+        assert!(
+            providers
+                .iter()
+                .any(|p| { p.get("id").and_then(Value::as_str) == Some("metacubex-lite") })
+        );
+    }
+
+    #[test]
+    fn conflict_detection_allowlist() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.split_routing.port_mode = PortMode::AllowList;
+            inner.state.split_routing.proxy_ports = vec!["80".to_owned(), "443".to_owned()];
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "SSH".to_owned(),
+                target: "active".to_owned(),
+                ports: vec!["22".to_owned()],
+                ..Default::default()
+            });
+        }
+        let (status, _, body) = handle_routing_get(&daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        let conflicts = result["conflicts"].as_array().expect("conflicts");
+        assert_eq!(conflicts.len(), 1);
+        let msg = conflicts[0].as_str().expect("conflict msg");
+        assert!(msg.contains("22"));
+        assert!(msg.contains("SSH"));
+    }
+
+    #[test]
+    fn conflict_detection_no_conflicts_when_all_mode() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.split_routing.port_mode = PortMode::All;
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "SSH".to_owned(),
+                target: "active".to_owned(),
+                ports: vec!["22".to_owned()],
+                ..Default::default()
+            });
+        }
+        let (status, _, body) = handle_routing_get(&daemon);
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).expect("parse json");
+        let conflicts = result["conflicts"].as_array().expect("conflicts");
+        assert!(conflicts.is_empty());
     }
 }

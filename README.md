@@ -43,6 +43,19 @@ Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN eve
 
 ## Features
 
+### v0.16.0
+
+- **MATCH toggle**: the final `MATCH` rule is now visible as an immutable first row in the rules table. Toggle between `MATCH,proxy` (everything through VPN) and `MATCH,direct` (everything direct, rules decide what goes through VPN). Locked to `proxy` when no rules exist.
+- **Inline cell editing**: click any cell in the rules table to edit it in place — name, domains/IPs, target (active/direct/reject/best), ports (with include/exclude mode), and protocol (any/tcp/udp). No separate edit form needed.
+- **Per-rule port mode**: each rule can specify ports as "only these" (`DST-PORT`) or "except these" (`AND` with `NOT,DST-PORT`). Generates correct Mihomo AND-rules.
+- **AND rule composition**: when a rule combines domains/IPs + ports + network, they are ANDed together (`AND,((DOMAIN-SUFFIX,example.com),(DST-PORT,443),(NETWORK,udp)),target`) instead of emitting separate OR-style rules.
+- **QUIC block is now a regular rule**: the old "Block QUIC globally" checkbox and "QUIC mode" dropdown are removed from settings. QUIC blocking is now a visible, editable rule in the table (`network=udp, ports=443, target=reject`). Migrated automatically from old state.
+- **Geo provider management**: new "Геобаза" card with provider selection (MetaCubeX/Loyalsoldier/v2fly), file status (size/exists), and one-click download through the SOCKS proxy. `GET /api/geo/providers`, `POST /api/geo/download`, `GET /api/geo/status`.
+- **Preset target override**: clicking a preset chip now shows a target selector (active/direct/reject) — apply "RU Direct" with target `active` to route Russian IPs through VPN instead of direct.
+- **Routing conflict detection**: `GET /api/routing` returns `conflicts` array with warnings when per-rule ports clash with global PortMode (AllowList/DenyList). Shown as auto-hiding toast notifications.
+- **"Сеть" → "Протокол"**: renamed the "Network" column/field to "Protocol" throughout the UI.
+- 323 tests, 0 clippy warnings.
+
 ### v0.15.6
 
 - **RU Direct**: route Russian domains direct before `MATCH,proxy`. Two modes: `.ru`/`.рф` TLD suffixes or `GEOSITE,category-ru` (includes `vk.com`, `yandex.com`). Exceptions list for domains that should go through VPN anyway (e.g. `2ip.ru`). Rule order: user rules > QUIC block > RU Direct exceptions (→proxy) > RU Direct main (→DIRECT) > port-mode > MATCH.

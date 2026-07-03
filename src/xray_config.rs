@@ -101,6 +101,9 @@ pub struct RouterExtra {
     pub ru_direct_mode: String,
     /// v0.16: Domains exempt from RU Direct (go through VPN).
     pub ru_direct_exceptions: Vec<String>,
+    /// v0.16: MATCH rule target — `"proxy"` (default) or `"direct"`.
+    /// Controls the final fallback rule: `MATCH,proxy` or `MATCH,direct`.
+    pub match_target: String,
 }
 
 /// A daemon-level Xray routing rule after HincyRay has resolved UI targets
@@ -113,6 +116,10 @@ pub struct XrayRouteRule {
     pub block_quic: bool,
     pub ports: Vec<String>,
     pub network: Option<String>,
+    /// v0.16: Port matching mode.
+    /// `"include"` (default) — DST-PORT rules emitted separately.
+    /// `"exclude"` — domain/IP rules wrapped in AND with NOT,DST-PORT.
+    pub port_mode: String,
 }
 
 /// Build an Xray config for router mode: normal SOCKS inbound plus

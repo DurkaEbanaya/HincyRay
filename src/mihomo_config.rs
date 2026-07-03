@@ -1271,7 +1271,7 @@ pub fn build_mihomo_router_config(
     socks_port: u16,
     redirect_port: Option<u16>,
     tproxy_available: bool,
-    quic_mode: QuicMode,
+    _quic_mode: QuicMode,
     active_block_quic: bool,
     extra: &RouterExtra,
     features: &MihomoFeatures,
@@ -1298,8 +1298,12 @@ pub fn build_mihomo_router_config(
         rules.extend(rule_to_strings(rule));
     }
 
-    let should_block_quic = active_block_quic || quic_mode == QuicMode::Block || !tproxy_available;
-    if should_block_quic {
+    // System-level QUIC block: block when TPROXY is unavailable (UDP
+    // can't be transparent-proxied) or when the active profile doesn't
+    // support QUIC. User-level QUIC blocking (quic_mode, block_quic_global)
+    // is handled by a regular routing rule migrated in load_state().
+    let system_quic_block = active_block_quic || !tproxy_available;
+    if system_quic_block {
         rules.push(format!(
             "AND,((NETWORK,udp),(DST-PORT,443)),{}",
             REJECT_NAME
@@ -1337,21 +1341,30 @@ pub fn build_mihomo_router_config(
         }
     }
 
+    // v0.16: MATCH target is user-configurable (match_target field).
+    // Default is "proxy" (everything through VPN). When set to "direct",
+    // unmatched traffic goes direct and routing rules decide what goes
+    // through VPN. PortMode adds explicit DST-PORT rules before MATCH.
+    let match_target_name = match extra.match_target.trim() {
+        "direct" => DIRECT_NAME,
+        _ => PROXY_NAME,
+    };
+
     match extra.port_mode {
         PortMode::AllowList if !extra.proxy_ports.is_empty() => {
             for port in &extra.proxy_ports {
                 rules.push(format!("DST-PORT,{},{}", port, PROXY_NAME));
             }
-            rules.push(format!("MATCH,{}", DIRECT_NAME));
+            rules.push(format!("MATCH,{}", match_target_name));
         }
         PortMode::DenyList if !extra.bypass_ports.is_empty() => {
             for port in &extra.bypass_ports {
                 rules.push(format!("DST-PORT,{},{}", port, DIRECT_NAME));
             }
-            rules.push(format!("MATCH,{}", PROXY_NAME));
+            rules.push(format!("MATCH,{}", match_target_name));
         }
         _ => {
-            rules.push(format!("MATCH,{}", PROXY_NAME));
+            rules.push(format!("MATCH,{}", match_target_name));
         }
     }
 
@@ -2754,27 +2767,94 @@ fn build_tailscale_proxy(profile: &Profile, name: &str) -> Result<Value, String>
 }
 
 /// Convert a daemon-level route rule into Mihomo rule strings.
+///
+/// When a rule combines multiple condition types (domains/IPs + ports,
+/// or ports + network), they are ANDed together so the rule matches
+/// only when ALL conditions are satisfied. When only one condition type
+/// is present, separate rules are emitted (current behaviour).
 fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
     let target = outbound_tag_to_name(&rule.outbound_tag);
     let mut result = Vec::new();
 
-    for domain in &rule.domains {
-        result.push(domain_rule(domain, &target));
+    let exclude_ports = rule.port_mode.trim().eq_ignore_ascii_case("exclude");
+    let network = rule.network.as_deref().and_then(normalize_mihomo_network);
+
+    // Collect DST-PORT conditions (exclude src-port:/in-port: which are
+    // emitted as separate rule types).
+    let dst_ports: Vec<&String> = rule
+        .ports
+        .iter()
+        .filter(|p| !p.starts_with("src-port:") && !p.starts_with("in-port:"))
+        .collect();
+
+    let port_conditions: Vec<String> = if exclude_ports {
+        dst_ports
+            .iter()
+            .map(|p| format!("(NOT,(DST-PORT,{p}))"))
+            .collect()
+    } else {
+        dst_ports
+            .iter()
+            .map(|p| format!("(DST-PORT,{p})"))
+            .collect()
+    };
+
+    let net_condition = network.map(|n| format!("(NETWORK,{n})"));
+
+    // Extra conditions = ports + network (anything besides domains/IPs).
+    let mut extra_conditions = port_conditions.clone();
+    if let Some(ref nc) = net_condition {
+        extra_conditions.push(nc.clone());
     }
-    for ip in &rule.ips {
-        result.push(ip_rule(ip, &target));
-    }
-    for port in &rule.ports {
-        if let Some(rest) = port.strip_prefix("src-port:") {
-            result.push(format!("SRC-PORT,{rest},{target}"));
-        } else if let Some(rest) = port.strip_prefix("in-port:") {
-            result.push(format!("IN-PORT,{rest},{target}"));
-        } else {
-            result.push(format!("DST-PORT,{port},{target}"));
+    let has_extra = !extra_conditions.is_empty();
+    let has_domains_or_ips = !rule.domains.is_empty() || !rule.ips.is_empty();
+
+    if has_domains_or_ips && has_extra {
+        // AND mode: wrap each domain/IP rule with port/network conditions.
+        // Example: AND,((DOMAIN-SUFFIX,example.com),(DST-PORT,443)),proxy
+        let extra_joined = extra_conditions.join(",");
+        for domain in &rule.domains {
+            let dr = domain_rule_body(domain);
+            result.push(format!("AND,(({dr}),{extra_joined}),{target}"));
         }
-    }
-    if let Some(network) = rule.network.as_deref().and_then(normalize_mihomo_network) {
-        result.push(format!("NETWORK,{network},{target}"));
+        for ip in &rule.ips {
+            let (ir_body, modifier) = ip_rule_body(ip);
+            let ir = match modifier {
+                Some(m) => format!("{ir_body},{m}"),
+                None => ir_body,
+            };
+            result.push(format!("AND,(({ir}),{extra_joined}),{target}"));
+        }
+    } else if !has_domains_or_ips && !port_conditions.is_empty() && net_condition.is_some() {
+        // Ports + network without domains/IPs: AND them together.
+        // Example: AND,((NETWORK,udp),(DST-PORT,443)),REJECT
+        let mut conditions: Vec<String> = Vec::new();
+        if let Some(ref nc) = net_condition {
+            conditions.push(nc.clone());
+        }
+        conditions.extend(port_conditions.iter().cloned());
+        let conditions_joined = conditions.join(",");
+        result.push(format!("AND,({conditions_joined}),{target}"));
+    } else {
+        // Simple mode: emit separate rules for each condition.
+        for domain in &rule.domains {
+            result.push(domain_rule(domain, &target));
+        }
+        for ip in &rule.ips {
+            result.push(ip_rule(ip, &target));
+        }
+        for port in &rule.ports {
+            if let Some(rest) = port.strip_prefix("src-port:") {
+                result.push(format!("SRC-PORT,{rest},{target}"));
+            } else if let Some(rest) = port.strip_prefix("in-port:") {
+                result.push(format!("IN-PORT,{rest},{target}"));
+            } else {
+                result.push(format!("DST-PORT,{port},{target}"));
+            }
+        }
+        if let Some(net) = network {
+            result.push(format!("NETWORK,{net},{target}"));
+        }
     }
 
     result
@@ -2788,7 +2868,7 @@ fn normalize_mihomo_network(network: &str) -> Option<&'static str> {
     }
 }
 
-/// Build a single domain rule string for Mihomo.
+/// Build a single domain rule string for Mihomo (with target).
 ///
 /// Supported prefixes:
 /// - `geosite:xxx` → `GEOSITE,xxx,target`
@@ -2798,22 +2878,28 @@ fn normalize_mihomo_network(network: &str) -> Option<&'static str> {
 /// - `wildcard:xxx` → `DOMAIN-WILDCARD,wildcard,target`
 /// - bare domain → `DOMAIN-SUFFIX,domain,target`
 fn domain_rule(domain: &str, target: &str) -> String {
+    format!("{},{}", domain_rule_body(domain), target)
+}
+
+/// Build the domain rule body without the target suffix.
+/// Used inside AND rules where the target is only at the end.
+fn domain_rule_body(domain: &str) -> String {
     if let Some(name) = domain.strip_prefix("geosite:") {
-        format!("GEOSITE,{name},{target}")
+        format!("GEOSITE,{name}")
     } else if let Some(exact) = domain.strip_prefix('=') {
-        format!("DOMAIN,{exact},{target}")
+        format!("DOMAIN,{exact}")
     } else if let Some(keyword) = domain.strip_prefix("keyword:") {
-        format!("DOMAIN-KEYWORD,{keyword},{target}")
+        format!("DOMAIN-KEYWORD,{keyword}")
     } else if let Some(regex) = domain.strip_prefix("regex:") {
-        format!("DOMAIN-REGEX,{regex},{target}")
+        format!("DOMAIN-REGEX,{regex}")
     } else if let Some(wildcard) = domain.strip_prefix("wildcard:") {
-        format!("DOMAIN-WILDCARD,{wildcard},{target}")
+        format!("DOMAIN-WILDCARD,{wildcard}")
     } else {
-        format!("DOMAIN-SUFFIX,{domain},{target}")
+        format!("DOMAIN-SUFFIX,{domain}")
     }
 }
 
-/// Build a single IP/routing rule string for Mihomo.
+/// Build a single IP/routing rule string for Mihomo (with target).
 ///
 /// Supported prefixes:
 /// - `geoip:CN` → `GEOIP,CN,target`
@@ -2827,38 +2913,48 @@ fn domain_rule(domain: &str, target: &str) -> String {
 /// - `src-ip-suffix:192.168.1.0/8` → `SRC-IP-SUFFIX,192.168.1.0/8,target`
 /// - bare IP/CIDR → `IP-CIDR,<ip>,<target>`
 fn ip_rule(ip: &str, target: &str) -> String {
+    let (body, modifier) = ip_rule_body(ip);
+    match modifier {
+        Some(m) => format!("{body},{target},{m}"),
+        None => format!("{body},{target}"),
+    }
+}
+
+/// Build the IP rule body and optional modifier (without target).
+/// Used inside AND rules where the target is only at the end.
+/// Returns `(rule_type+value, optional_modifier)`.
+fn ip_rule_body(ip: &str) -> (String, Option<String>) {
     if let Some(rest) = ip.strip_prefix("geoip:") {
-        // Support optional no-resolve suffix: `geoip:CN,no-resolve`
         if let Some((code, suffix)) = rest.split_once(',') {
-            format!("GEOIP,{code},{target},{suffix}")
+            (format!("GEOIP,{code}"), Some(suffix.to_string()))
         } else {
-            format!("GEOIP,{rest},{target}")
+            (format!("GEOIP,{rest}"), None)
         }
     } else if let Some(rest) = ip
         .strip_prefix("geoip-asn:")
         .or_else(|| ip.strip_prefix("ip-asn:"))
     {
         if let Some((asn, suffix)) = rest.split_once(',') {
-            format!("IP-ASN,{asn},{target},{suffix}")
+            (format!("IP-ASN,{asn}"), Some(suffix.to_string()))
         } else {
-            format!("IP-ASN,{rest},{target}")
+            (format!("IP-ASN,{rest}"), None)
         }
     } else if let Some(rest) = ip.strip_prefix("src-geoip:") {
-        format!("SRC-GEOIP,{rest},{target}")
+        (format!("SRC-GEOIP,{rest}"), None)
     } else if let Some(rest) = ip.strip_prefix("src-ip-asn:") {
-        format!("SRC-IP-ASN,{rest},{target}")
+        (format!("SRC-IP-ASN,{rest}"), None)
     } else if let Some(rest) = ip.strip_prefix("ip-suffix:") {
         if let Some((code, suffix)) = rest.split_once(',') {
-            format!("IP-SUFFIX,{code},{target},{suffix}")
+            (format!("IP-SUFFIX,{code}"), Some(suffix.to_string()))
         } else {
-            format!("IP-SUFFIX,{rest},{target}")
+            (format!("IP-SUFFIX,{rest}"), None)
         }
     } else if let Some(rest) = ip.strip_prefix("src-ip-cidr:") {
-        format!("SRC-IP-CIDR,{rest},{target}")
+        (format!("SRC-IP-CIDR,{rest}"), None)
     } else if let Some(rest) = ip.strip_prefix("src-ip-suffix:") {
-        format!("SRC-IP-SUFFIX,{rest},{target}")
+        (format!("SRC-IP-SUFFIX,{rest}"), None)
     } else {
-        format!("IP-CIDR,{ip},{target}")
+        (format!("IP-CIDR,{ip}"), None)
     }
 }
 
@@ -3115,7 +3211,7 @@ mod tests {
         build_mihomo_router_config, build_openvpn_proxy, build_shadowsocks_proxy,
         build_shadowsocksr_proxy, build_snell_proxy, build_socks_proxy, build_ssh_proxy,
         build_tailscale_proxy, build_trojan_proxy, build_tuic_proxy, build_vless_proxy,
-        build_vmess_proxy, build_wireguard_proxy,
+        build_vmess_proxy, build_wireguard_proxy, domain_rule_body, ip_rule_body,
     };
     use crate::profiles::parse_profiles;
     use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule};
@@ -3535,15 +3631,27 @@ mod tests {
             "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
         );
         let profile = &profiles[0];
+        // v0.16: QUIC block is now a regular routing rule, not auto-generated
+        // from quic_mode. System-level QUIC block (TPROXY unavailable) still
+        // works via the active_block_quic / tproxy_available parameters.
+        let quic_rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec![],
+            outbound_tag: "reject".to_owned(),
+            block_quic: false,
+            ports: vec!["443".to_owned()],
+            network: Some("udp".to_owned()),
+            port_mode: "include".to_owned(),
+        };
         let yaml = build_mihomo_router_config(
             profile,
             &[],
-            &[],
+            &[quic_rule],
             "0.0.0.0",
             10808,
             Some(10810),
             true,
-            QuicMode::Block,
+            QuicMode::Proxy,
             false,
             &RouterExtra::default(),
             &MihomoFeatures::default(),
@@ -3608,6 +3716,7 @@ mod tests {
             block_quic: false,
             ports: vec!["53".to_owned()],
             network: Some("udp".to_owned()),
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -3630,10 +3739,13 @@ mod tests {
             .and_then(Value::as_array)
             .expect("rules");
         let rule_strings: Vec<_> = rules.iter().filter_map(|rule| rule.as_str()).collect();
-        assert!(rule_strings.contains(&"GEOSITE,cn,DIRECT"));
-        assert!(rule_strings.contains(&"IP-CIDR,192.168.0.0/16,DIRECT"));
-        assert!(rule_strings.contains(&"DST-PORT,53,DIRECT"));
-        assert!(rule_strings.contains(&"NETWORK,udp,DIRECT"));
+        // v0.16: when a rule has domains/IPs + ports + network, they are
+        // ANDed together: "geosite:cn on port 53 via UDP → DIRECT"
+        assert!(rule_strings.contains(&"AND,((GEOSITE,cn),(DST-PORT,53),(NETWORK,udp)),DIRECT"));
+        assert!(
+            rule_strings
+                .contains(&"AND,((IP-CIDR,192.168.0.0/16),(DST-PORT,53),(NETWORK,udp)),DIRECT")
+        );
     }
 
     #[test]
@@ -3645,6 +3757,7 @@ mod tests {
         let extra = RouterExtra {
             port_mode: PortMode::AllowList,
             proxy_ports: vec!["443".to_owned(), "8443".to_owned()],
+            match_target: "direct".to_owned(),
             ..RouterExtra::default()
         };
         let yaml = build_mihomo_router_config(
@@ -4326,6 +4439,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -4366,6 +4480,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5007,6 +5122,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5043,6 +5159,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5083,6 +5200,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5123,6 +5241,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5163,6 +5282,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5223,6 +5343,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5265,6 +5386,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5305,6 +5427,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5345,6 +5468,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5387,6 +5511,7 @@ mod tests {
             block_quic: false,
             ports: vec!["src-port:7777".to_owned()],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5427,6 +5552,7 @@ mod tests {
             block_quic: false,
             ports: vec!["in-port:7890".to_owned()],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -5831,6 +5957,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         };
         let yaml = build_mihomo_router_config(
             profile,
@@ -6114,6 +6241,7 @@ mod tests {
             block_quic: false,
             ports: vec![],
             network: None,
+            port_mode: "include".to_owned(),
         }];
         let extra = RouterExtra {
             ru_direct_mode: "tld".to_owned(),
@@ -6152,5 +6280,106 @@ mod tests {
             ru_idx.expect("ru idx") < match_idx.expect("match idx"),
             "RU Direct rules must precede MATCH"
         );
+    }
+
+    #[test]
+    fn port_exclude_generates_and_with_not() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec!["example.com".to_owned()],
+            ips: vec![],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec!["22".to_owned()],
+            network: None,
+            port_mode: "exclude".to_owned(),
+        };
+        let extra = RouterExtra {
+            match_target: "proxy".to_owned(),
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Proxy,
+            false,
+            &extra,
+            &MihomoFeatures::default(),
+        )
+        .expect("config");
+        let rules = router_rules(&yaml);
+        // Exclude mode: AND,((DOMAIN-SUFFIX,example.com),(NOT,(DST-PORT,22))),DIRECT
+        let has_exclude = rules
+            .iter()
+            .any(|r| r == "AND,((DOMAIN-SUFFIX,example.com),(NOT,(DST-PORT,22))),DIRECT");
+        assert!(
+            has_exclude,
+            "expected AND with NOT,DST-PORT, got: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn match_target_direct_generates_match_direct_in_config() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let rule = XrayRouteRule {
+            domains: vec!["geosite:youtube".to_owned()],
+            ips: vec![],
+            outbound_tag: "active".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+            port_mode: "include".to_owned(),
+        };
+        let extra = RouterExtra {
+            match_target: "direct".to_owned(),
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[rule],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Proxy,
+            false,
+            &extra,
+            &MihomoFeatures::default(),
+        )
+        .expect("config");
+        let rules = router_rules(&yaml);
+        let last = rules.last().map(|r| r.as_str()).expect("last rule");
+        assert_eq!(last, "MATCH,DIRECT");
+    }
+
+    #[test]
+    fn domain_and_ip_rule_bodies_exclude_target() {
+        assert_eq!(domain_rule_body("geosite:youtube"), "GEOSITE,youtube");
+        assert_eq!(domain_rule_body("example.com"), "DOMAIN-SUFFIX,example.com");
+        assert_eq!(domain_rule_body("=exact.com"), "DOMAIN,exact.com");
+        assert_eq!(domain_rule_body("keyword:foo"), "DOMAIN-KEYWORD,foo");
+
+        let (body, modi) = ip_rule_body("geoip:CN");
+        assert_eq!(body, "GEOIP,CN");
+        assert_eq!(modi, None);
+
+        let (body, modi) = ip_rule_body("geoip:CN,no-resolve");
+        assert_eq!(body, "GEOIP,CN");
+        assert_eq!(modi, Some("no-resolve".to_string()));
+
+        let (body, _) = ip_rule_body("192.168.1.0/24");
+        assert_eq!(body, "IP-CIDR,192.168.1.0/24");
     }
 }

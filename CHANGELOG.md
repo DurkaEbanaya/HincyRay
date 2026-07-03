@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.16.0 - 2026-07-04
+
+### Added
+- **MATCH toggle**: `SplitRoutingSettings.match_target` field (`"proxy"` or `"direct"`). Controls the final `MATCH,proxy` vs `MATCH,direct` rule. Visible as an immutable first row in the rules table with a dropdown. Locked to `proxy` when no routing rules exist. API rejects `match_target=direct` when rules are empty.
+- **Per-rule port mode**: `RoutingRule.port_mode` field (`"include"` or `"exclude"`). "Include" emits standard `DST-PORT` rules. "Exclude" wraps domain/IP rules in `AND,((<rule>),(NOT,(DST-PORT,<port>))),target`.
+- **AND rule composition**: `rule_to_strings()` in `mihomo_config.rs` now ANDs multiple condition types (domains/IPs + ports + network) into a single Mihomo rule instead of emitting separate OR-style rules. Refactored `domain_rule_body()` and `ip_rule_body()` to produce rule bodies without target for AND composition.
+- **Geo provider API**: `GET /api/geo/providers` (MetaCubeX/Loyalsoldier/v2fly), `POST /api/geo/download` (downloads geosite.dat/geoip.metadb through SOCKS proxy with .bak backup), `GET /api/geo/status` (file exists/size).
+- **Preset target override**: `POST /api/routing-presets/apply` accepts optional `target` field to override preset's hardcoded target.
+- **Routing conflict detection**: `GET /api/routing` returns `conflicts` array with warnings when per-rule ports clash with global PortMode.
+- **Inline cell editing in WebUI**: click any cell in the rules table to edit in place. Target and protocol use re-rendered `<select>` (same pattern as MATCH row). Name, domains, and ports use inline input/textarea.
+- **Geo provider card in WebUI**: provider dropdown, file status, download button.
+- **Preset target picker in WebUI**: clicking a preset chip shows a target selector dropdown.
+- 10 new tests (323 total).
+
+### Changed
+- **QUIC block migrated to regular rule**: `load_state()` converts `block_quic_global`/`quic_mode=Block` into a `RoutingRule { name: "QUIC Block", network: "udp", ports: ["443"], target: "reject" }`. Removed "Block QUIC globally" checkbox and "QUIC mode" dropdown from WebUI settings. `build_mihomo_router_config()` only auto-generates QUIC block for system-level reasons (TPROXY unavailable, per-profile block_quic).
+- **"Сеть" → "Протокол"**: renamed throughout WebUI.
+- **`saveRoutingSettings()`**: sends `match_target`, removed `block_quic`/`quic_mode` fields.
+- **`XrayRouteRule`**: added `port_mode` field.
+- **`RouterExtra`**: added `match_target` field.
+
+### Migration
+- Old state files without `match_target`: migrated based on `port_mode` (AllowList→`direct`, others→`proxy`).
+- Old state files with `block_quic_global=true` or `quic_mode=block`: "QUIC Block" rule inserted at index 0.
+
 ## v0.15.6 - 2026-07-03
 
 ### Added
