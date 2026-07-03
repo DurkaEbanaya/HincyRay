@@ -466,6 +466,7 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .result-badge.ok{background:rgba(34,197,94,.15);color:#22c55e}
 .result-badge.bad{background:rgba(239,68,68,.15);color:#ef4444}
 .result-badge.warn{background:rgba(245,158,11,.15);color:#f59e0b}
+.result-badge.info{background:var(--accent-soft);color:var(--accent)}
 .result-pre{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px;font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:240px;overflow-y:auto;margin-top:6px}
 
 /* ═══ ROUTING CHAIN METRO ═══ */
@@ -480,6 +481,7 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .metro-node.ok::before,.metro-node.ok .metro-dot{background:var(--success)}
 .metro-node.bad::before,.metro-node.bad .metro-dot{background:var(--danger)}
 .metro-node.warn::before,.metro-node.warn .metro-dot{background:var(--warning)}
+.metro-node.info::before,.metro-node.info .metro-dot{background:var(--accent)}
 .metro-node.neutral::before,.metro-node.neutral .metro-dot{background:var(--border)}
 .metro-label{font-weight:600;color:var(--fg);margin-bottom:4px;white-space:nowrap}
 .metro-detail{font-family:var(--font-mono);font-size:11px;line-height:1.35;word-break:break-word;color:var(--muted)}
@@ -3340,8 +3342,8 @@ function closeResultModal() {
 
 // ─── TRACE ───────────────────────────────────────────────────────────
 function metroBadge(status) {
-  const map = {ok:'OK', warn:'WARN', bad:'FAIL', neutral:'—'};
-  const cls = status === 'bad' ? 'bad' : status === 'warn' ? 'warn' : status === 'ok' ? 'ok' : 'warn';
+  const map = {ok:'OK', warn:'WARN', bad:'FAIL', info:'INFO', neutral:'—'};
+  const cls = status === 'bad' ? 'bad' : status === 'warn' ? 'warn' : status === 'ok' ? 'ok' : status === 'info' ? 'info' : 'warn';
   return `<span class="result-badge ${cls}">${map[status] || status || '—'}</span>`;
 }
 
@@ -3361,7 +3363,7 @@ function renderChainCheck(d) {
   if (!out) return;
   const s = d.summary || {};
   const summaryCls = s.status === 'bad' ? 'bad' : s.status === 'warn' ? 'warn' : 'ok';
-  let html = `<div class="metro-summary"><b>Итог:</b> <span class="result-badge ${summaryCls}">${s.status || 'unknown'}</span> · failures=${s.bad ?? 0} · warnings=${s.warn ?? 0}</div>`;
+  let html = `<div class="metro-summary"><b>Итог:</b> <span class="result-badge ${summaryCls}">${s.status || 'unknown'}</span> · failures=${s.bad ?? 0} · warnings=${s.warn ?? 0}${s.info ? ' · info=' + s.info : ''}</div>`;
   html += renderMetroLine('Общая цепь', d.overall || []);
   if (d.device && d.device.length) html += renderMetroLine('Цепь устройства ' + (d.source_ip || ''), d.device);
   out.innerHTML = html;

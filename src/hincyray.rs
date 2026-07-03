@@ -4783,7 +4783,7 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
             if routing_rules.is_empty() {
                 "ok"
             } else if uses_geo_assets {
-                "warn"
+                "info"
             } else {
                 "ok"
             },
@@ -4803,7 +4803,7 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
             "Видимость в Mihomo",
             match source_seen {
                 Some(true) => "ok",
-                Some(false) => "warn",
+                Some(false) => "info",
                 None => "neutral",
             },
             match source_seen {
@@ -4909,10 +4909,12 @@ fn expected_chain_result(
 fn chain_summary(overall: &[Value], device: &[Value]) -> Value {
     let mut bad = 0usize;
     let mut warn = 0usize;
+    let mut info = 0usize;
     for node in overall.iter().chain(device.iter()) {
         match node.get("status").and_then(Value::as_str) {
             Some("bad") => bad += 1,
             Some("warn") => warn += 1,
+            Some("info") => info += 1,
             _ => {}
         }
     }
@@ -4920,6 +4922,7 @@ fn chain_summary(overall: &[Value], device: &[Value]) -> Value {
         "status": if bad > 0 { "bad" } else if warn > 0 { "warn" } else { "ok" },
         "bad": bad,
         "warn": warn,
+        "info": info,
     })
 }
 
@@ -11864,6 +11867,74 @@ mod tests {
                 .as_str()
                 .expect("detail")
                 .contains("имеет приоритет над всеми общими правилами")
+        );
+    }
+
+    #[test]
+    fn routing_chain_check_geo_rules_are_info_not_warn() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.split_routing.enabled = true;
+            inner.state.split_routing.vpn_subnet = "192.168.2.0/24".to_owned();
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "CN direct".to_owned(),
+                target: "direct".to_owned(),
+                domains: vec!["geoip:CN".to_owned()],
+                ..Default::default()
+            });
+        }
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/routing/chain-check",
+            r#"{"source_ip":"192.168.2.99"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("json");
+
+        // The "rules" node must be "info" (informational), not "warn".
+        let rules_node = response["device"]
+            .as_array()
+            .expect("device")
+            .iter()
+            .find(|node| node["id"] == json!("rules"))
+            .expect("rules node");
+        assert_eq!(
+            rules_node["status"],
+            json!("info"),
+            "geo-asset rules should be 'info', not 'warn'"
+        );
+
+        // The summary must count info nodes separately.
+        let summary = &response["summary"];
+        assert!(
+            summary["info"].as_u64().unwrap_or(0) > 0,
+            "info count must be > 0"
+        );
+
+        // info must not inflate the warn count: compare with a daemon that
+        // has no geo-asset rules — the warn count should be identical.
+        let (_dir2, daemon2) = test_daemon();
+        {
+            let mut inner = lock(&daemon2.inner);
+            inner.state.split_routing.enabled = true;
+            inner.state.split_routing.vpn_subnet = "192.168.2.0/24".to_owned();
+            // No routing rules → no geo assets → rules node will be "ok".
+        }
+        let (_, _, body2) = dispatch(
+            "POST",
+            "/api/routing/chain-check",
+            r#"{"source_ip":"192.168.2.99"}"#,
+            &daemon2,
+        );
+        let response2: Value = serde_json::from_str(&body2).expect("json");
+        let warn_with_info = summary["warn"].as_u64().unwrap_or(0);
+        let warn_without_info = response2["summary"]["warn"].as_u64().unwrap_or(0);
+        assert_eq!(
+            warn_with_info, warn_without_info,
+            "info nodes must not inflate warn count"
         );
     }
 
