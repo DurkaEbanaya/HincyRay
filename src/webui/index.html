@@ -1009,6 +1009,11 @@ https://sub.example.com/…"></textarea>
               <div class="field" id="proxyPortsField" style="display:none"><label style="font-size:var(--fs-sm);color:var(--muted)">Proxy ports</label><textarea id="rProxyPorts" class="mono" rows="2" placeholder="80,443,8080"></textarea></div>
               <div class="field" id="bypassPortsField" style="display:none"><label style="font-size:var(--fs-sm);color:var(--muted)">Bypass ports</label><textarea id="rBypassPorts" class="mono" rows="2" placeholder="22,53"></textarea></div>
             </div>
+            <div class="feature-card">
+              <h4>RU Direct</h4>
+              <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Режим</label><select id="rRuDirectMode"><option value="off">Выключено</option><option value="tld">.ru и .рф (TLD)</option><option value="geosite">Все русские сайты (GEOSITE)</option></select></div>
+              <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Исключения (через VPN, по одному на строку)</label><textarea id="rRuDirectExceptions" class="mono" rows="3" placeholder="2ip.ru&#10;blocked-site.ru"></textarea></div>
+            </div>
           </div>
           <div style="display:flex;gap:8px;margin:12px 0">
             <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить настройки</button>
@@ -3654,6 +3659,8 @@ function saveRoutingSettings() {
     port_mode: document.getElementById('rPortMode')?.value || 'all',
     proxy_ports: (document.getElementById('rProxyPorts')?.value || '').split(/[,\n]/).map(s=>s.trim()).filter(Boolean),
     bypass_ports: (document.getElementById('rBypassPorts')?.value || '').split(/[,\n]/).map(s=>s.trim()).filter(Boolean),
+    ru_direct_mode: document.getElementById('rRuDirectMode')?.value || 'off',
+    ru_direct_exceptions: (document.getElementById('rRuDirectExceptions')?.value || '').split('\n').map(s=>s.trim()).filter(Boolean),
   };
   apiAction('POST','/api/routing/settings',body,t('Настройки маршрутизации сохранены'),refreshDashboard);
 }
@@ -3725,6 +3732,8 @@ const TOOLTIPS = {
   'rRedirPort': 'Порт TCP NAT REDIRECT listener Mihomo. Не меняйте без необходимости',
   'rPolicy': 'Имя traffic policy в Keenetic, к которой привязаны правила firewall',
   'rPortMode': 'All — проксировать все порты. AllowList — только указанные. DenyList — всё кроме указанных',
+  'rRuDirectMode': 'Выключено — RU Direct не действует. .ru и .рф — DOMAIN-SUFFIX для российских TLD. GEOSITE — category-ru из geosite.dat (включает vk.com, yandex.com и др.)',
+  'rRuDirectExceptions': 'Домены, которые пойдут через VPN несмотря на RU Direct. Один на строку. Например: 2ip.ru',
   // DNS
   'dnsEnabled': 'Включить DNS anti-leak. В режиме split routing всегда включён (firewall DNATит DNS на 127.0.0.1:1053)',
   'dnsStrategy': 'UseIPv4 — только A-записи. UseIPv6 — только AAAA. UseIP — и A, и AAAA',
@@ -3896,6 +3905,8 @@ function updateRoutingForm(sr) {
   safeValue('rPortMode', sr.port_mode || 'all');
   safeValue('rProxyPorts', Array.isArray(sr.proxy_ports) ? sr.proxy_ports.join(',') : (sr.proxy_ports || ''));
   safeValue('rBypassPorts', Array.isArray(sr.bypass_ports) ? sr.bypass_ports.join(',') : (sr.bypass_ports || ''));
+  safeValue('rRuDirectMode', sr.ru_direct_mode || 'off');
+  safeValue('rRuDirectExceptions', Array.isArray(sr.ru_direct_exceptions) ? sr.ru_direct_exceptions.join('\n') : (sr.ru_direct_exceptions || ''));
   updatePortModeFields();
   refreshCustomSelects();
 }

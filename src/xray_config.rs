@@ -97,6 +97,10 @@ pub struct RouterExtra {
     pub proxy_ports: Vec<String>,
     pub bypass_ports: Vec<String>,
     pub geo_asset_path: Option<String>,
+    /// v0.16: RU Direct mode — `"off"`, `"tld"`, or `"geosite"`.
+    pub ru_direct_mode: String,
+    /// v0.16: Domains exempt from RU Direct (go through VPN).
+    pub ru_direct_exceptions: Vec<String>,
 }
 
 /// A daemon-level Xray routing rule after HincyRay has resolved UI targets

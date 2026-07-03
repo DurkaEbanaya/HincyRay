@@ -901,6 +901,14 @@ pub struct SplitRoutingSettings {
     /// directory is passed as the Mihomo `-d` home directory flag.
     #[serde(default = "default_geo_asset_path")]
     pub geo_asset_path: String,
+    /// v0.16: RU Direct mode — route Russian domains direct before MATCH,proxy.
+    /// `"off"` (default), `"tld"` (.ru + .рф suffixes), `"geosite"` (GEOSITE,category-ru).
+    #[serde(default)]
+    pub ru_direct_mode: String,
+    /// v0.16: Domains that bypass RU Direct and go through VPN instead.
+    /// One domain per line in the UI; stored as a Vec.
+    #[serde(default)]
+    pub ru_direct_exceptions: Vec<String>,
 }
 
 impl Default for SplitRoutingSettings {
@@ -920,6 +928,8 @@ impl Default for SplitRoutingSettings {
             proxy_ports: Vec::new(),
             bypass_ports: Vec::new(),
             geo_asset_path: default_geo_asset_path(),
+            ru_direct_mode: String::new(),
+            ru_direct_exceptions: Vec::new(),
         }
     }
 }
@@ -2347,6 +2357,8 @@ fn build_routing_context<'a>(
         } else {
             Some(state.split_routing.geo_asset_path.clone())
         },
+        ru_direct_mode: state.split_routing.ru_direct_mode.clone(),
+        ru_direct_exceptions: normalize_route_items(&state.split_routing.ru_direct_exceptions),
     };
     (extra_profiles, routes, active_block_quic, extra)
 }
@@ -4178,6 +4190,16 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
     }
     if let Some(v) = value.get("geo_asset_path").and_then(Value::as_str) {
         inner.state.split_routing.geo_asset_path = v.trim().to_owned();
+    }
+    if let Some(v) = value.get("ru_direct_mode").and_then(Value::as_str) {
+        inner.state.split_routing.ru_direct_mode = v.trim().to_owned();
+    }
+    if let Some(v) = value.get("ru_direct_exceptions").and_then(Value::as_array) {
+        inner.state.split_routing.ru_direct_exceptions = v
+            .iter()
+            .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
+            .filter(|s| !s.is_empty())
+            .collect();
     }
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         return (

@@ -1316,6 +1316,27 @@ pub fn build_mihomo_router_config(
     );
     rules.extend(features.raw_rules.iter().filter(|r| !r.is_empty()).cloned());
 
+    // v0.16: RU Direct — route Russian domains direct before port-mode
+    // fallbacks and MATCH,proxy.  Exceptions (go through VPN) are emitted
+    // first so they take precedence over the broad direct rules.
+    let ru_mode = extra.ru_direct_mode.trim().to_ascii_lowercase();
+    if ru_mode == "tld" || ru_mode == "geosite" {
+        for domain in extra
+            .ru_direct_exceptions
+            .iter()
+            .map(|d| d.trim())
+            .filter(|d| !d.is_empty())
+        {
+            rules.push(format!("DOMAIN-SUFFIX,{domain},{}", PROXY_NAME));
+        }
+        if ru_mode == "tld" {
+            rules.push(format!("DOMAIN-SUFFIX,ru,{}", DIRECT_NAME));
+            rules.push(format!("DOMAIN-SUFFIX,xn--p1ai,{}", DIRECT_NAME));
+        } else {
+            rules.push(format!("GEOSITE,category-ru,{}", DIRECT_NAME));
+        }
+    }
+
     match extra.port_mode {
         PortMode::AllowList if !extra.proxy_ports.is_empty() => {
             for port in &extra.proxy_ports {
@@ -5916,5 +5937,220 @@ mod tests {
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
         // Bench config should NOT have a dns section — no DNS needed for benchmarking.
         assert!(config.get("dns").is_none());
+    }
+
+    // ── RU Direct tests ──────────────────────────────────────────────
+
+    fn router_rules(yaml: &str) -> Vec<String> {
+        let config: Value = serde_yaml::from_str(yaml).expect("parse yaml");
+        config
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("rules")
+            .iter()
+            .filter_map(|r| r.as_str().map(ToOwned::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn ru_direct_off_emits_no_ru_rules() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let extra = RouterExtra {
+            ru_direct_mode: "off".to_owned(),
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            &profiles[0],
+            &[],
+            &[],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &extra,
+            &MihomoFeatures::default(),
+        )
+        .expect("config");
+        let rules = router_rules(&yaml);
+        assert!(
+            !rules.iter().any(|r| r.contains("DOMAIN-SUFFIX,ru,")
+                || r.contains("category-ru")
+                || r.contains("xn--p1ai")),
+            "off mode must not emit any RU Direct rules, got: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn ru_direct_tld_emits_suffix_rules() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let extra = RouterExtra {
+            ru_direct_mode: "tld".to_owned(),
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            &profiles[0],
+            &[],
+            &[],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &extra,
+            &MihomoFeatures::default(),
+        )
+        .expect("config");
+        let rules = router_rules(&yaml);
+        assert!(
+            rules.contains(&"DOMAIN-SUFFIX,ru,DIRECT".to_owned()),
+            "tld mode must emit DOMAIN-SUFFIX,ru,DIRECT, got: {rules:?}"
+        );
+        assert!(
+            rules.contains(&"DOMAIN-SUFFIX,xn--p1ai,DIRECT".to_owned()),
+            "tld mode must emit .рф (xn--p1ai) rule, got: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn ru_direct_geosite_emits_category_ru() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let extra = RouterExtra {
+            ru_direct_mode: "geosite".to_owned(),
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            &profiles[0],
+            &[],
+            &[],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &extra,
+            &MihomoFeatures::default(),
+        )
+        .expect("config");
+        let rules = router_rules(&yaml);
+        assert!(
+            rules.contains(&"GEOSITE,category-ru,DIRECT".to_owned()),
+            "geosite mode must emit GEOSITE,category-ru,DIRECT, got: {rules:?}"
+        );
+        // Should NOT emit TLD rules in geosite mode.
+        assert!(
+            !rules.contains(&"DOMAIN-SUFFIX,ru,DIRECT".to_owned()),
+            "geosite mode must not emit DOMAIN-SUFFIX,ru,DIRECT"
+        );
+    }
+
+    #[test]
+    fn ru_direct_exceptions_emitted_before_main_rules() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let extra = RouterExtra {
+            ru_direct_mode: "tld".to_owned(),
+            ru_direct_exceptions: vec!["2ip.ru".to_owned(), "blocked.ru".to_owned()],
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            &profiles[0],
+            &[],
+            &[],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &extra,
+            &MihomoFeatures::default(),
+        )
+        .expect("config");
+        let rules = router_rules(&yaml);
+
+        // Exceptions must use PROXY (not DIRECT).
+        let exc_idx_2ip = rules.iter().position(|r| r == "DOMAIN-SUFFIX,2ip.ru,proxy");
+        let exc_idx_blocked = rules
+            .iter()
+            .position(|r| r == "DOMAIN-SUFFIX,blocked.ru,proxy");
+        let main_idx = rules.iter().position(|r| r == "DOMAIN-SUFFIX,ru,DIRECT");
+
+        assert!(exc_idx_2ip.is_some(), "2ip.ru exception must exist");
+        assert!(exc_idx_blocked.is_some(), "blocked.ru exception must exist");
+        assert!(main_idx.is_some(), "main RU rule must exist");
+
+        // Exceptions must come before the main rule.
+        assert!(
+            exc_idx_2ip.expect("2ip idx") < main_idx.expect("main idx"),
+            "exceptions must precede main RU Direct rules"
+        );
+        assert!(
+            exc_idx_blocked.expect("blocked idx") < main_idx.expect("main idx"),
+            "exceptions must precede main RU Direct rules"
+        );
+    }
+
+    #[test]
+    fn ru_direct_rules_after_user_rules_before_match() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        // User rule: youtube via proxy.
+        let user_rules = vec![XrayRouteRule {
+            domains: vec!["geosite:youtube".to_owned()],
+            ips: vec![],
+            outbound_tag: "active".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+        }];
+        let extra = RouterExtra {
+            ru_direct_mode: "tld".to_owned(),
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            &profiles[0],
+            &[],
+            &user_rules,
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &extra,
+            &MihomoFeatures::default(),
+        )
+        .expect("config");
+        let rules = router_rules(&yaml);
+
+        let user_idx = rules.iter().position(|r| r == "GEOSITE,youtube,proxy");
+        let ru_idx = rules.iter().position(|r| r == "DOMAIN-SUFFIX,ru,DIRECT");
+        let match_idx = rules.iter().position(|r| r == "MATCH,proxy");
+
+        assert!(user_idx.is_some(), "user rule must exist");
+        assert!(ru_idx.is_some(), "RU Direct rule must exist");
+        assert!(match_idx.is_some(), "MATCH must exist");
+
+        // User < RU Direct < MATCH.
+        assert!(
+            user_idx.expect("user idx") < ru_idx.expect("ru idx"),
+            "user rules must precede RU Direct rules"
+        );
+        assert!(
+            ru_idx.expect("ru idx") < match_idx.expect("match idx"),
+            "RU Direct rules must precede MATCH"
+        );
     }
 }
