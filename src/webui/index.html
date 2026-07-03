@@ -139,7 +139,7 @@ select::-ms-expand{display:none}
 table{border-collapse:collapse;width:100%}
 
 /* ═══ APP SHELL ═══ */
-.app{display:flex;height:100vh;overflow:hidden;position:relative;z-index:1}
+.app{display:flex;min-height:100vh;overflow-x:hidden;position:relative;z-index:1}
 .sidebar{
   width:var(--sidebar-w);min-width:var(--sidebar-w);
   background:var(--sidebar-tint);
@@ -319,7 +319,7 @@ table{border-collapse:collapse;width:100%}
 .logout-icon-collapsed:hover{color:var(--danger)}
 .sidebar.collapsed .logout-icon-collapsed{display:block}
 .sidebar.collapsed .btn.btn-sm{display:none}
-.main{flex:1;overflow-y:auto;display:flex;flex-direction:column}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
 .main-content{flex:1;padding:24px;max-width:1200px;width:100%}
 .theme-toggle{
   background:transparent;border:1px solid var(--border);border-radius:var(--radius);
@@ -608,6 +608,7 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 /* ═══ SECTION-SPECIFIC OVERRIDES ═══ */
 .profiles-table-wrap{overflow-x:auto}
 .profiles-table-wrap .tbl td,.profiles-table-wrap .tbl th{white-space:nowrap}
+.tbl-compact th,.tbl-compact td{padding:4px 8px!important;font-size:12px}
 .routing-rules .tbl td:nth-child(3),.routing-rules .tbl td:nth-child(4){font-family:var(--font-mono);font-size:12px}
 .feature-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:var(--gap-lg)}
 .feature-card{padding:16px}
@@ -816,7 +817,7 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
       <!-- ═══ S3: PROFILES ═══ -->
       <section class="section-panel" data-section="profiles" data-od-id="sec-profiles">
         <div class="section-header" onclick="toggleSection(this)">
-          <h2>Профили <span class="badge badge-info" id="profileCountBadge">42</span></h2>
+          <h2>Профили <span class="badge badge-info" id="profileCountBadge">—</span></h2>
           <svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg>
         </div>
         <div class="section-body">
@@ -836,10 +837,10 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
             <input type="text" placeholder="Поиск профиля…" id="profileSearch" oninput="filterProfiles(this.value)" style="flex:1;min-width:200px">
           </div>
           <div class="profiles-table-wrap">
-            <table class="tbl" id="profilesTable">
+            <table class="tbl tbl-compact" id="profilesTable">
               <thead>
                 <tr>
-                  <th>★</th><th>ID</th><th>Имя</th><th>Протокол</th><th>Транспорт</th><th>Адрес</th><th>QUIC</th><th>Задержка</th><th>Джиттер</th><th>Потери</th><th>Скорость</th><th>EWMA</th><th>Ошибки</th><th>Cooldown</th><th>Балл</th><th></th>
+                  <th>★</th><th>ID</th><th>Имя</th><th>Протокол</th><th>Адрес</th><th>Задержка</th><th>Скорость</th><th>Балл</th><th></th>
                 </tr>
               </thead>
               <tbody id="profilesBody"></tbody>
@@ -2510,6 +2511,20 @@ function initCustomSelects() {
 }
 
 // ─── PROFILES TABLE ──────────────────────────────────────────────────
+// Track collapsed profile groups across re-renders (5s refresh safe).
+const collapsedGroups = new Set();
+
+function shortGroupName(name) {
+  // If group is a URL, show only the domain for readability.
+  try {
+    if (name.startsWith('http://') || name.startsWith('https://')) {
+      const u = new URL(name);
+      return u.hostname;
+    }
+  } catch(e) {}
+  return name;
+}
+
 function renderProfiles(data) {
   const body = document.getElementById('profilesBody');
   if (!body) return;
@@ -2518,38 +2533,38 @@ function renderProfiles(data) {
     (acc[key] ||= []).push(p);
     return acc;
   }, {});
+  const NUM_COLS = 9; // must match thead below
   body.innerHTML = Object.entries(groups).map(([group, items]) => {
     const safeGroup = group.replace(/'/g, "&#39;");
+    const isCollapsed = collapsedGroups.has(group);
+    const display = isCollapsed ? 'none' : '';
+    const arrow = isCollapsed ? '▸' : '▾';
     return `<tr class="profile-group-row" data-profile-group="${safeGroup}">
-      <td colspan="16" style="font-weight:600">
-        <button class="btn btn-sm" onclick="toggleProfileGroup('${safeGroup}')">▾</button>
-        <span>${group}</span>
+      <td colspan="${NUM_COLS}" style="font-weight:600">
+        <button class="btn btn-sm" onclick="toggleProfileGroup('${safeGroup}')">${arrow}</button>
+        <span>${shortGroupName(group)}</span>
         <span class="badge badge-info">${items.length}</span>
-        <button class="btn btn-sm" onclick="refreshProfileGroup('${safeGroup}')">↻ Refresh</button>
+        <button class="btn btn-sm" onclick="refreshProfileGroup('${safeGroup}')">↻</button>
       </td>
-    </tr>` + items.map(p => `<tr data-profile-row="${safeGroup}" style="${p.active?'background:var(--accent-soft)':''}">
+    </tr>` + items.map(p => `<tr data-profile-row="${safeGroup}" style="display:${display};${p.active?'background:var(--accent-soft)':''}">
     <td><span class="star ${p.favorite?'on':''}" onclick="toggleFav(${p.id})">★</span></td>
-    <td class="mono">${p.id}</td>
-    <td style="font-weight:${p.active?'600':'400'}">${p.name}</td>
-    <td><span class="badge badge-info">${p.protocol}</span></td>
-    <td>${p.transport}</td>
-    <td class="mono">${p.address}:${p.port}</td>
-    <td><label class="toggle"><input type="checkbox" ${p.block_quic?'checked':''} onchange="api('POST','/api/profiles/block-quic',{profile_id:${p.id},block_quic:this.checked})"><span class="slider"></span></label></td>
-    <td class="mono">${p.last_latency_ms ?? '—'}<span style="font-size:10px;color:var(--fg);margin-left:4px">ms</span></td>
-    <td class="mono">${p.last_jitter_ms ?? '—'}</td>
-    <td class="mono">${p.last_loss_percent ?? '—'}<span style="font-size:10px;color:var(--fg);margin-left:4px">%</span></td>
-    <td class="mono">${p.last_download_mbps ?? '—'}<span style="font-size:10px;color:var(--fg);margin-left:4px">Mbps</span></td>
-    <td class="mono" style="font-size:11px;line-height:1.35">${p.ewma_score ?? '—'}<br><span style="color:var(--muted)">${p.ewma_latency_ms ?? '—'}ms · ${p.ewma_download_mbps ?? '—'}Mbps</span></td>
-    <td class="mono" style="color:${(p.consecutive_failures ?? p.failure_count)>3?'var(--danger)':'var(--fg)'}">${p.consecutive_failures ?? p.failure_count}</td>
-    <td class="mono" style="font-size:11px">${p.cooldown_until_unix ? formatTime(p.cooldown_until_unix) : '—'}</td>
-    <td class="mono" style="font-weight:600;color:${p.score>=80?'var(--success)':p.score>=60?'var(--warning)':'var(--danger)'}">${p.score ?? '—'}</td>
-    <td>
+    <td class="mono" style="color:var(--muted)">${p.id}</td>
+    <td style="font-weight:${p.active?'600':'400'};max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${p.name}</td>
+    <td><span class="badge badge-info" style="font-size:10px">${p.protocol}</span></td>
+    <td class="mono" style="font-size:11px;color:var(--muted)">${p.address}:${p.port}</td>
+    <td class="mono">${p.last_latency_ms ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
+    <td class="mono">${p.last_download_mbps ? p.last_download_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
+    <td class="mono" style="font-weight:600;color:${(p.score??0)>=80?'var(--success)':(p.score??0)>=60?'var(--warning)':'var(--danger)'}">${p.score ?? '—'}</td>
+    <td style="white-space:nowrap">
       ${!p.active?`<button class="btn btn-sm" onclick="api('POST','/api/active-profile',{profile_id:${p.id}})">${t('Выбрать')}</button>`:`<span class="badge badge-success">${t('Активен')}</span>`}
-      <button class="btn btn-sm" onclick="editProfileName(${p.id})">Переименовать</button>
+      <button class="btn-icon btn-sm" onclick="editProfileName(${p.id})" title="${t('Переименовать')}">✎</button>
       <button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' ${p.name}?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button>
     </td>
   </tr>`).join('');
   }).join('');
+  // Update count badge
+  const badge = document.getElementById('profileCountBadge');
+  if (badge) badge.textContent = data.length;
   renderFavorites(MOCK.profiles);
 }
 function renderFavorites(data) {
@@ -2583,9 +2598,18 @@ function toggleFav(id) {
   renderProfiles(MOCK.profiles);
 }
 function toggleProfileGroup(group) {
-  document.querySelectorAll(`[data-profile-row="${group}"]`).forEach(row => {
-    row.style.display = row.style.display === 'none' ? '' : 'none';
-  });
+  if (collapsedGroups.has(group)) {
+    collapsedGroups.delete(group);
+  } else {
+    collapsedGroups.add(group);
+  }
+  // Toggle DOM immediately without full re-render.
+  const rows = document.querySelectorAll(`[data-profile-row="${group}"]`);
+  const collapsed = collapsedGroups.has(group);
+  rows.forEach(row => { row.style.display = collapsed ? 'none' : ''; });
+  // Update arrow.
+  const header = document.querySelector(`[data-profile-group="${group}"] button`);
+  if (header) header.textContent = collapsed ? '▸' : '▾';
 }
 function refreshProfileGroup(group) {
   api('POST','/api/subscriptions/refresh-one',{group:group === t('Без группы') ? null : group}).then(()=>showToast('success',t('Группа обновлена')+': '+group));
@@ -3071,8 +3095,39 @@ function safeSet(id, value) { const el = document.getElementById(id); if (el) el
 function safeValue(id, value) { const el = document.getElementById(id); if (el) el.value = value ?? ''; }
 function safeChecked(id, value) { const el = document.getElementById(id); if (el) el.checked = !!value; }
 function normalizeProfiles(statsData, profilesData) {
-  if (statsData && Array.isArray(statsData.stats)) return statsData.stats;
-  if (profilesData && Array.isArray(profilesData.profiles)) return profilesData.profiles;
+  // Build a lookup from stats by profile_id so we can overlay
+  // benchmark metrics onto the base profile entries.
+  const statsMap = {};
+  if (statsData && Array.isArray(statsData.stats)) {
+    statsData.stats.forEach(s => { statsMap[s.profile_id] = s; });
+  }
+  // Profiles endpoint is the base: has id, block_quic, group (friendly name).
+  // Stats endpoint has benchmark fields (latency, score, ewma, etc.).
+  if (profilesData && Array.isArray(profilesData.profiles)) {
+    return profilesData.profiles.map(p => {
+      const st = statsMap[p.id];
+      if (!st) return p;
+      return Object.assign({}, p, {
+        favorite: st.favorite ?? p.favorite ?? false,
+        last_latency_ms: st.last_latency_ms || 0,
+        last_jitter_ms: st.last_jitter_ms || 0,
+        last_download_mbps: st.last_download_mbps || 0,
+        last_loss_percent: st.last_loss_percent || 0,
+        score: st.score || 0,
+        success_count: st.success_count || 0,
+        failure_count: st.failure_count || 0,
+        ewma_score: st.ewma_score || 0,
+        ewma_latency_ms: st.ewma_latency_ms || 0,
+        ewma_download_mbps: st.ewma_download_mbps || 0,
+        consecutive_failures: st.consecutive_failures || 0,
+        cooldown_until_unix: st.cooldown_until_unix || 0,
+      });
+    });
+  }
+  // Fallback: stats only — map profile_id → id so render works.
+  if (statsData && Array.isArray(statsData.stats)) {
+    return statsData.stats.map(s => Object.assign({}, s, { id: s.profile_id }));
+  }
   return [];
 }
 function updateStatusCards(s) {
