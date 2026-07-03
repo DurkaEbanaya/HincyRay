@@ -1222,12 +1222,12 @@ OR,((DOMAIN-SUFFIX,google.com),(DOMAIN-KEYword,google)),PROXY"></textarea>
         </div>
         <div class="section-body">
           <div class="cards" style="margin-bottom:16px">
-            <div class="card"><div class="card-label">Входящий ↑</div><div class="card-value mono">12 kbps</div></div>
-            <div class="card"><div class="card-label">Исходящий ↓</div><div class="card-value mono">34 kbps</div></div>
-            <div class="card"><div class="card-label">Память Mihomo</div><div class="card-value mono">12 MB</div></div>
+            <div class="card"><div class="card-label">Входящий ↑</div><div class="card-value mono" id="psUp">—</div></div>
+            <div class="card"><div class="card-label">Исходящий ↓</div><div class="card-value mono" id="psDown">—</div></div>
+            <div class="card"><div class="card-label">Память Mihomo</div><div class="card-value mono" id="psMem">—</div></div>
           </div>
           <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
-            <button class="btn btn-sm" onclick="api('POST','/api/mihomo-api/delay')">Тест задержки</button>
+            <button class="btn btn-sm" onclick="delayTest()">Тест задержки</button>
             <button class="btn btn-sm" onclick="api('POST','/api/mihomo-api/cache/fakeip/flush')">Сброс Fake-IP</button>
             <button class="btn btn-sm" onclick="api('POST','/api/mihomo-api/cache/dns/flush')">Сброс DNS</button>
             <button class="btn btn-sm btn-danger" onclick="api('POST','/api/mihomo-api/connections/close',{scope:'all'})">Закрыть все соединения</button>
@@ -1264,10 +1264,10 @@ OR,((DOMAIN-SUFFIX,google.com),(DOMAIN-KEYword,google)),PROXY"></textarea>
         </div>
         <div class="section-body">
           <div class="cards" style="margin-bottom:16px">
-            <div class="card"><div class="card-label">↑ Скорость</div><div class="card-value mono" id="tUp">12 kbps</div></div>
-            <div class="card"><div class="card-label">↓ Скорость</div><div class="card-value mono" id="tDown">34 kbps</div></div>
-            <div class="card"><div class="card-label">↑ Всего</div><div class="card-value mono" id="tUpTotal">1.2 MB</div></div>
-            <div class="card"><div class="card-label">↓ Всего</div><div class="card-value mono" id="tDownTotal">9.4 MB</div></div>
+            <div class="card"><div class="card-label">↑ Скорость</div><div class="card-value mono" id="tUp">—</div></div>
+            <div class="card"><div class="card-label">↓ Скорость</div><div class="card-value mono" id="tDown">—</div></div>
+            <div class="card"><div class="card-label">↑ Всего</div><div class="card-value mono" id="tUpTotal">—</div></div>
+            <div class="card"><div class="card-label">↓ Всего</div><div class="card-value mono" id="tDownTotal">—</div></div>
           </div>
           <button class="btn btn-accent btn-sm" onclick="api('POST','/api/mihomo-api/speed-test')" style="margin-bottom:12px">Тест скорости</button>
           <h3 style="font-size:var(--fs-h3);margin:0 0 8px">Лог подключений</h3>
@@ -1668,13 +1668,13 @@ rules:
           </table>
           <h3 style="font-size:var(--fs-h3);margin:20px 0 8px">WebDAV</h3>
           <div class="form-row">
-            <div class="form-group" style="flex:1"><label>URL</label><input placeholder="https://webdav.example.com/path/state.json" class="mono"></div>
-            <div class="form-group"><label>Имя</label><input placeholder="user"></div>
-            <div class="form-group"><label>Пароль</label><input type="password" placeholder="pass"></div>
+            <div class="form-group" style="flex:1"><label>URL</label><input id="webdavUrl" placeholder="https://webdav.example.com/path/state.json" class="mono"></div>
+            <div class="form-group"><label>Имя</label><input id="webdavUser" placeholder="user"></div>
+            <div class="form-group"><label>Пароль</label><input id="webdavPass" type="password" placeholder="pass"></div>
           </div>
           <div style="display:flex;gap:8px;margin-top:8px">
-            <button class="btn" onclick="api('POST','/api/backups/webdav-upload')">↑ Загрузить</button>
-            <button class="btn" onclick="api('POST','/api/backups/webdav-download')">↓ Скачать</button>
+            <button class="btn" onclick="webdavUpload()">↑ Загрузить</button>
+            <button class="btn" onclick="webdavDownload()">↓ Скачать</button>
           </div>
         </div>
       </section>
@@ -2117,6 +2117,7 @@ const I18N = {
   'Тест задержки':'Delay Test','Сброс Fake-IP':'Flush Fake-IP','Сброс DNS':'Flush DNS','Закрыть все соединения':'Close All Connections',
   'Тест скорости':'Speed Test','Проверить обновления':'Check for Updates','Обновить':'Update',
   'Загрузить в WebDAV':'Upload to WebDAV','Скачать из WebDAV':'Download from WebDAV',
+  'Введите URL':'Enter URL','Загружено':'Uploaded','Восстановлено':'Restored',
   'Войти':'Login','Отмена':'Cancel','Подтвердить':'Confirm',
   'Запустить файрвол':'Start Firewall','Остановить':'Stop',
   // Form labels
@@ -2928,6 +2929,10 @@ function fmtBytes(b) {
   if(b<1048576) return (b/1024).toFixed(1)+' KB';
   return (b/1048576).toFixed(1)+' MB';
 }
+function fmtKbps(kbps) {
+  if(kbps<1024) return Math.round(kbps)+' kbps';
+  return (kbps/1024).toFixed(1)+' Mbps';
+}
 
 // ─── INIT ────────────────────────────────────────────────────────────
 // ─── TOOLTIPS SYSTEM ─────────────────────────────────────────────────
@@ -3125,7 +3130,51 @@ function loadRouting() { return api('GET','/api/routing').then(d => { MOCK.routi
 function loadSubscriptions() { return api('GET','/api/subscriptions').then(d => renderSubs(d.subscriptions || [])); }
 function loadDeviceRoutes() { return api('GET','/api/device-routes').then(d => renderDeviceRoutes(d.device_routes || d.routes || [])); }
 function loadBackups() { return api('GET','/api/backups').then(d => renderBackups(d.backups || [])); }
-function loadTrafficAndConnections() { api('GET','/api/connection-log').then(d => renderConnLog(d.connection_log || d.log || [])).catch(()=>{}); api('GET','/api/mihomo-api/connections').then(d => renderActiveConns(normalizeConnections(d))).catch(()=>{}); api('GET','/api/mihomo-api/proxies').then(d => renderProxyGroups(normalizeProxyGroups(d))).catch(()=>{}); }
+function loadTrafficAndConnections() { loadTrafficMemory(); api('GET','/api/connection-log').then(d => renderConnLog(d.connection_log || d.log || [])).catch(()=>{}); api('GET','/api/mihomo-api/connections').then(d => renderActiveConns(normalizeConnections(d))).catch(()=>{}); api('GET','/api/mihomo-api/proxies').then(d => renderProxyGroups(normalizeProxyGroups(d))).catch(()=>{}); }
+
+function loadTrafficMemory() {
+  // Fetch cumulative + realtime traffic stats, and Mihomo memory.
+  api('GET','/api/traffic').then(d => {
+    const up = d.current_up_kbps ?? 0;
+    const down = d.current_down_kbps ?? 0;
+    const el = id => document.getElementById(id);
+    if (el('tUp')) el('tUp').textContent = fmtKbps(up);
+    if (el('tDown')) el('tDown').textContent = fmtKbps(down);
+    if (el('tUpTotal')) el('tUpTotal').textContent = fmtBytes(d.total_up_bytes ?? 0);
+    if (el('tDownTotal')) el('tDownTotal').textContent = fmtBytes(d.total_down_bytes ?? 0);
+    if (el('psUp')) el('psUp').textContent = fmtKbps(up);
+    if (el('psDown')) el('psDown').textContent = fmtKbps(down);
+  }).catch(()=>{});
+  api('GET','/api/mihomo-api/memory').then(d => {
+    const mem = d.inuse ?? 0;  // Mihomo reports KB
+    const el = document.getElementById('psMem');
+    if (el) el.textContent = fmtBytes(mem * 1024);
+  }).catch(()=>{});
+}
+
+function delayTest() {
+  api('POST','/api/mihomo-api/delay',{}).then(r => {
+    if (r && r.delay != null) showToast('success', t('Задержка') + ': ' + r.delay + ' ms');
+  }).catch(()=>{});
+}
+
+function webdavUpload() {
+  const url = document.getElementById('webdavUrl')?.value?.trim();
+  if (!url) { showToast('error', t('Введите URL')); return; }
+  api('POST','/api/backups/webdav-upload',{
+    url, username: document.getElementById('webdavUser')?.value || '',
+    password: document.getElementById('webdavPass')?.value || ''
+  }).then(()=> showToast('success', t('Загружено'))).catch(()=>{});
+}
+
+function webdavDownload() {
+  const url = document.getElementById('webdavUrl')?.value?.trim();
+  if (!url) { showToast('error', t('Введите URL')); return; }
+  api('POST','/api/backups/webdav-download',{
+    url, username: document.getElementById('webdavUser')?.value || '',
+    password: document.getElementById('webdavPass')?.value || ''
+  }).then(()=> { showToast('success', t('Восстановлено')); refreshDashboard(); }).catch(()=>{});
+}
 function loadDns() { return api('GET','/api/dns').then(d => { const dns = d.dns || d.settings || d; safeChecked('dnsEnabled', dns.enabled); safeValue('dnsStrategy', dns.query_strategy || 'UseIPv4'); safeValue('dnsRemote', Array.isArray(dns.remote_servers) ? dns.remote_servers.join('\n') : ''); safeValue('dnsLocal', Array.isArray(dns.local_servers) ? dns.local_servers.join('\n') : ''); refreshCustomSelects(); }); }
 function loadHwid() { return api('GET','/api/hwid').then(d => { const h = d.hwid || d; safeValue('hwidVal', h.hwid); safeValue('hwidOs', h.os_version); safeValue('hwidModel', h.device_model); safeValue('hwidDeviceOs', h.device_os); safeValue('hwidApp', h.app_version); safeValue('hwidBundle', h.bundle_id); safeValue('hwidApi', h.api_version); }); }
 function loadAuthSettings() { return api('GET','/api/auth-settings').then(d => { const a = d.auth || d; safeChecked('authEnabled', a.enabled); safeValue('authUser', a.username || 'admin'); if (a.enabled && !localStorage.getItem('hincyray_token')) showLoginOverlay(); }); }

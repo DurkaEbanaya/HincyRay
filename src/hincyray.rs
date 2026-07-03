@@ -5356,14 +5356,20 @@ fn handle_mihomo_api_delay(body: &str, daemon: &Daemon) -> (u16, &'static str, S
             }
         }
     };
-    let req: Value = match serde_json::from_str(body) {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                400,
-                "application/json",
-                json!({"error": format!("invalid JSON: {e}")}).to_string(),
-            );
+    // Empty body is treated as `{}` — use all defaults.
+    // Invalid non-empty JSON is still a 400 error.
+    let req: Value = if body.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    400,
+                    "application/json",
+                    json!({"error": format!("invalid JSON: {e}")}).to_string(),
+                );
+            }
         }
     };
     let name = req
@@ -10207,6 +10213,23 @@ mod tests {
         let (code, _, body) = handle_mihomo_api_delay("not json", &daemon);
         assert_eq!(code, 400);
         assert!(body.contains("invalid JSON"));
+    }
+
+    #[test]
+    fn api_delay_empty_body_uses_defaults() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.mihomo_features.external_controller.enabled = true;
+            inner.state.mihomo_features.external_controller.address = "127.0.0.1:9090".to_owned();
+        }
+        // Empty body should not return 400 "invalid JSON" — it should
+        // fall through to the delay test (which will fail because no
+        // Mihomo is running, but the error is a connection error, not
+        // a parse error).
+        let (code, _, body) = handle_mihomo_api_delay("", &daemon);
+        assert_ne!(code, 400);
+        assert!(!body.contains("invalid JSON"));
     }
 
     #[test]
