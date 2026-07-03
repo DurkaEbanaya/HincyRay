@@ -1,4 +1,4 @@
-# HincyRay v0.15.0
+# HincyRay v0.15.1
 
 [English](README.md) | [Русский](README.ru.md)
 
