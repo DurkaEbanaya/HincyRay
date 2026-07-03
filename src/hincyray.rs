@@ -2284,11 +2284,7 @@ fn build_routing_context<'a>(
             }
         }
         let ports = normalize_route_items(&rule.ports);
-        let network = if rule.network.trim().is_empty() {
-            None
-        } else {
-            Some(rule.network.trim().to_owned())
-        };
+        let network = normalize_route_network(&rule.network);
         if domains.is_empty() && ips.is_empty() && ports.is_empty() && network.is_none() {
             continue;
         }
@@ -2382,6 +2378,15 @@ fn normalize_route_items(items: &[String]) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn normalize_route_network(network: &str) -> Option<String> {
+    match network.trim().to_ascii_lowercase().as_str() {
+        "" | "any" | "all" | "*" | "tcp,udp" | "udp,tcp" => None,
+        "tcp" => Some("tcp".to_owned()),
+        "udp" => Some("udp".to_owned()),
+        _ => None,
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -4557,17 +4562,17 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
     let mut overall = Vec::new();
     overall.push(chain_node(
         "split",
-        "Split routing",
+        "Split Routing",
         if split.enabled { "ok" } else { "bad" },
         if split.enabled {
-            "transparent routing enabled".to_owned()
+            "прозрачная маршрутизация включена".to_owned()
         } else {
-            "disabled: policy traffic goes DIRECT through Keenetic".to_owned()
+            "выключено: трафик политики пойдёт напрямую через Keenetic".to_owned()
         },
     ));
     overall.push(chain_node(
         "policy",
-        "Keenetic policy",
+        "Политика Keenetic",
         if split.policy_mark.as_deref().is_some_and(|m| !m.is_empty()) {
             "ok"
         } else if split.enabled {
@@ -4576,17 +4581,17 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
             "neutral"
         },
         format!(
-            "policy={} mark={}",
+            "политика={} mark={}",
             split.policy_name,
             split
                 .policy_mark
                 .as_deref()
-                .unwrap_or("unknown until firewall apply")
+                .unwrap_or("неизвестно до применения firewall")
         ),
     ));
     overall.push(chain_node(
         "firewall",
-        "Firewall rules",
+        "Правила firewall",
         if !split.enabled {
             "neutral"
         } else if firewall_active && nat_ok && dns_ok && (!tproxy_available || tproxy_ok) {
@@ -4595,18 +4600,18 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
             "bad"
         },
         format!(
-            "state={} nat={} dns={} tproxy={} route={}",
+            "состояние={} NAT={} DNS={} TPROXY={} route={}",
             if firewall_active {
-                "running"
+                "работает"
             } else {
-                "stopped"
+                "остановлен"
             },
             ok_fail(nat_ok),
             ok_fail(dns_ok),
             if tproxy_available {
                 ok_fail(tproxy_ok)
             } else {
-                "unavailable"
+                "недоступен"
             },
             ok_fail(route_ok)
         ),
@@ -4622,9 +4627,13 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
             "bad"
         },
         format!(
-            "DNAT={} Mihomo core={}",
+            "DNAT={} ядро Mihomo={}",
             ok_fail(dns_ok),
-            if core_running { "running" } else { "stopped" }
+            if core_running {
+                "работает"
+            } else {
+                "остановлено"
+            }
         ),
     ));
     overall.push(chain_node(
@@ -4638,10 +4647,14 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
             "bad"
         },
         format!(
-            "NAT={} redirect-port={} Mihomo core={}",
+            "NAT={} redirect-port={} ядро Mihomo={}",
             ok_fail(nat_ok),
             split.redirect_port,
-            if core_running { "running" } else { "stopped" }
+            if core_running {
+                "работает"
+            } else {
+                "остановлено"
+            }
         ),
     ));
     overall.push(chain_node(
@@ -4663,24 +4676,30 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
                 ok_fail(route_ok)
             )
         } else {
-            "TPROXY unavailable: UDP/QUIC is limited or blocked".to_owned()
+            "TPROXY недоступен: TCP-прозрачный VPN работает, UDP/QUIC ограничен или блокируется"
+                .to_owned()
         },
     ));
     overall.push(chain_node(
         "mihomo",
-        "Mihomo core",
+        "Ядро Mihomo",
         if core_running { "ok" } else { "bad" },
-        if core_running { "running" } else { "stopped" }.to_owned(),
+        if core_running {
+            "работает"
+        } else {
+            "остановлено"
+        }
+        .to_owned(),
     ));
     overall.push(chain_node(
         "proxy",
-        "Active proxy",
+        "Активный proxy",
         if active_profile_id.is_some() {
             "ok"
         } else {
             "bad"
         },
-        active_profile_name.unwrap_or_else(|| "no active profile".to_owned()),
+        active_profile_name.unwrap_or_else(|| "активный профиль не выбран".to_owned()),
     ));
     overall.push(chain_node(
         "geo",
@@ -4700,7 +4719,7 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
                 ok_fail(geosite_dat)
             )
         } else {
-            "routing rules do not require GEOIP/GEOSITE/RULE-SET assets".to_owned()
+            "правила маршрутизации не требуют GEOIP/GEOSITE/RULE-SET assets".to_owned()
         },
     ));
 
@@ -4709,9 +4728,9 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
         let in_subnet = ip_matches_cidr_text(ip, &split.vpn_subnet);
         device.push(chain_node(
             "device",
-            "Selected device",
+            "Выбранное устройство",
             if arp_device.is_some() { "ok" } else { "warn" },
-            arp_device.unwrap_or_else(|| format!("{ip}: not present in /proc/net/arp now")),
+            arp_device.unwrap_or_else(|| format!("{ip}: сейчас нет в /proc/net/arp")),
         ));
         device.push(chain_node(
             "subnet",
@@ -4720,16 +4739,16 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
             format!(
                 "{ip} {} {}",
                 if in_subnet {
-                    "belongs to"
+                    "входит в"
                 } else {
-                    "is outside"
+                    "вне"
                 },
                 split.vpn_subnet
             ),
         ));
         device.push(chain_node(
             "override",
-            "Device override",
+            "Override устройства",
             match device_route.as_ref().map(|r| r.target.as_str()) {
                 Some("direct") | Some("reject") => "bad",
                 Some(_) => "warn",
@@ -4737,30 +4756,30 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
             },
             match device_route {
                 Some(route) => format!(
-                    "{} -> {} (overrides all routing rules)",
+                    "{} -> {} (имеет приоритет над всеми общими правилами)",
                     route.ip, route.target
                 ),
-                None => "none: general routing rules will decide".to_owned(),
+                None => "нет: будут применены общие правила маршрутизации".to_owned(),
             },
         ));
         device.push(chain_node(
             "port_mode",
-            "Port mode",
+            "Режим портов",
             "ok",
             match split.port_mode {
-                PortMode::All => "All: every port continues to routing rules".to_owned(),
+                PortMode::All => "All: все порты продолжают обработку правилами".to_owned(),
                 PortMode::AllowList => format!(
-                    "AllowList: only {:?} continue to proxy rules",
+                    "AllowList: только {:?} продолжают обработку proxy-правилами",
                     split.proxy_ports
                 ),
                 PortMode::DenyList => {
-                    format!("DenyList: {:?} bypass proxy rules", split.bypass_ports)
+                    format!("DenyList: {:?} обходят proxy-правила", split.bypass_ports)
                 }
             },
         ));
         device.push(chain_node(
             "rules",
-            "Routing rules",
+            "Правила маршрутизации",
             if routing_rules.is_empty() {
                 "ok"
             } else if uses_geo_assets {
@@ -4769,33 +4788,39 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
                 "ok"
             },
             if routing_rules.is_empty() {
-                "no custom rules: final MATCH,proxy sends traffic to VPN".to_owned()
+                "нет пользовательских правил: финальное MATCH,proxy отправит трафик в VPN".to_owned()
             } else if uses_geo_assets {
                 format!(
-                    "{} rule(s); GEOIP/GEOSITE/RULE-SET are evaluated by Mihomo runtime",
+                    "{} правил(а); GEOIP/GEOSITE/RULE-SET оцениваются внутри Mihomo во время соединения",
                     routing_rules.len()
                 )
             } else {
-                format!("{} rule(s) before final MATCH,proxy", routing_rules.len())
+                format!("{} правил(а) перед финальным MATCH,proxy", routing_rules.len())
             },
         ));
         device.push(chain_node(
             "observed",
-            "Observed in Mihomo",
+            "Видимость в Mihomo",
             match source_seen {
                 Some(true) => "ok",
                 Some(false) => "warn",
                 None => "neutral",
             },
             match source_seen {
-                Some(true) => format!("active connection from {ip} is visible in Mihomo"),
-                Some(false) => format!("no active Mihomo connection from {ip} at this moment"),
-                None => "external controller unavailable or core stopped".to_owned(),
+                Some(true) => format!("активное соединение от {ip} видно в Mihomo"),
+                Some(false) => format!("сейчас нет активного соединения от {ip} в Mihomo"),
+                None if !core_running => {
+                    "ядро Mihomo остановлено, поэтому External Controller недоступен".to_owned()
+                }
+                None if ec.is_none() => {
+                    "External Controller выключен в настройках Mihomo".to_owned()
+                }
+                None => "не удалось опросить External Controller Mihomo".to_owned(),
             },
         ));
         device.push(chain_node(
             "result",
-            "Expected result",
+            "Ожидаемый результат",
             if transparent_ready { "ok" } else { "bad" },
             expected_chain_result(transparent_ready, routing_rules.is_empty(), uses_geo_assets),
         ));
@@ -4869,14 +4894,15 @@ fn expected_chain_result(
     uses_geo_assets: bool,
 ) -> String {
     if !transparent_ready {
-        return "transparent VPN chain is broken; traffic will be DIRECT or connectivity may fail depending on the broken stage".to_owned();
+        return "прозрачная VPN-цепь нарушена; трафик пойдёт напрямую или соединение сломается на проблемном этапе".to_owned();
     }
     if rules_empty {
-        "all intercepted traffic reaches final MATCH,proxy: VPN".to_owned()
+        "весь перехваченный трафик доходит до финального MATCH,proxy: VPN".to_owned()
     } else if uses_geo_assets {
-        "rules include runtime GEOIP/GEOSITE/RULE-SET; Mihomo will decide, then final MATCH,proxy sends non-matching traffic to VPN".to_owned()
+        "правила содержат runtime GEOIP/GEOSITE/RULE-SET; решение принимает Mihomo, а несовпавший трафик уйдёт в финальный MATCH,proxy: VPN".to_owned()
     } else {
-        "first matching routing rule wins; non-matching traffic reaches MATCH,proxy: VPN".to_owned()
+        "первое совпавшее правило побеждает; несовпавший трафик доходит до MATCH,proxy: VPN"
+            .to_owned()
     }
 }
 
@@ -10649,6 +10675,44 @@ mod tests {
     }
 
     #[test]
+    fn routing_rule_with_network_any_does_not_emit_mihomo_network_rule() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "YouTube any".to_owned(),
+                target: "active".to_owned(),
+                services: vec!["youtube".to_owned()],
+                network: "any".to_owned(),
+                ..Default::default()
+            });
+        }
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let rules = config["rules"].as_array().expect("rules");
+        // GEOSITE,youtube,proxy should be present
+        assert!(
+            rules
+                .iter()
+                .any(|r| { r.as_str() == Some("GEOSITE,youtube,proxy") })
+        );
+        // NETWORK,any must never appear — it crashes Mihomo
+        assert!(
+            !rules
+                .iter()
+                .any(|r| { r.as_str().unwrap_or("").starts_with("NETWORK,") })
+        );
+    }
+
+    #[test]
     fn split_routing_config_with_dns_enabled_includes_dns_section() {
         let (_dir, daemon) = test_daemon();
         handle_import(
@@ -11756,7 +11820,12 @@ mod tests {
             .find(|node| node["id"] == json!("split"))
             .expect("split node");
         assert_eq!(split["status"], json!("bad"));
-        assert!(split["detail"].as_str().expect("detail").contains("DIRECT"));
+        assert!(
+            split["detail"]
+                .as_str()
+                .expect("detail")
+                .contains("напрямую")
+        );
     }
 
     #[test]
@@ -11794,7 +11863,7 @@ mod tests {
             override_node["detail"]
                 .as_str()
                 .expect("detail")
-                .contains("overrides all routing rules")
+                .contains("имеет приоритет над всеми общими правилами")
         );
     }
 

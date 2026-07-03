@@ -2752,11 +2752,19 @@ fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
             result.push(format!("DST-PORT,{port},{target}"));
         }
     }
-    if let Some(network) = &rule.network {
-        result.push(format!("NETWORK,{},{}", network, target));
+    if let Some(network) = rule.network.as_deref().and_then(normalize_mihomo_network) {
+        result.push(format!("NETWORK,{network},{target}"));
     }
 
     result
+}
+
+fn normalize_mihomo_network(network: &str) -> Option<&'static str> {
+    match network.trim().to_ascii_lowercase().as_str() {
+        "tcp" => Some("tcp"),
+        "udp" => Some("udp"),
+        _ => None,
+    }
 }
 
 /// Build a single domain rule string for Mihomo.
