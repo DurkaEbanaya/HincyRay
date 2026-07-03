@@ -3070,7 +3070,7 @@ function normalizeProfiles(statsData, profilesData) {
   if (profilesData && Array.isArray(profilesData.profiles)) return profilesData.profiles;
   return [];
 }
-function updateStatusUI(s) {
+function updateStatusCards(s) {
   if (!s) return;
   safeSet('sCore', s.core_status || '—');
   safeSet('sProfile', s.active_profile_name || '—');
@@ -3079,7 +3079,9 @@ function updateStatusUI(s) {
   safeSet('sSocks', (s.listen_host || '127.0.0.1') + ':' + (s.socks_port ?? '—'));
   safeSet('sHttp', s.http_port ? ((s.listen_host || '127.0.0.1') + ':' + s.http_port) : 'disabled');
   safeSet('sVersion', s.mihomo_version || '—');
-  const sr = s.split_routing || {};
+}
+function updateRoutingForm(sr) {
+  if (!sr) return;
   safeChecked('splitEnabled', sr.enabled);
   safeChecked('rAutoSwitch', sr.auto_switch);
   safeChecked('rBlockQuic', sr.block_quic_global);
@@ -3094,6 +3096,11 @@ function updateStatusUI(s) {
   safeValue('rBypassPorts', Array.isArray(sr.bypass_ports) ? sr.bypass_ports.join(',') : (sr.bypass_ports || ''));
   updatePortModeFields();
   refreshCustomSelects();
+}
+function updateStatusUI(s) {
+  if (!s) return;
+  updateStatusCards(s);
+  if (s.split_routing) updateRoutingForm(s.split_routing);
 }
 function updateSystemUI(sys) {
   if (!sys) return;
@@ -3114,7 +3121,7 @@ function normalizeConnections(data) {
   return Array.isArray(list) ? list.slice(0,50).map(c => ({host:c.metadata && c.metadata.host || c.host || c.metadata && c.metadata.destinationIP || '', source_ip:c.metadata && c.metadata.sourceIP || c.source_ip || '', destination_ip:c.metadata && c.metadata.destinationIP || c.destination_ip || '', network:c.metadata && c.metadata.network || c.network || '', chains:Array.isArray(c.chains) ? c.chains.join(' → ') : (c.chains || ''), rule:c.rule || '', upload:c.upload || 0, download:c.download || 0})) : [];
 }
 function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>null), api('GET','/api/profiles').catch(()=>null)]).then(([stats,profiles]) => { MOCK.profiles = normalizeProfiles(stats, profiles); renderProfiles(MOCK.profiles); }); }
-function loadRouting() { return api('GET','/api/routing').then(d => { MOCK.routing_rules = d.rules || d.routing_rules || []; renderRoutingRules(MOCK.routing_rules); if (d.settings || d.split_routing) updateStatusUI({split_routing:d.settings || d.split_routing}); }); }
+function loadRouting() { return api('GET','/api/routing').then(d => { MOCK.routing_rules = d.rules || d.routing_rules || []; renderRoutingRules(MOCK.routing_rules); if (d.settings || d.split_routing) updateRoutingForm(d.settings || d.split_routing); }); }
 function loadSubscriptions() { return api('GET','/api/subscriptions').then(d => renderSubs(d.subscriptions || [])); }
 function loadDeviceRoutes() { return api('GET','/api/device-routes').then(d => renderDeviceRoutes(d.device_routes || d.routes || [])); }
 function loadBackups() { return api('GET','/api/backups').then(d => renderBackups(d.backups || [])); }
