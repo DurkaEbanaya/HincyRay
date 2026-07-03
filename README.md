@@ -1,4 +1,4 @@
-# HincyRay v0.15.2
+# HincyRay v0.15.3
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,12 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.15.3
+
+- **DNS section fixed**: Save button now sends all fields (remote/local servers, strategy, enabled) with success toast. Leak test and Diagnostics buttons now display results in a modal — structured table with status badges, iptables rule checks, proxy exit IP, DNS resolver comparison, nslookup output, Mihomo EC DNS query, Cloudflare trace.
+- **DNS diagnostics on BusyBox**: replaced `nslookup` (which doesn't support custom ports on BusyBox) with pure-Rust DNS-over-TCP query (`dns_query_tcp`) — no external tools needed.
+- 301 tests, 0 clippy warnings.
 
 ### v0.15.2
 
@@ -191,7 +197,7 @@ cargo build --release --bin xray-vpn-test
 ```bash
 cargo fmt --all
 cargo check --all-targets --all-features
-cargo test --all-targets --all-features   # 295 tests
+cargo test --all-targets --all-features   # 301 tests
 cargo clippy --all-targets --all-features   # 0 warnings
 ```
 

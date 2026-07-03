@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.15.3 - 2026-07-03
+
+### Fixed
+
+- **DNS section buttons now functional**: "Тест утечки" (leak test), "Диагностика" (diagnostics), and "Сохранить" (save) buttons in the Web UI DNS section were calling the API but discarding the response — nothing was displayed to the user.
+  - **Save**: now sends all 4 fields (`enabled`, `query_strategy`, `remote_servers`, `local_servers`) from the form, previously only sent `enabled` and `query_strategy`. Shows success toast.
+  - **Leak test**: results now displayed in a wide modal with a structured table — status badge (OK/leak/warn), split routing state, iptables rule checks, DNS inbound listener, proxy exit IP + location, DNS via proxy vs direct, leak verdict.
+  - **Diagnostics**: results now displayed in a wide modal — split routing state, DNS listener port, local DNS query (via Mihomo), direct DNS query (system resolver), Mihomo EC DNS query, proxy trace sample.
+- **DNS diagnostics `local_dns` broken on BusyBox**: `run_nslookup` used `nslookup host server#port` syntax (Bind9), but Keenetic BusyBox nslookup doesn't support port at all. Replaced with `dns_query_tcp` — a pure-Rust DNS-over-TCP (RFC 7766) query implementation with no external tool dependencies. Constructs a minimal DNS A-record query (RFC 1035), sends over TCP, parses the response (answer IPs, rcode, answer count). Works on any platform.
+  - `build_dns_a_query(name)` — constructs DNS query packet
+  - `parse_dns_a_response(resp)` — parses DNS response, extracts A-record IPs
+  - `dns_query_tcp(host, port, name)` — ties them together with TCP I/O (3s connect timeout, 5s read timeout)
+
+### Added
+
+- Result modal (`#resultModal`) with `.modal-wide` CSS variant (max-width 680px, scrollable).
+- `.result-table`, `.result-badge` (ok/bad/warn), `.result-pre` CSS classes for structured result display.
+- `showResultModal(title, html)` / `closeResultModal()` helpers.
+- i18n translations for all DNS result labels (RU/EN).
+- 6 new tests: `dns_a_query_builds_valid_packet`, `dns_a_query_single_label`, `dns_a_response_parse_ok`, `dns_a_response_parse_nxdomain`, `dns_a_response_parse_too_short`, `dns_query_tcp_connection_refused`.
+
+### Verified
+
+- Local gates: 301 tests, 0 clippy warnings.
+- Router E2E on Keenetic Giga: DNS GET returns settings, DNS POST saves all 4 fields, leak test returns `status:"ok"` with proxy exit IP/location, diagnostics returns `local_dns: {ok:true, ips:["198.18.0.10"]}` (Mihomo fake-ip), `direct_dns` via nslookup works, `mihomo_dns_query` via EC API works, proxy trace shows Cloudflare trace.
+
 ## v0.15.2 - 2026-07-03
 
 ### Added

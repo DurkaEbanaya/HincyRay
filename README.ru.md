@@ -1,4 +1,4 @@
-# HincyRay v0.15.2
+# HincyRay v0.15.3
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,12 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 Демон `ndm` в Keenetic пересоздаёт все iptables chains при изменениях конфигурации, событиях WAN и обновлении DHCP. HincyRay устанавливает hook-скрипт в `/opt/etc/ndm/netfilter.d/hincyray.sh`, который **ndm вызывает сам** после каждой перезагрузки firewall, переустанавливая все правила атомарно. Watchdog каждые 10 секунд — запасная страховка.
 
 ## Возможности
+
+### v0.15.3
+
+- **Починен раздел DNS**: кнопка «Сохранить» теперь отправляет все поля (удалённые/локальные DNS, стратегию, флаг включения) с toast об успехе. Кнопки «Тест утечки» и «Диагностика» теперь показывают результаты в модальном окне — структурированная таблица со статус-бейджами, проверкой правил iptables, IP выхода прокси, сравнением DNS-резолверов, выводом nslookup, DNS-запросом через Mihomo API, Cloudflare trace.
+- **Диагностика DNS на BusyBox**: заменён `nslookup` (не поддерживает кастомные порты на BusyBox) на чистый Rust DNS-over-TCP запрос (`dns_query_tcp`) — без внешних инструментов.
+- 301 тест, 0 clippy предупреждений.
 
 ### v0.15.2
 
@@ -191,7 +197,7 @@ cargo build --release --bin xray-vpn-test
 ```bash
 cargo fmt --all
 cargo check --all-targets --all-features
-cargo test --all-targets --all-features   # 295 тестов
+cargo test --all-targets --all-features   # 301 тест
 cargo clippy --all-targets --all-features   # 0 предупреждений
 ```
 

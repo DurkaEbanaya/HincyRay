@@ -5898,7 +5898,7 @@ fn handle_dns_diagnostics(daemon: &Daemon) -> (u16, &'static str, String) {
             inner.core.is_running(),
         )
     };
-    let local_dns = run_nslookup("example.com", Some(("127.0.0.1", dns_port)));
+    let local_dns = dns_query_tcp("127.0.0.1", dns_port, "example.com");
     let direct_dns = run_nslookup("example.com", None);
     let mihomo_query = ec.as_ref().map(|(addr, secret)| {
         mihomo_api_get_json(
@@ -5956,6 +5956,134 @@ fn run_nslookup(host: &str, server: Option<(&str, u16)>) -> Value {
         }),
         Err(error) => json!({"ok": false, "error": error.to_string()}),
     }
+}
+
+/// Build a minimal DNS A-record query message (RFC 1035 §4.1).
+fn build_dns_a_query(name: &str) -> Vec<u8> {
+    let mut q = Vec::with_capacity(32);
+    // Header: id=1, flags=0x0100 (RD), qdcount=1, others=0
+    q.extend_from_slice(&[
+        0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    // Question: encode domain name as labels
+    for label in name.split('.') {
+        let l = label.len();
+        if l > 63 {
+            break;
+        }
+        q.push(l as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0); // root label
+    q.extend_from_slice(&[0x00, 0x01]); // Type A
+    q.extend_from_slice(&[0x00, 0x01]); // Class IN
+    q
+}
+
+/// Parse a DNS response message, extracting A-record IPs and status.
+fn parse_dns_a_response(resp: &[u8]) -> Value {
+    if resp.len() < 12 {
+        return json!({"ok": false, "error": "response too short"});
+    }
+    let rcode = u16::from_be_bytes([resp[2], resp[3]]) & 0x000f;
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]);
+    // Skip question section
+    let mut pos = 12;
+    while pos < resp.len() {
+        let b = resp[pos];
+        if b == 0 {
+            pos += 1;
+            break;
+        }
+        if b & 0xc0 == 0xc0 {
+            pos += 2; // compressed pointer
+            break;
+        }
+        pos += b as usize + 1;
+    }
+    pos += 4; // Type + Class of question
+    // Parse answer RRs
+    let mut ips: Vec<String> = Vec::new();
+    for _ in 0..ancount {
+        if pos >= resp.len() {
+            break;
+        }
+        // Skip name (possibly compressed)
+        if resp[pos] & 0xc0 == 0xc0 {
+            pos += 2;
+        } else {
+            while pos < resp.len() && resp[pos] != 0 {
+                pos += resp[pos] as usize + 1;
+            }
+            pos += 1;
+        }
+        if pos + 10 > resp.len() {
+            break;
+        }
+        let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
+        pos += 8; // Type(2) + Class(2) + TTL(4)
+        let rdlen = u16::from_be_bytes([resp[pos], resp[pos + 1]]) as usize;
+        pos += 2;
+        if rtype == 1 && rdlen == 4 && pos + 4 <= resp.len() {
+            ips.push(format!(
+                "{}.{}.{}.{}",
+                resp[pos],
+                resp[pos + 1],
+                resp[pos + 2],
+                resp[pos + 3]
+            ));
+        }
+        pos += rdlen;
+    }
+    json!({
+        "ok": rcode == 0,
+        "rcode": rcode,
+        "answer_count": ancount,
+        "ips": ips,
+    })
+}
+
+/// Send a DNS A-record query over TCP (RFC 7766) and parse the response.
+/// Works on any platform — no external tools needed.
+fn dns_query_tcp(host: &str, port: u16, name: &str) -> Value {
+    let query = build_dns_a_query(name);
+    // TCP DNS: 2-byte big-endian length prefix
+    let len = query.len() as u16;
+    let mut packet = Vec::with_capacity(query.len() + 2);
+    packet.extend_from_slice(&len.to_be_bytes());
+    packet.extend_from_slice(&query);
+
+    use std::io::{Read, Write};
+    let addr: std::net::Ipv4Addr = match host.parse() {
+        Ok(a) => a,
+        Err(_) => std::net::Ipv4Addr::UNSPECIFIED,
+    };
+    let mut stream = match std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from((std::net::IpAddr::V4(addr), port)),
+        std::time::Duration::from_secs(3),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return json!({"ok": false, "error": format!("connect: {e}")});
+        }
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    if let Err(e) = stream.write_all(&packet) {
+        return json!({"ok": false, "error": format!("write: {e}")});
+    }
+    let mut len_buf = [0u8; 2];
+    if let Err(e) = stream.read_exact(&mut len_buf) {
+        return json!({"ok": false, "error": format!("read length: {e}")});
+    }
+    let resp_len = u16::from_be_bytes(len_buf) as usize;
+    if resp_len > 4096 {
+        return json!({"ok": false, "error": "response too large"});
+    }
+    let mut resp = vec![0u8; resp_len];
+    if let Err(e) = stream.read_exact(&mut resp) {
+        return json!({"ok": false, "error": format!("read body: {e}")});
+    }
+    parse_dns_a_response(&resp)
 }
 
 fn handle_backups_list(daemon: &Daemon) -> (u16, &'static str, String) {
@@ -9687,6 +9815,89 @@ mod tests {
         assert!(inner.state.dns_settings.enabled);
         assert_eq!(inner.state.dns_settings.remote_servers.len(), 2);
         assert_eq!(inner.state.dns_settings.local_servers.len(), 1);
+    }
+
+    #[test]
+    fn dns_a_query_builds_valid_packet() {
+        let q = build_dns_a_query("example.com");
+        // Header (12) + 7+example + 3+com + root(1) + type(2) + class(2) = 12+8+4+1+2+2 = 29
+        assert_eq!(q.len(), 29);
+        // Transaction ID = 1
+        assert_eq!(&q[0..2], &[0x00, 0x01]);
+        // Flags: RD=1
+        assert_eq!(&q[2..4], &[0x01, 0x00]);
+        // QDCOUNT = 1
+        assert_eq!(&q[4..6], &[0x00, 0x01]);
+        // First label length = 7 ("example")
+        assert_eq!(q[12], 7);
+        // Type A
+        assert_eq!(&q[25..27], &[0x00, 0x01]);
+        // Class IN
+        assert_eq!(&q[27..29], &[0x00, 0x01]);
+    }
+
+    #[test]
+    fn dns_a_query_single_label() {
+        let q = build_dns_a_query("localhost");
+        // 12 + 1+9 + 1 + 2 + 2 = 27
+        assert_eq!(q.len(), 27);
+        assert_eq!(q[12], 9);
+    }
+
+    #[test]
+    fn dns_a_response_parse_ok() {
+        // Craft a minimal DNS response: 1 answer, A record = 1.2.3.4
+        let mut resp = Vec::new();
+        // Header: id=1, flags=0x8180 (response, RD, RA), qd=1, an=1, ns=0, ar=0
+        resp.extend_from_slice(&[
+            0x00, 0x01, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        // Question: example.com type A class IN
+        resp.extend_from_slice(&[
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, 0x00, 0x01,
+        ]);
+        // Answer: compressed name ptr (0xc00c), type A, class IN, TTL 60, rdlen 4, data 1.2.3.4
+        resp.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 1, 2, 3, 4,
+        ]);
+        let v = parse_dns_a_response(&resp);
+        assert_eq!(v["ok"], json!(true));
+        assert_eq!(v["rcode"], json!(0));
+        assert_eq!(v["answer_count"], json!(1));
+        assert_eq!(v["ips"][0], json!("1.2.3.4"));
+    }
+
+    #[test]
+    fn dns_a_response_parse_nxdomain() {
+        // NXDOMAIN: rcode=3, 0 answers
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&[
+            0x00, 0x01, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        resp.extend_from_slice(&[
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, 0x00, 0x01,
+        ]);
+        let v = parse_dns_a_response(&resp);
+        assert_eq!(v["ok"], json!(false));
+        assert_eq!(v["rcode"], json!(3));
+        assert_eq!(v["answer_count"], json!(0));
+    }
+
+    #[test]
+    fn dns_a_response_parse_too_short() {
+        let v = parse_dns_a_response(&[0x00, 0x01]);
+        assert_eq!(v["ok"], json!(false));
+        assert!(v["error"].as_str().is_some());
+    }
+
+    #[test]
+    fn dns_query_tcp_connection_refused() {
+        // Port 1 is almost certainly not listening
+        let v = dns_query_tcp("127.0.0.1", 1, "example.com");
+        assert_eq!(v["ok"], json!(false));
+        assert!(v["error"].as_str().is_some());
     }
 
     #[test]
