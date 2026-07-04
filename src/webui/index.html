@@ -1107,6 +1107,10 @@ https://sub.example.com/…"></textarea>
             <div class="form-group" style="flex:1"><label>Локальные DNS (напрямую)</label><textarea class="mono" id="dnsLocal" rows="3" placeholder="223.5.5.5
 223.6.6.6"></textarea></div>
           </div>
+          <div class="form-row">
+            <label class="toggle"><input type="checkbox" id="dnsSniffOverride"><span class="slider"></span></label>
+            <span style="font-weight:500">Override destination (sniffed domain)</span>
+          </div>
           <div style="display:flex;gap:8px;margin-top:8px">
             <button class="btn btn-accent" onclick="saveDns()">Сохранить</button>
             <button class="btn" onclick="dnsLeakTest()">Тест утечки</button>
@@ -3651,8 +3655,15 @@ function saveDns() {
     enabled:document.getElementById('dnsEnabled').checked,
     query_strategy:document.getElementById('dnsStrategy').value,
     remote_servers:remote,
-    local_servers:local
-  }).then(()=>showToast('success',t('DNS настройки сохранены'))).catch(()=>{});
+    local_servers:local,
+    sniffer_override_destination:document.getElementById('dnsSniffOverride').checked
+  }).then(()=>{
+    showToast('info',t('Применяем конфигурацию…'));
+    return api('POST','/api/routing/apply',{});
+  }).then(()=>{
+    showToast('success',t('DNS настройки сохранены и применены'));
+    refreshDashboard();
+  }).catch(()=>{});
 }
 
 function dnsLeakTest() {
@@ -4121,6 +4132,7 @@ const TOOLTIPS = {
   'dnsStrategy': 'UseIPv4 — только A-записи. UseIPv6 — только AAAA. UseIP — и A, и AAAA',
   'dnsRemote': 'DNS-серверы для запросов через прокси (DoH/DoT/IP). Например: https://1.1.1.1/dns-query',
   'dnsLocal': 'DNS-серверы для прямых запросов (резолв локальных доменов). Например: 223.5.5.5',
+  'dnsSniffOverride': 'Подменять адрес назначения доменом из SNI. Нужно, чтобы доменные правила работали даже когда клиенты используют свой DNS (DoH/DoT в Chrome/Firefox). Отключите только если возникают проблемы с маршрутизацией по доменам',
   // HWID
   'hwidVal': '16-значный hex идентификатор устройства. Должен быть реалистичным для прохождения cross-check сервера',
   'hwidOs': 'Версия ОС для User-Agent. Должна соответствовать device_model',
@@ -4419,7 +4431,7 @@ function webdavDownload() {
     password: document.getElementById('webdavPass')?.value || ''
   }).then(()=> { showToast('success', t('Восстановлено')); refreshDashboard(); }).catch(()=>{});
 }
-function loadDns() { return api('GET','/api/dns').then(d => { const dns = d.dns || d.settings || d; safeChecked('dnsEnabled', dns.enabled); safeValue('dnsStrategy', dns.query_strategy || 'UseIPv4'); safeValue('dnsRemote', Array.isArray(dns.remote_servers) ? dns.remote_servers.join('\n') : ''); safeValue('dnsLocal', Array.isArray(dns.local_servers) ? dns.local_servers.join('\n') : ''); refreshCustomSelects(); }); }
+function loadDns() { return api('GET','/api/dns').then(d => { const dns = d.dns || d.settings || d; safeChecked('dnsEnabled', dns.enabled); safeValue('dnsStrategy', dns.query_strategy || 'UseIPv4'); safeValue('dnsRemote', Array.isArray(dns.remote_servers) ? dns.remote_servers.join('\n') : ''); safeValue('dnsLocal', Array.isArray(dns.local_servers) ? dns.local_servers.join('\n') : ''); safeChecked('dnsSniffOverride', d.sniffer_override_destination !== false); refreshCustomSelects(); }); }
 function loadHwid() { return api('GET','/api/hwid').then(d => { const h = d.hwid || d; safeValue('hwidVal', h.hwid); safeValue('hwidOs', h.os_version); safeValue('hwidModel', h.device_model); safeValue('hwidDeviceOs', h.device_os); safeValue('hwidApp', h.app_version); safeValue('hwidBundle', h.bundle_id); safeValue('hwidApi', h.api_version); }); }
 function loadAuthSettings() { return api('GET','/api/auth-settings').then(d => { const a = d.auth || d; safeChecked('authEnabled', a.enabled); safeValue('authUser', a.username || 'admin'); if (a.enabled && !localStorage.getItem('hincyray_token')) showLoginOverlay(); }); }
 function refreshDashboard() {

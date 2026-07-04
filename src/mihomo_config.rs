@@ -580,6 +580,10 @@ pub struct MihomoFeatures {
     pub dns_fallback_filter: Option<FallbackFilter>,
 
     // --- Sniffer extra ---
+    /// Override destination with sniffed domain so DOMAIN-* rules match
+    /// even when clients bypass the router's DNS (DoH/DoT).  Default true.
+    #[serde(default = "default_true")]
+    pub sniffer_override_destination: bool,
     #[serde(default)]
     pub sniffer_force_domain: Vec<String>,
     #[serde(default)]
@@ -651,6 +655,7 @@ impl Default for MihomoFeatures {
             dns_disable_ipv6: false,
             dns_disable_qtypes: Vec::new(),
             dns_fallback_filter: None,
+            sniffer_override_destination: true,
             sniffer_force_domain: Vec::new(),
             sniffer_skip_domain: Vec::new(),
             sniffer_skip_src_address: Vec::new(),
@@ -1234,7 +1239,7 @@ fn build_sniffer_json(features: &MihomoFeatures) -> Value {
         // match even when clients bypass the router's DNS (DoH/DoT).  Without
         // this the sniffer stores the SNI in `sniffHost` but leaves `host`
         // empty, and Mihomo matches DOMAIN-* rules against `host` only.
-        "override-destination": true,
+        "override-destination": features.sniffer_override_destination,
         "sniff": {
             "HTTP": {
                 "ports": [80, "8080-8880"],
@@ -3573,6 +3578,66 @@ mod tests {
         assert!(sniff.get("HTTP").is_some());
         assert!(sniff.get("TLS").is_some());
         assert!(sniff.get("QUIC").is_some());
+    }
+
+    #[test]
+    fn sniffer_override_destination_default_true() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let sniffer = config.get("sniffer").expect("sniffer");
+        assert_eq!(
+            sniffer.get("override-destination").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn sniffer_override_destination_false_when_disabled() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let profile = &profiles[0];
+        let features = MihomoFeatures {
+            sniffer_override_destination: false,
+            ..MihomoFeatures::default()
+        };
+        let yaml = build_mihomo_router_config(
+            profile,
+            &[],
+            &[],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &RouterExtra::default(),
+            &features,
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let sniffer = config.get("sniffer").expect("sniffer");
+        assert_eq!(
+            sniffer.get("override-destination").and_then(Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

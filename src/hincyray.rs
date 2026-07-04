@@ -5739,7 +5739,11 @@ fn handle_dns_get(daemon: &Daemon) -> (u16, &'static str, String) {
     (
         200,
         "application/json",
-        json!({"dns": inner.state.dns_settings}).to_string(),
+        json!({
+            "dns": inner.state.dns_settings,
+            "sniffer_override_destination": inner.state.mihomo_features.sniffer_override_destination,
+        })
+        .to_string(),
     )
 }
 
@@ -5772,6 +5776,12 @@ fn handle_dns_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     if let Some(v) = value.get("query_strategy").and_then(Value::as_str) {
         inner.state.dns_settings.query_strategy = v.trim().to_owned();
     }
+    if let Some(v) = value
+        .get("sniffer_override_destination")
+        .and_then(Value::as_bool)
+    {
+        inner.state.mihomo_features.sniffer_override_destination = v;
+    }
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         return (
             500,
@@ -5782,7 +5792,11 @@ fn handle_dns_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     (
         200,
         "application/json",
-        json!({"dns": inner.state.dns_settings}).to_string(),
+        json!({
+            "dns": inner.state.dns_settings,
+            "sniffer_override_destination": inner.state.mihomo_features.sniffer_override_destination,
+        })
+        .to_string(),
     )
 }
 
@@ -11011,6 +11025,25 @@ mod tests {
         assert!(inner.state.dns_settings.enabled);
         assert_eq!(inner.state.dns_settings.remote_servers.len(), 2);
         assert_eq!(inner.state.dns_settings.local_servers.len(), 1);
+    }
+
+    #[test]
+    fn dns_api_get_includes_sniffer_override_default_true() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("GET", "/api/dns", "", &daemon);
+        assert_eq!(status, 200);
+        assert!(body.contains("\"sniffer_override_destination\":true"));
+    }
+
+    #[test]
+    fn dns_api_set_sniffer_override_false_persists() {
+        let (_dir, daemon) = test_daemon();
+        let body = r#"{"sniffer_override_destination":false}"#;
+        let (status, _, response) = dispatch("POST", "/api/dns", body, &daemon);
+        assert_eq!(status, 200);
+        assert!(response.contains("\"sniffer_override_destination\":false"));
+        let inner = lock(&daemon.inner);
+        assert!(!inner.state.mihomo_features.sniffer_override_destination);
     }
 
     #[test]
