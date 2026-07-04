@@ -49,10 +49,16 @@ REQUIRED_MARKERS = [
     "/api/subscriptions/refresh-report",
     "/api/undo",
     "function refreshSystem()",
+    "function refreshStatus()",
     "function startAutoRefreshLoops()",
     "function showMemoryBreakdown()",
     "hrSystemRefreshInterval",
+    "hrStatusRefreshInterval",
+]
+
+FORBIDDEN_MARKERS = [
     "hrDashboardRefreshInterval",
+    "setInterval(refreshDashboard",
 ]
 
 SYSTEM_DOM_IDS = [
@@ -101,6 +107,7 @@ def dom_id_exists(html_text: str, dom_id: str) -> bool:
 def main() -> int:
     html_text = HTML.read_text(encoding="utf-8")
     missing_markers = [marker for marker in REQUIRED_MARKERS if marker not in html_text]
+    forbidden_markers = [marker for marker in FORBIDDEN_MARKERS if marker in html_text]
     missing_system_ids = [dom_id for dom_id in SYSTEM_DOM_IDS if not dom_id_exists(html_text, dom_id)]
     nav = nav_sections(html_text)
     panels = panel_sections(html_text)
@@ -112,10 +119,14 @@ def main() -> int:
     used = ui_routes()
     missing_routes = sorted(used - served)
     missing_routes = [(method, path) for method, path in missing_routes if not path.endswith("/")]
-    if missing_markers or missing_system_ids or nav_without_panel or nav_without_map or map_without_panel or missing_routes:
+    if missing_markers or forbidden_markers or missing_system_ids or nav_without_panel or nav_without_map or map_without_panel or missing_routes:
         if missing_markers:
             print("Missing required UI markers:")
             for marker in missing_markers:
+                print(f"  - {marker}")
+        if forbidden_markers:
+            print("Forbidden heavyweight auto-refresh markers found:")
+            for marker in forbidden_markers:
                 print(f"  - {marker}")
         if missing_system_ids:
             print("System renderer writes to missing DOM ids:")

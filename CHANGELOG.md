@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.19.3 - 2026-07-04
+
+- Emergency Web UI performance fix: removed the periodic heavyweight `refreshDashboard()` loop that fanned out across profiles, routing, subscriptions, backups, DNS, HWID, auth, update status, traffic, connection log, and Mihomo EC endpoints every 5 seconds.
+- Kept only lightweight periodic loops: `/api/system` + `/api/memory-guard` every 3 seconds and `/api/status` every 5 seconds.
+- Added a frontend contract guard forbidding `setInterval(refreshDashboard...)` / `hrDashboardRefreshInterval` so the request-storm regression cannot return.
+- Live router latency after fix: `/` ~200 ms, `/api/health` ~150-200 ms, `/api/system` ~200 ms (previous bad v0.19.2 build caused multi-second delays/timeouts under the Web UI request storm).
+
 ## v0.19.2 - 2026-07-04
 
 - Made the System hardware/resource block refresh independently every 3 seconds via a lightweight `/api/system` + `/api/memory-guard` heartbeat.
