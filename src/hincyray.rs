@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 
 use percent_encoding::NON_ALPHANUMERIC;
 use percent_encoding::utf8_percent_encode;
+use qrcode::{QrCode, render::svg};
 
 use crate::benchmark::{
     BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL, SharedJob,
@@ -2752,6 +2753,9 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/profiles/add") => handle_profile_add(body, daemon),
         ("POST", "/api/profiles/delete") => handle_profile_delete(body, daemon),
         ("POST", "/api/profiles/update") => handle_profile_update(body, daemon),
+        ("POST", "/api/profiles/share") => handle_profile_share(body, daemon),
+        ("POST", "/api/profile-groups/share") => handle_profile_group_share(body, daemon),
+        ("POST", "/api/profile-groups/delete") => handle_profile_group_delete(body, daemon),
         ("POST", "/api/profiles/block-quic") => handle_profile_block_quic(body, daemon),
         ("POST", "/api/active-profile") => handle_set_active(body, daemon),
         ("GET", "/api/mihomo-config") => handle_get_mihomo_config(daemon),
@@ -3755,6 +3759,213 @@ fn handle_profile_update(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
     )
 }
 
+/// Return a profile's raw share link and QR SVG. The UI deliberately sends
+/// only a local `profile_id`; the daemon resolves the sensitive raw link from
+/// current persisted state so the browser does not need to cache it in the
+/// profile table payload.
+fn handle_profile_share(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(id) = value
+        .get("profile_id")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+    else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing profile_id"}).to_string(),
+        );
+    };
+
+    let profile = {
+        let inner = lock(&daemon.inner);
+        inner.state.profiles.iter().find(|p| p.id == id).cloned()
+    };
+    let Some(profile) = profile else {
+        return (
+            404,
+            "application/json",
+            json!({"error": "profile not found", "profile_id": id}).to_string(),
+        );
+    };
+
+    let code = match QrCode::new(profile.raw.as_bytes()) {
+        Ok(code) => code,
+        Err(error) => {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("QR generation failed: {error}")}).to_string(),
+            );
+        }
+    };
+    let qr_svg = code
+        .render::<svg::Color<'_>>()
+        .min_dimensions(256, 256)
+        .dark_color(svg::Color("#111827"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+
+    (
+        200,
+        "application/json",
+        json!({
+            "profile_id": profile.id,
+            "name": profile.name,
+            "protocol": profile.protocol.to_string(),
+            "link": profile.raw,
+            "qr_svg": qr_svg,
+        })
+        .to_string(),
+    )
+}
+
+fn group_from_body(body: &str) -> Result<String, (u16, &'static str, String)> {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return Err((
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        ));
+    };
+    let Some(group) = value.get("group").and_then(Value::as_str).map(str::trim) else {
+        return Err((
+            400,
+            "application/json",
+            json!({"error": "missing group"}).to_string(),
+        ));
+    };
+    if group.is_empty() {
+        return Err((
+            400,
+            "application/json",
+            json!({"error": "missing group"}).to_string(),
+        ));
+    }
+    Ok(group.to_owned())
+}
+
+/// Return a UI-visible profile group as one shareable subscription bundle.
+/// If the group is a saved subscription URL, that URL is the canonical shared
+/// link. Otherwise the daemon returns a newline-separated raw-link bundle for
+/// all profiles in the group.
+fn handle_profile_group_share(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let group = match group_from_body(body) {
+        Ok(group) => group,
+        Err(response) => return response,
+    };
+
+    let (canonical_url, links, display_name) = {
+        let inner = lock(&daemon.inner);
+        let links: Vec<String> = inner
+            .state
+            .profiles
+            .iter()
+            .filter(|p| p.group.as_deref() == Some(group.as_str()))
+            .map(|p| p.raw.clone())
+            .collect();
+        let canonical_url = inner
+            .state
+            .subscriptions
+            .iter()
+            .find(|s| s.url == group)
+            .map(|s| s.url.clone());
+        (canonical_url, links, group.clone())
+    };
+
+    if links.is_empty() {
+        return (
+            404,
+            "application/json",
+            json!({"error": "profile group not found", "group": group}).to_string(),
+        );
+    }
+
+    let link = canonical_url.clone().unwrap_or_else(|| links.join("\n"));
+    let qr_svg = match QrCode::new(link.as_bytes()) {
+        Ok(code) => Some(
+            code.render::<svg::Color<'_>>()
+                .min_dimensions(256, 256)
+                .dark_color(svg::Color("#111827"))
+                .light_color(svg::Color("#ffffff"))
+                .build(),
+        ),
+        Err(_) => None,
+    };
+
+    (
+        200,
+        "application/json",
+        json!({
+            "group": group,
+            "name": display_name,
+            "profile_count": links.len(),
+            "subscription_url": canonical_url,
+            "link": link,
+            "links": links,
+            "qr_svg": qr_svg,
+        })
+        .to_string(),
+    )
+}
+
+/// Delete every server profile in a UI-visible group/subscription.
+/// This is intentionally keyed by `group`, not by saved subscription URL, so
+/// imported/named subscription groups such as "Tutnet online" are removable
+/// through the same user-visible contract as URL-backed subscriptions.
+fn handle_profile_group_delete(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let group = match group_from_body(body) {
+        Ok(group) => group,
+        Err(response) => return response,
+    };
+
+    let mut inner = lock(&daemon.inner);
+    if !inner
+        .state
+        .profiles
+        .iter()
+        .any(|p| p.group.as_deref() == Some(group.as_str()))
+    {
+        return (
+            404,
+            "application/json",
+            json!({"error": "profile group not found", "group": group}).to_string(),
+        );
+    }
+
+    let (removed_profiles, removed_active) = purge_profile_group(&mut inner.state, &group);
+    if removed_active {
+        let _ = inner.core.stop();
+        let _ = fs::remove_file(&daemon.mihomo_config_path);
+    }
+
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+
+    (
+        200,
+        "application/json",
+        json!({
+            "group": group,
+            "removed_profiles": removed_profiles,
+            "removed_active": removed_active,
+            "profile_count": inner.state.profiles.len(),
+        })
+        .to_string(),
+    )
+}
+
 fn handle_favorites_toggle(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return (
@@ -3916,6 +4127,36 @@ fn purge_subscription(state: &mut HincyrayState, url: &str) -> bool {
     let removed_active = new_active.is_none();
     state.active_profile_id = new_active;
     removed_active
+}
+
+/// Remove all profiles in a UI-visible profile group. If the group also
+/// corresponds to a saved subscription URL, remove that subscription record as
+/// well. Re-indexes remaining profiles and updates `active_profile_id`.
+/// Returns `(removed_profiles, removed_active)`.
+fn purge_profile_group(state: &mut HincyrayState, group: &str) -> (usize, bool) {
+    let active_raw = state
+        .active_profile_id
+        .and_then(|id| state.profiles.iter().find(|p| p.id == id))
+        .map(|p| p.raw.clone());
+
+    state.subscriptions.retain(|s| s.url != group);
+
+    let before = state.profiles.len();
+    state.profiles.retain(|p| p.group.as_deref() != Some(group));
+    let removed = before.saturating_sub(state.profiles.len());
+
+    for (i, p) in state.profiles.iter_mut().enumerate() {
+        p.id = i;
+    }
+
+    let new_active = active_raw
+        .as_ref()
+        .and_then(|raw| state.profiles.iter().find(|p| &p.raw == raw))
+        .map(|p| p.id);
+    let removed_active = active_raw.is_some() && new_active.is_none();
+    state.active_profile_id = new_active;
+
+    (removed, removed_active)
 }
 
 /// Result of refreshing all subscriptions.
@@ -10974,6 +11215,48 @@ mod tests {
     }
 
     #[test]
+    fn profile_share_returns_raw_link_and_qr_svg_by_id() {
+        let (_dir, daemon) = test_daemon();
+        let raw = "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo";
+        handle_import(raw, &daemon);
+
+        let (status, content_type, body) = dispatch(
+            "POST",
+            "/api/profiles/share",
+            r#"{"profile_id":0}"#,
+            &daemon,
+        );
+
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        let response: Value = serde_json::from_str(&body).expect("parse profile share response");
+        assert_eq!(response["profile_id"], 0);
+        assert_eq!(response["name"], "Demo");
+        assert_eq!(response["link"], raw);
+        let qr_svg = response["qr_svg"].as_str().expect("qr svg string");
+        assert!(qr_svg.contains("<svg"));
+        assert!(qr_svg.contains("</svg>"));
+    }
+
+    #[test]
+    fn profile_share_rejects_unknown_or_missing_profile_id() {
+        let (_dir, daemon) = test_daemon();
+
+        let (missing_status, _, _) = dispatch("POST", "/api/profiles/share", r#"{}"#, &daemon);
+        assert_eq!(missing_status, 400);
+
+        let (unknown_status, _, body) = dispatch(
+            "POST",
+            "/api/profiles/share",
+            r#"{"profile_id":99}"#,
+            &daemon,
+        );
+        assert_eq!(unknown_status, 404);
+        let response: Value = serde_json::from_str(&body).expect("parse profile share error");
+        assert_eq!(response["profile_id"], 99);
+    }
+
+    #[test]
     fn favorites_list_endpoint_returns_imported_favorites() {
         let (_dir, daemon) = test_daemon();
         handle_import(
@@ -11567,6 +11850,94 @@ mod tests {
         assert_eq!(state.profiles[0].raw, "raw2");
         assert_eq!(state.profiles[0].id, 0);
         assert_eq!(state.active_profile_id, Some(0));
+    }
+
+    #[test]
+    fn purge_profile_group_removes_named_group_without_subscription_record() {
+        let mut state = HincyrayState::default();
+        let group = "Tutnet online";
+
+        state
+            .profiles
+            .push(make_profile(0, "Sub1", "raw1", Some(group)));
+        state
+            .profiles
+            .push(make_profile(1, "Sub2", "raw2", Some(group)));
+        state
+            .profiles
+            .push(make_profile(2, "Other", "raw3", Some("Other group")));
+        state.active_profile_id = Some(0);
+
+        let (removed, removed_active) = purge_profile_group(&mut state, group);
+
+        assert_eq!(removed, 2);
+        assert!(removed_active);
+        assert_eq!(state.profiles.len(), 1);
+        assert_eq!(state.profiles[0].id, 0);
+        assert_eq!(state.profiles[0].raw, "raw3");
+        assert_eq!(state.active_profile_id, None);
+    }
+
+    #[test]
+    fn profile_group_share_returns_all_links_for_named_group() {
+        let (_dir, daemon) = test_daemon();
+        let group = "Named subscription";
+        {
+            let mut inner = lock(&daemon.inner);
+            inner
+                .state
+                .profiles
+                .push(make_profile(0, "Sub1", "raw1", Some(group)));
+            inner
+                .state
+                .profiles
+                .push(make_profile(1, "Sub2", "raw2", Some(group)));
+        }
+
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/profile-groups/share",
+            &json!({"group": group}).to_string(),
+            &daemon,
+        );
+
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(response["group"], group);
+        assert_eq!(response["profile_count"], 2);
+        assert_eq!(response["link"], "raw1\nraw2");
+        assert_eq!(response["links"].as_array().expect("links").len(), 2);
+    }
+
+    #[test]
+    fn profile_group_delete_removes_named_group() {
+        let (_dir, daemon) = test_daemon();
+        let group = "Named subscription";
+        {
+            let mut inner = lock(&daemon.inner);
+            inner
+                .state
+                .profiles
+                .push(make_profile(0, "Sub1", "raw1", Some(group)));
+            inner
+                .state
+                .profiles
+                .push(make_profile(1, "Other", "raw2", Some("Other")));
+        }
+
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/profile-groups/delete",
+            &json!({"group": group}).to_string(),
+            &daemon,
+        );
+
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse");
+        assert_eq!(response["removed_profiles"], 1);
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 1);
+        assert_eq!(inner.state.profiles[0].group.as_deref(), Some("Other"));
     }
 
     #[test]

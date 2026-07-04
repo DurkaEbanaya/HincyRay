@@ -1,4 +1,4 @@
-# HincyRay v0.17.0
+# HincyRay v0.18.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,16 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.18.0
+
+Web UI sharing and audit hardening:
+
+- Profile sharing APIs: `POST /api/profile-groups/share` shares a whole subscription/group (all servers in that group) and `POST /api/profiles/share` remains available for a single server profile.
+- Web UI has **Share / QR** and delete actions on every subscription/group header in the profiles table, so URL-backed subscriptions and named imported groups are handled uniformly.
+- Fixed profile add payload (`raw`), Sub-Store sorting (`sort_by`), EC raw response rendering, auto-update settings wiring, system metrics binding, and routing delete undo.
+- Removed confusing per-server share/QUIC actions from the table row flow; subscription/group actions live on the group header, while QUIC remains controlled through routing rules.
+- Added Web UI controls audit document.
 
 ### v0.17.0
 

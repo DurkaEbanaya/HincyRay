@@ -2605,6 +2605,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+dependencies = [
+ "image",
+]
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4542,7 +4551,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xray-vpn-test"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "arboard",
  "base64",
@@ -4550,6 +4559,7 @@ dependencies = [
  "egui_extras",
  "maxminddb",
  "percent-encoding",
+ "qrcode",
  "reqwest",
  "serde",
  "serde_json",

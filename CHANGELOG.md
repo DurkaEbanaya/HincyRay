@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.18.0 - 2026-07-04
+
+- Added profile group sharing API `POST /api/profile-groups/share` for sharing a whole subscription/group (all servers in the group), plus `POST /api/profile-groups/delete` for deleting a whole visible group/subscription.
+- Kept single-server `POST /api/profiles/share`, but moved user-facing Web UI sharing/deletion to subscription/group headers in the profiles table.
+- Fixed Web UI/backend contract mismatches: single profile add now sends `raw`, Sub-Store sends `sort_by`, auto-update settings save/load uses `/api/update/settings` and `/api/update/status`.
+- Fixed EC raw buttons to display real API responses instead of mock data.
+- Fixed `/api/system` Web UI binding to the actual nested system schema and replaced demo values with placeholders.
+- Removed confusing per-server share/QUIC row actions from the subscription workflow; routing rules remain the user-facing QUIC control.
+- Added 15-second undo for routing rule deletion and updated device view toward connected devices with traffic aggregation.
+- Added Web UI controls audit document.
+- Tests: 344 passed, 0 clippy warnings.
+
 ## v0.17.0 - 2026-07-04
 
 ### Added
