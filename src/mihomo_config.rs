@@ -1230,11 +1230,14 @@ fn build_sniffer_json(features: &MihomoFeatures) -> Value {
         "enable": true,
         "force-dns-mapping": true,
         "parse-pure-ip": true,
-        "override-destination": false,
+        // Override destination with the sniffed domain so that domain rules
+        // match even when clients bypass the router's DNS (DoH/DoT).  Without
+        // this the sniffer stores the SNI in `sniffHost` but leaves `host`
+        // empty, and Mihomo matches DOMAIN-* rules against `host` only.
+        "override-destination": true,
         "sniff": {
             "HTTP": {
                 "ports": [80, "8080-8880"],
-                "override-destination": true,
             },
             "TLS": {
                 "ports": [443, 8443],
