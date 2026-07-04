@@ -4,7 +4,7 @@
 //! so the desktop app and the daemon share parser/scoring/config code.
 
 fn main() {
-    if let Err(error) = xray_vpn_test::hincyray::run() {
+    if let Err(error) = xray_vpn_test::hincyray::run_cli() {
         eprintln!("hincyray: {error}");
         std::process::exit(1);
     }

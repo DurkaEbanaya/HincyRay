@@ -1,4 +1,4 @@
-# Project: HincyRay v0.18.0 (crate `xray-vpn-test`)
+# Project: HincyRay v0.19.0 (crate `xray-vpn-test`)
 
 Rust crate shipping two binaries: the `hincyray` router daemon for Keenetic/Entware aarch64 and the `xray-vpn-test` desktop diagnostics app (macOS, feature `desktop`). Current router mode uses Mihomo plus iptables NAT REDIRECT/TPROXY; v0.14 adds diagnostics/recovery, Rule Trace, Sub-Store Lite, Smart Auto-Select 2.0, backups/WebDAV, scheduled maintenance, connection close control, and EC wildcard dial safety. Shared parsing/scoring lives in `src/profiles.rs`, `src/scoring.rs`, and `src/xray_config.rs`.
 
@@ -19,6 +19,10 @@ Tech stack: Rust 2024, Cargo, `eframe/egui` desktop GUI (feature-gated), `reqwes
 * `src/theme.rs` - Fluent/Acrylic-inspired egui styling.
 * `scripts/wifi-segment-setup.sh` - v0.1.1 opt-in WiFi VPN segment: create the `HincyRay-VPN` SSID on `192.168.2.0/24` via Keenetic `ndmc`.
 * `scripts/hincyray-install.sh` - v0.6.1 interactive atomic installer (archinstall-style): staging -> backup -> atomic `mv` -> verify -> commit/rollback. v0.7: checks for kernel modules (xt_TPROXY, xt_socket, xt_comment) and ndm hook directory.
+* `scripts/frontend-contract-test.py` - static Web UI ↔ daemon API contract test; run after changing `src/webui/index.html` or API routes.
+* `scripts/router-e2e.sh` - remote/router smoke test for `/api/health`, status, system, memory guard, DNS/UDP diagnostics, validator, and `/metrics`.
+* `scripts/hincyray-doctor.sh` - one-command terminal diagnostics bundle for support (`HINCYRAY_URL` override supported).
+* `.github/workflows/ci.yml` - CI pipeline: fmt, check, fast daemon clippy, full clippy, tests, frontend contract.
 
 ## Architectural Invariants
 
@@ -37,8 +41,12 @@ Tech stack: Rust 2024, Cargo, `eframe/egui` desktop GUI (feature-gated), `reqwes
 
 * Build/check: `cargo check`
 * Format: `cargo fmt`
-* Lint: `cargo clippy --all-targets --all-features`
-* Test: `cargo test` (339 tests)
+* Lint full: `cargo clippy --all-targets --all-features`
+* Lint fast daemon profile: `cargo clippy --all-targets --no-default-features --bin hincyray -- -D warnings`
+* Test: `cargo test --all-targets --all-features` (348 tests)
+* Frontend/API contract: `python3 scripts/frontend-contract-test.py`
+* Router E2E after deploy: `HINCYRAY_URL=http://127.0.0.1:8088 scripts/router-e2e.sh` (or set router URL when run remotely)
+* Terminal diagnostics: `hincyray doctor` or `scripts/hincyray-doctor.sh`
 * Run GUI: `cargo run`
 * Release build: `cargo build --release`
 * Cross-compile: `cargo zigbuild --release --no-default-features --bin hincyray --target aarch64-unknown-linux-gnu.2.27` + patchelf `--set-interpreter /opt/lib/ld-linux-aarch64.so.1 --set-rpath /opt/lib`
@@ -50,6 +58,7 @@ Tech stack: Rust 2024, Cargo, `eframe/egui` desktop GUI (feature-gated), `reqwes
 * Subscription bodies are tried as plain text and common base64 variants.
 * Happ/TutNet Xray-style JSON with DNS-over-HTTPS URLs is parsed via the `outbounds` fallback when no direct profiles are found.
 * Do not add OS-specific APIs unless guarded behind a cross-platform boundary.
+* v0.19.0 adds: System section now includes hardware metrics; Mihomo config validator (`POST /api/mihomo-config/validate`); DNS diagnostics 2.0 (`GET /api/diagnostics/dns`); UDP/QUIC diagnostics (`GET /api/diagnostics/udp-quic`); Memory Guard (`GET /api/memory-guard`) with top RSS processes; Prometheus metrics (`GET /metrics`); subscription refresh reports (`GET /api/subscriptions/refresh-report`); backend undo stack (`GET /api/undo`, `POST /api/undo/restore`); state compaction; CLI commands (`status`, `doctor`, `validate-config`, `restart-core`, `apply-routing`, `backup`); global Web UI search; frontend contract test; router E2E script; CI with split clippy profiles. 348 tests.
 * v0.18.0 adds: subscription/group sharing API (`POST /api/profile-groups/share`) for sharing all servers in a visible profile group, group deletion API (`POST /api/profile-groups/delete`), and single-server `POST /api/profiles/share` for raw share-link + backend-generated SVG QR by `profile_id`. Web UI puts Share/QR and delete actions on every subscription/group header, so URL-backed subscriptions and named imported groups are handled uniformly. Web UI contract fixes: single profile add sends `raw`, Sub-Store sends `sort_by`, EC raw buttons show real API responses, auto-update settings are wired, `/api/system` binding uses the actual nested schema, profile-table QUIC toggle removed, routing rule delete has 15s undo, device screen is connected-device focused. `qrcode` dependency added. Web UI controls audit doc added. 344 tests, 0 clippy warnings.
 * v0.17.0 adds: RKN Bypass (`SplitRoutingSettings.rkn_bypass_enabled` default `true`, `rkn_bypass_url`, `rkn_bypass_interval`) — injects `RULE-SET,ru-bypass,proxy` rule provider downloading `itworksig/rublacklist` bypass.list (744K+ domains) through proxy every 24h. Also injects `GEOIP,RU,DIRECT` + `GEOIP,CN,DIRECT`. Rule order: user rules > QUIC block > raw rules > RKN bypass (RULE-SET → GEOIP,RU → GEOIP,CN) > RU Direct > port-mode > MATCH. `RouterExtra` gains `rkn_bypass_enabled`/`rkn_bypass_url`/`rkn_bypass_interval`. `RKN_BYPASS_DEFAULT_URL`/`RKN_BYPASS_DEFAULT_INTERVAL` constants. Reset to factory defaults (`POST /api/routing/reset` — resets rkn_bypass, ru_direct, match_target, port_mode, proxy_ports, routing_rules, raw_rules; preserves infrastructure settings). Configurable sniffer `override-destination` toggle (`MihomoFeatures.sniffer_override_destination` default `true`, bridged via `/api/dns` GET/POST, WebUI checkbox in DNS section, `saveDns()` calls `/api/routing/apply`). 339 tests, 0 clippy warnings. Router E2E verified on Keenetic Giga: bypass list downloaded (24MB, 744K rules, 5s), RSS 157MB, toggle on/off verified, reset restores defaults.
 * v0.16.0 adds: MATCH toggle (`SplitRoutingSettings.match_target` — `"proxy"` or `"direct"`, controls final `MATCH,proxy` vs `MATCH,direct`). Per-rule port mode (`RoutingRule.port_mode` — `"include"` or `"exclude"`, generates `AND` with `NOT,DST-PORT` for exclude). AND rule composition in `rule_to_strings()` — multiple condition types (domains+ports+network) ANDed into single Mihomo rule. `domain_rule_body()`/`ip_rule_body()` split for AND composition. QUIC block migrated from settings to regular routing rule in `load_state()`. Removed "Block QUIC" checkbox + "QUIC mode" dropdown from WebUI. Geo provider API (`GET /api/geo/providers`, `POST /api/geo/download`, `GET /api/geo/status`). Preset target override (`POST /api/routing-presets/apply` with optional `target` field). Routing conflict detection (`GET /api/routing` returns `conflicts` array). WebUI inline cell editing (click any cell in rules table to edit in place — target/protocol use re-rendered `<select>`, name/domains/ports use inline input). Geo provider card in WebUI. Preset target picker dropdown. "Сеть" → "Протокол" renamed. `XrayRouteRule.port_mode`, `RouterExtra.match_target` added. 323 tests, 0 clippy warnings. Router E2E verified on Keenetic Giga: MATCH row visible, QUIC Block as regular rule, inline target/protocol editing works, geo status shows geoip.metadb 8.4MB + geosite.dat 10MB, preset target override works, config `MATCH,DIRECT` with 3 rules.

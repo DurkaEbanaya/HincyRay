@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.19.0 - 2026-07-04
+
+- Moved hardware metrics into the System page and kept `/api/system` as the single structured system source.
+- Added Mihomo config validator: `POST /api/mihomo-config/validate`.
+- Added diagnostics: `GET /api/diagnostics/dns`, `GET /api/diagnostics/udp-quic`, and `GET /api/memory-guard` with top RSS processes.
+- Added Prometheus metrics endpoint: `GET /metrics`.
+- Added subscription refresh reports: `GET /api/subscriptions/refresh-report`.
+- Added backend undo stack: `GET /api/undo`, `POST /api/undo/restore`.
+- Added bounded state compaction for metrics history, connection log, undo stack, and refresh reports.
+- Added `hincyray` CLI commands: `status`, `doctor`, `validate-config`, `restart-core`, `apply-routing`, `backup`.
+- Added global Web UI search in the sidebar.
+- Added `scripts/frontend-contract-test.py`, `scripts/router-e2e.sh`, `scripts/hincyray-doctor.sh`, and CI with fast daemon clippy + full clippy.
+- Tests: 348 passed.
+
 ## v0.18.0 - 2026-07-04
 
 - Added profile group sharing API `POST /api/profile-groups/share` for sharing a whole subscription/group (all servers in the group), plus `POST /api/profile-groups/delete` for deleting a whole visible group/subscription.

@@ -50,6 +50,8 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_SAMPLES: usize = 1000;
 const MAX_CONNECTION_LOG: usize = 500;
 const MAX_BACKUPS: usize = 20;
+const MAX_UNDO_STACK: usize = 10;
+const MAX_REFRESH_REPORT_ENTRIES: usize = 100;
 
 /// Global shutdown flag set by the SIGTERM/SIGINT handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -179,6 +181,90 @@ pub fn run() -> Result<(), String> {
         let _ = persist_state(&daemon.state_path, &inner.state);
         eprintln!("hincyray: state persisted, children stopped, iptables cleaned");
     }
+    Ok(())
+}
+
+pub fn run_cli() -> Result<(), String> {
+    let mut args = std::env::args().skip(1);
+    let Some(cmd) = args.next() else {
+        return run();
+    };
+    match cmd.as_str() {
+        "serve" | "daemon" => run(),
+        "status" => cli_api("GET", "/api/status", None).map(|body| println!("{body}")),
+        "doctor" => cli_doctor(),
+        "validate-config" => cli_api("POST", "/api/mihomo-config/validate", Some("{}"))
+            .map(|body| println!("{body}")),
+        "restart-core" => {
+            cli_api("POST", "/api/core/restart", Some("{}")).map(|body| println!("{body}"))
+        }
+        "apply-routing" => {
+            cli_api("POST", "/api/routing/apply", Some("{}")).map(|body| println!("{body}"))
+        }
+        "backup" => {
+            cli_api("POST", "/api/backups/create", Some("{}")).map(|body| println!("{body}"))
+        }
+        "help" | "--help" | "-h" => {
+            println!(
+                "hincyray [serve|status|doctor|validate-config|restart-core|apply-routing|backup]"
+            );
+            Ok(())
+        }
+        other => Err(format!("unknown command '{other}', run 'hincyray help'")),
+    }
+}
+
+fn cli_base_url() -> String {
+    std::env::var("HINCYRAY_API").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned())
+}
+
+fn cli_api(method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
+    let url = format!("{}{}", cli_base_url().trim_end_matches('/'), path);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let request = match method {
+        "GET" => client.get(&url),
+        "POST" => client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body.unwrap_or("").to_owned()),
+        _ => return Err(format!("unsupported CLI method {method}")),
+    };
+    let response = request.send().map_err(|error| format!("{url}: {error}"))?;
+    let status = response.status();
+    let text = response.text().map_err(|error| error.to_string())?;
+    if status.is_success() {
+        Ok(text)
+    } else {
+        Err(format!("{url}: HTTP {status}: {text}"))
+    }
+}
+
+fn cli_doctor() -> Result<(), String> {
+    let checks = [
+        ("status", "GET", "/api/status"),
+        ("system", "GET", "/api/system"),
+        ("memory_guard", "GET", "/api/memory-guard"),
+        ("dns", "GET", "/api/diagnostics/dns"),
+        ("udp_quic", "GET", "/api/diagnostics/udp-quic"),
+        ("config_validator", "POST", "/api/mihomo-config/validate"),
+    ];
+    let mut report = serde_json::Map::new();
+    for (name, method, path) in checks {
+        let value = match cli_api(method, path, Some("{}")) {
+            Ok(text) => {
+                serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({"raw": text}))
+            }
+            Err(error) => json!({"ok": false, "error": error}),
+        };
+        report.insert(name.to_owned(), value);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&Value::Object(report)).map_err(|error| error.to_string())?
+    );
     Ok(())
 }
 
@@ -488,6 +574,15 @@ pub struct HincyrayState {
     /// v0.14: scheduled maintenance window settings.
     #[serde(default)]
     pub maintenance: MaintenanceSettings,
+    /// v0.19: last structured subscription refresh report shown in Web UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_subscription_refresh_report: Option<SubscriptionRefreshReport>,
+    /// v0.19: bounded server-side undo snapshots for destructive state changes.
+    #[serde(default)]
+    pub undo_stack: Vec<UndoEntry>,
+    /// v0.19: memory guard thresholds and last warning state.
+    #[serde(default)]
+    pub memory_guard: MemoryGuardSettings,
 }
 
 impl Default for HincyrayState {
@@ -527,8 +622,73 @@ impl Default for HincyrayState {
             sub_store_lite: SubStoreLiteSettings::default(),
             smart_select: SmartSelectSettings::default(),
             maintenance: MaintenanceSettings::default(),
+            last_subscription_refresh_report: None,
+            undo_stack: Vec::new(),
+            memory_guard: MemoryGuardSettings::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SubscriptionRefreshReport {
+    pub timestamp: u64,
+    pub refreshed: usize,
+    pub added: usize,
+    pub removed: usize,
+    pub changed: usize,
+    pub failed: usize,
+    #[serde(default)]
+    pub entries: Vec<SubscriptionRefreshEntry>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SubscriptionRefreshEntry {
+    pub url: String,
+    pub status: String,
+    pub previous_count: usize,
+    pub new_count: usize,
+    pub added: usize,
+    pub removed: usize,
+    pub changed: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UndoEntry {
+    pub id: String,
+    pub label: String,
+    pub timestamp: u64,
+    /// JSON snapshot with `undo_stack` cleared to avoid recursive state growth.
+    pub state_json: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryGuardSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_memory_guard_mihomo_rss_kb")]
+    pub mihomo_rss_warn_kb: u64,
+    #[serde(default = "default_memory_guard_system_pct")]
+    pub system_usage_warn_pct: f64,
+}
+
+impl Default for MemoryGuardSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mihomo_rss_warn_kb: default_memory_guard_mihomo_rss_kb(),
+            system_usage_warn_pct: default_memory_guard_system_pct(),
+        }
+    }
+}
+
+fn default_memory_guard_mihomo_rss_kb() -> u64 {
+    180 * 1024
+}
+
+fn default_memory_guard_system_pct() -> f64 {
+    90.0
 }
 
 /// v0.14: lightweight subscription cleanup inspired by Sub-Store.
@@ -1129,6 +1289,14 @@ impl CoreManager {
             "running"
         } else {
             "stopped"
+        }
+    }
+
+    fn pid(&mut self) -> Option<u32> {
+        if self.is_running() {
+            self.child.as_ref().map(Child::id)
+        } else {
+            None
         }
     }
 
@@ -2237,14 +2405,57 @@ fn load_state(state_path: &Path) -> HincyrayState {
     state
 }
 
+fn compact_state_for_persist(state: &mut HincyrayState) {
+    if state.metrics_history.len() > MAX_HISTORY_SAMPLES {
+        let start = state
+            .metrics_history
+            .len()
+            .saturating_sub(MAX_HISTORY_SAMPLES);
+        state.metrics_history = state.metrics_history[start..].to_vec();
+    }
+    if state.connection_log.len() > MAX_CONNECTION_LOG {
+        let start = state
+            .connection_log
+            .len()
+            .saturating_sub(MAX_CONNECTION_LOG);
+        state.connection_log = state.connection_log[start..].to_vec();
+    }
+    if state.undo_stack.len() > MAX_UNDO_STACK {
+        let start = state.undo_stack.len().saturating_sub(MAX_UNDO_STACK);
+        state.undo_stack = state.undo_stack[start..].to_vec();
+    }
+    if let Some(report) = state.last_subscription_refresh_report.as_mut()
+        && report.entries.len() > MAX_REFRESH_REPORT_ENTRIES
+    {
+        report.entries.truncate(MAX_REFRESH_REPORT_ENTRIES);
+    }
+}
+
 fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String> {
     if let Some(parent) = state_path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let text = serde_json::to_string_pretty(state).map_err(|error| error.to_string())?;
+    let mut compacted = state.clone();
+    compact_state_for_persist(&mut compacted);
+    let text = serde_json::to_string_pretty(&compacted).map_err(|error| error.to_string())?;
     let tmp = state_path.with_extension("tmp");
     fs::write(&tmp, &text).map_err(|error| error.to_string())?;
     fs::rename(&tmp, state_path).map_err(|error| error.to_string())
+}
+
+fn push_undo_snapshot(state: &mut HincyrayState, label: impl Into<String>) {
+    let mut snapshot = state.clone();
+    snapshot.undo_stack.clear();
+    compact_state_for_persist(&mut snapshot);
+    if let Ok(state_json) = serde_json::to_string(&snapshot) {
+        state.undo_stack.push(UndoEntry {
+            id: format!("undo-{}-{}", unix_now(), state.undo_stack.len()),
+            label: label.into(),
+            timestamp: unix_now(),
+            state_json,
+        });
+        compact_state_for_persist(state);
+    }
 }
 
 fn write_config_file(path: &Path, config_yaml: &str) -> Result<(), String> {
@@ -2759,6 +2970,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/profiles/block-quic") => handle_profile_block_quic(body, daemon),
         ("POST", "/api/active-profile") => handle_set_active(body, daemon),
         ("GET", "/api/mihomo-config") => handle_get_mihomo_config(daemon),
+        ("POST", "/api/mihomo-config/validate") => handle_mihomo_config_validate(daemon),
         ("POST", "/api/core/start") => handle_core_start(daemon),
         ("POST", "/api/core/stop") => handle_core_stop(daemon),
         ("POST", "/api/core/restart") => handle_core_restart(daemon),
@@ -2769,11 +2981,14 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/favorites/toggle") => handle_favorites_toggle(body, daemon),
         ("GET", "/api/favorites") => handle_favorites_list(daemon),
         ("POST", "/api/subscriptions/refresh") => handle_subscriptions_refresh(daemon),
+        ("GET", "/api/subscriptions/refresh-report") => handle_subscriptions_refresh_report(daemon),
         ("POST", "/api/subscriptions/refresh-one") => {
             handle_subscriptions_refresh_one(body, daemon)
         }
         ("GET", "/api/subscriptions") => handle_subscriptions_list(daemon),
         ("POST", "/api/subscriptions/delete") => handle_subscriptions_delete(body, daemon),
+        ("GET", "/api/undo") => handle_undo_list(daemon),
+        ("POST", "/api/undo/restore") => handle_undo_restore(body, daemon),
         ("GET", "/api/routing") => handle_routing_get(daemon),
         ("POST", "/api/routing/settings") => handle_routing_settings(body, daemon),
         ("POST", "/api/routing/rules") => handle_routing_rules(body, daemon),
@@ -2795,6 +3010,10 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/dns") => handle_dns_set(body, daemon),
         ("GET", "/api/dns/leak-test") => handle_dns_leak_test(daemon),
         ("GET", "/api/dns/diagnostics") => handle_dns_diagnostics(daemon),
+        ("GET", "/api/diagnostics/dns") => handle_dns_diagnostics_v2(daemon),
+        ("GET", "/api/diagnostics/udp-quic") => handle_udp_quic_diagnostics(daemon),
+        ("GET", "/api/memory-guard") => handle_memory_guard(daemon),
+        ("GET", "/metrics") => handle_prometheus_metrics(daemon),
         ("GET", "/api/logs") => handle_logs(daemon),
         ("GET", "/api/system") => handle_system(daemon),
         ("GET", "/api/auto-settings") => handle_auto_settings_get(daemon),
@@ -3084,6 +3303,68 @@ fn handle_get_mihomo_config(daemon: &Daemon) -> (u16, &'static str, String) {
             "application/json",
             json!({"error": error, "profile_id": inner.state.active_profile_id}).to_string(),
         ),
+    }
+}
+
+fn handle_mihomo_config_validate(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    match build_daemon_config(&inner.state) {
+        Ok(config_yaml) => {
+            let result = validate_mihomo_config_yaml(
+                &inner.state.mihomo_path,
+                &config_yaml,
+                geo_dir_from_state(&inner.state).as_deref(),
+            );
+            (200, "application/json", result.to_string())
+        }
+        Err(error) => (
+            400,
+            "application/json",
+            json!({"ok": false, "supported": true, "stage": "generate", "error": error})
+                .to_string(),
+        ),
+    }
+}
+
+fn validate_mihomo_config_yaml(
+    binary_path: &str,
+    config_yaml: &str,
+    geo_dir: Option<&str>,
+) -> Value {
+    let temp_path = std::env::temp_dir().join(format!("hincyray-validate-{}.yaml", unix_now()));
+    if let Err(error) = fs::write(&temp_path, config_yaml) {
+        return json!({"ok": false, "supported": true, "stage": "write-temp", "error": error.to_string()});
+    }
+    let mut cmd = Command::new(binary_path);
+    cmd.arg("-t").arg("-f").arg(&temp_path);
+    if let Some(dir) = geo_dir.filter(|d| !d.is_empty()) {
+        cmd.arg("-d").arg(dir);
+    }
+    let output = cmd.output();
+    let _ = fs::remove_file(&temp_path);
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+            let unsupported = !output.status.success()
+                && (text.contains("unknown shorthand flag")
+                    || text.contains("flag provided but not defined")
+                    || text.contains("unknown command"));
+            json!({
+                "ok": output.status.success(),
+                "supported": !unsupported,
+                "exit_code": output.status.code(),
+                "stdout": stdout,
+                "stderr": stderr,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({
+            "ok": false,
+            "supported": false,
+            "error": format!("mihomo binary not found: {binary_path}"),
+        }),
+        Err(error) => json!({"ok": false, "supported": true, "error": error.to_string()}),
     }
 }
 
@@ -3626,6 +3907,7 @@ fn handle_profile_delete(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
     }
 
     let was_active = inner.state.active_profile_id == Some(id);
+    push_undo_snapshot(&mut inner.state, format!("Delete profile #{id}"));
 
     // Remove the profile.
     inner.state.profiles.retain(|p| p.id != id);
@@ -3939,6 +4221,7 @@ fn handle_profile_group_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
         );
     }
 
+    push_undo_snapshot(&mut inner.state, format!("Delete group {group}"));
     let (removed_profiles, removed_active) = purge_profile_group(&mut inner.state, &group);
     if removed_active {
         let _ = inner.core.stop();
@@ -4164,6 +4447,7 @@ struct RefreshResult {
     refreshed: usize,
     added: usize,
     errors: Vec<String>,
+    report: SubscriptionRefreshReport,
 }
 
 /// Core logic for refreshing all saved subscriptions.
@@ -4187,10 +4471,18 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
     };
 
     if subs.is_empty() {
+        let report = SubscriptionRefreshReport {
+            timestamp: unix_now(),
+            ..SubscriptionRefreshReport::default()
+        };
+        let mut inner = lock(&daemon.inner);
+        inner.state.last_subscription_refresh_report = Some(report.clone());
+        let _ = persist_state(&daemon.state_path, &inner.state);
         return RefreshResult {
             refreshed: 0,
             added: 0,
             errors: Vec::new(),
+            report,
         };
     }
 
@@ -4198,10 +4490,19 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
     let mut added_total = 0usize;
     let mut refreshed = 0usize;
     let now = unix_now();
+    let mut entries: Vec<SubscriptionRefreshEntry> = Vec::new();
 
     for source in &subs {
         let outcome = load_subscription_for_daemon(source, &proxy_info, &hwid);
         let mut inner = lock(&daemon.inner);
+        let previous_raw: HashSet<String> = inner
+            .state
+            .profiles
+            .iter()
+            .filter(|p| p.group.as_deref() == Some(&source.url))
+            .map(|p| p.raw.clone())
+            .collect();
+        let previous_count = previous_raw.len();
         let stored = inner
             .state
             .subscriptions
@@ -4210,6 +4511,10 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
         match outcome {
             SubscriptionLoadOutcome::Ok(report) => {
                 let count = report.profiles.len();
+                let fresh_raw: HashSet<String> =
+                    report.profiles.iter().map(|p| p.raw.clone()).collect();
+                let added_for_source = fresh_raw.difference(&previous_raw).count();
+                let removed_for_source = previous_raw.difference(&fresh_raw).count();
                 if let Some(stored) = stored {
                     stored.last_loaded_unix = Some(now);
                     stored.last_error = None;
@@ -4219,6 +4524,16 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
                     replace_subscription_profiles(&mut inner.state, &source.url, report.profiles);
                 added_total += added;
                 refreshed += 1;
+                entries.push(SubscriptionRefreshEntry {
+                    url: source.url.clone(),
+                    status: "ok".to_owned(),
+                    previous_count,
+                    new_count: count,
+                    added: added_for_source,
+                    removed: removed_for_source,
+                    changed: 0,
+                    error: None,
+                });
             }
             SubscriptionLoadOutcome::Failed { direct, proxy } => {
                 let error = SubscriptionLoadOutcome::format_error(&direct, proxy.as_deref());
@@ -4226,15 +4541,57 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
                     stored.last_error = Some(error.clone());
                 }
                 errors.push(error);
+                entries.push(SubscriptionRefreshEntry {
+                    url: source.url.clone(),
+                    status: "error".to_owned(),
+                    previous_count,
+                    new_count: previous_count,
+                    added: 0,
+                    removed: 0,
+                    changed: 0,
+                    error: errors.last().cloned(),
+                });
             }
         }
+        let failed = entries
+            .iter()
+            .filter(|entry| entry.status == "error")
+            .count();
+        let removed: usize = entries.iter().map(|entry| entry.removed).sum();
+        let changed: usize = entries.iter().map(|entry| entry.changed).sum();
+        inner.state.last_subscription_refresh_report = Some(SubscriptionRefreshReport {
+            timestamp: now,
+            refreshed,
+            added: added_total,
+            removed,
+            changed,
+            failed,
+            entries: entries.clone(),
+        });
         let _ = persist_state(&daemon.state_path, &inner.state);
     }
+
+    let failed = entries
+        .iter()
+        .filter(|entry| entry.status == "error")
+        .count();
+    let removed: usize = entries.iter().map(|entry| entry.removed).sum();
+    let changed: usize = entries.iter().map(|entry| entry.changed).sum();
+    let report = SubscriptionRefreshReport {
+        timestamp: now,
+        refreshed,
+        added: added_total,
+        removed,
+        changed,
+        failed,
+        entries,
+    };
 
     RefreshResult {
         refreshed,
         added: added_total,
         errors,
+        report,
     }
 }
 
@@ -4244,11 +4601,21 @@ fn handle_subscriptions_refresh(daemon: &Daemon) -> (u16, &'static str, String) 
         "refreshed": result.refreshed,
         "added": result.added,
         "errors": result.errors,
+        "report": result.report,
     });
     if result.refreshed == 0 && result.errors.is_empty() {
         response["note"] = json!("no saved subscriptions; import a subscription URL first");
     }
     (200, "application/json", response.to_string())
+}
+
+fn handle_subscriptions_refresh_report(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    (
+        200,
+        "application/json",
+        json!({"report": inner.state.last_subscription_refresh_report}).to_string(),
+    )
 }
 
 /// Refresh a single saved subscription by URL. Body: `{"url": "..."}`.
@@ -4303,6 +4670,14 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
     let now = unix_now();
 
     let mut inner = lock(&daemon.inner);
+    let previous_raw: HashSet<String> = inner
+        .state
+        .profiles
+        .iter()
+        .filter(|p| p.group.as_deref() == Some(&source.url))
+        .map(|p| p.raw.clone())
+        .collect();
+    let previous_count = previous_raw.len();
     let stored = inner
         .state
         .subscriptions
@@ -4311,6 +4686,10 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
     match outcome {
         SubscriptionLoadOutcome::Ok(report) => {
             let count = report.profiles.len();
+            let fresh_raw: HashSet<String> =
+                report.profiles.iter().map(|p| p.raw.clone()).collect();
+            let added_for_source = fresh_raw.difference(&previous_raw).count();
+            let removed_for_source = previous_raw.difference(&fresh_raw).count();
             if let Some(stored) = stored {
                 stored.last_loaded_unix = Some(now);
                 stored.last_error = None;
@@ -4320,6 +4699,25 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
             // the fresh set — removes stale entries, prevents duplicates.
             let added =
                 replace_subscription_profiles(&mut inner.state, &source.url, report.profiles);
+            let refresh_report = SubscriptionRefreshReport {
+                timestamp: now,
+                refreshed: 1,
+                added,
+                removed: removed_for_source,
+                changed: 0,
+                failed: 0,
+                entries: vec![SubscriptionRefreshEntry {
+                    url: source.url.clone(),
+                    status: "ok".to_owned(),
+                    previous_count,
+                    new_count: count,
+                    added: added_for_source,
+                    removed: removed_for_source,
+                    changed: 0,
+                    error: None,
+                }],
+            };
+            inner.state.last_subscription_refresh_report = Some(refresh_report.clone());
             let _ = persist_state(&daemon.state_path, &inner.state);
             let response = json!({
                 "url": source.url,
@@ -4327,6 +4725,7 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
                 "added": added,
                 "profile_count": count,
                 "errors": Vec::<String>::new(),
+                "report": refresh_report,
             });
             (200, "application/json", response.to_string())
         }
@@ -4335,6 +4734,25 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
             if let Some(stored) = stored {
                 stored.last_error = Some(error.clone());
             }
+            let refresh_report = SubscriptionRefreshReport {
+                timestamp: now,
+                refreshed: 0,
+                added: 0,
+                removed: 0,
+                changed: 0,
+                failed: 1,
+                entries: vec![SubscriptionRefreshEntry {
+                    url: source.url.clone(),
+                    status: "error".to_owned(),
+                    previous_count,
+                    new_count: previous_count,
+                    added: 0,
+                    removed: 0,
+                    changed: 0,
+                    error: Some(error.clone()),
+                }],
+            };
+            inner.state.last_subscription_refresh_report = Some(refresh_report.clone());
             let _ = persist_state(&daemon.state_path, &inner.state);
             (
                 200,
@@ -4344,6 +4762,7 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
                     "refreshed": 0,
                     "added": 0,
                     "errors": [error],
+                    "report": refresh_report,
                 })
                 .to_string(),
             )
@@ -4419,6 +4838,7 @@ fn handle_subscriptions_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
         .filter(|p| p.group.as_deref() == Some(url))
         .count();
 
+    push_undo_snapshot(&mut inner.state, format!("Delete subscription {url}"));
     let removed_active = purge_subscription(&mut inner.state, url);
 
     // If the active profile was removed, stop the core and clear the
@@ -4436,6 +4856,82 @@ fn handle_subscriptions_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
         "removed_active": removed_active,
     });
     (200, "application/json", response.to_string())
+}
+
+fn handle_undo_list(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let entries: Vec<Value> = inner
+        .state
+        .undo_stack
+        .iter()
+        .rev()
+        .map(|entry| json!({"id": entry.id, "label": entry.label, "timestamp": entry.timestamp}))
+        .collect();
+    (
+        200,
+        "application/json",
+        json!({"undo": entries, "count": entries.len()}).to_string(),
+    )
+}
+
+fn handle_undo_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(id) = value.get("id").and_then(Value::as_str) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing id"}).to_string(),
+        );
+    };
+
+    let mut inner = lock(&daemon.inner);
+    let Some(pos) = inner
+        .state
+        .undo_stack
+        .iter()
+        .position(|entry| entry.id == id)
+    else {
+        return (
+            404,
+            "application/json",
+            json!({"error": "undo entry not found", "id": id}).to_string(),
+        );
+    };
+    let entry = inner.state.undo_stack.remove(pos);
+    let mut restored: HincyrayState = match serde_json::from_str(&entry.state_json) {
+        Ok(state) => state,
+        Err(error) => {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("restore snapshot: {error}")}).to_string(),
+            );
+        }
+    };
+    // Preserve newer undo entries except the consumed snapshot, so the user can
+    // still recover from a mistaken restore if another snapshot existed.
+    restored.undo_stack = inner.state.undo_stack.clone();
+    inner.state = restored;
+    let _ = inner.core.stop();
+    let _ = fs::remove_file(&daemon.mihomo_config_path);
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+    (
+        200,
+        "application/json",
+        json!({"restored": true, "id": entry.id, "label": entry.label}).to_string(),
+    )
 }
 
 fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
@@ -4673,6 +5169,7 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         return (400, "application/json", json!({"error": error}).to_string());
     }
     let mut inner = lock(&daemon.inner);
+    push_undo_snapshot(&mut inner.state, "Replace routing rules");
     inner.state.routing_rules = rules;
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         return (
@@ -4807,6 +5304,7 @@ fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
 /// /api/routing/apply to regenerate the config and restart the core.
 fn handle_routing_reset(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
+    push_undo_snapshot(&mut inner.state, "Reset routing defaults");
 
     // Reset routing policy fields to factory defaults.
     let s = &mut inner.state.split_routing;
@@ -4896,6 +5394,7 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
     }
 
     let mut inner = lock(&daemon.inner);
+    push_undo_snapshot(&mut inner.state, format!("Apply preset {preset_id}"));
 
     // v0.16: optional target override. If the request includes a "target"
     // field, all preset rules get this target instead of their hardcoded
@@ -6934,6 +7433,117 @@ fn read_process_rss_kb(pid: u32) -> Option<u64> {
     None
 }
 
+fn read_process_status_field(pid: u32, field: &str) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let prefix = format!("{field}:");
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            return rest.split_whitespace().next()?.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+fn read_process_comm(pid: u32) -> String {
+    fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_else(|_| pid.to_string())
+}
+
+fn top_processes_by_rss(limit: usize) -> Vec<Value> {
+    let mut rows: Vec<(u64, u32, String)> = Vec::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
+            if let Some(rss_kb) = read_process_rss_kb(pid) {
+                rows.push((rss_kb, pid, read_process_comm(pid)));
+            }
+        }
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse(row.0));
+    rows.into_iter()
+        .take(limit)
+        .map(|(rss_kb, pid, name)| json!({"pid": pid, "name": name, "rss_kb": rss_kb}))
+        .collect()
+}
+
+fn memory_summary_from_proc() -> (u64, u64, f64) {
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let mut total = 0u64;
+    let mut available = 0u64;
+    for line in meminfo.lines() {
+        let mut parts = line.split_whitespace();
+        match (parts.next().map(|s| s.trim_end_matches(':')), parts.next()) {
+            (Some("MemTotal"), Some(v)) => total = v.parse().unwrap_or(0),
+            (Some("MemAvailable"), Some(v)) => available = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    let usage_pct = if total > 0 {
+        ((total.saturating_sub(available)) as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    (total, available, (usage_pct * 10.0).round() / 10.0)
+}
+
+fn handle_memory_guard(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (settings, mihomo_pid) = {
+        let mut inner = lock(&daemon.inner);
+        (inner.state.memory_guard.clone(), inner.core.pid())
+    };
+    let (total_kb, available_kb, usage_pct) = memory_summary_from_proc();
+    let mihomo = mihomo_pid.map(|pid| {
+        json!({
+            "pid": pid,
+            "name": read_process_comm(pid),
+            "rss_kb": read_process_rss_kb(pid).unwrap_or(0),
+            "vm_size_kb": read_process_status_field(pid, "VmSize").unwrap_or(0),
+            "vm_data_kb": read_process_status_field(pid, "VmData").unwrap_or(0),
+            "vm_swap_kb": read_process_status_field(pid, "VmSwap").unwrap_or(0),
+        })
+    });
+    let mihomo_rss = mihomo
+        .as_ref()
+        .and_then(|v| v.get("rss_kb"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let warnings = [
+        (settings.enabled && usage_pct >= settings.system_usage_warn_pct).then(|| {
+            format!(
+                "system memory usage {usage_pct}% >= {}%",
+                settings.system_usage_warn_pct
+            )
+        }),
+        (settings.enabled && mihomo_rss >= settings.mihomo_rss_warn_kb).then(|| {
+            format!(
+                "mihomo RSS {mihomo_rss} KiB >= {} KiB",
+                settings.mihomo_rss_warn_kb
+            )
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    (
+        200,
+        "application/json",
+        json!({
+            "ok": warnings.is_empty(),
+            "enabled": settings.enabled,
+            "thresholds": settings,
+            "system": {"total_kb": total_kb, "available_kb": available_kb, "usage_pct": usage_pct},
+            "mihomo": mihomo,
+            "top_processes": top_processes_by_rss(10),
+            "warnings": warnings,
+        })
+        .to_string(),
+    )
+}
+
 /// Return cumulative traffic statistics (persisted totals) plus
 /// real-time speed from Mihomo `/traffic` API (if EC enabled).
 fn handle_traffic_stats(daemon: &Daemon) -> (u16, &'static str, String) {
@@ -6972,6 +7582,63 @@ fn handle_traffic_stats(daemon: &Daemon) -> (u16, &'static str, String) {
         })
         .to_string(),
     )
+}
+
+fn handle_prometheus_metrics(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (profiles, active, total_up, total_down, core_running, firewall_running, mihomo_pid) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            inner.state.profiles.len(),
+            inner.state.active_profile_id,
+            inner.state.traffic_total_up_bytes,
+            inner.state.traffic_total_down_bytes,
+            inner.core.is_running(),
+            inner.firewall.is_running(),
+            inner.core.pid(),
+        )
+    };
+    let (mem_total, mem_available, mem_usage_pct) = memory_summary_from_proc();
+    let mihomo_rss = mihomo_pid.and_then(read_process_rss_kb).unwrap_or(0);
+    let mut out = String::new();
+    out.push_str("# HELP hincyray_up HincyRay daemon metrics endpoint status\n# TYPE hincyray_up gauge\nhincyray_up 1\n");
+    out.push_str("# HELP hincyray_core_running Mihomo core running state\n# TYPE hincyray_core_running gauge\n");
+    out.push_str(&format!(
+        "hincyray_core_running {}\n",
+        if core_running { 1 } else { 0 }
+    ));
+    out.push_str("# HELP hincyray_firewall_running HincyRay firewall running state\n# TYPE hincyray_firewall_running gauge\n");
+    out.push_str(&format!(
+        "hincyray_firewall_running {}\n",
+        if firewall_running { 1 } else { 0 }
+    ));
+    out.push_str("# HELP hincyray_profiles_total Number of loaded profiles\n# TYPE hincyray_profiles_total gauge\n");
+    out.push_str(&format!("hincyray_profiles_total {profiles}\n"));
+    out.push_str("# HELP hincyray_active_profile_id Active profile id, -1 when none\n# TYPE hincyray_active_profile_id gauge\n");
+    out.push_str(&format!(
+        "hincyray_active_profile_id {}\n",
+        active.map(|v| v as i64).unwrap_or(-1)
+    ));
+    out.push_str("# HELP hincyray_traffic_total_bytes Persisted proxy traffic totals\n# TYPE hincyray_traffic_total_bytes counter\n");
+    out.push_str(&format!(
+        "hincyray_traffic_total_bytes{{direction=\"up\"}} {total_up}\n"
+    ));
+    out.push_str(&format!(
+        "hincyray_traffic_total_bytes{{direction=\"down\"}} {total_down}\n"
+    ));
+    out.push_str(
+        "# HELP hincyray_memory_kib System memory KiB\n# TYPE hincyray_memory_kib gauge\n",
+    );
+    out.push_str(&format!(
+        "hincyray_memory_kib{{kind=\"total\"}} {mem_total}\n"
+    ));
+    out.push_str(&format!(
+        "hincyray_memory_kib{{kind=\"available\"}} {mem_available}\n"
+    ));
+    out.push_str("# HELP hincyray_memory_usage_percent System memory usage percent\n# TYPE hincyray_memory_usage_percent gauge\n");
+    out.push_str(&format!("hincyray_memory_usage_percent {mem_usage_pct}\n"));
+    out.push_str("# HELP hincyray_mihomo_rss_kib Mihomo process RSS KiB\n# TYPE hincyray_mihomo_rss_kib gauge\n");
+    out.push_str(&format!("hincyray_mihomo_rss_kib {mihomo_rss}\n"));
+    (200, "text/plain; version=0.0.4; charset=utf-8", out)
 }
 
 /// Speed test: download a file through the SOCKS proxy and measure
@@ -7459,6 +8126,108 @@ fn handle_dns_diagnostics(daemon: &Daemon) -> (u16, &'static str, String) {
         })
         .to_string(),
     )
+}
+
+fn handle_dns_diagnostics_v2(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (split_enabled, dns_port, ec, core_running, remote_servers, local_servers) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            inner.state.split_routing.enabled,
+            1053u16,
+            mihomo_controller(&inner.state.mihomo_features),
+            inner.core.is_running(),
+            inner.state.dns_settings.remote_servers.clone(),
+            inner.state.dns_settings.local_servers.clone(),
+        )
+    };
+    let local_tcp = dns_query_tcp("127.0.0.1", dns_port, "example.com");
+    let local_google = dns_query_tcp("127.0.0.1", dns_port, "google.com");
+    let mihomo_query = ec.as_ref().map(|(addr, secret)| {
+        mihomo_api_get_json(
+            addr,
+            secret.as_deref(),
+            "/dns/query?name=example.com&type=A",
+        )
+    });
+    let verdict_ok = local_tcp
+        .get("ok")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    (
+        200,
+        "application/json",
+        json!({
+            "ok": verdict_ok,
+            "summary": if verdict_ok { "Mihomo DNS TCP listener answered" } else { "Mihomo DNS TCP listener did not answer" },
+            "split_routing_enabled": split_enabled,
+            "core_running": core_running,
+            "dns_listener": {"host": "127.0.0.1", "port": dns_port, "tcp_example": local_tcp, "tcp_google": local_google},
+            "configured_servers": {"remote": remote_servers, "local": local_servers},
+            "mihomo_dns_query": match mihomo_query {
+                Some(Ok(v)) => json!({"ok": true, "response": v}),
+                Some(Err(e)) => json!({"ok": false, "error": e}),
+                None => json!({"ok": false, "error": "external controller disabled"}),
+            },
+            "hints": [
+                "DNS is always enabled in router mode because firewall DNATs DNS to 127.0.0.1:1053",
+                "If local TCP DNS fails, validate Mihomo config and core logs before changing rules"
+            ],
+        })
+        .to_string(),
+    )
+}
+
+fn handle_udp_quic_diagnostics(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (split, firewall_active, tproxy_available, core_running) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            inner.state.split_routing.clone(),
+            inner.firewall.is_running(),
+            inner.firewall.tproxy_available,
+            inner.core.is_running(),
+        )
+    };
+    let modules = ["xt_TPROXY", "xt_socket", "xt_comment"]
+        .into_iter()
+        .map(|name| json!({"name": name, "loaded": kernel_module_loaded(name)}))
+        .collect::<Vec<_>>();
+    let nat_rules = command_json("iptables", &["-t", "nat", "-S"]);
+    let mangle_rules = command_json("iptables", &["-t", "mangle", "-S"]);
+    let ip_rules = command_json("ip", &["rule", "show"]);
+    let verdict_ok = split.enabled
+        && firewall_active
+        && (tproxy_available || split.quic_mode == QuicMode::Block);
+    (
+        200,
+        "application/json",
+        json!({
+            "ok": verdict_ok,
+            "summary": if verdict_ok { "UDP/QUIC path is consistent with current routing mode" } else { "UDP/QUIC path needs attention" },
+            "split_routing_enabled": split.enabled,
+            "core_running": core_running,
+            "firewall_active": firewall_active,
+            "redirect_port_tcp": split.redirect_port,
+            "tproxy_port_udp": split.redirect_port + 1,
+            "tproxy_available": tproxy_available,
+            "quic_mode": format!("{:?}", split.quic_mode),
+            "modules": modules,
+            "iptables": {"nat": nat_rules, "mangle": mangle_rules},
+            "policy_routing": ip_rules,
+        })
+        .to_string(),
+    )
+}
+
+fn command_json(program: &str, args: &[&str]) -> Value {
+    match Command::new(program).args(args).output() {
+        Ok(output) => json!({
+            "ok": output.status.success(),
+            "exit_code": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+            "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+        }),
+        Err(error) => json!({"ok": false, "error": error.to_string()}),
+    }
 }
 
 fn run_nslookup(host: &str, server: Option<(&str, u16)>) -> Value {
@@ -11691,6 +12460,82 @@ mod tests {
             loaded.dns_settings.enabled,
             "load_state must force dns_settings.enabled=true when split routing is on"
         );
+    }
+
+    #[test]
+    fn compact_state_for_persist_caps_unbounded_collections() {
+        let mut state = HincyrayState {
+            connection_log: (0..(MAX_CONNECTION_LOG + 5))
+                .map(|i| ConnectionLogEntry {
+                    timestamp: i as u64,
+                    ..Default::default()
+                })
+                .collect(),
+            undo_stack: (0..(MAX_UNDO_STACK + 3))
+                .map(|i| UndoEntry {
+                    id: i.to_string(),
+                    label: "x".to_owned(),
+                    timestamp: i as u64,
+                    state_json: "{}".to_owned(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        compact_state_for_persist(&mut state);
+        assert_eq!(state.connection_log.len(), MAX_CONNECTION_LOG);
+        assert_eq!(state.undo_stack.len(), MAX_UNDO_STACK);
+        assert_eq!(
+            state
+                .connection_log
+                .first()
+                .expect("compacted connection log keeps newest entries")
+                .timestamp,
+            5
+        );
+    }
+
+    #[test]
+    fn undo_restore_restores_previous_state() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner
+                .state
+                .profiles
+                .push(make_profile(0, "A", "raw-a", None));
+            push_undo_snapshot(&mut inner.state, "before delete");
+            inner.state.profiles.clear();
+        }
+        let id = {
+            let inner = lock(&daemon.inner);
+            inner.state.undo_stack[0].id.clone()
+        };
+        let (status, _, _) = handle_undo_restore(&format!(r#"{{"id":"{id}"}}"#), &daemon);
+        assert_eq!(status, 200);
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 1);
+        assert_eq!(inner.state.profiles[0].name, "A");
+    }
+
+    #[test]
+    fn prometheus_metrics_exposes_core_series() {
+        let (_dir, daemon) = test_daemon();
+        let (status, content_type, body) = handle_prometheus_metrics(&daemon);
+        assert_eq!(status, 200);
+        assert!(content_type.starts_with("text/plain"));
+        assert!(body.contains("hincyray_up 1"));
+        assert!(body.contains("hincyray_profiles_total"));
+    }
+
+    #[test]
+    fn mihomo_validator_reports_missing_binary_as_unsupported() {
+        let result = validate_mihomo_config_yaml(
+            "/definitely/missing/hincyray-mihomo",
+            "mixed-port: 10809\n",
+            None,
+        );
+        assert_eq!(result["ok"], json!(false));
+        assert_eq!(result["supported"], json!(false));
     }
 
     // ── Subscription replace / delete tests ───────────────────────────

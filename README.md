@@ -1,4 +1,4 @@
-# HincyRay v0.18.0
+# HincyRay v0.19.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,18 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.19.0
+
+Diagnostics and release-hardening:
+
+- System page now includes hardware metrics directly: CPU/RAM/temp/load/uptime/host/core breakdown from `/api/system`.
+- Added Mihomo config validator: `POST /api/mihomo-config/validate` runs the generated YAML through Mihomo test mode when supported.
+- Added DNS diagnostics 2.0 (`GET /api/diagnostics/dns`) and UDP/QUIC diagnostics (`GET /api/diagnostics/udp-quic`).
+- Added Memory Guard (`GET /api/memory-guard`) with Mihomo RSS and top RSS processes.
+- Added Prometheus metrics at `GET /metrics`.
+- Added subscription refresh reports, backend undo stack, bounded state compaction, global Web UI search, CLI commands, doctor script, router E2E script, frontend contract test, and CI with split clippy profiles.
+- Tests: 348 passed.
 
 ### v0.18.0
 
