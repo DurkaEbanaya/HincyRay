@@ -1,4 +1,4 @@
-# HincyRay v0.19.0
+# HincyRay v0.19.1
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,10 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.19.1
+
+Hotfix: the System page now visibly renders hardware/resource metrics, the dead Hardware sidebar item is removed, and Mihomo config validation is bounded so a hung `mihomo -t` cannot block the daemon API.
 
 ### v0.19.0
 

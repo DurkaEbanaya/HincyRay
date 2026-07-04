@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.19.1 - 2026-07-04
+
+- Fixed the System page hardware block: hardware/resource metrics are visible in the existing System section, and the dead sidebar "Hardware" item was removed.
+- Made `POST /api/mihomo-config/validate` bounded: the daemon releases the state lock before validation, runs `mihomo -t` with an 8-second deadline, captures bounded stdout/stderr, kills hung validators, and returns `timeout: true` instead of blocking the API.
+- Strengthened `scripts/frontend-contract-test.py` to reject sidebar navigation entries without section panels/NAV_MAP entries and to verify System renderer DOM targets.
+- Tests: 350 passed, 0 clippy warnings.
+
 ## v0.19.0 - 2026-07-04
 
 - Moved hardware metrics into the System page and kept `/api/system` as the single structured system source.

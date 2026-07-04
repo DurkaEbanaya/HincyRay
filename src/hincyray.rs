@@ -52,6 +52,8 @@ const MAX_CONNECTION_LOG: usize = 500;
 const MAX_BACKUPS: usize = 20;
 const MAX_UNDO_STACK: usize = 10;
 const MAX_REFRESH_REPORT_ENTRIES: usize = 100;
+const MIHOMO_VALIDATE_TIMEOUT: Duration = Duration::from_secs(8);
+const COMMAND_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024;
 
 /// Global shutdown flag set by the SIGTERM/SIGINT handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -3307,14 +3309,18 @@ fn handle_get_mihomo_config(daemon: &Daemon) -> (u16, &'static str, String) {
 }
 
 fn handle_mihomo_config_validate(daemon: &Daemon) -> (u16, &'static str, String) {
-    let inner = lock(&daemon.inner);
-    match build_daemon_config(&inner.state) {
+    let (config_result, mihomo_path, geo_dir) = {
+        let inner = lock(&daemon.inner);
+        (
+            build_daemon_config(&inner.state),
+            inner.state.mihomo_path.clone(),
+            geo_dir_from_state(&inner.state),
+        )
+    };
+    match config_result {
         Ok(config_yaml) => {
-            let result = validate_mihomo_config_yaml(
-                &inner.state.mihomo_path,
-                &config_yaml,
-                geo_dir_from_state(&inner.state).as_deref(),
-            );
+            let result =
+                validate_mihomo_config_yaml(&mihomo_path, &config_yaml, geo_dir.as_deref());
             (200, "application/json", result.to_string())
         }
         Err(error) => (
@@ -3331,7 +3337,21 @@ fn validate_mihomo_config_yaml(
     config_yaml: &str,
     geo_dir: Option<&str>,
 ) -> Value {
-    let temp_path = std::env::temp_dir().join(format!("hincyray-validate-{}.yaml", unix_now()));
+    validate_mihomo_config_yaml_with_timeout(
+        binary_path,
+        config_yaml,
+        geo_dir,
+        MIHOMO_VALIDATE_TIMEOUT,
+    )
+}
+
+fn validate_mihomo_config_yaml_with_timeout(
+    binary_path: &str,
+    config_yaml: &str,
+    geo_dir: Option<&str>,
+    timeout: Duration,
+) -> Value {
+    let temp_path = unique_temp_path("hincyray-validate", "yaml");
     if let Err(error) = fs::write(&temp_path, config_yaml) {
         return json!({"ok": false, "supported": true, "stage": "write-temp", "error": error.to_string()});
     }
@@ -3340,32 +3360,150 @@ fn validate_mihomo_config_yaml(
     if let Some(dir) = geo_dir.filter(|d| !d.is_empty()) {
         cmd.arg("-d").arg(dir);
     }
-    let output = cmd.output();
+    let output = run_bounded_command(cmd, timeout);
     let _ = fs::remove_file(&temp_path);
     match output {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        BoundedCommandResult::Completed {
+            success,
+            exit_code,
+            stdout,
+            stderr,
+        } => {
             let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-            let unsupported = !output.status.success()
+            let unsupported = !success
                 && (text.contains("unknown shorthand flag")
                     || text.contains("flag provided but not defined")
                     || text.contains("unknown command"));
             json!({
-                "ok": output.status.success(),
+                "ok": success,
                 "supported": !unsupported,
-                "exit_code": output.status.code(),
+                "exit_code": exit_code,
                 "stdout": stdout,
                 "stderr": stderr,
             })
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({
+        BoundedCommandResult::TimedOut { stdout, stderr } => json!({
             "ok": false,
-            "supported": false,
-            "error": format!("mihomo binary not found: {binary_path}"),
+            "supported": true,
+            "timeout": true,
+            "timeout_secs": timeout.as_secs_f64(),
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": "mihomo config validation timed out and was terminated",
         }),
-        Err(error) => json!({"ok": false, "supported": true, "error": error.to_string()}),
+        BoundedCommandResult::SpawnError(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            json!({
+                "ok": false,
+                "supported": false,
+                "error": format!("mihomo binary not found: {binary_path}"),
+            })
+        }
+        BoundedCommandResult::SpawnError(error) => {
+            json!({"ok": false, "supported": true, "error": error.to_string()})
+        }
     }
+}
+
+enum BoundedCommandResult {
+    Completed {
+        success: bool,
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    },
+    TimedOut {
+        stdout: String,
+        stderr: String,
+    },
+    SpawnError(std::io::Error),
+}
+
+fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let thread_id = format!("{:?}", thread::current().id())
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>();
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{thread_id}-{nanos}.{extension}",
+        std::process::id()
+    ))
+}
+
+fn run_bounded_command(mut cmd: Command, timeout: Duration) -> BoundedCommandResult {
+    let stdout_path = unique_temp_path("hincyray-command-stdout", "log");
+    let stderr_path = unique_temp_path("hincyray-command-stderr", "log");
+    let stdout_file = match fs::File::create(&stdout_path) {
+        Ok(file) => file,
+        Err(error) => return BoundedCommandResult::SpawnError(error),
+    };
+    let stderr_file = match fs::File::create(&stderr_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(&stdout_path);
+            return BoundedCommandResult::SpawnError(error);
+        }
+    };
+    cmd.stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = fs::remove_file(&stdout_path);
+            let _ = fs::remove_file(&stderr_path);
+            return BoundedCommandResult::SpawnError(error);
+        }
+    };
+    let started = SystemTime::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = read_limited_trimmed(&stdout_path);
+                let stderr = read_limited_trimmed(&stderr_path);
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
+                return BoundedCommandResult::Completed {
+                    success: status.success(),
+                    exit_code: status.code(),
+                    stdout,
+                    stderr,
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = fs::remove_file(&stdout_path);
+                let _ = fs::remove_file(&stderr_path);
+                return BoundedCommandResult::SpawnError(error);
+            }
+        }
+        let elapsed = started.elapsed().unwrap_or_default();
+        if elapsed >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stdout = read_limited_trimmed(&stdout_path);
+            let stderr = read_limited_trimmed(&stderr_path);
+            let _ = fs::remove_file(&stdout_path);
+            let _ = fs::remove_file(&stderr_path);
+            return BoundedCommandResult::TimedOut { stdout, stderr };
+        }
+        let remaining = timeout.saturating_sub(elapsed);
+        thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+}
+
+fn read_limited_trimmed(path: &Path) -> String {
+    let mut output = Vec::new();
+    if let Ok(file) = fs::File::open(path) {
+        let _ = file
+            .take(COMMAND_OUTPUT_LIMIT_BYTES)
+            .read_to_end(&mut output);
+    }
+    String::from_utf8_lossy(&output).trim().to_owned()
 }
 
 /// Regenerate the Mihomo config and write it to the daemon's config
@@ -12536,6 +12674,74 @@ mod tests {
         );
         assert_eq!(result["ok"], json!(false));
         assert_eq!(result["supported"], json!(false));
+    }
+
+    #[test]
+    fn mihomo_validator_times_out_and_terminates_hung_process() {
+        let dir = TempDir::new().expect("temp dir");
+        let script_path = dir.path().join("hung-mihomo.sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\necho validator-started\nsleep 10\necho validator-finished\n",
+        )
+        .expect("write script");
+        let chmod = Command::new("chmod")
+            .arg("+x")
+            .arg(&script_path)
+            .status()
+            .expect("chmod script");
+        assert!(chmod.success());
+
+        let started = SystemTime::now();
+        let result = validate_mihomo_config_yaml_with_timeout(
+            script_path.to_str().expect("utf-8 path"),
+            "mixed-port: 10809\n",
+            None,
+            Duration::from_millis(100),
+        );
+        let elapsed = started.elapsed().unwrap_or_default();
+
+        assert_eq!(result["ok"], json!(false));
+        assert_eq!(result["supported"], json!(true));
+        assert_eq!(result["timeout"], json!(true));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "validator timeout must bound handler lifetime, elapsed={elapsed:?}"
+        );
+        assert!(
+            result["stdout"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("validator-started")
+        );
+    }
+
+    #[test]
+    fn mihomo_validator_preserves_unsupported_flag_detection() {
+        let dir = TempDir::new().expect("temp dir");
+        let script_path = dir.path().join("unsupported-mihomo.sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\necho 'unknown shorthand flag: t' >&2\nexit 2\n",
+        )
+        .expect("write script");
+        let chmod = Command::new("chmod")
+            .arg("+x")
+            .arg(&script_path)
+            .status()
+            .expect("chmod script");
+        assert!(chmod.success());
+
+        let result = validate_mihomo_config_yaml_with_timeout(
+            script_path.to_str().expect("utf-8 path"),
+            "mixed-port: 10809\n",
+            None,
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(result["ok"], json!(false));
+        assert_eq!(result["supported"], json!(false));
+        assert_eq!(result["exit_code"], json!(2));
     }
 
     // ── Subscription replace / delete tests ───────────────────────────
