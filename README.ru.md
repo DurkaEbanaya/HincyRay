@@ -1,4 +1,4 @@
-# HincyRay v0.19.1
+# HincyRay v0.19.2
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,10 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 Демон `ndm` в Keenetic пересоздаёт все iptables chains при изменениях конфигурации, событиях WAN и обновлении DHCP. HincyRay устанавливает hook-скрипт в `/opt/etc/ndm/netfilter.d/hincyray.sh`, который **ndm вызывает сам** после каждой перезагрузки firewall, переустанавливая все правила атомарно. Watchdog каждые 10 секунд — запасная страховка.
 
 ## Возможности
+
+### v0.19.2
+
+Hotfix UX системы: показатели железа и ресурсов теперь обновляются лёгким heartbeat каждые 3 секунды, а карточка «Память» открывает live breakdown с Linux memory summary, RSS Mihomo/HincyRay, top RSS процессов и предупреждениями Memory Guard.
 
 ### v0.19.1
 

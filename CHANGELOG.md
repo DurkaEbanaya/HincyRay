@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.19.2 - 2026-07-04
+
+- Made the System hardware/resource block refresh independently every 3 seconds via a lightweight `/api/system` + `/api/memory-guard` heartbeat.
+- Made the Memory card clickable and keyboard-accessible, opening a live breakdown with Linux memory summary, Mihomo/HincyRay RSS, top RSS processes, and Memory Guard warnings.
+- Moved auto-refresh loop registration to the start of Web UI initialization and made it idempotent/exception-safe so later UI initialization errors cannot leave resource metrics stuck at the first snapshot.
+- Strengthened `scripts/frontend-contract-test.py` to require the System refresh loop, memory breakdown entrypoint, and new memory DOM targets.
+- Tests: 350 passed, 0 clippy warnings.
+
 ## v0.19.1 - 2026-07-04
 
 - Fixed the System page hardware block: hardware/resource metrics are visible in the existing System section, and the dead sidebar "Hardware" item was removed.

@@ -48,6 +48,11 @@ REQUIRED_MARKERS = [
     "/api/memory-guard",
     "/api/subscriptions/refresh-report",
     "/api/undo",
+    "function refreshSystem()",
+    "function startAutoRefreshLoops()",
+    "function showMemoryBreakdown()",
+    "hrSystemRefreshInterval",
+    "hrDashboardRefreshInterval",
 ]
 
 SYSTEM_DOM_IDS = [
@@ -55,6 +60,7 @@ SYSTEM_DOM_IDS = [
     "sysCpuModel",
     "sysRam",
     "sysRamText",
+    "sysMihomoRam",
     "sysTemp",
     "sysLoad",
     "sysUptime",
@@ -64,6 +70,7 @@ SYSTEM_DOM_IDS = [
     "sysCpuBar",
     "sysRamBar",
     "sysTempBar",
+    "sysMemoryCard",
 ]
 
 

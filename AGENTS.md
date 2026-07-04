@@ -1,4 +1,4 @@
-# Project: HincyRay v0.19.1 (crate `xray-vpn-test`)
+# Project: HincyRay v0.19.2 (crate `xray-vpn-test`)
 
 Rust crate shipping two binaries: the `hincyray` router daemon for Keenetic/Entware aarch64 and the `xray-vpn-test` desktop diagnostics app (macOS, feature `desktop`). Current router mode uses Mihomo plus iptables NAT REDIRECT/TPROXY; v0.14 adds diagnostics/recovery, Rule Trace, Sub-Store Lite, Smart Auto-Select 2.0, backups/WebDAV, scheduled maintenance, connection close control, and EC wildcard dial safety. Shared parsing/scoring lives in `src/profiles.rs`, `src/scoring.rs`, and `src/xray_config.rs`.
 
@@ -43,7 +43,7 @@ Tech stack: Rust 2024, Cargo, `eframe/egui` desktop GUI (feature-gated), `reqwes
 * Format: `cargo fmt`
 * Lint full: `cargo clippy --all-targets --all-features`
 * Lint fast daemon profile: `cargo clippy --all-targets --no-default-features --bin hincyray -- -D warnings`
-* Test: `cargo test --all-targets --all-features` (348 tests)
+* Test: `cargo test --all-targets --all-features` (350 tests)
 * Frontend/API contract: `python3 scripts/frontend-contract-test.py`
 * Router E2E after deploy: `HINCYRAY_URL=http://127.0.0.1:8088 scripts/router-e2e.sh` (or set router URL when run remotely)
 * Terminal diagnostics: `hincyray doctor` or `scripts/hincyray-doctor.sh`
@@ -58,6 +58,7 @@ Tech stack: Rust 2024, Cargo, `eframe/egui` desktop GUI (feature-gated), `reqwes
 * Subscription bodies are tried as plain text and common base64 variants.
 * Happ/TutNet Xray-style JSON with DNS-over-HTTPS URLs is parsed via the `outbounds` fallback when no direct profiles are found.
 * Do not add OS-specific APIs unless guarded behind a cross-platform boundary.
+* v0.19.2 hotfix: System hardware/resource metrics refresh through an exception-safe lightweight 3s heartbeat (`/api/system` + `/api/memory-guard`) registered at the start of Web UI init, so later UI init errors cannot freeze the first snapshot. The Memory card is clickable/keyboard-accessible and opens a live breakdown with Linux memory summary, Mihomo/HincyRay RSS, top RSS processes, and Memory Guard warnings. Frontend contract test now requires the refresh loop, memory breakdown entrypoint, and new memory DOM targets. 350 tests, 0 clippy warnings.
 * v0.19.1 hotfix: System page visibly renders the hardware/resource metrics and removes the dead sidebar Hardware item; `POST /api/mihomo-config/validate` is bounded with state-lock release, 8s deadline, captured stdout/stderr, and kill-on-timeout so a hung `mihomo -t` cannot block the daemon API. Frontend contract test now rejects nav entries without panels/NAV_MAP entries and verifies System renderer DOM IDs. 350 tests, 0 clippy warnings.
 * v0.19.0 adds: System section now includes hardware metrics; Mihomo config validator (`POST /api/mihomo-config/validate`); DNS diagnostics 2.0 (`GET /api/diagnostics/dns`); UDP/QUIC diagnostics (`GET /api/diagnostics/udp-quic`); Memory Guard (`GET /api/memory-guard`) with top RSS processes; Prometheus metrics (`GET /metrics`); subscription refresh reports (`GET /api/subscriptions/refresh-report`); backend undo stack (`GET /api/undo`, `POST /api/undo/restore`); state compaction; CLI commands (`status`, `doctor`, `validate-config`, `restart-core`, `apply-routing`, `backup`); global Web UI search; frontend contract test; router E2E script; CI with split clippy profiles. 348 tests.
 * v0.18.0 adds: subscription/group sharing API (`POST /api/profile-groups/share`) for sharing all servers in a visible profile group, group deletion API (`POST /api/profile-groups/delete`), and single-server `POST /api/profiles/share` for raw share-link + backend-generated SVG QR by `profile_id`. Web UI puts Share/QR and delete actions on every subscription/group header, so URL-backed subscriptions and named imported groups are handled uniformly. Web UI contract fixes: single profile add sends `raw`, Sub-Store sends `sort_by`, EC raw buttons show real API responses, auto-update settings are wired, `/api/system` binding uses the actual nested schema, profile-table QUIC toggle removed, routing rule delete has 15s undo, device screen is connected-device focused. `qrcode` dependency added. Web UI controls audit doc added. 344 tests, 0 clippy warnings.
