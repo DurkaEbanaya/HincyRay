@@ -104,6 +104,17 @@ pub struct RouterExtra {
     /// v0.16: MATCH rule target — `"proxy"` (default) or `"direct"`.
     /// Controls the final fallback rule: `MATCH,proxy` or `MATCH,direct`.
     pub match_target: String,
+    /// v0.17: RKN Bypass — when true, injects a RULE-SET provider that
+    /// downloads a list of domains blocked in Russia and routes them
+    /// through proxy. Also injects GEOIP,RU,DIRECT and GEOIP,CN,DIRECT
+    /// so Russian/Chinese IPs go direct.
+    pub rkn_bypass_enabled: bool,
+    /// v0.17: URL for the RKN bypass rule provider. Defaults to
+    /// `itworksig/rublacklist` bypass.list on GitHub.
+    pub rkn_bypass_url: String,
+    /// v0.17: Update interval for the RKN bypass rule provider (seconds).
+    /// Default: 86400 (24 hours).
+    pub rkn_bypass_interval: u32,
 }
 
 /// A daemon-level Xray routing rule after HincyRay has resolved UI targets

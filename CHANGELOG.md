@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.17.0 - 2026-07-04
+
+### Added
+- **RKN Bypass**: `SplitRoutingSettings.rkn_bypass_enabled` (default `true`), `rkn_bypass_url`, `rkn_bypass_interval` fields. When enabled, injects a `RULE-SET,ru-bypass,proxy` rule provider that downloads `itworksig/rublacklist` bypass.list (744K+ domains blocked in Russia) through the proxy, refreshed every 24h. Also injects `GEOIP,RU,DIRECT` and `GEOIP,CN,DIRECT` so Russian/Chinese IPs go direct. Rule order: user rules → QUIC block → raw rules → RKN bypass (RULE-SET → GEOIP,RU → GEOIP,CN) → RU Direct → port-mode → MATCH. `RouterExtra` gains `rkn_bypass_enabled`, `rkn_bypass_url`, `rkn_bypass_interval`. `RKN_BYPASS_DEFAULT_URL`/`RKN_BYPASS_DEFAULT_INTERVAL` constants in `mihomo_config.rs`.
+- **Reset to factory defaults**: `POST /api/routing/reset` endpoint. Resets rkn_bypass (enabled, default URL, 24h interval), ru_direct_mode=geosite, match_target=proxy, port_mode=AllowList, proxy_ports=80/443, routing_rules=QUIC Block only, raw_rules=cleared. Infrastructure settings (enabled, auto_switch, vpn_subnet, redirect_port, policy_name, geo_asset_path) preserved. WebUI button "↺ Штатные настройки" calls reset then apply.
+- **Configurable sniffer override-destination**: `MihomoFeatures.sniffer_override_destination` (default `true`). `/api/dns` GET/POST bridges the field. WebUI checkbox in DNS section. `saveDns()` now calls `/api/routing/apply` after saving.
+- 12 new tests (339 total).
+
+### Changed
+- `build_mihomo_router_config()`: RKN bypass rules and rule provider injected when `extra.rkn_bypass_enabled`. Provider merged with user-configured rule providers (user's `ru-bypass` takes precedence).
+- `handle_routing_settings()`: accepts `rkn_bypass_enabled`, `rkn_bypass_url`, `rkn_bypass_interval`.
+- `build_sniffer_json()`: reads `features.sniffer_override_destination` instead of hardcoded `true`.
+- `saveRoutingSettings()` in WebUI: sends `rkn_bypass_enabled`, `rkn_bypass_url`, `rkn_bypass_interval`.
+- `updateRoutingForm()` in WebUI: reads RKN bypass fields from API response.
+
+### Migration
+- Old state files: `rkn_bypass_enabled` defaults to `true`, `rkn_bypass_url` defaults to `itworksig/rublacklist`, `rkn_bypass_interval` defaults to 86400. `sniffer_override_destination` defaults to `true`.
+
 ## v0.16.0 - 2026-07-04
 
 ### Added

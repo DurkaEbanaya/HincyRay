@@ -35,8 +35,8 @@ use crate::benchmark::{
     run_bench,
 };
 use crate::mihomo_config::{
-    DIRECT_NAME, MihomoFeatures, PROXY_NAME, REJECT_NAME, build_mihomo_config,
-    build_mihomo_router_config,
+    DIRECT_NAME, MihomoFeatures, PROXY_NAME, REJECT_NAME, RKN_BYPASS_DEFAULT_INTERVAL,
+    RKN_BYPASS_DEFAULT_URL, build_mihomo_config, build_mihomo_router_config,
 };
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionSource, load_subscription_detailed_via_proxy_with_hwid,
@@ -914,6 +914,17 @@ pub struct SplitRoutingSettings {
     /// Empty string (old state) is migrated in `load_state()`.
     #[serde(default)]
     pub match_target: String,
+    /// v0.17: RKN Bypass — injects a RULE-SET provider with domains
+    /// blocked in Russia, routing them through proxy. Also injects
+    /// GEOIP,RU,DIRECT and GEOIP,CN,DIRECT.
+    #[serde(default = "default_true")]
+    pub rkn_bypass_enabled: bool,
+    /// v0.17: URL for the RKN bypass rule provider.
+    #[serde(default = "default_rkn_bypass_url")]
+    pub rkn_bypass_url: String,
+    /// v0.17: Update interval for the RKN bypass rule provider (seconds).
+    #[serde(default = "default_rkn_bypass_interval")]
+    pub rkn_bypass_interval: u32,
 }
 
 impl Default for SplitRoutingSettings {
@@ -936,6 +947,9 @@ impl Default for SplitRoutingSettings {
             ru_direct_mode: String::new(),
             ru_direct_exceptions: Vec::new(),
             match_target: String::new(),
+            rkn_bypass_enabled: true,
+            rkn_bypass_url: default_rkn_bypass_url(),
+            rkn_bypass_interval: default_rkn_bypass_interval(),
         }
     }
 }
@@ -966,6 +980,14 @@ fn default_geo_asset_path() -> String {
     } else {
         String::new()
     }
+}
+
+fn default_rkn_bypass_url() -> String {
+    RKN_BYPASS_DEFAULT_URL.to_owned()
+}
+
+fn default_rkn_bypass_interval() -> u32 {
+    RKN_BYPASS_DEFAULT_INTERVAL
 }
 
 /// Policy-routing rule. `kind`/`pattern`/`target` existed as a v0.1
@@ -2420,6 +2442,9 @@ fn build_routing_context<'a>(
         ru_direct_mode: state.split_routing.ru_direct_mode.clone(),
         ru_direct_exceptions: normalize_route_items(&state.split_routing.ru_direct_exceptions),
         match_target: state.split_routing.match_target.clone(),
+        rkn_bypass_enabled: state.split_routing.rkn_bypass_enabled,
+        rkn_bypass_url: state.split_routing.rkn_bypass_url.clone(),
+        rkn_bypass_interval: state.split_routing.rkn_bypass_interval,
     };
     (extra_profiles, routes, active_block_quic, extra)
 }
@@ -2750,6 +2775,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/routing/rules") => handle_routing_rules(body, daemon),
         ("POST", "/api/routing/catalog/refresh") => handle_routing_catalog_refresh(body, daemon),
         ("POST", "/api/routing/apply") => handle_routing_apply(daemon),
+        ("POST", "/api/routing/reset") => handle_routing_reset(daemon),
         ("GET", "/api/routing-presets") => handle_routing_presets_list(),
         ("POST", "/api/routing-presets/apply") => handle_routing_preset_apply(body, daemon),
         ("GET", "/api/geo/providers") => handle_geo_providers(),
@@ -4349,6 +4375,15 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
             "proxy".to_owned()
         };
     }
+    if let Some(v) = value.get("rkn_bypass_enabled").and_then(Value::as_bool) {
+        inner.state.split_routing.rkn_bypass_enabled = v;
+    }
+    if let Some(v) = value.get("rkn_bypass_url").and_then(Value::as_str) {
+        inner.state.split_routing.rkn_bypass_url = v.trim().to_owned();
+    }
+    if let Some(v) = value.get("rkn_bypass_interval").and_then(Value::as_u64) {
+        inner.state.split_routing.rkn_bypass_interval = v as u32;
+    }
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         return (
             500,
@@ -4518,6 +4553,64 @@ fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
         200,
         "application/json",
         json!({"applied": true, "core_status": core_status, "firewall_status": firewall_status})
+            .to_string(),
+    )
+}
+
+/// v0.17: Reset routing policy to factory defaults.
+///
+/// Resets: rkn_bypass, ru_direct, match_target, port_mode, proxy_ports,
+/// quic_mode, routing_rules, raw_rules. Infrastructure settings (enabled,
+/// auto_switch, vpn_subnet, redirect_port, policy_name, geo_asset_path)
+/// are preserved. After resetting state, the caller should POST
+/// /api/routing/apply to regenerate the config and restart the core.
+fn handle_routing_reset(daemon: &Daemon) -> (u16, &'static str, String) {
+    let mut inner = lock(&daemon.inner);
+
+    // Reset routing policy fields to factory defaults.
+    let s = &mut inner.state.split_routing;
+    s.rkn_bypass_enabled = true;
+    s.rkn_bypass_url = default_rkn_bypass_url();
+    s.rkn_bypass_interval = default_rkn_bypass_interval();
+    s.ru_direct_mode = "geosite".to_owned();
+    s.ru_direct_exceptions = Vec::new();
+    s.match_target = "proxy".to_owned();
+    s.port_mode = PortMode::AllowList;
+    s.proxy_ports = vec!["80".to_owned(), "443".to_owned()];
+    s.bypass_ports = Vec::new();
+    s.quic_mode = QuicMode::Block;
+    s.block_quic_global = false;
+
+    // Reset routing rules to just QUIC Block (system-level).
+    inner.state.routing_rules = vec![RoutingRule {
+        enabled: true,
+        name: "QUIC Block".to_owned(),
+        kind: String::new(),
+        pattern: String::new(),
+        target: "reject".to_owned(),
+        domains: Vec::new(),
+        ips: Vec::new(),
+        services: Vec::new(),
+        ports: vec!["443".to_owned()],
+        network: "udp".to_owned(),
+        port_mode: "include".to_owned(),
+    }];
+
+    // Clear user-defined raw Mihomo rules (RKN bypass injects its own).
+    inner.state.mihomo_features.raw_rules = Vec::new();
+
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return (
+            500,
+            "application/json",
+            json!({"error": format!("persist state: {error}")}).to_string(),
+        );
+    }
+
+    (
+        200,
+        "application/json",
+        json!({"reset": true, "message": "Настройки сброшены к заводским. Нажмите «Применить» для активации."})
             .to_string(),
     )
 }
@@ -12723,5 +12816,188 @@ mod tests {
         let result: Value = serde_json::from_str(&body).expect("parse json");
         let conflicts = result["conflicts"].as_array().expect("conflicts");
         assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn rkn_bypass_enabled_by_default() {
+        let s = SplitRoutingSettings::default();
+        assert!(
+            s.rkn_bypass_enabled,
+            "rkn_bypass_enabled should default to true"
+        );
+        assert!(
+            !s.rkn_bypass_url.is_empty(),
+            "rkn_bypass_url should have default URL"
+        );
+        assert_eq!(
+            s.rkn_bypass_interval, 86400,
+            "default interval should be 24h"
+        );
+    }
+
+    #[test]
+    fn routing_settings_accepts_rkn_bypass() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, _body) =
+            handle_routing_settings(r#"{"rkn_bypass_enabled":false}"#, &daemon);
+        assert_eq!(status, 200);
+        let inner = lock(&daemon.inner);
+        assert!(
+            !inner.state.split_routing.rkn_bypass_enabled,
+            "rkn_bypass_enabled should be false after API call"
+        );
+    }
+
+    #[test]
+    fn routing_settings_accepts_rkn_bypass_url_and_interval() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, _body) = handle_routing_settings(
+            r#"{"rkn_bypass_url":"https://custom.example/list","rkn_bypass_interval":3600}"#,
+            &daemon,
+        );
+        assert_eq!(status, 200);
+        let inner = lock(&daemon.inner);
+        assert_eq!(
+            inner.state.split_routing.rkn_bypass_url,
+            "https://custom.example/list"
+        );
+        assert_eq!(inner.state.split_routing.rkn_bypass_interval, 3600);
+    }
+
+    #[test]
+    fn routing_reset_restores_factory_defaults() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.split_routing.rkn_bypass_enabled = false;
+            inner.state.split_routing.ru_direct_mode = "off".to_owned();
+            inner.state.split_routing.match_target = "direct".to_owned();
+            inner.state.split_routing.port_mode = PortMode::All;
+            inner.state.split_routing.proxy_ports = Vec::new();
+            inner.state.split_routing.ru_direct_exceptions = vec!["example.ru".to_owned()];
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "Custom".to_owned(),
+                target: "active".to_owned(),
+                domains: vec!["custom.com".to_owned()],
+                ..Default::default()
+            });
+            inner.state.mihomo_features.raw_rules = vec!["DOMAIN-SUFFIX,test.com,proxy".to_owned()];
+        }
+        let (status, _, _body) = handle_routing_reset(&daemon);
+        assert_eq!(status, 200);
+        {
+            let inner = lock(&daemon.inner);
+            let s = &inner.state.split_routing;
+            assert!(s.rkn_bypass_enabled, "rkn_bypass should be re-enabled");
+            assert_eq!(
+                s.ru_direct_mode, "geosite",
+                "ru_direct_mode should be geosite"
+            );
+            assert_eq!(s.match_target, "proxy", "match_target should be proxy");
+            assert_eq!(
+                s.port_mode,
+                PortMode::AllowList,
+                "port_mode should be AllowList"
+            );
+            assert_eq!(
+                s.proxy_ports,
+                vec!["80".to_owned(), "443".to_owned()],
+                "proxy_ports should be 80,443"
+            );
+            assert!(
+                s.ru_direct_exceptions.is_empty(),
+                "ru_direct_exceptions should be cleared"
+            );
+            // Routing rules should be just QUIC Block.
+            assert_eq!(
+                inner.state.routing_rules.len(),
+                1,
+                "should have exactly 1 rule (QUIC Block)"
+            );
+            assert_eq!(inner.state.routing_rules[0].name, "QUIC Block");
+            // Raw rules should be cleared.
+            assert!(
+                inner.state.mihomo_features.raw_rules.is_empty(),
+                "raw_rules should be cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn rkn_bypass_in_config_when_enabled() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.split_routing.rkn_bypass_enabled = true;
+            inner.state.split_routing.ru_direct_mode = "geosite".to_owned();
+            inner.state.split_routing.match_target = "proxy".to_owned();
+        }
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let rules = config["rules"].as_array().expect("rules");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str() == Some("RULE-SET,ru-bypass,proxy")),
+            "config must contain RULE-SET,ru-bypass,proxy"
+        );
+        assert!(
+            rules.iter().any(|r| r.as_str() == Some("GEOIP,RU,DIRECT")),
+            "config must contain GEOIP,RU,DIRECT"
+        );
+        let providers = config["rule-providers"]
+            .as_object()
+            .expect("rule-providers");
+        assert!(
+            providers.contains_key("ru-bypass"),
+            "ru-bypass provider must exist"
+        );
+    }
+
+    #[test]
+    fn rkn_bypass_not_in_config_when_disabled() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.split_routing.rkn_bypass_enabled = false;
+            inner.state.split_routing.match_target = "proxy".to_owned();
+        }
+        let (status, _, body) = handle_get_mihomo_config(&daemon);
+        assert_eq!(status, 200);
+        let config: Value = serde_yaml::from_str(&body).expect("parse config");
+        let rules = config["rules"].as_array().expect("rules");
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r.as_str().unwrap_or("").starts_with("RULE-SET,ru-bypass")),
+            "config must NOT contain RULE-SET,ru-bypass when disabled"
+        );
+        let providers = config.get("rule-providers").and_then(Value::as_object);
+        if let Some(providers) = providers {
+            assert!(
+                !providers.contains_key("ru-bypass"),
+                "ru-bypass provider must NOT exist when disabled"
+            );
+        }
     }
 }

@@ -1,4 +1,4 @@
-# HincyRay v0.15.6
+# HincyRay v0.17.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,14 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.17.0
+
+- **RKN Bypass**: automatic routing of domains blocked in Russia through proxy. Uses `itworksig/rublacklist` (auto-updated via GitHub Actions, 744K+ rules) as a Mihomo rule provider. The list is downloaded through the proxy itself and refreshed every 24 hours. Russian IPs (`GEOIP,RU`) and Chinese IPs (`GEOIP,CN`) are routed direct to avoid unnecessary proxy load. Toggle on/off in the WebUI with configurable URL and update interval.
+- **Reset to factory defaults**: one-click reset button restores the default routing policy — RKN Bypass on, RU Direct (geosite), MATCH,proxy, AllowList ports 80/443, QUIC Block rule, all user rules and raw rules cleared. The reset endpoint (`POST /api/routing/reset`) persists state; the WebUI then calls `/api/routing/apply` to regenerate the config and restart the core.
+- **Configurable sniffer override-destination**: toggle in the DNS section to control Mihomo's `override-destination` sniffer setting. Default `true` — ensures domain rules match even when clients use DoH/DoT (SNI is extracted into the destination field). `saveDns()` now calls `/api/routing/apply` after saving so DNS changes take effect immediately.
+- 339 tests, 0 clippy warnings.
+- Router E2E verified on Keenetic Giga: bypass list downloaded (24 MB, 744,070 rules, ~5s), Mihomo RSS 157 MB, toggle on/off verified in config, reset restores factory defaults.
 
 ### v0.16.0
 
