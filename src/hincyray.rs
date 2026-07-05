@@ -3943,9 +3943,11 @@ fn handle_profile_block_quic(body: &str, daemon: &Daemon) -> (u16, &'static str,
     )
 }
 
-/// Add a single profile from a raw share link.
-/// Body: `{"raw": "vless://..."}`.
-/// Parses the share link, deduplicates by `raw` string, assigns a new ID.
+/// Add a single profile from a raw share link or subscription URL.
+/// Body: `{"raw": "vless://...", "group": "optional"}`.
+/// If `raw` is a share link → parse, dedup, assign new ID.
+/// If `raw` is a subscription URL (http/https) → fetch, parse all profiles,
+/// dedup, persist subscription source for later refresh.
 fn handle_profile_add(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return (
@@ -3961,51 +3963,172 @@ fn handle_profile_add(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             json!({"error": "missing \"raw\" field"}).to_string(),
         );
     };
+    let group_param = value
+        .get("group")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
 
     let parsed = parse_input(raw);
-    if parsed.profiles.is_empty() {
+
+    // ─── Path 1: single share link → one profile ───
+    if !parsed.profiles.is_empty() {
+        let mut inner = lock(&daemon.inner);
+        let profile = parsed.profiles[0].clone();
+        let raw_key = profile.raw.clone();
+
+        // Dedup: check if a profile with the same raw link already exists.
+        if inner.state.profiles.iter().any(|p| p.raw == raw_key) {
+            return (
+                409,
+                "application/json",
+                json!({"error": "profile already exists", "raw": raw_key}).to_string(),
+            );
+        }
+
+        let new_id = inner.state.profiles.len();
+        let mut profile = profile;
+        profile.id = new_id;
+        if profile.group.is_none() {
+            profile.group = group_param.clone();
+        }
+        inner.state.profiles.push(profile);
+
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("persist state: {error}")}).to_string(),
+            );
+        }
+
         return (
-            400,
+            200,
             "application/json",
-            json!({"error": "could not parse share link", "candidate_count": parsed.candidates})
+            json!({
+                "profile_id": new_id,
+                "profile_count": inner.state.profiles.len(),
+            })
+            .to_string(),
+        );
+    }
+
+    // ─── Path 2: subscription URL → fetch and import all profiles ───
+    if !parsed.subscriptions.is_empty() {
+        // Grab proxy fallback info under a short lock; network I/O below
+        // runs without holding the mutex so the API stays responsive.
+        let (proxy_info, hwid) = {
+            let mut inner = lock(&daemon.inner);
+            let hwid = inner.state.hwid_config.clone();
+            (proxy_info_for_daemon(&mut inner), hwid)
+        };
+
+        let mut all_profiles: Vec<Profile> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut sub_outcomes: Vec<(SubscriptionSource, usize, Option<String>)> = Vec::new();
+
+        for source in &parsed.subscriptions {
+            let outcome = load_subscription_for_daemon(source, &proxy_info, &hwid);
+            match outcome {
+                SubscriptionLoadOutcome::Ok(report) => {
+                    let count = report.profiles.len();
+                    for mut profile in report.profiles {
+                        if profile.group.is_none() {
+                            profile.group = Some(source.url.clone());
+                        }
+                        all_profiles.push(profile);
+                    }
+                    sub_outcomes.push((source.clone(), count, None));
+                }
+                SubscriptionLoadOutcome::Failed { direct, proxy } => {
+                    let error = SubscriptionLoadOutcome::format_error(&direct, proxy.as_deref());
+                    errors.push(error.clone());
+                    sub_outcomes.push((source.clone(), 0, Some(error)));
+                }
+            }
+        }
+
+        let mut inner = lock(&daemon.inner);
+        let count_before = inner.state.profiles.len();
+        let mut seen: HashSet<String> =
+            inner.state.profiles.iter().map(|p| p.raw.clone()).collect();
+        for mut profile in all_profiles {
+            if seen.insert(profile.raw.clone()) {
+                profile.id = inner.state.profiles.len();
+                inner.state.profiles.push(profile);
+            }
+        }
+        let count_after = inner.state.profiles.len();
+        let added = count_after.saturating_sub(count_before);
+
+        // Persist subscription sources for later refresh.
+        let now = unix_now();
+        for (source, count, error) in &sub_outcomes {
+            let stored = inner
+                .state
+                .subscriptions
+                .iter_mut()
+                .find(|existing| existing.url == source.url);
+            let entry = if let Some(stored) = stored {
+                stored
+            } else {
+                inner.state.subscriptions.push(StoredSubscription {
+                    url: source.url.clone(),
+                    last_loaded_unix: None,
+                    last_error: None,
+                    profile_count: 0,
+                });
+                inner
+                    .state
+                    .subscriptions
+                    .last_mut()
+                    .expect("just pushed a subscription entry")
+            };
+            if error.is_none() {
+                entry.last_loaded_unix = Some(now);
+                entry.last_error = None;
+                entry.profile_count = *count;
+            } else {
+                entry.last_error = error.clone();
+            }
+        }
+
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            errors.push(format!("persist: {error}"));
+        }
+
+        if !errors.is_empty() {
+            return (
+                502,
+                "application/json",
+                json!({
+                    "error": errors.join("; "),
+                    "profile_count": count_after,
+                    "added": added,
+                    "subscriptions": parsed.subscriptions.len(),
+                })
                 .to_string(),
-        );
-    }
+            );
+        }
 
-    let mut inner = lock(&daemon.inner);
-    let profile = parsed.profiles[0].clone();
-    let raw_key = profile.raw.clone();
-
-    // Dedup: check if a profile with the same raw link already exists.
-    if inner.state.profiles.iter().any(|p| p.raw == raw_key) {
         return (
-            409,
+            200,
             "application/json",
-            json!({"error": "profile already exists", "raw": raw_key}).to_string(),
+            json!({
+                "profile_count": count_after,
+                "added": added,
+                "subscriptions": parsed.subscriptions.len(),
+            })
+            .to_string(),
         );
     }
 
-    let new_id = inner.state.profiles.len();
-    let mut profile = profile;
-    profile.id = new_id;
-    inner.state.profiles.push(profile);
-
-    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
-        return (
-            500,
-            "application/json",
-            json!({"error": format!("persist state: {error}")}).to_string(),
-        );
-    }
-
+    // ─── Path 3: neither share link nor subscription URL ───
     (
-        200,
+        400,
         "application/json",
-        json!({
-            "profile_id": new_id,
-            "profile_count": inner.state.profiles.len(),
-        })
-        .to_string(),
+        json!({"error": "could not parse share link", "candidate_count": parsed.candidates})
+            .to_string(),
     )
 }
 
@@ -11578,6 +11701,34 @@ mod tests {
 
         let (status, _, _) = handle_profile_add(&format!(r#"{{"raw":"{raw}"}}"#), &daemon);
         assert_eq!(status, 409);
+    }
+
+    #[test]
+    fn profile_add_subscription_url_attempts_fetch_not_parse_error() {
+        let (_dir, daemon) = test_daemon();
+        // A subscription URL should NOT return "could not parse share link".
+        // It should attempt a network fetch and return a fetch error (502).
+        let (status, _, body) =
+            handle_profile_add(r#"{"raw":"http://127.0.0.1:1/sub/never"}"#, &daemon);
+        // 502 = fetch was attempted (correct); 400 with "could not parse" = regression.
+        assert_ne!(status, 400);
+        let resp: Value = serde_json::from_str(&body).expect("parse response");
+        assert!(
+            !body.contains("could not parse share link"),
+            "subscription URL must not return parse error"
+        );
+        // The response should mention the URL in the error.
+        if let Some(error) = resp.get("error").and_then(Value::as_str) {
+            assert!(error.contains("127.0.0.1:1"));
+        }
+    }
+
+    #[test]
+    fn profile_add_garbage_still_returns_parse_error() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = handle_profile_add(r#"{"raw":"not-a-link"}"#, &daemon);
+        assert_eq!(status, 400);
+        assert!(body.contains("could not parse share link"));
     }
 
     #[test]
