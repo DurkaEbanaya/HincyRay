@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
+use crate::mihomo_config::build_mihomo_bench_config;
 use crate::profiles::Profile;
 #[cfg(test)]
 use crate::profiles::Protocol;
@@ -35,6 +36,7 @@ use crate::xray_config::build_xray_config;
 
 pub const DEFAULT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 pub const DEFAULT_DOWNLOAD_URL: &str = "https://proof.ovh.net/files/100Mb.dat";
+pub const DEFAULT_UPLOAD_URL: &str = "https://speed.cloudflare.com/__up";
 
 const PROBE_ATTEMPTS: usize = 3;
 const PROBE_TIMEOUT_SECS: u64 = 6;
@@ -81,6 +83,7 @@ pub struct BenchResult {
     pub latency_ms: u32,
     pub jitter_ms: u32,
     pub download_mbps: f32,
+    pub upload_mbps: f32,
     pub loss_percent: f32,
     pub score: u32,
     pub success: bool,
@@ -117,7 +120,10 @@ pub fn run_bench(
     method: BenchMethod,
     probe_url: String,
     download_url: String,
+    upload_url: String,
     xray_path: String,
+    test_download: bool,
+    test_upload: bool,
     job: SharedJob,
     cancel: Arc<AtomicBool>,
     on_result: Box<dyn Fn(BenchResult) + Send + 'static>,
@@ -145,7 +151,16 @@ pub fn run_bench(
                 state.last_updated = unix_now();
             }
 
-            let result = benchmark_profile(profile, method, &probe_url, &download_url, &xray_path);
+            let result = benchmark_profile(
+                profile,
+                method,
+                &probe_url,
+                &download_url,
+                &upload_url,
+                &xray_path,
+                test_download,
+                test_upload,
+            );
 
             on_result(result.clone());
             {
@@ -166,12 +181,16 @@ pub fn run_bench(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn benchmark_profile(
     profile: &Profile,
     method: BenchMethod,
     probe_url: &str,
     download_url: &str,
+    upload_url: &str,
     xray_path: &str,
+    test_download: bool,
+    test_upload: bool,
 ) -> BenchResult {
     let timestamp = unix_now();
     let base = || BenchResult {
@@ -182,6 +201,7 @@ fn benchmark_profile(
         latency_ms: 0,
         jitter_ms: 0,
         download_mbps: 0.0,
+        upload_mbps: 0.0,
         loss_percent: 100.0,
         score: 0,
         success: false,
@@ -189,33 +209,84 @@ fn benchmark_profile(
         timestamp,
     };
 
-    let outcome = match method {
+    // Step 1: Latency probe — TCP (direct) or HEAD/GET (via temp xray).
+    let latency_outcome = match method {
         BenchMethod::Tcp => run_tcp(profile),
         BenchMethod::Head | BenchMethod::Get => {
             run_via_temp_xray(profile, method, probe_url, download_url, xray_path)
         }
     };
 
-    match outcome {
-        Ok(metrics) => BenchResult {
-            latency_ms: metrics.latency_ms,
-            jitter_ms: metrics.jitter_ms,
-            download_mbps: metrics.download_mbps,
-            loss_percent: metrics.loss_percent,
-            score: quality_score(
-                metrics.latency_ms,
-                metrics.jitter_ms,
-                metrics.download_mbps,
-                metrics.loss_percent,
-            ),
-            success: true,
-            error: None,
-            ..base()
-        },
-        Err(error) => BenchResult {
-            error: Some(error),
-            ..base()
-        },
+    // Step 2: If speed test requested and not already done via GET, spawn
+    // a temporary mihomo instance to run download/upload through SOCKS.
+    // This is needed for TCP and HEAD methods which don't do speed tests.
+    let need_speed =
+        (test_download || test_upload) && matches!(method, BenchMethod::Tcp | BenchMethod::Head);
+
+    let speed_metrics = if need_speed {
+        run_speed_via_mihomo(
+            profile,
+            download_url,
+            upload_url,
+            test_download,
+            test_upload,
+        )
+    } else {
+        None
+    };
+
+    // Merge latency + speed results.
+    match latency_outcome {
+        Ok(mut metrics) => {
+            // If speed test ran separately, merge its results.
+            if let Some(sm) = speed_metrics {
+                if test_download {
+                    metrics.download_mbps = sm.download_mbps;
+                }
+                if test_upload {
+                    metrics.upload_mbps = sm.upload_mbps;
+                }
+            }
+            BenchResult {
+                latency_ms: metrics.latency_ms,
+                jitter_ms: metrics.jitter_ms,
+                download_mbps: metrics.download_mbps,
+                upload_mbps: metrics.upload_mbps,
+                loss_percent: metrics.loss_percent,
+                score: quality_score(
+                    metrics.latency_ms,
+                    metrics.jitter_ms,
+                    metrics.download_mbps,
+                    metrics.loss_percent,
+                ),
+                success: true,
+                error: None,
+                ..base()
+            }
+        }
+        Err(error) => {
+            // Latency failed — but speed might still work (e.g. server
+            // blocks direct TCP but works through proxy). If speed test
+            // succeeded, report partial success.
+            if let Some(sm) = speed_metrics {
+                BenchResult {
+                    latency_ms: 0,
+                    jitter_ms: 0,
+                    download_mbps: if test_download { sm.download_mbps } else { 0.0 },
+                    upload_mbps: if test_upload { sm.upload_mbps } else { 0.0 },
+                    loss_percent: 100.0,
+                    score: 0,
+                    success: false,
+                    error: Some(error),
+                    ..base()
+                }
+            } else {
+                BenchResult {
+                    error: Some(error),
+                    ..base()
+                }
+            }
+        }
     }
 }
 
@@ -223,6 +294,7 @@ struct Metrics {
     latency_ms: u32,
     jitter_ms: u32,
     download_mbps: f32,
+    upload_mbps: f32,
     loss_percent: f32,
 }
 
@@ -248,6 +320,7 @@ fn run_tcp(profile: &Profile) -> Result<Metrics, String> {
         latency_ms,
         jitter_ms,
         download_mbps: 0.0,
+        upload_mbps: 0.0,
         loss_percent,
     })
 }
@@ -347,7 +420,62 @@ fn run_via_temp_xray(
         latency_ms,
         jitter_ms,
         download_mbps,
+        upload_mbps: 0.0,
         loss_percent,
+    })
+}
+
+/// Spawn a temporary mihomo instance with a single profile to run
+/// download and/or upload speed tests through its SOCKS port. Used when
+/// the latency method is TCP or HEAD (which don't measure speed) but
+/// the user has enabled speed testing.
+fn run_speed_via_mihomo(
+    profile: &Profile,
+    download_url: &str,
+    upload_url: &str,
+    test_download: bool,
+    test_upload: bool,
+) -> Option<Metrics> {
+    let port = reserve_local_port().ok()?;
+    let config_yaml = build_mihomo_bench_config(profile, "127.0.0.1", port).ok()?;
+    let mut config_file = NamedTempFile::with_suffix(".yaml").ok()?;
+    config_file.write_all(config_yaml.as_bytes()).ok()?;
+    config_file.flush().ok()?;
+
+    let stderr_file = NamedTempFile::new().ok()?;
+    let stderr_writer = stderr_file.reopen().ok()?;
+
+    let child = Command::new("mihomo")
+        .arg("-f")
+        .arg(config_file.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_writer))
+        .spawn()
+        .ok()?;
+    let mut guard = ChildGuard { child: Some(child) };
+
+    if wait_until_socks_ready(port, guard.as_mut(), stderr_file.path()).is_err() {
+        return None;
+    }
+
+    let download_mbps = if test_download && !download_url.trim().is_empty() {
+        curl_download(port, download_url).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+
+    let upload_mbps = if test_upload && !upload_url.trim().is_empty() {
+        curl_upload(port, upload_url).unwrap_or(0.0)
+    } else {
+        0.0
+    };
+
+    Some(Metrics {
+        latency_ms: 0,
+        jitter_ms: 0,
+        download_mbps,
+        upload_mbps,
+        loss_percent: 0.0,
     })
 }
 
@@ -458,6 +586,84 @@ fn curl_download(port: u16, url: &str) -> Result<f32, String> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "curl download rc={rc}, http={http_code}, bytes={bytes}, {stderr}",
+            rc = output
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".to_owned())
+        ));
+    }
+    Ok(bytes * 8.0 / seconds.max(0.1) / 1_000_000.0)
+}
+
+/// Upload a 5MB chunk of data through the SOCKS proxy and measure
+/// upload speed in Mbps. Pipes data through curl's stdin to avoid
+/// temp-file filesystem quirks on Entware. Uses POST (Cloudflare __up
+/// expects POST).
+///
+/// HTTP `100 Continue` is accepted as a valid response: it means the
+/// server received the upload body. When curl times out (rc=28) after
+/// the body was fully sent, we still compute speed from `size_upload`
+/// and `time_total` — the upload itself succeeded, only the final
+/// `200 OK` response didn't arrive within the deadline.
+fn curl_upload(port: u16, url: &str) -> Result<f32, String> {
+    let chunk = vec![0xAAu8; 5_000_000];
+
+    let mut child = Command::new("curl")
+        .arg("--socks5-hostname")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("-L")
+        .arg("--max-time")
+        .arg("30")
+        .arg("-X")
+        .arg("POST")
+        .arg("--data-binary")
+        .arg("@-")
+        .arg("-H")
+        .arg("Content-Type: application/octet-stream")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--output")
+        .arg("/dev/null")
+        .arg("--write-out")
+        .arg("%{http_code} %{size_upload} %{time_total}")
+        .arg(url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("curl spawn: {e}"))?;
+
+    // Write the upload data to curl's stdin.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&chunk);
+        // stdin drops here, closing the pipe → EOF signals end of body.
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("curl wait: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = stdout.split_whitespace().collect();
+    if parts.len() != 3 {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "unexpected curl upload output: {stdout} ({stderr})"
+        ));
+    }
+    let http_code = parts[0];
+    let bytes: f32 = parts[1].parse::<f32>().map_err(|e| e.to_string())?;
+    let seconds: f32 = parts[2].parse::<f32>().map_err(|e| e.to_string())?;
+    // `1xx` = Continue (intermediate, upload accepted), `2xx` = final OK,
+    // `000` = no response received (proxy connect may have succeeded but
+    // server didn't reply — still count if data was sent).
+    let http_ok = http_code.starts_with('1') || http_code.starts_with('2') || http_code == "000";
+    let timed_out_with_data = output.status.code() == Some(28) && bytes > 0.0 && http_ok;
+    if (!output.status.success() && !timed_out_with_data) || !http_ok || bytes <= 0.0 {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "curl upload rc={rc}, http={http_code}, bytes={bytes}, {stderr}",
             rc = output
                 .status
                 .code()
@@ -593,7 +799,10 @@ mod tests {
             BenchMethod::Head,
             DEFAULT_PROBE_URL,
             DEFAULT_DOWNLOAD_URL,
+            DEFAULT_UPLOAD_URL,
             "xray",
+            false,
+            false,
         );
         assert!(!result.success);
         let err = result.error.expect("error message");
@@ -622,7 +831,10 @@ mod tests {
             BenchMethod::Tcp,
             DEFAULT_PROBE_URL,
             DEFAULT_DOWNLOAD_URL,
+            DEFAULT_UPLOAD_URL,
             "xray",
+            false,
+            false,
         );
         assert!(!result.success);
         assert!(result.error.is_some());
@@ -647,7 +859,10 @@ mod tests {
             BenchMethod::Tcp,
             DEFAULT_PROBE_URL.to_owned(),
             DEFAULT_DOWNLOAD_URL.to_owned(),
+            DEFAULT_UPLOAD_URL.to_owned(),
             "xray".to_owned(),
+            false,
+            false,
             Arc::clone(&job),
             cancel,
             on_result,

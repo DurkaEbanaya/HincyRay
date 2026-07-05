@@ -736,7 +736,6 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
           <div class="nav-sub-item active" data-section="ov-system" onclick="navTo('ov-system')"><span class="nav-label">Система</span></div>
           <div class="nav-sub-item" data-section="ov-proxy" onclick="navTo('ov-proxy')"><span class="nav-label">Статус прокси</span></div>
           <div class="nav-sub-item" data-section="ov-traffic" onclick="navTo('ov-traffic')"><span class="nav-label">Трафик</span></div>
-          <div class="nav-sub-item" data-section="ov-tests" onclick="navTo('ov-tests')"><span class="nav-label">Тесты</span></div>
         </div>
       </div>
       <!-- Группа 2: Профили и подписки -->
@@ -749,7 +748,6 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
         <div class="nav-sub-list">
           <div class="nav-sub-item" data-section="profiles" onclick="navTo('profiles')"><span class="nav-label">Профили</span></div>
           <div class="nav-sub-item" data-section="import" onclick="navTo('import')"><span class="nav-label">Импорт</span></div>
-          <div class="nav-sub-item" data-section="benchmark" onclick="navTo('benchmark')"><span class="nav-label">Бенчмарк</span></div>
           <div class="nav-sub-item" data-section="sub-store" onclick="navTo('sub-store')"><span class="nav-label">Sub-Store Lite</span></div>
         </div>
       </div>
@@ -924,6 +922,42 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
           <svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg>
         </div>
         <div class="section-body">
+          <details id="testPanel" style="margin-bottom:16px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
+            <summary style="cursor:pointer;font-weight:600;padding:10px 14px;background:var(--surface-2);user-select:none">Настройки тестирования</summary>
+            <div style="padding:12px 14px">
+              <div style="font-size:var(--fs-sm);color:var(--muted);margin-bottom:10px">Выберите метрики для тестирования и метод. Тест запускается кнопкой ⚡ у группы или сервера.</div>
+              <div class="form-row" style="align-items:flex-start;flex-wrap:wrap;gap:16px;margin-bottom:12px">
+                <div style="display:flex;flex-direction:column;gap:8px;min-width:180px">
+                  <div style="font-weight:600;font-size:var(--fs-sm);margin-bottom:2px">Метрики</div>
+                  <div style="display:flex;align-items:center;gap:8px"><label class="toggle"><input type="checkbox" id="metricLatency" checked><span class="slider"></span></label><span>Задержка</span></div>
+                  <div style="display:flex;align-items:center;gap:8px"><label class="toggle"><input type="checkbox" id="metricDownload" checked><span class="slider"></span></label><span>Закачка</span></div>
+                  <div style="display:flex;align-items:center;gap:8px"><label class="toggle"><input type="checkbox" id="metricUpload"><span class="slider"></span></label><span>Отдача</span></div>
+                  <div style="display:flex;align-items:center;gap:8px"><label class="toggle"><input type="checkbox" id="metricEwma" checked><span class="slider"></span></label><span>EWMA</span></div>
+                  <div style="display:flex;align-items:center;gap:8px"><label class="toggle"><input type="checkbox" id="metricJitter" checked><span class="slider"></span></label><span>Джиттер</span></div>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:8px;flex:1;min-width:250px">
+                  <div class="form-group" style="margin:0"><label>Метод</label>
+                    <select id="benchMethod"><option value="tcp">TCP ping</option><option value="head">HTTP HEAD</option><option value="get">HTTP GET</option></select>
+                  </div>
+                  <div class="form-group" style="margin:0;flex:1"><label>Probe URL</label><input id="benchProbe" placeholder="https://www.gstatic.com/generate_204"></div>
+                  <div class="form-group" style="margin:0;flex:1"><label>Download URL</label><input id="benchDL" placeholder="https://speed.cloudflare.com/__down?bytes=10485760"></div>
+                  <div class="form-group" style="margin:0;flex:1"><label>Upload URL</label><input id="benchUL" placeholder="https://speed.cloudflare.com/__up"></div>
+                </div>
+              </div>
+              <div id="benchProgress" style="display:none;margin-top:12px">
+                <div style="display:flex;justify-content:space-between;align-items:center;font-size:var(--fs-sm);color:var(--muted)">
+                  <span id="benchCurrent">—</span>
+                  <span><span id="benchCounter">0/0</span> <button class="btn btn-danger btn-sm" id="benchStop" onclick="apiAction('POST','/api/bench/stop',null,'Бенчмарк остановлен')" style="display:none;margin-left:8px">■ Остановить</button></span>
+                </div>
+                <div class="progress" style="margin-top:6px"><div class="progress-fill accent" id="benchBar" style="width:0%"></div></div>
+              </div>
+              <div id="benchSummary" style="margin-top:12px;display:none" class="cards">
+                <div class="card"><div class="card-label">Прошло</div><div class="card-value success" id="benchPassed">0</div></div>
+                <div class="card"><div class="card-label">Не прошло</div><div class="card-value danger" id="benchFailed">0</div></div>
+                <div class="card"><div class="card-label">Средняя задержка</div><div class="card-value mono" id="benchAvg">— ms</div></div>
+              </div>
+            </div>
+          </details>
           <h3 style="font-size:var(--fs-h3);margin:0 0 8px">Добавить один профиль</h3>
           <div class="form-row" style="align-items:flex-end;margin-bottom:16px">
             <div class="form-group" style="flex:1"><label>Share link</label><input id="profileAddLink" class="mono" placeholder="vless://…"></div>
@@ -943,7 +977,7 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
             <table class="tbl tbl-compact" id="profilesTable">
               <thead>
                 <tr>
-                  <th>★</th><th>ID</th><th onclick="sortByColumn(2)" style="cursor:pointer">Имя</th><th onclick="sortByColumn(3)" style="cursor:pointer">Протокол</th><th onclick="sortByColumn(4)" style="cursor:pointer">Балл</th><th></th><th onclick="sortByColumn(6)" style="cursor:pointer">Задержка</th><th onclick="sortByColumn(7)" style="cursor:pointer">Скорость</th><th onclick="sortByColumn(8)" style="cursor:pointer">EWMA</th><th onclick="sortByColumn(9)" style="cursor:pointer">Джиттер</th><th onclick="sortByColumn(10)" style="cursor:pointer">Потери</th><th onclick="sortByColumn(11)" style="cursor:pointer">Ошибки</th><th onclick="sortByColumn(12)" style="cursor:pointer">Cooldown</th><th onclick="sortByColumn(13)" style="cursor:pointer">Транспорт</th><th onclick="sortByColumn(14)" style="cursor:pointer">Адрес</th>
+                  <th>★</th><th>ID</th><th onclick="sortByColumn(2)" style="cursor:pointer">Имя</th><th onclick="sortByColumn(3)" style="cursor:pointer">Протокол</th><th onclick="sortByColumn(4)" style="cursor:pointer">Балл</th><th></th><th onclick="sortByColumn(6)" style="cursor:pointer">Задержка</th><th onclick="sortByColumn(7)" style="cursor:pointer">Скорость</th><th onclick="sortByColumn(8)" style="cursor:pointer">Отдача</th><th onclick="sortByColumn(9)" style="cursor:pointer">EWMA</th><th onclick="sortByColumn(10)" style="cursor:pointer">Джиттер</th><th onclick="sortByColumn(11)" style="cursor:pointer">Потери</th><th onclick="sortByColumn(12)" style="cursor:pointer">Ошибки</th><th onclick="sortByColumn(13)" style="cursor:pointer">Cooldown</th><th onclick="sortByColumn(14)" style="cursor:pointer">Транспорт</th><th onclick="sortByColumn(15)" style="cursor:pointer">Адрес</th>
                 </tr>
               </thead>
               <tbody id="profilesBody"></tbody>
@@ -956,7 +990,7 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
             <table class="tbl tbl-compact" id="favoritesTable">
               <thead>
                 <tr>
-                  <th>★</th><th>ID</th><th onclick="sortByColumn(2)" style="cursor:pointer">Имя</th><th onclick="sortByColumn(3)" style="cursor:pointer">Протокол</th><th onclick="sortByColumn(4)" style="cursor:pointer">Балл</th><th></th><th onclick="sortByColumn(6)" style="cursor:pointer">Задержка</th><th onclick="sortByColumn(7)" style="cursor:pointer">Скорость</th><th onclick="sortByColumn(8)" style="cursor:pointer">EWMA</th><th onclick="sortByColumn(9)" style="cursor:pointer">Джиттер</th><th onclick="sortByColumn(10)" style="cursor:pointer">Потери</th><th onclick="sortByColumn(11)" style="cursor:pointer">Ошибки</th><th onclick="sortByColumn(12)" style="cursor:pointer">Cooldown</th><th onclick="sortByColumn(13)" style="cursor:pointer">Транспорт</th><th onclick="sortByColumn(14)" style="cursor:pointer">Адрес</th>
+                  <th>★</th><th>ID</th><th onclick="sortByColumn(2)" style="cursor:pointer">Имя</th><th onclick="sortByColumn(3)" style="cursor:pointer">Протокол</th><th onclick="sortByColumn(4)" style="cursor:pointer">Балл</th><th></th><th onclick="sortByColumn(6)" style="cursor:pointer">Задержка</th><th onclick="sortByColumn(7)" style="cursor:pointer">Скорость</th><th onclick="sortByColumn(8)" style="cursor:pointer">Отдача</th><th onclick="sortByColumn(9)" style="cursor:pointer">EWMA</th><th onclick="sortByColumn(10)" style="cursor:pointer">Джиттер</th><th onclick="sortByColumn(11)" style="cursor:pointer">Потери</th><th onclick="sortByColumn(12)" style="cursor:pointer">Ошибки</th><th onclick="sortByColumn(13)" style="cursor:pointer">Cooldown</th><th onclick="sortByColumn(14)" style="cursor:pointer">Транспорт</th><th onclick="sortByColumn(15)" style="cursor:pointer">Адрес</th>
                 </tr>
               </thead>
               <tbody id="favoritesBody"></tbody>
@@ -990,47 +1024,6 @@ https://sub.example.com/…"></textarea>
             <thead><tr><th>URL</th><th>Профилей</th><th>Загружена</th><th>Ошибка</th><th></th></tr></thead>
             <tbody id="subsBody"></tbody>
           </table>
-        </div>
-      </section>
-
-      <!-- ═══ S5: BENCHMARK ═══ -->
-      <section class="section-panel" data-section="benchmark" data-od-id="sec-benchmark">
-        <div class="section-header" onclick="toggleSection(this)">
-          <h2>Бенчмарк</h2>
-          <svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg>
-        </div>
-        <div class="section-body">
-          <div class="form-row">
-            <div class="form-group"><label>Метод</label>
-              <select id="benchMethod"><option value="tcp">TCP ping</option><option value="head">HTTP HEAD</option><option value="get">HTTP GET</option></select>
-            </div>
-            <div class="form-group" style="flex:1"><label>Probe URL</label><input id="benchProbe" placeholder="https://www.gstatic.com/generate_204"></div>
-            <div class="form-group" style="flex:1"><label>Download URL</label><input id="benchDL" placeholder="https://speed.cloudflare.com/__down?bytes=10485760"></div>
-          </div>
-          <div class="form-row">
-            <button class="btn btn-accent" id="benchStart" onclick="startBench()">▶ Запустить</button>
-            <button class="btn btn-danger" id="benchStop" onclick="apiAction('POST','/api/bench/stop',null,t('Бенчмарк остановлен'))" style="display:none">■ Остановить</button>
-          </div>
-          <div id="benchProgress" style="display:none;margin-top:16px">
-            <div style="display:flex;justify-content:space-between;font-size:var(--fs-sm);color:var(--muted)">
-              <span id="benchCurrent">—</span><span id="benchCounter">0/0</span>
-            </div>
-            <div class="progress" style="margin-top:6px"><div class="progress-fill accent" id="benchBar" style="width:0%"></div></div>
-          </div>
-          <div id="benchSummary" style="margin-top:16px;display:none" class="cards">
-            <div class="card"><div class="card-label">Прошло</div><div class="card-value success" id="benchPassed">0</div></div>
-            <div class="card"><div class="card-label">Не прошло</div><div class="card-value danger" id="benchFailed">0</div></div>
-            <div class="card"><div class="card-label">Средняя задержка</div><div class="card-value mono" id="benchAvg">— ms</div></div>
-          </div>
-          <details id="benchDetails" style="margin-top:16px" open>
-            <summary style="cursor:pointer;font-weight:600">Результаты по серверам</summary>
-            <div class="profiles-table-wrap" style="margin-top:8px">
-              <table class="tbl tbl-compact">
-                <thead><tr><th>ID</th><th>Профиль</th><th>Статус</th><th>Задержка</th><th>Джиттер</th><th>Скорость</th><th>Потери</th><th>Ошибка</th></tr></thead>
-                <tbody id="benchResultsBody"><tr><td colspan="8" style="color:var(--muted)">Пока нет результатов</td></tr></tbody>
-              </table>
-            </div>
-          </details>
         </div>
       </section>
 
@@ -1440,33 +1433,6 @@ OR,((DOMAIN-SUFFIX,google.com),(DOMAIN-KEYword,google)),PROXY"></textarea>
       </section>
 
       <!-- ═══ OVERVIEW: TESTS ═══ -->
-      <section class="section-panel" data-section="ov-tests" data-od-id="sec-ov-tests">
-        <div class="section-header" onclick="toggleSection(this)">
-          <h2>Тесты</h2>
-          <svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg>
-        </div>
-        <div class="section-body">
-          <div class="cards" style="margin-bottom:16px">
-            <div class="card"><div class="card-label">Proxy ↑</div><div class="card-value mono" id="testsUp">—</div></div>
-            <div class="card"><div class="card-label">Proxy ↓</div><div class="card-value mono" id="testsDown">—</div></div>
-            <div class="card"><div class="card-label">Mihomo RAM</div><div class="card-value mono" id="testsMem">—</div></div>
-          </div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
-            <button class="btn btn-accent btn-sm" onclick="speedTest()">Тест скорости</button>
-            <button class="btn btn-sm" onclick="delayTest()">Тест задержки</button>
-            <button class="btn btn-sm" onclick="navTo('benchmark')">Бенчмарк серверов</button>
-            <button class="btn btn-sm" onclick="navTo('ov-proxy')">Статус прокси</button>
-            <button class="btn btn-sm" onclick="navTo('ov-traffic')">Трафик и подключения</button>
-          </div>
-          <details open>
-            <summary style="cursor:pointer;font-weight:600">Последний бенчмарк</summary>
-            <div class="profiles-table-wrap" style="margin-top:8px">
-              <table class="tbl tbl-compact"><thead><tr><th>ID</th><th>Профиль</th><th>Статус</th><th>Задержка</th><th>Скорость</th><th>Ошибка</th></tr></thead><tbody id="testsBenchBody"><tr><td colspan="6" style="color:var(--muted)">Пока нет результатов</td></tr></tbody></table>
-            </div>
-          </details>
-        </div>
-      </section>
-
       <!-- ═══ S11: DEVICES ═══ -->
       <section class="section-panel" data-section="devices" data-od-id="sec-devices">
         <div class="section-header" onclick="toggleSection(this)">
@@ -1882,11 +1848,11 @@ const MOCK = {
     split_routing: { enabled: true, auto_switch: false, block_quic_global: false, rule_source: "metacubex-lite", vpn_subnet: "192.168.2.0/24", redirect_port: 10810, policy_name: "HincyRay", geo_asset_path: "/opt/share/mihomo", quic_mode: "block", tproxy_available: true, port_mode: "all", proxy_ports: "80,443,8080", bypass_ports: "22,53" }
   },
   profiles: [
-    { id:0, name:"Server-1", protocol:"VLESS", transport:"tcp", address:"1.2.3.4", port:443, active:true, group:null, block_quic:false, favorite:true, last_latency_ms:150, last_jitter_ms:5, last_download_mbps:45.5, last_loss_percent:0, ewma_score:84, ewma_latency_ms:154, ewma_download_mbps:44.8, consecutive_failures:0, cooldown_until_unix:null, score:85, success_count:10, failure_count:2 },
-    { id:1, name:"Server-2", protocol:"VMess", transport:"ws", address:"5.6.7.8", port:443, active:false, group:"Group-A", block_quic:false, favorite:false, last_latency_ms:210, last_jitter_ms:12, last_download_mbps:32.1, last_loss_percent:1.5, ewma_score:70, ewma_latency_ms:218, ewma_download_mbps:31.4, consecutive_failures:1, cooldown_until_unix:null, score:72, success_count:8, failure_count:3 },
-    { id:2, name:"Server-3", protocol:"Trojan", transport:"grpc", address:"9.10.11.12", port:443, active:false, group:"Group-A", block_quic:true, favorite:false, last_latency_ms:180, last_jitter_ms:8, last_download_mbps:38.7, last_loss_percent:0, ewma_score:79, ewma_latency_ms:176, ewma_download_mbps:39.2, consecutive_failures:0, cooldown_until_unix:null, score:78, success_count:9, failure_count:1 },
-    { id:3, name:"Server-4", protocol:"VLESS", transport:"tcp", address:"13.14.15.16", port:443, active:false, group:null, block_quic:false, favorite:true, last_latency_ms:95, last_jitter_ms:3, last_download_mbps:62.3, last_loss_percent:0, ewma_score:91, ewma_latency_ms:99, ewma_download_mbps:60.9, consecutive_failures:0, cooldown_until_unix:null, score:92, success_count:15, failure_count:0 },
-    { id:4, name:"Server-5", protocol:"Shadowsocks", transport:"tcp", address:"17.18.19.20", port:8388, active:false, group:"Group-B", block_quic:false, favorite:false, last_latency_ms:320, last_jitter_ms:25, last_download_mbps:15.0, last_loss_percent:5, ewma_score:42, ewma_latency_ms:335, ewma_download_mbps:14.1, consecutive_failures:4, cooldown_until_unix:1719903700, score:45, success_count:4, failure_count:8 },
+    { id:0, name:"Server-1", protocol:"VLESS", transport:"tcp", address:"1.2.3.4", port:443, active:true, group:null, block_quic:false, favorite:true, last_latency_ms:150, last_jitter_ms:5, last_download_mbps:45.5, last_upload_mbps:12.3, last_loss_percent:0, ewma_score:84, ewma_latency_ms:154, ewma_download_mbps:44.8, consecutive_failures:0, cooldown_until_unix:null, score:85, success_count:10, failure_count:2 },
+    { id:1, name:"Server-2", protocol:"VMess", transport:"ws", address:"5.6.7.8", port:443, active:false, group:"Group-A", block_quic:false, favorite:false, last_latency_ms:210, last_jitter_ms:12, last_download_mbps:32.1, last_upload_mbps:8.5, last_loss_percent:1.5, ewma_score:70, ewma_latency_ms:218, ewma_download_mbps:31.4, consecutive_failures:1, cooldown_until_unix:null, score:72, success_count:8, failure_count:3 },
+    { id:2, name:"Server-3", protocol:"Trojan", transport:"grpc", address:"9.10.11.12", port:443, active:false, group:"Group-A", block_quic:true, favorite:false, last_latency_ms:180, last_jitter_ms:8, last_download_mbps:38.7, last_upload_mbps:10.1, last_loss_percent:0, ewma_score:79, ewma_latency_ms:176, ewma_download_mbps:39.2, consecutive_failures:0, cooldown_until_unix:null, score:78, success_count:9, failure_count:1 },
+    { id:3, name:"Server-4", protocol:"VLESS", transport:"tcp", address:"13.14.15.16", port:443, active:false, group:null, block_quic:false, favorite:true, last_latency_ms:95, last_jitter_ms:3, last_download_mbps:62.3, last_upload_mbps:18.7, last_loss_percent:0, ewma_score:91, ewma_latency_ms:99, ewma_download_mbps:60.9, consecutive_failures:0, cooldown_until_unix:null, score:92, success_count:15, failure_count:0 },
+    { id:4, name:"Server-5", protocol:"Shadowsocks", transport:"tcp", address:"17.18.19.20", port:8388, active:false, group:"Group-B", block_quic:false, favorite:false, last_latency_ms:320, last_jitter_ms:25, last_download_mbps:15.0, last_upload_mbps:3.2, last_loss_percent:5, ewma_score:42, ewma_latency_ms:335, ewma_download_mbps:14.1, consecutive_failures:4, cooldown_until_unix:1719903700, score:45, success_count:4, failure_count:8 },
   ],
   routing_rules: [
     { enabled:true, name:"RU Direct", target:"direct", domains:["geosite:ru"], ips:["geoip:ru"], services:[], ports:[], network:"" },
@@ -2062,10 +2028,8 @@ const NAV_MAP = {
   'ov-system':   {group:'overview',label:'Система'},
   'ov-proxy':    {group:'overview',label:'Статус прокси'},
   'ov-traffic':  {group:'overview',label:'Трафик'},
-  'ov-tests':    {group:'overview',label:'Тесты'},
   'profiles':    {group:'profiles',label:'Профили'},
   'import':      {group:'profiles',label:'Импорт'},
-  'benchmark':   {group:'profiles',label:'Бенчмарк'},
   'sub-store':   {group:'profiles',label:'Sub-Store Lite'},
   'routing':     {group:'routing',label:'Split Routing'},
   'devices':     {group:'routing',label:'По устройствам'},
@@ -2088,8 +2052,8 @@ const NAV_MAP = {
 };
 // Sub-pages per group (for mobile tabs)
 const GROUP_SUBS = {
-  overview:    ['ov-system','ov-proxy','ov-traffic','ov-tests'],
-  profiles:    ['profiles','import','benchmark','sub-store'],
+  overview:    ['ov-system','ov-proxy','ov-traffic'],
+  profiles:    ['profiles','import','sub-store'],
   routing:     ['routing','devices','dns'],
   mihomo:      ['features','config','logs','update'],
   automation:  ['auto-select','maintenance'],
@@ -2309,8 +2273,8 @@ const I18N = {
   'Обзор':'Overview','Профили и подписки':'Profiles & Subscriptions','Маршрутизация':'Routing',
   'Mihomo':'Mihomo','Автоматизация':'Automation','Диагностика':'Diagnostics','Администрирование':'Administration',
   // Nav sub-items + section titles
-  'Система':'System','Статус прокси':'Proxy Status','Трафик':'Traffic','Тесты':'Tests',
-  'Профили':'Profiles','Импорт':'Import','Бенчмарк':'Benchmark','Sub-Store Lite':'Sub-Store Lite',
+  'Система':'System','Статус прокси':'Proxy Status','Трафик':'Traffic',
+  'Профили':'Profiles','Импорт':'Import','Sub-Store Lite':'Sub-Store Lite',
   'Split Routing':'Split Routing','По устройствам':'Per-Device','DNS':'DNS',
   'Параметры':'Parameters','Конфигурация':'Configuration','Логи':'Logs','Обновление':'Update',
   'Auto-Select':'Auto-Select','Обслуживание':'Maintenance',
@@ -2347,6 +2311,7 @@ const I18N = {
   'Сканировать LAN':'Scan LAN','Добавить устройство':'Add Device',
   'Тест задержки':'Delay Test','Сброс Fake-IP':'Flush Fake-IP','Сброс DNS':'Flush DNS','Закрыть все соединения':'Close All Connections',
   'Тест скорости':'Speed Test','Проверить обновления':'Check for Updates','Обновить':'Update',
+  'Тест группы':'Test Group','Тест сервера':'Test Server',
   'Загрузить в WebDAV':'Upload to WebDAV','Скачать из WebDAV':'Download from WebDAV',
   'Введите URL':'Enter URL','Загружено':'Uploaded','Восстановлено':'Restored',
   'Войти':'Login','Отмена':'Cancel','Подтвердить':'Confirm',
@@ -2531,6 +2496,14 @@ const I18N = {
   'Вставьте share link профиля':'Enter profile share link','Профиль добавлен':'Profile added',
   'Правило добавлено':'Rule added','Бенчмарк завершён':'Benchmark completed',
   'Вставьте ссылки для импорта':'Paste links for import','Импорт запущен':'Import started',
+  'Ошибка загрузки подписки':'Subscription fetch error','Все пути загрузки исчерпаны':'All fetch paths exhausted',
+  'Подписка недоступна ни напрямую, ни через прокси. Возможные причины:':'Subscription unreachable both directly and via proxy. Possible causes:',
+  'RKN блокирует домен подписки напрямую':'RKN blocks the subscription domain directly',
+  'Прокси-сервер не может установить TLS с сервером подписки':'Proxy server cannot establish TLS with the subscription server',
+  'Сервер подписки блокирует IP прокси':'Subscription server blocks the proxy IP',
+  'Решение:':'Solution:',
+  'Откройте URL подписки в браузере на устройстве, где он доступен, скопируйте содержимое (base64 или список ссылок) и вставьте его в поле импорта выше.':'Open the subscription URL in a browser on a device where it is reachable, copy the content (base64 or link list) and paste it into the import field above.',
+  'Проверьте правильность ссылки. Можно также вставить содержимое подписки (base64) или отдельные share-ссылки (vless://, vmess:// и т.д.) в поле импорта.':'Check the link format. You can also paste the subscription body (base64) or individual share links (vless://, vmess://, etc.) into the import field.',
   'запрос отправлен':'request sent','Пресет':'Preset','применён':'applied',
   'Войдите':'Login','Запущен':'Running','Активен':'Active',
   'HincyRay — Панель управления Mihomo':'HincyRay — Mihomo Control Panel',
@@ -2806,7 +2779,7 @@ let profileSortState = { key: null, dir: 'asc' };
 // Map column index → sort key. Must match thead order.
 const PROFILE_SORT_KEYS = [
   null, null, 'name', 'protocol', 'score', null,
-  'last_latency_ms', 'last_download_mbps', 'ewma_score',
+  'last_latency_ms', 'last_download_mbps', 'last_upload_mbps', 'ewma_score',
   'last_jitter_ms', 'last_loss_percent', 'consecutive_failures',
   'cooldown_until_unix', 'transport', 'address'
 ];
@@ -2880,7 +2853,7 @@ function renderProfiles(data) {
     (acc[key] ||= []).push(p);
     return acc;
   }, {});
-  const NUM_COLS = 15; // must match thead
+  const NUM_COLS = 16; // must match thead
   body.innerHTML = Object.entries(groups).map(([group, items]) => {
     const groupAttr = attrEscape(group);
     const groupJs = jsStringAttr(group);
@@ -2889,7 +2862,9 @@ function renderProfiles(data) {
     const arrow = isCollapsed ? '▸' : '▾';
     const sub = subscriptionForGroup(group);
     const subRefresh = sub ? `<button class="btn btn-sm" data-url="${attrEscape(sub.url)}" onclick="refreshSubscriptionByButton(this)">↻</button>` : '';
+    const groupIds = items.map(p => p.id);
     const groupActions = `
+        <button class="btn btn-sm" onclick="benchGroup([${groupIds.join(',')}])" title="${t('Тест группы')}">⚡</button>
         ${subRefresh}
         <button class="btn btn-sm" onclick="shareProfileGroup(${groupJs})">⤴ ${t('Поделиться / QR')}</button>
         <button class="btn-icon btn-sm" onclick="deleteProfileGroup(${groupJs})" title="${t('Удалить подписку?')}">✕</button>`;
@@ -2908,11 +2883,13 @@ function renderProfiles(data) {
     <td class="mono" style="font-weight:600;color:${(p.score??0)>=80?'var(--success)':(p.score??0)>=60?'var(--warning)':'var(--danger)'}">${p.score ?? '—'}</td>
     <td style="white-space:nowrap">
       ${!p.active?`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`:`<span class="badge badge-success">${t('Активен')}</span>`}
+      <button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="${t('Тест сервера')}">⚡</button>
       <button class="btn-icon btn-sm" onclick="editProfileName(${p.id})" title="${t('Переименовать')}">✎</button>
       <button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button>
     </td>
     <td class="mono">${p.last_latency_ms ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
     <td class="mono">${p.last_download_mbps ? p.last_download_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
+    <td class="mono">${p.last_upload_mbps ? p.last_upload_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
     <td class="mono" style="font-size:11px;line-height:1.35">${p.ewma_score != null ? p.ewma_score.toFixed(0) : '—'}<br><span style="color:var(--muted)">${p.ewma_latency_ms != null ? p.ewma_latency_ms.toFixed(0)+'ms' : '—'} · ${p.ewma_download_mbps != null ? p.ewma_download_mbps.toFixed(1)+'Mb' : '—'}</span></td>
     <td class="mono">${p.last_jitter_ms ?? '—'}</td>
     <td class="mono">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
@@ -2951,7 +2928,7 @@ function renderFavorites(data) {
   if (!body) return;
   const favorites = data.filter(p => p.favorite);
   if (!favorites.length) {
-    body.innerHTML = `<tr><td colspan="15" style="color:var(--muted);text-align:center;padding:12px">${t('Нет избранных профилей')}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="16" style="color:var(--muted);text-align:center;padding:12px">${t('Нет избранных профилей')}</td></tr>`;
     return;
   }
   body.innerHTML = favorites.map(p => `<tr style="${p.active?'background:var(--accent-soft)':''}">
@@ -2962,10 +2939,12 @@ function renderFavorites(data) {
     <td class="mono" style="font-weight:600;color:${(p.score??0)>=80?'var(--success)':(p.score??0)>=60?'var(--warning)':'var(--danger)'}">${p.score ?? '—'}</td>
     <td style="white-space:nowrap">
       ${!p.active?`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`:`<span class="badge badge-success">${t('Активен')}</span>`}
+      <button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="${t('Тест сервера')}">⚡</button>
       <button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button>
     </td>
     <td class="mono">${p.last_latency_ms ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
     <td class="mono">${p.last_download_mbps ? p.last_download_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
+    <td class="mono">${p.last_upload_mbps ? p.last_upload_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
     <td class="mono" style="font-size:11px;line-height:1.35">${p.ewma_score != null ? p.ewma_score.toFixed(0) : '—'}<br><span style="color:var(--muted)">${p.ewma_latency_ms != null ? p.ewma_latency_ms.toFixed(0)+'ms' : '—'} · ${p.ewma_download_mbps != null ? p.ewma_download_mbps.toFixed(1)+'Mb' : '—'}</span></td>
     <td class="mono">${p.last_jitter_ms ?? '—'}</td>
     <td class="mono">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
@@ -3043,7 +3022,9 @@ function addProfileByLink(link, group) {
   if (!link || !link.trim()) return showToast('error',t('Вставьте share link профиля'));
   const id = Math.max(...MOCK.profiles.map(p=>p.id)) + 1;
   MOCK.profiles.push({ id, name:'Profile-'+id, protocol:(link.split('://')[0]||'proxy').toUpperCase(), transport:'tcp', address:'new.profile.local', port:443, active:false, group:group||null, block_quic:false, favorite:false, last_latency_ms:null, last_jitter_ms:null, last_download_mbps:null, last_loss_percent:null, ewma_score:null, ewma_latency_ms:null, ewma_download_mbps:null, consecutive_failures:0, cooldown_until_unix:null, score:null, success_count:0, failure_count:0 });
-  api('POST','/api/profiles/add',{raw:link,group:group||undefined}).then(()=>showToast('success',t('Профиль добавлен'))).then(refreshDashboard).catch(()=>{});
+  api('POST','/api/profiles/add',{raw:link,group:group||undefined})
+    .then(()=>{ showToast('success',t('Профиль добавлен')); refreshDashboard(); })
+    .catch(err => showSubscriptionErrorModal(err));
   renderProfiles(MOCK.profiles);
 }
 function addSingleProfileFromProfiles() {
@@ -3731,62 +3712,107 @@ function updateBenchStatus(data) {
   const done = Number(data && (data.completed || data.done || (data.results && data.results.length) || 0)) || 0;
   const current = (data && (data.current_profile || data.current_profile_name || data.current || '—')) || '—';
   const pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
-  document.getElementById('benchProgress').style.display = running || done ? 'block' : 'none';
-  document.getElementById('benchStart').style.display = running ? 'none' : 'inline-flex';
-  document.getElementById('benchStop').style.display = running ? 'inline-flex' : 'none';
-  document.getElementById('benchBar').style.width = pct + '%';
-  document.getElementById('benchCounter').textContent = done + '/' + total;
-  document.getElementById('benchCurrent').textContent = current;
+  const progressEl = document.getElementById('benchProgress');
+  const stopEl = document.getElementById('benchStop');
+  if (progressEl) progressEl.style.display = running || done ? 'block' : 'none';
+  if (stopEl) stopEl.style.display = running ? 'inline-flex' : 'none';
+  const barEl = document.getElementById('benchBar');
+  if (barEl) barEl.style.width = pct + '%';
+  const counterEl = document.getElementById('benchCounter');
+  if (counterEl) counterEl.textContent = done + '/' + total;
+  const currentEl = document.getElementById('benchCurrent');
+  if (currentEl) currentEl.textContent = current;
   const results = data && Array.isArray(data.results) ? data.results : [];
-  if (!running && results.length) {
+  // Summary bar (passed/failed/avg) only for group tests, not single server.
+  const isGroup = window.benchIsGroup !== false;
+  if (!running && results.length && isGroup) {
     const passed = results.filter(r => r.success).length;
     const failed = results.length - passed;
     const avg = results.length ? Math.round(results.reduce((s,r)=>s+(r.latency_ms||0),0)/results.length) : 0;
-    document.getElementById('benchSummary').style.display='grid';
-    document.getElementById('benchPassed').textContent = passed;
-    document.getElementById('benchFailed').textContent = failed;
-    document.getElementById('benchAvg').textContent = avg ? avg + ' ms' : '— ms';
+    const summaryEl = document.getElementById('benchSummary');
+    if (summaryEl) summaryEl.style.display='grid';
+    const passedEl = document.getElementById('benchPassed');
+    if (passedEl) passedEl.textContent = passed;
+    const failedEl = document.getElementById('benchFailed');
+    if (failedEl) failedEl.textContent = failed;
+    const avgEl = document.getElementById('benchAvg');
+    if (avgEl) avgEl.textContent = avg ? avg + ' ms' : '— ms';
+  } else if (!isGroup) {
+    const summaryEl = document.getElementById('benchSummary');
+    if (summaryEl) summaryEl.style.display = 'none';
   }
-  renderBenchResults(results);
+  // Merge bench results into MOCK.profiles and re-render the table so
+  // latency / speed / jitter / loss / score columns update in real time.
+  // EWMA and cooldown are updated by the backend (apply_bench_result) and
+  // will appear after the final refreshDashboard() below.
+  mergeBenchResultsIntoProfiles(results);
   if (!running && benchPoll) { clearInterval(benchPoll); benchPoll = null; refreshDashboard(); }
 }
-function renderBenchResults(results) {
-  const body = document.getElementById('benchResultsBody');
-  const testsBody = document.getElementById('testsBenchBody');
-  if (!results || !results.length) {
-    if (body) body.innerHTML = `<tr><td colspan="8" style="color:var(--muted)">${t('Пока нет результатов')}</td></tr>`;
-    if (testsBody) testsBody.innerHTML = `<tr><td colspan="6" style="color:var(--muted)">${t('Пока нет результатов')}</td></tr>`;
-    return;
+
+/// Update MOCK.profiles in place with the latest bench results and
+/// re-render the profiles + favorites tables so metric columns reflect
+/// the test in real time. Only metrics enabled in the test settings
+/// sliders are updated — disabled metrics keep their previous value.
+function mergeBenchResultsIntoProfiles(results) {
+  if (!results || !results.length) return;
+  const tog = metricToggles();
+  let changed = false;
+  for (const r of results) {
+    const p = MOCK.profiles.find(p => p.id === r.profile_id);
+    if (!p) continue;
+    if (r.success) {
+      if (tog.latency) p.last_latency_ms = r.latency_ms || p.last_latency_ms;
+      if (tog.jitter) p.last_jitter_ms = r.jitter_ms ?? p.last_jitter_ms;
+      if (tog.download) p.last_download_mbps = r.download_mbps || p.last_download_mbps;
+      if (tog.upload) p.last_upload_mbps = r.upload_mbps || p.last_upload_mbps;
+      p.last_loss_percent = r.loss_percent ?? p.last_loss_percent;
+      p.score = r.score ?? p.score;
+    }
+    changed = true;
   }
-  const fullRows = results.map(r => `<tr>
-    <td class="mono">${r.profile_id ?? '—'}</td>
-    <td>${r.profile_name || r.profile_raw || '—'}</td>
-    <td><span class="result-badge ${r.success?'ok':'bad'}">${r.success?t('OK'):t('Ошибка')}</span></td>
-    <td class="mono">${r.latency_ms != null ? r.latency_ms + ' ms' : '—'}</td>
-    <td class="mono">${r.jitter_ms != null ? r.jitter_ms + ' ms' : '—'}</td>
-    <td class="mono">${r.download_mbps ? r.download_mbps.toFixed ? r.download_mbps.toFixed(2)+' Mbps' : r.download_mbps+' Mbps' : '—'}</td>
-    <td class="mono">${r.loss_percent != null ? r.loss_percent + '%' : '—'}</td>
-    <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis">${r.error || ''}</td>
-  </tr>`).join('');
-  if (body) body.innerHTML = fullRows;
-  if (testsBody) testsBody.innerHTML = results.slice(0,20).map(r => `<tr>
-    <td class="mono">${r.profile_id ?? '—'}</td><td>${r.profile_name || '—'}</td>
-    <td><span class="result-badge ${r.success?'ok':'bad'}">${r.success?t('OK'):t('Ошибка')}</span></td>
-    <td class="mono">${r.latency_ms != null ? r.latency_ms + ' ms' : '—'}</td>
-    <td class="mono">${r.download_mbps ? r.download_mbps + ' Mbps' : '—'}</td>
-    <td>${r.error || ''}</td>
-  </tr>`).join('');
+  if (changed) renderProfiles(MOCK.profiles);
 }
 function pollBenchStatus() { api('GET','/api/bench/status').then(updateBenchStatus).catch(()=>{}); }
-function startBench() {
-  const body = {
-    method: document.getElementById('benchMethod').value,
-    probe_url: document.getElementById('benchProbe').value,
-    download_url: document.getElementById('benchDL').value
+
+/// Read which metrics are enabled in the test settings panel.
+/// Controls which fields get updated when merging bench results.
+function metricToggles() {
+  return {
+    latency: document.getElementById('metricLatency')?.checked ?? true,
+    download: document.getElementById('metricDownload')?.checked ?? true,
+    upload: document.getElementById('metricUpload')?.checked ?? false,
+    ewma: document.getElementById('metricEwma')?.checked ?? true,
+    jitter: document.getElementById('metricJitter')?.checked ?? true,
   };
-  document.getElementById('benchProgress').style.display = 'block';
-  document.getElementById('benchStart').style.display = 'none';
-  document.getElementById('benchStop').style.display = 'inline-flex';
+}
+
+/// Benchmark a single profile by id. Uses the method/probe/download settings
+/// from the test settings panel (falls back to defaults if not present).
+function benchOne(id) {
+  startBenchWithIds([id]);
+}
+
+/// Benchmark all profiles in a group/subscription.
+function benchGroup(ids) {
+  if (!ids || !ids.length) return;
+  startBenchWithIds(ids);
+}
+
+function startBenchWithIds(ids) {
+  const tog = metricToggles();
+  const body = {
+    method: document.getElementById('benchMethod')?.value || 'tcp',
+    probe_url: document.getElementById('benchProbe')?.value || '',
+    download_url: document.getElementById('benchDL')?.value || '',
+    upload_url: document.getElementById('benchUL')?.value || '',
+    profile_ids: ids,
+    test_download: tog.download,
+    test_upload: tog.upload,
+  };
+  // Track whether this is a group test (for summary bar visibility).
+  window.benchIsGroup = ids.length > 1;
+  const progressEl = document.getElementById('benchProgress');
+  if (progressEl) progressEl.style.display = 'block';
   api('POST','/api/bench/start', body).then(() => {
     if (benchPoll) clearInterval(benchPoll);
     pollBenchStatus();
@@ -4284,7 +4310,37 @@ function doImport() {
   const text = document.getElementById('importText').value;
   const group = document.getElementById('importGroup').value;
   if(!text.trim()) return showToast('error',t('Вставьте ссылки для импорта'));
-  api('POST','/api/profiles/import',{text,group:group||undefined}).then(()=>showToast('success',t('Импорт запущен')));
+  api('POST','/api/profiles/import',{text,group:group||undefined})
+    .then(()=>showToast('success',t('Импорт запущен')))
+    .catch(err => showSubscriptionErrorModal(err));
+}
+
+/// Display a detailed error modal when subscription fetch or profile
+/// import fails. Detects multi-path fetch errors (containing [direct],
+/// [socks5h], [socks5], [http] labels) and shows actionable advice:
+/// download the subscription body on another device and paste it.
+function showSubscriptionErrorModal(err) {
+  const msg = (err && err.message) ? err.message : String(err);
+  const hasAttempts = msg.includes('[direct]') || msg.includes('[socks5h]') || msg.includes('[socks5]') || msg.includes('[http]');
+  const hint = hasAttempts
+    ? `<div style="padding:14px;background:var(--bg-card);border-radius:8px;border:1px solid var(--border)">
+         <p style="margin:0 0 8px;font-weight:600">${t('Все пути загрузки исчерпаны')}</p>
+         <p style="margin:0 0 8px;font-size:13px;color:var(--text-secondary)">${t('Подписка недоступна ни напрямую, ни через прокси. Возможные причины:')}</p>
+         <ul style="margin:0 0 12px 18px;font-size:13px;color:var(--text-secondary)">
+           <li>${t('RKN блокирует домен подписки напрямую')}</li>
+           <li>${t('Прокси-сервер не может установить TLS с сервером подписки')}</li>
+           <li>${t('Сервер подписки блокирует IP прокси')}</li>
+         </ul>
+         <p style="margin:0;font-size:13px"><strong>${t('Решение:')} </strong>${t('Откройте URL подписки в браузере на устройстве, где он доступен, скопируйте содержимое (base64 или список ссылок) и вставьте его в поле импорта выше.')}</p>
+       </div>`
+    : `<div style="padding:14px;background:var(--bg-card);border-radius:8px;border:1px solid var(--border)">
+         <p style="margin:0;font-size:13px"><strong>${t('Решение:')} </strong>${t('Проверьте правильность ссылки. Можно также вставить содержимое подписки (base64) или отдельные share-ссылки (vless://, vmess:// и т.д.) в поле импорта.')}</p>
+       </div>`;
+  const html = `<div style="display:grid;gap:12px">
+    <pre class="result-pre" style="white-space:pre-wrap;word-break:break-word;max-height:300px;overflow-y:auto">${htmlEscape(msg)}</pre>
+    ${hint}
+  </div>`;
+  showResultModal(t('Ошибка загрузки подписки'), html);
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────
@@ -4480,6 +4536,7 @@ function normalizeProfiles(statsData, profilesData) {
         last_latency_ms: st.last_latency_ms || 0,
         last_jitter_ms: st.last_jitter_ms || 0,
         last_download_mbps: st.last_download_mbps || 0,
+        last_upload_mbps: st.last_upload_mbps || 0,
         last_loss_percent: st.last_loss_percent || 0,
         score: st.score || 0,
         success_count: st.success_count || 0,
@@ -4682,16 +4739,12 @@ function loadTrafficMemory() {
     if (el('tDownTotal')) el('tDownTotal').textContent = fmtBytes(d.total_down_bytes ?? 0);
     if (el('psUp')) el('psUp').textContent = fmtKbps(up);
     if (el('psDown')) el('psDown').textContent = fmtKbps(down);
-    if (el('testsUp')) el('testsUp').textContent = fmtKbps(up);
-    if (el('testsDown')) el('testsDown').textContent = fmtKbps(down);
   }).catch(()=>{});
   api('GET','/api/mihomo-api/memory',undefined,true).then(d => {
     const mem = d.inuse ?? 0;  // Mihomo reports KB
     const el = document.getElementById('psMem');
     if (el) el.textContent = fmtBytes(mem * 1024);
-    const te = document.getElementById('testsMem');
-    if (te) te.textContent = fmtBytes(mem * 1024);
-  }).catch(()=>{ const el = document.getElementById('psMem'); if (el) el.textContent = 'EC off'; const te = document.getElementById('testsMem'); if (te) te.textContent = 'EC off'; });
+  }).catch(()=>{ const el = document.getElementById('psMem'); if (el) el.textContent = 'EC off'; });
 }
 
 function loadUpdateStatus() {

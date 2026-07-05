@@ -32,8 +32,8 @@ use percent_encoding::utf8_percent_encode;
 use qrcode::{QrCode, render::svg};
 
 use crate::benchmark::{
-    BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL, SharedJob,
-    run_bench,
+    BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL,
+    DEFAULT_UPLOAD_URL, SharedJob, run_bench,
 };
 use crate::mihomo_config::{
     DIRECT_NAME, MihomoFeatures, PROXY_NAME, REJECT_NAME, RKN_BYPASS_DEFAULT_INTERVAL,
@@ -995,6 +995,8 @@ pub struct ProfileStats {
     pub last_jitter_ms: u32,
     #[serde(default)]
     pub last_download_mbps: f32,
+    #[serde(default)]
+    pub last_upload_mbps: f32,
     #[serde(default)]
     pub last_loss_percent: f32,
     #[serde(default)]
@@ -2709,76 +2711,113 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// short lock and then used by `load_subscription_for_daemon` outside
 /// the mutex so network I/O does not block the API.
 struct DaemonProxyInfo {
-    socks_url: String,
+    /// `socks5h://host:port` — remote DNS (proxy server resolves hostname).
+    socks5h_url: String,
+    /// `socks5://host:port` — local DNS (router resolves hostname via
+    /// Mihomo fake-ip, then connects to the IP through the proxy).
+    socks5_url: String,
+    /// `http://host:port` — HTTP CONNECT proxy (Mihomo mixed inbound).
+    http_url: Option<String>,
     core_running: bool,
 }
 
 /// Result of `load_subscription_for_daemon`: either a successful
-/// `SubscriptionLoadReport` (regardless of whether direct or proxy
-/// path was used), or the direct error paired with an optional proxy
-/// fallback error. The `direct` error is always present on failure;
-/// `proxy` is `Some` only when a proxy attempt was actually made and
-/// also failed, so callers can build a single combined error string.
+/// `SubscriptionLoadReport`, or a list of all attempted paths with
+/// their errors. Each entry is `(label, error_message)` so callers
+/// can show the user exactly what was tried and why each path failed.
 enum SubscriptionLoadOutcome {
     Ok(crate::profiles::SubscriptionLoadReport),
-    Failed {
-        direct: String,
-        proxy: Option<String>,
-    },
+    Failed { attempts: Vec<(String, String)> },
 }
 
 impl SubscriptionLoadOutcome {
-    fn format_error(direct: &str, proxy: Option<&str>) -> String {
-        match proxy {
-            Some(proxy_err) => format!("{direct}; via proxy: {proxy_err}"),
-            None => direct.to_owned(),
+    /// Format all attempt errors into a single string. When only one
+    /// path was tried, returns the error as-is. When multiple paths
+    /// failed, prefixes each with `[label]` and joins with `; `.
+    fn format_error(attempts: &[(String, String)]) -> String {
+        match attempts.len() {
+            0 => String::new(),
+            1 => attempts[0].1.clone(),
+            _ => attempts
+                .iter()
+                .map(|(label, error)| format!("[{label}] {error}"))
+                .collect::<Vec<_>>()
+                .join("; "),
         }
     }
 }
 
 fn proxy_info_for_daemon(inner: &mut DaemonInner) -> DaemonProxyInfo {
     let core_running = inner.core.is_running();
-    let socks_url = format!(
-        "socks5h://{}:{}",
-        inner.state.listen_host, inner.state.socks_port
-    );
+    let host = &inner.state.listen_host;
+    let socks_port = inner.state.socks_port;
     DaemonProxyInfo {
-        socks_url,
+        socks5h_url: format!("socks5h://{host}:{socks_port}"),
+        socks5_url: format!("socks5://{host}:{socks_port}"),
+        http_url: inner.state.http_port.map(|p| format!("http://{host}:{p}")),
         core_running,
     }
 }
 
-/// Try direct fetch first; on failure, fall back to the local core
-/// SOCKS inbound (`socks5h://127.0.0.1:<socks_port>`) iff the active
-/// core is running. Network I/O happens here, so the caller must NOT
-/// hold the daemon mutex.
+/// Try every available fetch path in order and return the first success
+/// or a collected list of all failures. The order is:
+///
+/// 1. **Direct** (no proxy) — works when the router can reach the URL
+///    directly (e.g. non-RKN-blocked domains).
+/// 2. **SOCKS5h** (remote DNS) — the proxy server resolves the hostname.
+///    Works when the proxy can reach the URL and its DNS is functional.
+/// 3. **SOCKS5** (local DNS) — the router resolves the hostname (via
+///    Mihomo fake-ip DNS) and connects to the IP through the proxy.
+///    Works when the proxy's DNS is broken but the router's Mihomo DNS
+///    can resolve the domain.
+/// 4. **HTTP** (CONNECT proxy) — uses the Mihomo HTTP/mixed inbound if
+///    configured. A different transport that may succeed when SOCKS
+///    fails (e.g. due to TLS interception on SOCKS).
+///
+/// Network I/O happens here, so the caller must NOT hold the daemon mutex.
 fn load_subscription_for_daemon(
     source: &SubscriptionSource,
     proxy_info: &DaemonProxyInfo,
     hwid: &HwidConfig,
 ) -> SubscriptionLoadOutcome {
+    let mut attempts: Vec<(String, String)> = Vec::new();
+
+    // 1. Direct (no proxy)
     match load_subscription_detailed_via_proxy_with_hwid(source, None, hwid) {
-        Ok(report) => SubscriptionLoadOutcome::Ok(report),
-        Err(direct_err) => {
-            if !proxy_info.core_running {
-                return SubscriptionLoadOutcome::Failed {
-                    direct: direct_err,
-                    proxy: None,
-                };
-            }
-            match load_subscription_detailed_via_proxy_with_hwid(
-                source,
-                Some(&proxy_info.socks_url),
-                hwid,
-            ) {
-                Ok(report) => SubscriptionLoadOutcome::Ok(report),
-                Err(proxy_err) => SubscriptionLoadOutcome::Failed {
-                    direct: direct_err,
-                    proxy: Some(proxy_err),
-                },
-            }
+        Ok(report) => return SubscriptionLoadOutcome::Ok(report),
+        Err(err) => attempts.push(("direct".to_owned(), err)),
+    }
+
+    if !proxy_info.core_running {
+        return SubscriptionLoadOutcome::Failed { attempts };
+    }
+
+    // 2. SOCKS5h (remote DNS)
+    match load_subscription_detailed_via_proxy_with_hwid(
+        source,
+        Some(&proxy_info.socks5h_url),
+        hwid,
+    ) {
+        Ok(report) => return SubscriptionLoadOutcome::Ok(report),
+        Err(err) => attempts.push(("socks5h".to_owned(), err)),
+    }
+
+    // 3. SOCKS5 (local DNS — router resolves hostname via Mihomo fake-ip)
+    match load_subscription_detailed_via_proxy_with_hwid(source, Some(&proxy_info.socks5_url), hwid)
+    {
+        Ok(report) => return SubscriptionLoadOutcome::Ok(report),
+        Err(err) => attempts.push(("socks5".to_owned(), err)),
+    }
+
+    // 4. HTTP proxy (if configured — default port 10809)
+    if let Some(http_url) = &proxy_info.http_url {
+        match load_subscription_detailed_via_proxy_with_hwid(source, Some(http_url), hwid) {
+            Ok(report) => return SubscriptionLoadOutcome::Ok(report),
+            Err(err) => attempts.push(("http".to_owned(), err)),
         }
     }
+
+    SubscriptionLoadOutcome::Failed { attempts }
 }
 
 /// v0.13: Check if a request is authorized. Returns true if:
@@ -3153,8 +3192,8 @@ fn handle_import(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
                 incoming.extend(sub_profiles);
                 StoredOutcome::Ok { count }
             }
-            SubscriptionLoadOutcome::Failed { direct, proxy } => {
-                let error = SubscriptionLoadOutcome::format_error(&direct, proxy.as_deref());
+            SubscriptionLoadOutcome::Failed { attempts } => {
+                let error = SubscriptionLoadOutcome::format_error(&attempts);
                 errors.push(error.clone());
                 StoredOutcome::Failed { error }
             }
@@ -3655,6 +3694,20 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(DEFAULT_DOWNLOAD_URL)
         .to_owned();
+    let upload_url = value
+        .get("upload_url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_UPLOAD_URL)
+        .to_owned();
+    let test_download = value
+        .get("test_download")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let test_upload = value
+        .get("test_upload")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     // Decide which profiles to benchmark. Either an explicit `profile_ids`
     // array (single ping if length 1) or all imported profiles.
@@ -3711,7 +3764,10 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         method,
         probe_url,
         download_url,
+        upload_url,
         "xray".to_owned(),
+        test_download,
+        test_upload,
         Arc::clone(&job),
         Arc::clone(&cancel),
         on_result,
@@ -3791,6 +3847,7 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
             stats_entry.last_latency_ms = result.latency_ms;
             stats_entry.last_jitter_ms = result.jitter_ms;
             stats_entry.last_download_mbps = result.download_mbps;
+            stats_entry.last_upload_mbps = result.upload_mbps;
             stats_entry.last_loss_percent = result.loss_percent;
             stats_entry.last_score = result.score;
             stats_entry.last_error = None;
@@ -3849,6 +3906,7 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
                 "last_latency_ms": stat.map(|s| s.last_latency_ms).unwrap_or(0),
                 "last_jitter_ms": stat.map(|s| s.last_jitter_ms).unwrap_or(0),
                 "last_download_mbps": stat.map(|s| s.last_download_mbps).unwrap_or(0.0),
+                "last_upload_mbps": stat.map(|s| s.last_upload_mbps).unwrap_or(0.0),
                 "last_loss_percent": stat.map(|s| s.last_loss_percent).unwrap_or(0.0),
                 "score": stat.map(|s| s.last_score).unwrap_or(0),
                 "success_count": stat.map(|s| s.success_count).unwrap_or(0),
@@ -4040,8 +4098,8 @@ fn handle_profile_add(body: &str, daemon: &Daemon) -> (u16, &'static str, String
                     }
                     sub_outcomes.push((source.clone(), count, None));
                 }
-                SubscriptionLoadOutcome::Failed { direct, proxy } => {
-                    let error = SubscriptionLoadOutcome::format_error(&direct, proxy.as_deref());
+                SubscriptionLoadOutcome::Failed { attempts } => {
+                    let error = SubscriptionLoadOutcome::format_error(&attempts);
                     errors.push(error.clone());
                     sub_outcomes.push((source.clone(), 0, Some(error)));
                 }
@@ -4124,10 +4182,17 @@ fn handle_profile_add(body: &str, daemon: &Daemon) -> (u16, &'static str, String
     }
 
     // ─── Path 3: neither share link nor subscription URL ───
+    // parse_input already tried base64 decoding, so reaching here
+    // means the input is truly unrecognisable. Give the user an
+    // actionable hint.
     (
         400,
         "application/json",
-        json!({"error": "could not parse share link", "candidate_count": parsed.candidates})
+        json!({
+            "error": "could not parse share link or subscription URL",
+            "candidate_count": parsed.candidates,
+            "hint": "Paste a share link (vless://, vmess://, …), a subscription URL (https://…), or the raw base64 body of a subscription."
+        })
             .to_string(),
     )
 }
@@ -4796,8 +4861,8 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
                     error: None,
                 });
             }
-            SubscriptionLoadOutcome::Failed { direct, proxy } => {
-                let error = SubscriptionLoadOutcome::format_error(&direct, proxy.as_deref());
+            SubscriptionLoadOutcome::Failed { attempts } => {
+                let error = SubscriptionLoadOutcome::format_error(&attempts);
                 if let Some(stored) = stored {
                     stored.last_error = Some(error.clone());
                 }
@@ -4990,8 +5055,8 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
             });
             (200, "application/json", response.to_string())
         }
-        SubscriptionLoadOutcome::Failed { direct, proxy } => {
-            let error = SubscriptionLoadOutcome::format_error(&direct, proxy.as_deref());
+        SubscriptionLoadOutcome::Failed { attempts } => {
+            let error = SubscriptionLoadOutcome::format_error(&attempts);
             if let Some(stored) = stored {
                 stored.last_error = Some(error.clone());
             }
@@ -5462,7 +5527,7 @@ fn handle_routing_catalog_refresh(body: &str, daemon: &Daemon) -> (u16, &'static
     };
     let proxy = proxy_info
         .core_running
-        .then_some(proxy_info.socks_url.as_str());
+        .then_some(proxy_info.socks5h_url.as_str());
     match fetch_service_catalog(&source, proxy) {
         Ok(catalog) => (
             200,
@@ -10394,7 +10459,10 @@ fn start_auto_benchmark(daemon: &Daemon) {
         BenchMethod::Tcp,
         DEFAULT_PROBE_URL.to_owned(),
         DEFAULT_DOWNLOAD_URL.to_owned(),
+        DEFAULT_UPLOAD_URL.to_owned(),
         "xray".to_owned(),
+        false,
+        false,
         Arc::clone(&job),
         Arc::clone(&cancel),
         on_result,
@@ -11330,7 +11398,12 @@ mod tests {
         // attempted by load_subscription_for_daemon. The SOCKS URL is
         // built from listen_host + socks_port.
         assert!(!proxy_info.core_running);
-        assert_eq!(proxy_info.socks_url, "socks5h://127.0.0.1:10808");
+        assert_eq!(proxy_info.socks5h_url, "socks5h://127.0.0.1:10808");
+        assert_eq!(proxy_info.socks5_url, "socks5://127.0.0.1:10808");
+        assert_eq!(
+            proxy_info.http_url.as_deref(),
+            Some("http://127.0.0.1:10809")
+        );
     }
 
     #[test]
@@ -11342,15 +11415,132 @@ mod tests {
     }
 
     #[test]
-    fn format_error_combines_direct_and_proxy_messages() {
-        let direct = "https://provider.example/sub/x: connection refused";
-        let proxy = "socks5h://127.0.0.1:10808: connect error";
-        let combined = SubscriptionLoadOutcome::format_error(direct, Some(proxy));
-        assert!(combined.contains(direct));
-        assert!(combined.contains("via proxy"));
-        assert!(combined.contains(proxy));
-        let direct_only = SubscriptionLoadOutcome::format_error(direct, None);
-        assert_eq!(direct_only, direct);
+    fn format_error_combines_multiple_attempt_messages() {
+        // Single attempt → error returned as-is.
+        let single = SubscriptionLoadOutcome::format_error(&[(
+            "direct".to_owned(),
+            "https://provider.example/sub/x: connection refused".to_owned(),
+        )]);
+        assert_eq!(single, "https://provider.example/sub/x: connection refused");
+
+        // Multiple attempts → each prefixed with [label], joined with "; ".
+        let attempts = vec![
+            (
+                "direct".to_owned(),
+                "https://v.example/sub: таймаут (30с): ...".to_owned(),
+            ),
+            (
+                "socks5h".to_owned(),
+                "https://v.example/sub: TLS handshake failed: ...".to_owned(),
+            ),
+            (
+                "socks5".to_owned(),
+                "https://v.example/sub: TLS handshake failed: ...".to_owned(),
+            ),
+        ];
+        let combined = SubscriptionLoadOutcome::format_error(&attempts);
+        assert!(combined.contains("[direct]"));
+        assert!(combined.contains("[socks5h]"));
+        assert!(combined.contains("[socks5]"));
+        assert!(combined.contains("таймаут"));
+        assert!(combined.contains("TLS handshake failed"));
+
+        // Empty → empty string.
+        assert_eq!(SubscriptionLoadOutcome::format_error(&[]), "");
+    }
+
+    #[test]
+    fn load_subscription_for_daemon_core_stopped_only_direct_attempt() {
+        // When the core is NOT running, load_subscription_for_daemon
+        // should try only the "direct" path and return a single
+        // attempt in the Failed variant.
+        let (_dir, daemon) = test_daemon();
+        let mut inner = lock(&daemon.inner);
+        let proxy_info = proxy_info_for_daemon(&mut inner);
+        let hwid = inner.state.hwid_config.clone();
+        drop(inner);
+
+        let source = SubscriptionSource {
+            url: "http://127.0.0.1:1/sub/never".to_owned(),
+        };
+        let outcome = load_subscription_for_daemon(&source, &proxy_info, &hwid);
+        match outcome {
+            SubscriptionLoadOutcome::Failed { attempts } => {
+                assert_eq!(
+                    attempts.len(),
+                    1,
+                    "core stopped → only direct attempt, got {attempts:?}"
+                );
+                assert_eq!(attempts[0].0, "direct");
+            }
+            SubscriptionLoadOutcome::Ok(_) => {
+                panic!("expected failure, got success");
+            }
+        }
+    }
+
+    #[test]
+    fn load_subscription_for_daemon_core_running_tries_all_paths() {
+        // When the core IS running (simulated by constructing
+        // DaemonProxyInfo manually), load_subscription_for_daemon
+        // should try all 4 paths: direct, socks5h, socks5, http.
+        // Since nothing is listening on the test ports, all will fail.
+        let proxy_info = DaemonProxyInfo {
+            socks5h_url: "socks5h://127.0.0.1:1".to_owned(),
+            socks5_url: "socks5://127.0.0.1:1".to_owned(),
+            http_url: Some("http://127.0.0.1:1".to_owned()),
+            core_running: true,
+        };
+        let hwid = crate::profiles::HwidConfig::default();
+        let source = SubscriptionSource {
+            url: "http://127.0.0.1:1/sub/never".to_owned(),
+        };
+        let outcome = load_subscription_for_daemon(&source, &proxy_info, &hwid);
+        match outcome {
+            SubscriptionLoadOutcome::Failed { attempts } => {
+                assert_eq!(
+                    attempts.len(),
+                    4,
+                    "core running → 4 attempts (direct+socks5h+socks5+http), got {attempts:?}"
+                );
+                let labels: Vec<&str> = attempts.iter().map(|(l, _)| l.as_str()).collect();
+                assert_eq!(labels, vec!["direct", "socks5h", "socks5", "http"]);
+            }
+            SubscriptionLoadOutcome::Ok(_) => {
+                panic!("expected all paths to fail, got success");
+            }
+        }
+    }
+
+    #[test]
+    fn load_subscription_for_daemon_no_http_port_tries_three_paths() {
+        // When http_port is None, only 3 paths are tried:
+        // direct, socks5h, socks5.
+        let proxy_info = DaemonProxyInfo {
+            socks5h_url: "socks5h://127.0.0.1:1".to_owned(),
+            socks5_url: "socks5://127.0.0.1:1".to_owned(),
+            http_url: None,
+            core_running: true,
+        };
+        let hwid = crate::profiles::HwidConfig::default();
+        let source = SubscriptionSource {
+            url: "http://127.0.0.1:1/sub/never".to_owned(),
+        };
+        let outcome = load_subscription_for_daemon(&source, &proxy_info, &hwid);
+        match outcome {
+            SubscriptionLoadOutcome::Failed { attempts } => {
+                assert_eq!(
+                    attempts.len(),
+                    3,
+                    "no http port → 3 attempts, got {attempts:?}"
+                );
+                let labels: Vec<&str> = attempts.iter().map(|(l, _)| l.as_str()).collect();
+                assert_eq!(labels, vec!["direct", "socks5h", "socks5"]);
+            }
+            SubscriptionLoadOutcome::Ok(_) => {
+                panic!("expected all paths to fail, got success");
+            }
+        }
     }
 
     #[test]
@@ -11706,15 +11896,15 @@ mod tests {
     #[test]
     fn profile_add_subscription_url_attempts_fetch_not_parse_error() {
         let (_dir, daemon) = test_daemon();
-        // A subscription URL should NOT return "could not parse share link".
-        // It should attempt a network fetch and return a fetch error (502).
+        // A subscription URL should NOT return a parse error. It should
+        // attempt a network fetch and return a fetch error (502).
         let (status, _, body) =
             handle_profile_add(r#"{"raw":"http://127.0.0.1:1/sub/never"}"#, &daemon);
         // 502 = fetch was attempted (correct); 400 with "could not parse" = regression.
         assert_ne!(status, 400);
         let resp: Value = serde_json::from_str(&body).expect("parse response");
         assert!(
-            !body.contains("could not parse share link"),
+            !body.contains("could not parse"),
             "subscription URL must not return parse error"
         );
         // The response should mention the URL in the error.
@@ -11728,7 +11918,9 @@ mod tests {
         let (_dir, daemon) = test_daemon();
         let (status, _, body) = handle_profile_add(r#"{"raw":"not-a-link"}"#, &daemon);
         assert_eq!(status, 400);
-        assert!(body.contains("could not parse share link"));
+        assert!(body.contains("could not parse"));
+        // Should include a hint about acceptable input formats.
+        assert!(body.contains("hint"));
     }
 
     #[test]
@@ -12362,6 +12554,7 @@ mod tests {
             latency_ms: 80,
             jitter_ms: 4,
             download_mbps: 0.0,
+            upload_mbps: 0.0,
             loss_percent: 0.0,
             score: 70,
             success: true,
@@ -12390,6 +12583,7 @@ mod tests {
             latency_ms: 0,
             jitter_ms: 0,
             download_mbps: 0.0,
+            upload_mbps: 0.0,
             loss_percent: 100.0,
             score: 0,
             success: false,
@@ -12424,6 +12618,7 @@ mod tests {
                     latency_ms: 10 + i as u32,
                     jitter_ms: 0,
                     download_mbps: 0.0,
+                    upload_mbps: 0.0,
                     loss_percent: 0.0,
                     score: 50,
                     success: true,

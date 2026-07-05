@@ -1,4 +1,4 @@
-# Project: HincyRay v0.19.4 (crate `xray-vpn-test`)
+# Project: HincyRay v0.19.5 (crate `xray-vpn-test`)
 
 Rust crate shipping two binaries: the `hincyray` router daemon for Keenetic/Entware aarch64 and the `xray-vpn-test` desktop diagnostics app (macOS, feature `desktop`). Current router mode uses Mihomo plus iptables NAT REDIRECT/TPROXY; v0.14 adds diagnostics/recovery, Rule Trace, Sub-Store Lite, Smart Auto-Select 2.0, backups/WebDAV, scheduled maintenance, connection close control, and EC wildcard dial safety. Shared parsing/scoring lives in `src/profiles.rs`, `src/scoring.rs`, and `src/xray_config.rs`.
 
@@ -43,13 +43,131 @@ Tech stack: Rust 2024, Cargo, `eframe/egui` desktop GUI (feature-gated), `reqwes
 * Format: `cargo fmt`
 * Lint full: `cargo clippy --all-targets --all-features`
 * Lint fast daemon profile: `cargo clippy --all-targets --no-default-features --bin hincyray -- -D warnings`
-* Test: `cargo test --all-targets --all-features` (350 tests)
+* Test: `cargo test --all-targets --all-features` (359 tests)
 * Frontend/API contract: `python3 scripts/frontend-contract-test.py`
 * Router E2E after deploy: `HINCYRAY_URL=http://127.0.0.1:8088 scripts/router-e2e.sh` (or set router URL when run remotely)
 * Terminal diagnostics: `hincyray doctor` or `scripts/hincyray-doctor.sh`
 * Run GUI: `cargo run`
 * Release build: `cargo build --release`
 * Cross-compile: `cargo zigbuild --release --no-default-features --bin hincyray --target aarch64-unknown-linux-gnu.2.27` + patchelf `--set-interpreter /opt/lib/ld-linux-aarch64.so.1 --set-rpath /opt/lib`
+
+## Operations: Keenetic Router Access & Deploy
+
+Target device: Keenetic Giga KN-1012 (Entware aarch64). These rules cover SSH access, on-router paths, build/deploy, gates, and GitHub release. Apply on every router-facing task.
+
+### SSH access (expect pattern)
+
+SSH key auth fails in the MCP SSH server (PEM Base64 error), so use `expect` with a password heredoc. Same pattern for SCP (note the `-O` legacy-protocol flag).
+
+SSH command:
+```
+expect <<'EXPECT'
+set timeout 15
+spawn ssh -o StrictHostKeyChecking=no -p 222 root@192.168.1.1 "COMMAND"
+expect {
+    -glob "*password:*" { send -- "keenetic\r"; exp_continue }
+    eof { }
+}
+EXPECT
+```
+
+SCP (file → router):
+```
+expect <<'EXPECT'
+set timeout 60
+spawn scp -O -P 222 local_file root@192.168.1.1:/tmp/remote_file
+expect {
+    -glob "*password:*" { send -- "keenetic\r"; exp_continue }
+    -glob "*100%*" { }
+    eof { }
+}
+EXPECT
+```
+
+### Router paths & services
+
+| Purpose | Path / value |
+|---|---|
+| Binary | `/opt/sbin/hincyray` |
+| Init script | `/opt/etc/init.d/S99hincyray` |
+| State | `/opt/etc/hincyray/state.json` |
+| Mihomo config | `/opt/etc/hincyray/mihomo-config.yaml` |
+| Geo dir (geoip.metadb here) | `/opt/etc/hincyray` |
+| Binary backup | `/opt/sbin/hincyray.bak` |
+| Daemon API | `http://127.0.0.1:8088` |
+| Mihomo EC | `127.0.0.1:9090`, secret `hincyray2026` |
+| SOCKS port | `10808` |
+| HTTP (mixed) port | `10809` |
+| Redir port (TCP) | `10810` |
+| Tproxy port (UDP) | `10811` |
+
+Daemon control on router: start `/opt/etc/init.d/S99hincyray start`; stop `kill $(pgrep -f /opt/sbin/hincyray)`.
+
+### Router toolchain constraints
+
+Missing: `python3`, `bc`, `timeout`, `iw`, `iwconfig`. Available: `jq`, `awk`, `curl`, `iperf3`, `nc`, `find`, `sha256sum`. Do not assume GNU coreutils semantics (BusyBox). No `timeout` → use `curl --max-time` or background+pkill for deadline control.
+
+### Build & deploy
+
+```
+# Build (macOS host)
+cargo zigbuild --release --no-default-features --bin hincyray --target aarch64-unknown-linux-gnu.2.27
+patchelf --set-interpreter /opt/lib/ld-linux-aarch64.so.1 --set-rpath /opt/lib \
+    target/aarch64-unknown-linux-gnu/release/hincyray
+shasum -a 256 target/aarch64-unknown-linux-gnu/release/hincyray
+
+# Deploy: SCP binary to /tmp/hincyray-new, then on router via SSH:
+#   cp /opt/sbin/hincyray /opt/sbin/hincyray.bak
+#   cp /tmp/hincyray-new /opt/sbin/hincyray && chmod +x /opt/sbin/hincyray
+#   sha256sum /opt/sbin/hincyray   # must match the local shasum
+#   /opt/etc/init.d/S99hincyray start
+#   curl -s http://127.0.0.1:8088/api/health   # expect {"version":"0.19.5"}
+```
+
+Always back up the running binary to `.bak` before overwriting, and verify the on-router SHA256 matches the local build before starting the daemon.
+
+### Gates (all green before any commit)
+
+```
+cargo fmt --all --check
+cargo check --all-targets --all-features
+cargo clippy --all-targets --no-default-features --bin hincyray -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+python3 scripts/frontend-contract-test.py
+git diff --check
+```
+
+Current gate status: all green, 359 tests, 0 clippy warnings.
+
+### GitHub release
+
+Release token lives at `/Users/lain/Documents/токен телега.rtf`. **NEVER write the token contents into AGENTS.md, source, or commits** — reference it only by loading at call time:
+```
+GH_TOKEN="$(cat '/Users/lain/Documents/токен телега.rtf')" gh release create v0.19.5 \
+    target/aarch64-unknown-linux-gnu/release/hincyray \
+    --title "v0.19.5" --notes "..."
+```
+
+### v0.19.5 release status
+
+Released. All changes committed, tagged, pushed, and published to GitHub.
+
+v0.19.5 includes two major feature areas:
+
+**1. Subscription fetch resilience:**
+* `profiles.rs` — `fetch_subscription`: 30s timeout + 10s connect_timeout + `classify_http_error()` turning `reqwest::Error` into human messages ("таймаут (30с)", "TLS handshake failed", "DNS не разрешён", …).
+* `profiles.rs` — `parse_input` base64 fallback: zero profiles/subscriptions/placeholders → `decode_subscription_body()` → rescan. `scan_candidates()` split out.
+* `hincyray.rs` — multi-path fetch (4 paths: direct → socks5h → socks5 → http). `DaemonProxyInfo` with `socks5h_url`/`socks5_url`/`http_url`/`core_running`. `SubscriptionLoadOutcome::Failed { attempts: Vec<(String, String)> }`. `format_error()` prefixes each attempt with `[direct]`/`[socks5h]`/`[socks5]`/`[http]`.
+* `hincyray.rs` — `handle_profile_add` path 3: "could not parse share link or subscription URL" + `hint` field.
+* `webui/index.html` — `showSubscriptionErrorModal()` detects the `[direct]/[socks5h]/[socks5]/[http]` labels, shows a modal with advice; 9 i18n entries; `.catch(err => showSubscriptionErrorModal(err))` on `addProfileByLink` and `doImport`.
+
+**2. Testing UI overhaul + upload speed:**
+* `benchmark.rs` — `run_speed_via_mihomo()` spawns a temporary mihomo instance for download+upload speed testing when the latency method is TCP or HEAD (which don't measure speed). `curl_upload()` pipes 5MB through curl stdin via POST to Cloudflare `__up`, accepts HTTP `100 Continue` as valid, handles timeout-with-data (rc=28). `BenchResult`/`Metrics` gain `upload_mbps` field. `run_bench()` signature extended with `upload_url`, `test_download`, `test_upload` params. `DEFAULT_UPLOAD_URL` constant.
+* `hincyray.rs` — `ProfileStats.last_upload_mbps` field. `handle_bench_start` parses `test_download`, `test_upload`, `upload_url` from request body. `apply_bench_result` and `handle_stats` updated for upload metric.
+* `webui/index.html` — Removed `benchmark` section and `ov-tests` Overview section. Added collapsible "Настройки тестирования" panel in Profiles section (method select, probe/download/upload URLs). ⚡ buttons on each profile row (`benchOne`) and group header (`benchGroup`). `mergeBenchResultsIntoProfiles()` merges bench results into MOCK.profiles in real-time. `metricToggles()` controls which metrics get tested (latency/download/upload/ewma/jitter). Summary bar only for group tests. "Отдача" column added to profiles and favorites tables (NUM_COLS 15→16). `PROFILE_SORT_KEYS` updated for upload metric.
+
+E2E on Keenetic Giga verified: `/api/health` → `{"version":"0.19.5"}`; TCP bench profile #4: latency=32ms, download=2.90 Mbps, upload=7.35 Mbps; `/api/stats` returns `last_upload_mbps: 7.35`; subscription multi-path fetch all 4 paths reported; base64 import 12 profiles, 84 total. 359 tests, 0 clippy warnings.
 
 ## Notes
 
@@ -58,6 +176,7 @@ Tech stack: Rust 2024, Cargo, `eframe/egui` desktop GUI (feature-gated), `reqwes
 * Subscription bodies are tried as plain text and common base64 variants.
 * Happ/TutNet Xray-style JSON with DNS-over-HTTPS URLs is parsed via the `outbounds` fallback when no direct profiles are found.
 * Do not add OS-specific APIs unless guarded behind a cross-platform boundary.
+* v0.19.5 adds: subscription fetch resilience — `fetch_subscription` gets 30s timeout + 10s connect_timeout + `classify_http_error()` (turns `reqwest::Error` into human messages). `parse_input` base64 fallback: zero candidates → `decode_subscription_body()` → rescan (`scan_candidates()` split out). Router daemon multi-path fetch (4 paths: direct → socks5h → socks5 → http) with `DaemonProxyInfo`, `SubscriptionLoadOutcome::Failed { attempts: Vec<(String, String)> }`, `format_error()` prefixing each attempt with `[direct]/[socks5h]/[socks5]/[http]`. `handle_profile_add` path 3 returns `hint` field. Web UI `showSubscriptionErrorModal()` detects path labels, shows advice modal, 9 i18n entries, wired on `addProfileByLink` and `doImport`. Testing UI overhaul + upload speed: `run_speed_via_mihomo()` spawns temp mihomo for download+upload speed testing when method is TCP/HEAD. `curl_upload()` pipes 5MB via curl stdin POST to Cloudflare `__up`, accepts HTTP `100 Continue` as valid, handles timeout-with-data (rc=28). `BenchResult`/`Metrics` gain `upload_mbps` field. `run_bench()` extended with `upload_url`, `test_download`, `test_upload` params. `ProfileStats.last_upload_mbps` field. `handle_bench_start` parses `test_download`/`test_upload`/`upload_url` from request body. Web UI: removed `benchmark` section and `ov-tests` Overview section, added collapsible "Настройки тестирования" panel in Profiles section (method select, probe/download/upload URLs), ⚡ buttons on each profile row (`benchOne`) and group header (`benchGroup`), `mergeBenchResultsIntoProfiles()` merges bench results in real-time, `metricToggles()` controls which metrics get tested (latency/download/upload/ewma/jitter), summary bar only for group tests, "Отдача" column added to profiles and favorites tables (NUM_COLS 15→16), `PROFILE_SORT_KEYS` updated for upload metric. E2E on Keenetic Giga: `/api/health` 0.19.5, TCP bench profile #4 latency=32ms download=2.90 Mbps upload=7.35 Mbps, `/api/stats` returns `last_upload_mbps: 7.35`, all 4 fetch paths reported, base64 import 12 profiles, 84 total. 359 tests, 0 clippy warnings.
 * v0.19.3 emergency hotfix: Removed the periodic heavyweight `refreshDashboard()` loop after it caused a Web UI request storm and multi-second admin latency on Keenetic. Periodic polling is now limited to lightweight `/api/system` + `/api/memory-guard` every 3s and `/api/status` every 5s. Frontend contract test forbids `setInterval(refreshDashboard...)` / `hrDashboardRefreshInterval` to prevent regression. v0.19.2 GitHub release should be considered bad for router deployment; use v0.19.3+.
 * v0.19.2 hotfix: System hardware/resource metrics refresh through an exception-safe lightweight 3s heartbeat (`/api/system` + `/api/memory-guard`) registered at the start of Web UI init, so later UI init errors cannot freeze the first snapshot. The Memory card is clickable/keyboard-accessible and opens a live breakdown with Linux memory summary, Mihomo/HincyRay RSS, top RSS processes, and Memory Guard warnings. Frontend contract test now requires the refresh loop, memory breakdown entrypoint, and new memory DOM targets. 350 tests, 0 clippy warnings.
 * v0.19.1 hotfix: System page visibly renders the hardware/resource metrics and removes the dead sidebar Hardware item; `POST /api/mihomo-config/validate` is bounded with state-lock release, 8s deadline, captured stdout/stderr, and kill-on-timeout so a hung `mihomo -t` cannot block the daemon API. Frontend contract test now rejects nav entries without panels/NAV_MAP entries and verifies System renderer DOM IDs. 350 tests, 0 clippy warnings.

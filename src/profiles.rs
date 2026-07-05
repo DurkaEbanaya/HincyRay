@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
@@ -245,10 +246,14 @@ pub fn parse_profiles(input: &str) -> Vec<Profile> {
     output.profiles
 }
 
-pub fn parse_input(input: &str) -> ParseOutput {
+/// Core candidate-scanning logic shared by `parse_input` and its
+/// base64 fallback path. Splits `text` into candidates, classifies
+/// each as profile / subscription URL / unsupported placeholder, and
+/// tries JSON `outbounds` parsing as a last resort.
+fn scan_candidates(text: &str) -> ParseOutput {
     let mut output = ParseOutput::default();
 
-    let candidates = extract_candidates(input);
+    let candidates = extract_candidates(text);
     output.candidates = candidates.len();
 
     for candidate in candidates {
@@ -264,13 +269,39 @@ pub fn parse_input(input: &str) -> ParseOutput {
     }
 
     if output.profiles.is_empty() {
-        let json_profiles = parse_json_profiles(input);
+        let json_profiles = parse_json_profiles(text);
         if !json_profiles.is_empty() {
             // Candidate scan picks up DNS-over-HTTPS and other URLs embedded in
             // Xray-style JSON; once outbounds parse into real profiles, those URLs
             // are not subscription sources, so drop the false positives.
             output.profiles = json_profiles;
             output.subscriptions.clear();
+        }
+    }
+
+    output
+}
+
+pub fn parse_input(input: &str) -> ParseOutput {
+    let mut output = scan_candidates(input);
+
+    // Base64 fallback: if nothing was found, the user may have pasted
+    // the raw base64 body of a subscription (e.g. downloaded on another
+    // device where the URL is unreachable). Try to decode and re-scan.
+    // This is safe from infinite loops because share links contain `:`
+    // which is not a valid base64 character, so a second decode of the
+    // decoded text will fail and return the original — stopping the
+    // fallback.
+    if output.profiles.is_empty()
+        && output.subscriptions.is_empty()
+        && output.unsupported_placeholders == 0
+    {
+        let decoded = decode_subscription_body(input);
+        if decoded != input {
+            let decoded_output = scan_candidates(&decoded);
+            if !decoded_output.profiles.is_empty() || !decoded_output.subscriptions.is_empty() {
+                output = decoded_output;
+            }
         }
     }
 
@@ -340,7 +371,10 @@ fn fetch_subscription(
         SubscriptionRequestMode::SingBox => subscription_user_agent().to_owned(),
         SubscriptionRequestMode::HappAndroid => hwid.user_agent(),
     };
-    let mut builder = reqwest::blocking::Client::builder().user_agent(user_agent);
+    let mut builder = reqwest::blocking::Client::builder()
+        .user_agent(user_agent)
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10));
     if let Some(proxy_url) = proxy {
         // `Proxy::all` validates the URL before any network I/O, so a
         // malformed proxy surfaces here without touching the network.
@@ -364,11 +398,57 @@ fn fetch_subscription(
 
     request
         .send()
-        .map_err(|error| format!("{}: {error}", source.url))?
+        .map_err(|error| classify_http_error(&source.url, &error))?
         .error_for_status()
-        .map_err(|error| format!("{}: {error}", source.url))?
+        .map_err(|error| classify_http_error(&source.url, &error))?
         .text()
-        .map_err(|error| format!("{}: {error}", source.url))
+        .map_err(|error| classify_http_error(&source.url, &error))
+}
+
+/// Turn a `reqwest::Error` into a human-readable string that explains
+/// *why* the request failed (DNS, TLS, timeout, connection refused,
+/// HTTP status, body decode, etc.) so the user can act on it.
+fn classify_http_error(url: &str, error: &reqwest::Error) -> String {
+    let detail = error.to_string();
+    let detail_lower = detail.to_ascii_lowercase();
+    let category = if error.is_timeout() {
+        "таймаут (30с)"
+    } else if error.is_connect() {
+        if detail_lower.contains("dns")
+            || detail_lower.contains("resolve")
+            || detail_lower.contains("name resolution")
+            || detail_lower.contains("no such host")
+        {
+            "DNS не разрешён"
+        } else if detail_lower.contains("tls")
+            || detail_lower.contains("ssl")
+            || detail_lower.contains("handshake")
+            || detail_lower.contains("unexpected eof")
+        {
+            "TLS handshake failed"
+        } else if detail_lower.contains("refused") || detail_lower.contains("reset") {
+            "соединение отклонено"
+        } else {
+            "ошибка подключения"
+        }
+    } else if error.is_status() {
+        return format!(
+            "{}: HTTP {}",
+            url,
+            error.status().map(|s| s.as_u16()).unwrap_or(0)
+        );
+    } else if error.is_body() {
+        "ошибка чтения тела ответа"
+    } else if error.is_decode() {
+        "ошибка декодирования ответа"
+    } else if error.is_redirect() {
+        "слишком много редиректов"
+    } else if error.is_request() {
+        "ошибка формирования запроса"
+    } else {
+        "сетевая ошибка"
+    };
+    format!("{url}: {category}: {detail}")
 }
 
 fn parse_subscription_response(response: &str) -> (String, ParseOutput) {
@@ -1377,5 +1457,55 @@ https://provider.example/sub/token-b}"#;
         );
         assert_eq!(output.profiles.len(), 1);
         assert_eq!(output.profiles[0].name, "TUIC_NoPass");
+    }
+
+    #[test]
+    fn parse_input_decodes_base64_subscription_body() {
+        // When the user pastes the raw base64 body of a subscription
+        // (e.g. downloaded on another device where the URL is
+        // unreachable), parse_input should decode it and find the
+        // share links inside.
+        let body = "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#ServerA\ntrojan://secretpass@example.com:443?security=tls#ServerB";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
+        let output = parse_input(&encoded);
+        assert_eq!(output.profiles.len(), 2);
+        assert_eq!(output.profiles[0].name, "ServerA");
+        assert_eq!(output.profiles[1].name, "ServerB");
+    }
+
+    #[test]
+    fn parse_input_decodes_base64_subscription_url() {
+        // Base64 body that decodes to a subscription URL should be
+        // detected as a subscription, not a profile.
+        let body = "https://provider.example/sub/token";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
+        let output = parse_input(&encoded);
+        assert_eq!(output.profiles.len(), 0);
+        assert_eq!(output.subscriptions.len(), 1);
+        assert_eq!(output.subscriptions[0].url, body);
+    }
+
+    #[test]
+    fn parse_input_does_not_falsely_decode_garbage_as_base64() {
+        // Short garbage strings that happen to be valid base64 but
+        // decode to non-share-link bytes should not produce profiles.
+        // "not-a-link" is valid URL-safe base64 but decodes to
+        // non-UTF8 bytes, so decode_subscription_body returns the
+        // original string and parse_input finds nothing.
+        let output = parse_input("not-a-link");
+        assert_eq!(output.profiles.len(), 0);
+        assert_eq!(output.subscriptions.len(), 0);
+    }
+
+    #[test]
+    fn parse_input_base64_fallback_respects_unsupported_placeholder() {
+        // If the raw input contains an unsupported placeholder, the
+        // base64 fallback must not trigger (unsupported_placeholders > 0).
+        let placeholder =
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#unsupported";
+        let output = parse_input(placeholder);
+        assert_eq!(output.profiles.len(), 0);
+        assert_eq!(output.unsupported_placeholders, 1);
+        assert_eq!(output.subscriptions.len(), 0);
     }
 }
