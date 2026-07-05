@@ -1,4 +1,4 @@
-# HincyRay v0.19.3
+# HincyRay v0.19.4
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,10 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.19.4
+
+Fluent Reveal spotlight effect fixed (var() in radial-gradient was not resolving) and extended to buttons, chips, section headers, select triggers, and tabs. `/api/profiles/add` now accepts subscription URLs, not just share links — pasting a subscription URL fetches and imports all profiles instead of returning a parse error.
 
 ### v0.19.3
 

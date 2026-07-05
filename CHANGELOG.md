@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.19.4 - 2026-07-05
+
+- Fluent Reveal spotlight effect fixed and extended to all interactive elements:
+  - Root cause fix: `var()` inside `radial-gradient()` position was not resolving in some browsers, making the spotlight static at 50%/50% (looked like a flat fill).
+  - Moved `var()` to `left`/`top` + `transform:translate(-50%,-50%)` for reliable cross-browser cursor tracking.
+  - Extended Reveal from sidebar nav to buttons (`.btn`), chips (`.chip`), section headers (`.section-header`), custom select triggers/options, sub-tabs, and nav flyout items.
+  - `btn-accent` gets a light spotlight (`var(--bg) 24%`) for visibility on blue background.
+  - Switched `mousemove` to `pointermove` (touch + mouse). Handler moved to start of `init()` so async errors cannot prevent registration.
+- `/api/profiles/add` now accepts subscription URLs, not just share links. When a user pastes `https://provider.example/sub/<token>`, the endpoint fetches and imports all profiles from the subscription (direct + proxy fallback), instead of returning "could not parse share link". The subscription source is also persisted for later refresh.
+- Frontend contract test updated with new Reveal selectors and `pointermove` marker.
+- Tests: 352 passed, 0 clippy warnings.
+
 ## v0.19.3 - 2026-07-04
 
 - Emergency Web UI performance fix: removed the periodic heavyweight `refreshDashboard()` loop that fanned out across profiles, routing, subscriptions, backups, DNS, HWID, auth, update status, traffic, connection log, and Mihomo EC endpoints every 5 seconds.
