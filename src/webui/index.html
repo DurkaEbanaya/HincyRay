@@ -241,9 +241,10 @@ table{border-collapse:collapse;width:100%}
   position:relative;transition:color .1s ease;
 }
 .nav-group-header::before{
-  content:'';position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;
-  background:radial-gradient(120px circle at var(--rx,50%) var(--ry,50%),
-    color-mix(in srgb,var(--fg) 8%,transparent),transparent 70%);
+  content:'';position:absolute;width:160px;height:160px;
+  left:var(--rx,50%);top:var(--ry,50%);transform:translate(-50%,-50%);
+  z-index:0;pointer-events:none;opacity:0;
+  background:radial-gradient(circle,color-mix(in srgb,var(--fg) 14%,transparent),transparent 65%);
   transition:opacity .15s ease;
 }
 .nav-group-header:hover::before{opacity:1}
@@ -262,9 +263,10 @@ table{border-collapse:collapse;width:100%}
   position:relative;transition:color .1s ease;
 }
 .nav-sub-item::before{
-  content:'';position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;
-  background:radial-gradient(100px circle at var(--rx,50%) var(--ry,50%),
-    color-mix(in srgb,var(--fg) 8%,transparent),transparent 70%);
+  content:'';position:absolute;width:140px;height:140px;
+  left:var(--rx,50%);top:var(--ry,50%);transform:translate(-50%,-50%);
+  z-index:0;pointer-events:none;opacity:0;
+  background:radial-gradient(circle,color-mix(in srgb,var(--fg) 12%,transparent),transparent 65%);
   transition:opacity .15s ease;
 }
 .nav-sub-item:hover::before{opacity:1}
@@ -272,8 +274,7 @@ table{border-collapse:collapse;width:100%}
 .nav-sub-item>*{position:relative;z-index:1}
 .nav-sub-item.active{color:var(--accent);font-weight:600}
 .nav-sub-item.active::before{
-  background:radial-gradient(100px circle at var(--rx,50%) var(--ry,50%),
-    color-mix(in srgb,var(--accent) 12%,transparent),transparent 70%);
+  background:radial-gradient(circle,color-mix(in srgb,var(--accent) 16%,transparent),transparent 65%);
   opacity:1;
 }
 .sidebar.collapsed .nav-group-header{padding:8px 0;justify-content:center}
@@ -286,9 +287,10 @@ table{border-collapse:collapse;width:100%}
   user-select:none;white-space:nowrap;overflow:hidden;position:relative;
 }
 .nav-item::before{
-  content:'';position:absolute;inset:0;z-index:0;pointer-events:none;opacity:0;
-  background:radial-gradient(120px circle at var(--rx,50%) var(--ry,50%),
-    color-mix(in srgb,var(--fg) 10%,transparent),transparent 70%);
+  content:'';position:absolute;width:160px;height:160px;
+  left:var(--rx,50%);top:var(--ry,50%);transform:translate(-50%,-50%);
+  z-index:0;pointer-events:none;opacity:0;
+  background:radial-gradient(circle,color-mix(in srgb,var(--fg) 14%,transparent),transparent 65%);
   transition:opacity .15s ease;
 }
 .nav-item:hover::before{opacity:1}
@@ -296,8 +298,7 @@ table{border-collapse:collapse;width:100%}
 .nav-item>*{position:relative;z-index:1}
 .nav-item.active{color:var(--accent);font-weight:600;border-left-color:var(--accent)}
 .nav-item.active::before{
-  background:radial-gradient(120px circle at var(--rx,50%) var(--ry,50%),
-    color-mix(in srgb,var(--accent) 14%,transparent),transparent 70%);
+  background:radial-gradient(circle,color-mix(in srgb,var(--accent) 16%,transparent),transparent 65%);
   opacity:1;
 }
 .sidebar.collapsed .nav-item{padding:8px 0;justify-content:center;border-left-width:0}
@@ -496,6 +497,21 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .metro-label{font-weight:600;color:var(--fg);margin-bottom:4px;white-space:nowrap}
 .metro-detail{font-family:var(--font-mono);font-size:11px;line-height:1.35;word-break:break-word;color:var(--muted)}
 .metro-summary{padding:10px 12px;border:1px solid var(--border);background:var(--fg-soft);font-size:13px;margin-bottom:10px}
+
+/* ═══ FLUENT REVEAL — INTERACTIVE ELEMENTS ═══ */
+.btn,.chip,.section-header,.custom-select-trigger,.custom-select-option,.sub-tab,.nav-flyout-item{
+  position:relative;overflow:hidden;
+}
+.btn::before,.chip::before,.section-header::before,.custom-select-trigger::before,.custom-select-option::before,.sub-tab::before,.nav-flyout-item::before{
+  content:'';position:absolute;width:140px;height:140px;
+  left:var(--rx,50%);top:var(--ry,50%);transform:translate(-50%,-50%);
+  z-index:0;pointer-events:none;opacity:0;
+  background:radial-gradient(circle,color-mix(in srgb,var(--fg) 10%,transparent),transparent 60%);
+  transition:opacity .15s ease;
+}
+.btn:hover::before,.chip:hover::before,.section-header:hover::before,.custom-select-trigger:hover::before,.custom-select-option:hover::before,.sub-tab:hover::before,.nav-flyout-item:hover::before{opacity:1}
+.btn-accent::before{background:radial-gradient(circle,color-mix(in srgb,var(--bg) 24%,transparent),transparent 60%)}
+.btn>*,.chip>* ,.section-header>*{position:relative;z-index:1}
 
 /* ═══ ACRYLIC CONTROL (inline in Admin section) ═══ */
 .acrylic-control{display:grid;grid-template-columns:92px 1fr 42px;align-items:center;gap:10px;margin:8px 0}
@@ -4775,6 +4791,21 @@ function startAutoRefreshLoops() {
 }
 
 function init() {
+  // Fluent Reveal: register spotlight tracking FIRST, before any async UI
+  // init that could throw and prevent the handler from being attached.
+  document.querySelectorAll(
+    '.nav-group-header, .nav-sub-item, .nav-item, ' +
+    '.btn, .chip, .section-header, ' +
+    '.custom-select-trigger, .custom-select-option, ' +
+    '.sub-tab, .nav-flyout-item'
+  ).forEach(item => {
+    item.addEventListener('pointermove', e => {
+      const r = item.getBoundingClientRect();
+      item.style.setProperty('--rx', (e.clientX - r.left) + 'px');
+      item.style.setProperty('--ry', (e.clientY - r.top) + 'px');
+    });
+  });
+
   // Start periodic refresh loops first. A later UI initialization error must not
   // leave resource metrics stuck at the first page-load snapshot.
   startAutoRefreshLoops();
@@ -4802,15 +4833,6 @@ function init() {
   const savedSection = localStorage.getItem('hr_current_section');
   if (savedSection && NAV_MAP[savedSection]) navTo(savedSection);
   else { renderSubTabs('overview','ov-system'); }
-
-  // Fluent Reveal: spotlight follows cursor on nav groups + sub-items
-  document.querySelectorAll('.nav-group-header, .nav-sub-item').forEach(item => {
-    item.addEventListener('mousemove', e => {
-      const r = item.getBoundingClientRect();
-      item.style.setProperty('--rx', (e.clientX - r.left) + 'px');
-      item.style.setProperty('--ry', (e.clientY - r.top) + 'px');
-    });
-  });
 
   // Mobile: hide bottom-nav on scroll down, show on scroll up
   const mainEl = document.querySelector('.main');

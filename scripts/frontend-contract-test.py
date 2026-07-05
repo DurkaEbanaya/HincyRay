@@ -54,6 +54,8 @@ REQUIRED_MARKERS = [
     "function showMemoryBreakdown()",
     "hrSystemRefreshInterval",
     "hrStatusRefreshInterval",
+    ".btn, .chip, .section-header,",
+    "addEventListener('pointermove'",
 ]
 
 FORBIDDEN_MARKERS = [
