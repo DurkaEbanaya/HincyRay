@@ -750,10 +750,17 @@ fn default_smux_protocol() -> String {
 
 /// Tag/name constants used in generated Mihomo configs.
 pub const PROXY_NAME: &str = "proxy";
+pub const PROXY_ACTIVE_NAME: &str = "proxy-active";
 pub const DIRECT_NAME: &str = "DIRECT";
 pub const REJECT_NAME: &str = "REJECT";
 pub const REDIR_LISTENER: &str = "redir-in";
 pub const TPROXY_LISTENER: &str = "tproxy-in";
+
+/// Health-check URL for the direct-fallback proxy group. Mihomo probes
+/// this URL **through the proxy** to determine availability. When the
+/// probe fails, mihomo automatically falls back to DIRECT — preventing
+/// connection storms when the upstream proxy is unreachable.
+const FALLBACK_HEALTH_URL: &str = "https://www.gstatic.com/generate_204";
 
 /// v0.17: Default URL for the RKN bypass rule provider.
 /// `itworksig/rublacklist` is auto-updated via GitHub Actions and
@@ -1104,16 +1111,21 @@ fn build_proxy_groups_json(
     };
     group["type"] = json!(group_type_str);
 
-    // DIRECT is only included in "select" groups where the user can
-    // manually choose it. In url-test / fallback / load-balance groups,
-    // DIRECT would always win the latency test (direct connection is
-    // always faster than any VPN), defeating the purpose of the group.
+    // DIRECT is included in "select" groups (user can manually choose
+    // it) and as a last-resort in "fallback" groups (so traffic goes
+    // direct when all proxies are unreachable, preventing storms).
+    // In url-test / load-balance groups DIRECT is excluded because it
+    // would always win the latency test (direct is always faster than
+    // any VPN), defeating the purpose of the group.
     let mut proxies = Vec::new();
     if group_config.group_type == ProxyGroupType::Select {
         proxies.push(DIRECT_NAME.to_owned());
     }
     proxies.extend(proxy_names.iter().cloned());
     proxies.extend(extra_group_names.iter().cloned());
+    if group_config.group_type == ProxyGroupType::Fallback {
+        proxies.push(DIRECT_NAME.to_owned());
+    }
     group["proxies"] = json!(proxies);
 
     if group_config.group_type == ProxyGroupType::UrlTest {
@@ -1294,14 +1306,17 @@ pub fn build_mihomo_router_config(
     extra: &RouterExtra,
     features: &MihomoFeatures,
 ) -> Result<String, String> {
-    // When proxy groups are enabled, the active profile is named
-    // "proxy-active" and a proxy group named "proxy" wraps all
-    // profiles — so existing rules referencing PROXY_NAME still work.
-    let active_proxy_name = if features.proxy_group.enabled {
-        "proxy-active".to_owned()
-    } else {
-        PROXY_NAME.to_owned()
-    };
+    // The active profile outbound is always named "proxy-active".
+    // A fallback proxy group named "proxy" wraps it with DIRECT as a
+    // last-resort destination — so when the upstream proxy is
+    // unreachable, mihomo automatically routes traffic direct instead
+    // of timing out every connection (which causes a storm that can
+    // OOM the router). When the proxy recovers, mihomo switches back.
+    //
+    // When the user has explicitly enabled proxy groups (url-test /
+    // fallback / load-balance / select), those groups are used instead
+    // and the direct-fallback is merged into them.
+    let active_proxy_name = PROXY_ACTIVE_NAME.to_owned();
 
     let mut proxies = vec![build_proxy(active_profile, &active_proxy_name)?];
     for (profile, name) in extra_profiles {
@@ -1441,6 +1456,20 @@ pub fn build_mihomo_router_config(
         if let Some(groups) = build_proxy_groups_json(&features.proxy_group, &proxy_names, &[]) {
             config["proxy-groups"] = groups;
         }
+    } else {
+        // Direct-fallback: when proxy groups are not explicitly enabled,
+        // wrap the single active proxy in a `fallback` group with DIRECT
+        // as the last resort. This prevents connection storms when the
+        // upstream proxy is unreachable — mihomo automatically routes
+        // traffic direct instead of timing out every connection.
+        config["proxy-groups"] = json!([{
+            "name": PROXY_NAME,
+            "type": "fallback",
+            "proxies": [active_proxy_name, DIRECT_NAME],
+            "url": FALLBACK_HEALTH_URL,
+            "interval": 30,
+            "timeout": 5000,
+        }]);
     }
 
     // Proxy providers — Mihomo fetches subscriptions itself.
@@ -4486,17 +4515,35 @@ mod tests {
     #[test]
     fn proxy_group_disabled_uses_single_proxy_name() {
         let config = build_test_router_config(&default_features());
-        // When proxy groups disabled, active proxy is named "proxy"
+        // When proxy groups disabled, active proxy outbound is named
+        // "proxy-active" and a direct-fallback group named "proxy" wraps
+        // it with DIRECT as last resort.
         let proxies = config
             .get("proxies")
             .and_then(Value::as_array)
             .expect("proxies");
         assert_eq!(
             proxies[0].get("name").and_then(Value::as_str),
-            Some("proxy")
+            Some("proxy-active")
         );
-        // No proxy-groups section
-        assert!(config.get("proxy-groups").is_none());
+        // Direct-fallback proxy group is always present
+        let groups = config
+            .get("proxy-groups")
+            .and_then(Value::as_array)
+            .expect("proxy-groups");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].get("name").and_then(Value::as_str), Some("proxy"));
+        assert_eq!(
+            groups[0].get("type").and_then(Value::as_str),
+            Some("fallback")
+        );
+        let group_proxies = groups[0]
+            .get("proxies")
+            .and_then(Value::as_array)
+            .expect("group proxies");
+        assert_eq!(group_proxies.len(), 2);
+        assert_eq!(group_proxies[0].as_str(), Some("proxy-active"));
+        assert_eq!(group_proxies[1].as_str(), Some("DIRECT"));
     }
 
     // --- Proxy provider tests ---

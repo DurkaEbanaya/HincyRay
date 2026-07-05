@@ -1,4 +1,4 @@
-# Project: HincyRay v0.19.5 (crate `xray-vpn-test`)
+# Project: HincyRay v0.19.6 (crate `xray-vpn-test`)
 
 Rust crate shipping two binaries: the `hincyray` router daemon for Keenetic/Entware aarch64 and the `xray-vpn-test` desktop diagnostics app (macOS, feature `desktop`). Current router mode uses Mihomo plus iptables NAT REDIRECT/TPROXY; v0.14 adds diagnostics/recovery, Rule Trace, Sub-Store Lite, Smart Auto-Select 2.0, backups/WebDAV, scheduled maintenance, connection close control, and EC wildcard dial safety. Shared parsing/scoring lives in `src/profiles.rs`, `src/scoring.rs`, and `src/xray_config.rs`.
 
@@ -121,7 +121,7 @@ shasum -a 256 target/aarch64-unknown-linux-gnu/release/hincyray
 #   cp /tmp/hincyray-new /opt/sbin/hincyray && chmod +x /opt/sbin/hincyray
 #   sha256sum /opt/sbin/hincyray   # must match the local shasum
 #   /opt/etc/init.d/S99hincyray start
-#   curl -s http://127.0.0.1:8088/api/health   # expect {"version":"0.19.5"}
+#   curl -s http://127.0.0.1:8088/api/health   # expect {"version":"0.19.6"}
 ```
 
 Always back up the running binary to `.bak` before overwriting, and verify the on-router SHA256 matches the local build before starting the daemon.
@@ -144,10 +144,26 @@ Current gate status: all green, 359 tests, 0 clippy warnings.
 
 Release token lives at `/Users/lain/Documents/токен телега.rtf`. **NEVER write the token contents into AGENTS.md, source, or commits** — reference it only by loading at call time:
 ```
-GH_TOKEN="$(cat '/Users/lain/Documents/токен телега.rtf')" gh release create v0.19.5 \
+GH_TOKEN="$(cat '/Users/lain/Documents/токен телега.rtf')" gh release create v0.19.6 \
     target/aarch64-unknown-linux-gnu/release/hincyray \
-    --title "v0.19.5" --notes "..."
+    --title "v0.19.6" --notes "..."
 ```
+
+### v0.19.6 release status
+
+Released. Critical stability patch — direct-fallback proxy group + always-on health check.
+
+v0.19.6 fixes a router OOM death spiral caused by dead proxy servers. When the upstream proxy is unreachable, Mihomo previously timed out every connection — clients retried, creating a connection storm that consumed all RAM (available memory dropped to 7.8MB on 512MB Keenetic Giga) and sent I/O pressure to 99.5%, rendering the router unresponsive.
+
+**Root causes fixed:**
+
+1. **Connection storm on dead proxy** — Mihomo outbound `proxy` had no fallback. When the upstream server died, every connection timed out and clients retried → OOM. Fix: `build_mihomo_router_config()` now **always** wraps the active proxy in a `fallback` group named `proxy` with `[proxy-active, DIRECT]`. Mihomo automatically routes traffic direct when the proxy is unreachable and switches back when it recovers — no restart, no storm. When user-configured proxy groups are enabled, DIRECT is added as last resort in fallback-type groups.
+
+2. **Health check disabled when auto_switch=false** — Watchdog Phase 3 was guarded by `if auto_switch`, so health monitoring was completely skipped when the user disabled auto-switching. The daemon had no idea the proxy was dead. Fix: health check now runs **always** (when `core_running && !bench_running`). The `auto_switch` flag controls only *what happens on failure*: `true` → switch to next-best profile; `false` → log "proxy unreachable, mihomo fallback to DIRECT". EC delay test now probes `PROXY_ACTIVE_NAME` ("proxy-active" — the actual outbound), not `PROXY_NAME` ("proxy" — the fallback group), so a fallback to DIRECT is detected as a proxy failure, not a success.
+
+**New constants:** `PROXY_ACTIVE_NAME` ("proxy-active"), `FALLBACK_HEALTH_URL` (gstatic generate_204).
+
+**E2E verified on Keenetic Giga:** I/O pressure 99.46% → 0.03%, MemAvailable 7.8MB → 119MB, load average 22 → 0.11, CPU iowait 45% → 0%, health check detects proxy flapping (failed 1/3 → recovered 191ms), fallback group `type: Fallback, now: proxy-active, alive: true`. 359 tests, 0 clippy warnings.
 
 ### v0.19.5 release status
 
@@ -171,6 +187,7 @@ E2E on Keenetic Giga verified: `/api/health` → `{"version":"0.19.5"}`; TCP ben
 
 ## Notes
 
+* v0.19.6 critical stability patch: always-on direct-fallback proxy group + always-on health check. `build_mihomo_router_config()` now always wraps the active proxy in a `fallback` group named `proxy` with `[proxy-active, DIRECT]` — Mihomo auto-switches to DIRECT when the upstream proxy is unreachable and back when it recovers, preventing connection storms that OOM the router. `PROXY_ACTIVE_NAME` ("proxy-active") constant. `FALLBACK_HEALTH_URL` (gstatic generate_204). Watchdog Phase 3 health check runs always (not just `auto_switch`); `auto_switch` controls only the action on failure (`true` → switch profile, `false` → log + rely on mihomo fallback). EC delay test probes `PROXY_ACTIVE_NAME` (outbound), not `PROXY_NAME` (group). `build_proxy_groups_json` adds DIRECT as last resort in `fallback`-type groups. E2E on Keenetic Giga: I/O pressure 99.46% → 0.03%, MemAvailable 7.8MB → 119MB, load 22 → 0.11, health check detects proxy flapping (failed 1/3 → recovered 191ms). 359 tests, 0 clippy warnings.
 * Runtime benchmarking requires `mihomo` in `PATH` (desktop only).
 * Router daemon requires `mihomo` binary and `geoip.metadb` file in the geo directory.
 * Subscription bodies are tried as plain text and common base64 variants.

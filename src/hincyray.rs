@@ -36,8 +36,9 @@ use crate::benchmark::{
     DEFAULT_UPLOAD_URL, SharedJob, run_bench,
 };
 use crate::mihomo_config::{
-    DIRECT_NAME, MihomoFeatures, PROXY_NAME, REJECT_NAME, RKN_BYPASS_DEFAULT_INTERVAL,
-    RKN_BYPASS_DEFAULT_URL, build_mihomo_config, build_mihomo_router_config,
+    DIRECT_NAME, MihomoFeatures, PROXY_ACTIVE_NAME, PROXY_NAME, REJECT_NAME,
+    RKN_BYPASS_DEFAULT_INTERVAL, RKN_BYPASS_DEFAULT_URL, build_mihomo_config,
+    build_mihomo_router_config,
 };
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionSource, load_subscription_detailed_via_proxy_with_hwid,
@@ -10746,8 +10747,15 @@ fn start_watchdog(daemon: Daemon) {
                 }
             }
 
-            // --- Phase 3: Health check + failover (auto_switch) ---
-            if auto_switch && !bench_running && core_running {
+            // --- Phase 3: Health check (always) + failover (auto_switch) ---
+            // Health check runs on every tick when the core is running and
+            // no benchmark is in progress. The `auto_switch` flag controls
+            // *what happens on failure*: when enabled, the watchdog switches
+            // to the next-best profile; when disabled, it just logs — the
+            // Mihomo direct-fallback proxy group already routes traffic to
+            // DIRECT when the upstream proxy is unreachable, preventing
+            // connection storms.
+            if !bench_running && core_running {
                 // When proxy groups are enabled, Mihomo handles failover
                 // natively via url-test / fallback / load-balance groups.
                 // The daemon must NOT restart the core or switch profiles —
@@ -10781,14 +10789,14 @@ fn start_watchdog(daemon: Daemon) {
                     }
                 } else if let Some(ref addr) = ec_addr {
                     // External controller enabled but no proxy groups —
-                    // use Mihomo API delay test for health check. This is
-                    // more accurate than the SOCKS curl approach because
-                    // it tests the actual proxy through Mihomo's internal
-                    // mechanism and returns latency, not just a boolean.
+                    // use Mihomo API delay test for health check. We test
+                    // PROXY_ACTIVE_NAME (the actual outbound), not the
+                    // fallback group "proxy", so that a fallback to DIRECT
+                    // is detected as a proxy failure, not a success.
                     let delay = mihomo_api_delay(
                         addr,
                         ec_secret.as_deref(),
-                        PROXY_NAME,
+                        PROXY_ACTIVE_NAME,
                         "https://www.gstatic.com/generate_204",
                         5000,
                     );
@@ -10805,21 +10813,28 @@ fn start_watchdog(daemon: Daemon) {
                             inner.failover_fail_count += 1;
                             const FAILOVER_THRESHOLD: u32 = 3;
                             eprintln!(
-                                "hincyray: API health check failed ({}/{}) — {error}",
+                                "hincyray: health check failed ({}/{}) — {error}",
                                 inner.failover_fail_count, FAILOVER_THRESHOLD
                             );
                             if inner.failover_fail_count >= FAILOVER_THRESHOLD {
-                                if let Some(id) = active_profile_id {
-                                    failover_rejected_profiles.insert(id);
-                                }
-                                if let Some(next_id) = find_best_profile_by_score(
-                                    &inner.state,
-                                    &failover_rejected_profiles,
-                                ) {
-                                    eprintln!("hincyray: failover to profile {next_id}");
-                                    switch_active_profile(&mut inner, &daemon, next_id);
+                                if auto_switch {
+                                    if let Some(id) = active_profile_id {
+                                        failover_rejected_profiles.insert(id);
+                                    }
+                                    if let Some(next_id) = find_best_profile_by_score(
+                                        &inner.state,
+                                        &failover_rejected_profiles,
+                                    ) {
+                                        eprintln!("hincyray: failover to profile {next_id}");
+                                        switch_active_profile(&mut inner, &daemon, next_id);
+                                    } else {
+                                        eprintln!("hincyray: no alternative profile for failover");
+                                    }
                                 } else {
-                                    eprintln!("hincyray: no alternative profile for failover");
+                                    eprintln!(
+                                        "hincyray: proxy unreachable, \
+                                         mihomo fallback to DIRECT (auto-switch disabled)"
+                                    );
                                 }
                                 inner.failover_fail_count = 0;
                             }
@@ -10827,6 +10842,9 @@ fn start_watchdog(daemon: Daemon) {
                     }
                 } else {
                     // Fallback: no external controller, use SOCKS curl.
+                    // Note: when the mihomo direct-fallback group switches
+                    // to DIRECT, SOCKS health check will pass (through
+                    // DIRECT). Enable EC for accurate proxy health monitoring.
                     let healthy = socks_health_check(socks_port);
                     let mut inner = lock(&daemon.inner);
                     if healthy {
@@ -10843,17 +10861,19 @@ fn start_watchdog(daemon: Daemon) {
                             inner.failover_fail_count, FAILOVER_THRESHOLD
                         );
                         if inner.failover_fail_count >= FAILOVER_THRESHOLD {
-                            if let Some(id) = active_profile_id {
-                                failover_rejected_profiles.insert(id);
-                            }
-                            if let Some(next_id) = find_best_profile_by_score(
-                                &inner.state,
-                                &failover_rejected_profiles,
-                            ) {
-                                eprintln!("hincyray: failover to profile {next_id}");
-                                switch_active_profile(&mut inner, &daemon, next_id);
-                            } else {
-                                eprintln!("hincyray: no alternative profile for failover");
+                            if auto_switch {
+                                if let Some(id) = active_profile_id {
+                                    failover_rejected_profiles.insert(id);
+                                }
+                                if let Some(next_id) = find_best_profile_by_score(
+                                    &inner.state,
+                                    &failover_rejected_profiles,
+                                ) {
+                                    eprintln!("hincyray: failover to profile {next_id}");
+                                    switch_active_profile(&mut inner, &daemon, next_id);
+                                } else {
+                                    eprintln!("hincyray: no alternative profile for failover");
+                                }
                             }
                             inner.failover_fail_count = 0;
                         }
