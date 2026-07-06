@@ -90,6 +90,47 @@ pub fn run() -> Result<(), String> {
     let state = load_state(&state_path);
     let daemon = Daemon::new(state, state_path, mihomo_config_path);
 
+    // v0.19.7: Prepare RKN bypass list in domain format before generating
+    // the Mihomo config. The rule provider uses `type: file, behavior: domain`
+    // so the file must exist (or be empty) before Mihomo starts.
+    //
+    // On startup we only:
+    //   1. Ensure the directory + an empty file exist (so Mihomo can start).
+    //   2. If the file exists but is in the old `DOMAIN,xxx` classical format,
+    //      preprocess it in-place to bare domain names (migration).
+    // We do NOT download on startup — that would block for 60s when GitHub
+    // is unreachable, leaving the router without proxy. The watchdog
+    // (Phase 11) handles downloads through the SOCKS proxy once the core
+    // is running.
+    {
+        let inner = lock(&daemon.inner);
+        let split = &inner.state.split_routing;
+        if split.rkn_bypass_enabled
+            && let Some(geo_dir) = geo_dir_from_state(&inner.state)
+        {
+            let bypass_path = Path::new(&geo_dir)
+                .join("rule-providers")
+                .join("ru-bypass.list");
+            if let Some(parent) = bypass_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if !bypass_path.exists() {
+                let _ = fs::write(&bypass_path, "");
+                eprintln!("hincyray: bypass list not found, created empty file");
+            } else {
+                // Migrate: if the file is in old `DOMAIN,xxx` format, preprocess
+                // it in-place to bare domain names for `behavior: domain`.
+                match preprocess_bypass_list_in_place(&bypass_path) {
+                    Ok(true) => {
+                        eprintln!("hincyray: bypass list migrated from classical to domain format")
+                    }
+                    Ok(false) => {} // already in domain format
+                    Err(e) => eprintln!("hincyray: bypass list migration failed: {e}"),
+                }
+            }
+        }
+    }
+
     // Regenerate config from state on startup so the transparent proxy
     // inbounds are included when split routing is enabled.
     {
@@ -484,7 +525,8 @@ pub struct HincyrayState {
     /// in a single binary, replacing the previous dual-engine approach.
     #[serde(default = "default_mihomo_path")]
     pub mihomo_path: String,
-    #[serde(default)]
+    /// Not persisted — transient data, rebuilt on each session.
+    #[serde(skip)]
     pub metrics_history: Vec<MetricSample>,
     #[serde(default)]
     pub routing_rules: Vec<RoutingRule>,
@@ -532,8 +574,8 @@ pub struct HincyrayState {
     /// v0.12: Cumulative downloaded bytes through the proxy (persisted).
     #[serde(default)]
     pub traffic_total_down_bytes: u64,
-    /// v0.12: Persisted connection log (cap MAX_CONNECTION_LOG entries).
-    #[serde(default)]
+    /// Not persisted — transient data, rebuilt on each session by the watchdog.
+    #[serde(skip)]
     pub connection_log: Vec<ConnectionLogEntry>,
     /// v0.12: Per-device routing rules. Each sends a specific device's
     /// traffic to a different target (direct, specific profile, etc.).
@@ -581,7 +623,9 @@ pub struct HincyrayState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_subscription_refresh_report: Option<SubscriptionRefreshReport>,
     /// v0.19: bounded server-side undo snapshots for destructive state changes.
-    #[serde(default)]
+    /// Not persisted — undo is session-level only (lost on daemon restart)
+    /// to avoid bloating state.json with 3MB+ of JSON snapshots.
+    #[serde(skip)]
     pub undo_stack: Vec<UndoEntry>,
     /// v0.19: memory guard thresholds and last warning state.
     #[serde(default)]
@@ -2442,6 +2486,12 @@ fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String>
     }
     let mut compacted = state.clone();
     compact_state_for_persist(&mut compacted);
+    // Clear transient fields before serialization. They have #[serde(skip)]
+    // so they won't appear in the output, but clearing them avoids holding
+    // 3MB+ of undo_stack JSON strings in memory during serialization.
+    compacted.undo_stack.clear();
+    compacted.connection_log.clear();
+    compacted.metrics_history.clear();
     let text = serde_json::to_string_pretty(&compacted).map_err(|error| error.to_string())?;
     let tmp = state_path.with_extension("tmp");
     fs::write(&tmp, &text).map_err(|error| error.to_string())?;
@@ -10570,6 +10620,168 @@ fn switch_active_profile(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon, p
     }
 }
 
+/// Check if a bypass list file is in the old `classical` format (contains
+/// `DOMAIN,` or `DOMAIN-SUFFIX,` prefixes) and preprocess it in-place to
+/// bare domain names for Mihomo's `behavior: domain`.
+///
+/// Returns `Ok(true)` if migration was performed, `Ok(false)` if the file
+/// is already in domain format (or empty).
+fn preprocess_bypass_list_in_place(path: &Path) -> Result<bool, String> {
+    let content = fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+    // Detect old format: look for any line starting with `DOMAIN,` or `DOMAIN-SUFFIX,`.
+    let needs_migration = content.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("DOMAIN,") || line.starts_with("DOMAIN-SUFFIX,")
+    });
+    if !needs_migration {
+        return Ok(false);
+    }
+    // Preprocess: strip prefixes, strip trailing dots, skip unsupported types.
+    let mut output = String::with_capacity(content.len() / 2);
+    let mut converted = 0u32;
+    let mut skipped = 0u32;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(domain) = line.strip_prefix("DOMAIN,") {
+            let domain = domain.trim().trim_end_matches('.');
+            if !domain.is_empty() {
+                output.push_str(domain);
+                output.push('\n');
+                converted += 1;
+            }
+        } else if let Some(domain) = line.strip_prefix("DOMAIN-SUFFIX,") {
+            let domain = domain.trim().trim_end_matches('.');
+            if !domain.is_empty() {
+                output.push_str(domain);
+                output.push('\n');
+                converted += 1;
+            }
+        } else {
+            skipped += 1;
+        }
+    }
+    fs::write(path, &output).map_err(|e| format!("write: {e}"))?;
+    eprintln!(
+        "hincyray: bypass list preprocessed — {converted} domains converted, {skipped} unsupported rules skipped"
+    );
+    Ok(true)
+}
+
+/// Download the RKN bypass list and preprocess it to `domain` behavior format.
+///
+/// The raw bypass list uses `classical` format (`DOMAIN,xxx`, `DOMAIN-SUFFIX,xxx`,
+/// `USER-AGENT,xxx`, etc.). Mihomo's `domain` behavior expects bare domain names.
+/// This function strips `DOMAIN,` and `DOMAIN-SUFFIX,` prefixes and skips
+/// unsupported rule types (USER-AGENT, IP-CIDR, DOMAIN-KEYWORD, etc.).
+///
+/// Tries direct download first (GitHub is often accessible without proxy),
+/// then falls back to SOCKS proxy if the core is running.
+fn update_bypass_list(
+    url: &str,
+    socks_port: u16,
+    core_running: bool,
+    dest_path: &Path,
+) -> Result<(), String> {
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+    }
+    let tmp_path = dest_path.with_extension("tmp");
+
+    // Try direct download first.
+    let mut downloaded = false;
+    let direct_status = Command::new("curl")
+        .args([
+            "-sL",
+            "--max-time",
+            "60",
+            "-H",
+            "User-Agent: hincyray",
+            "-o",
+        ])
+        .arg(&tmp_path)
+        .arg(url)
+        .status()
+        .map_err(|e| format!("curl spawn: {e}"))?;
+    if direct_status.success() && tmp_path.exists() {
+        downloaded = true;
+    }
+
+    // If direct failed and the core is running, try through SOCKS proxy.
+    if !downloaded && core_running {
+        let proxy_status = Command::new("curl")
+            .args([
+                "-sL",
+                "--max-time",
+                "120",
+                "--socks5-hostname",
+                &format!("127.0.0.1:{socks_port}"),
+                "-H",
+                "User-Agent: hincyray",
+                "-o",
+            ])
+            .arg(&tmp_path)
+            .arg(url)
+            .status()
+            .map_err(|e| format!("curl proxy spawn: {e}"))?;
+        if proxy_status.success() && tmp_path.exists() {
+            downloaded = true;
+        }
+    }
+
+    if !downloaded {
+        let _ = fs::remove_file(&tmp_path);
+        return Err("bypass list download failed (both direct and proxy)".to_owned());
+    }
+
+    // Read and preprocess: strip DOMAIN,/DOMAIN-SUFFIX, prefixes for domain behavior.
+    // Also strip trailing dots (e.g. `example.com.` → `example.com`) which
+    // Mihomo's domain behavior rejects as invalid.
+    let content = fs::read_to_string(&tmp_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("read bypass list: {e}")
+    })?;
+    let mut output = String::with_capacity(content.len() / 2);
+    let mut skipped = 0u32;
+    let mut converted = 0u32;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(domain) = line.strip_prefix("DOMAIN,") {
+            let domain = domain.trim().trim_end_matches('.');
+            if !domain.is_empty() {
+                output.push_str(domain);
+                output.push('\n');
+                converted += 1;
+            }
+        } else if let Some(domain) = line.strip_prefix("DOMAIN-SUFFIX,") {
+            let domain = domain.trim().trim_end_matches('.');
+            if !domain.is_empty() {
+                output.push_str(domain);
+                output.push('\n');
+                converted += 1;
+            }
+        } else {
+            // Skip unsupported rule types (USER-AGENT, IP-CIDR, DOMAIN-KEYWORD, etc.)
+            skipped += 1;
+        }
+    }
+
+    fs::write(dest_path, &output).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("write bypass list: {e}")
+    })?;
+    let _ = fs::remove_file(&tmp_path);
+    eprintln!(
+        "hincyray: bypass list updated — {converted} domains converted, {skipped} unsupported rules skipped"
+    );
+    Ok(())
+}
+
 /// Background watchdog thread. Runs every 10 seconds and handles:
 ///
 /// 1. **Core monitoring (always)** — if the Mihomo core has crashed,
@@ -10589,6 +10801,7 @@ fn start_watchdog(daemon: Daemon) {
         let mut restart_backoff_secs: u64 = 0;
         let mut failover_rejected_profiles = HashSet::new();
         let mut watchdog_tick: u64 = 0;
+        let mut last_bypass_update_unix: u64 = 0;
 
         loop {
             thread::sleep(Duration::from_secs(10));
@@ -10621,6 +10834,10 @@ fn start_watchdog(daemon: Daemon) {
                 auto_refresh_interval_hours,
                 last_auto_refresh,
                 maintenance,
+                rkn_bypass_enabled,
+                rkn_bypass_url,
+                rkn_bypass_interval,
+                geo_asset_path,
             ) = {
                 let mut inner = lock(&daemon.inner);
                 let ec = mihomo_controller(&inner.state.mihomo_features);
@@ -10654,6 +10871,10 @@ fn start_watchdog(daemon: Daemon) {
                     inner.state.auto_refresh_interval_hours,
                     inner.state.last_auto_refresh_unix,
                     inner.state.maintenance.clone(),
+                    inner.state.split_routing.rkn_bypass_enabled,
+                    inner.state.split_routing.rkn_bypass_url.clone(),
+                    inner.state.split_routing.rkn_bypass_interval,
+                    inner.state.split_routing.geo_asset_path.clone(),
                 )
             };
 
@@ -10810,12 +11031,16 @@ fn start_watchdog(daemon: Daemon) {
                             failover_rejected_profiles.clear();
                         }
                         Err(error) => {
+                            let prev_count = inner.failover_fail_count;
                             inner.failover_fail_count += 1;
                             const FAILOVER_THRESHOLD: u32 = 3;
-                            eprintln!(
-                                "hincyray: health check failed ({}/{}) — {error}",
-                                inner.failover_fail_count, FAILOVER_THRESHOLD
-                            );
+                            // Only log the first failure (transition from healthy)
+                            // to avoid spamming the log with repeated failures.
+                            if prev_count == 0 {
+                                eprintln!(
+                                    "hincyray: health check failed (1/{FAILOVER_THRESHOLD}) — {error}"
+                                );
+                            }
                             if inner.failover_fail_count >= FAILOVER_THRESHOLD {
                                 if auto_switch {
                                     if let Some(id) = active_profile_id {
@@ -10830,13 +11055,18 @@ fn start_watchdog(daemon: Daemon) {
                                     } else {
                                         eprintln!("hincyray: no alternative profile for failover");
                                     }
+                                    inner.failover_fail_count = 0;
                                 } else {
-                                    eprintln!(
-                                        "hincyray: proxy unreachable, \
-                                         mihomo fallback to DIRECT (auto-switch disabled)"
-                                    );
+                                    // Only log once when first crossing threshold
+                                    if prev_count < FAILOVER_THRESHOLD {
+                                        eprintln!(
+                                            "hincyray: proxy unreachable, \
+                                             mihomo fallback to DIRECT (auto-switch disabled)"
+                                        );
+                                    }
+                                    // Cap at threshold — don't reset, avoid log spam
+                                    inner.failover_fail_count = FAILOVER_THRESHOLD;
                                 }
-                                inner.failover_fail_count = 0;
                             }
                         }
                     }
@@ -10854,12 +11084,12 @@ fn start_watchdog(daemon: Daemon) {
                         inner.failover_fail_count = 0;
                         failover_rejected_profiles.clear();
                     } else {
+                        let prev_count = inner.failover_fail_count;
                         inner.failover_fail_count += 1;
                         const FAILOVER_THRESHOLD: u32 = 3;
-                        eprintln!(
-                            "hincyray: health check failed ({}/{})",
-                            inner.failover_fail_count, FAILOVER_THRESHOLD
-                        );
+                        if prev_count == 0 {
+                            eprintln!("hincyray: health check failed (1/{FAILOVER_THRESHOLD})");
+                        }
                         if inner.failover_fail_count >= FAILOVER_THRESHOLD {
                             if auto_switch {
                                 if let Some(id) = active_profile_id {
@@ -10874,8 +11104,16 @@ fn start_watchdog(daemon: Daemon) {
                                 } else {
                                     eprintln!("hincyray: no alternative profile for failover");
                                 }
+                                inner.failover_fail_count = 0;
+                            } else {
+                                if prev_count < FAILOVER_THRESHOLD {
+                                    eprintln!(
+                                        "hincyray: proxy unreachable, \
+                                         mihomo fallback to DIRECT (auto-switch disabled)"
+                                    );
+                                }
+                                inner.failover_fail_count = FAILOVER_THRESHOLD;
                             }
-                            inner.failover_fail_count = 0;
                         }
                     }
                 }
@@ -11174,6 +11412,34 @@ fn start_watchdog(daemon: Daemon) {
                     ec_addr.as_deref(),
                     ec_secret.as_deref(),
                 );
+            }
+
+            // --- Phase 11: RKN bypass list update ---
+            // Periodically download and preprocess the bypass list to
+            // domain format. Runs every rkn_bypass_interval seconds.
+            if rkn_bypass_enabled && !geo_asset_path.trim().is_empty() {
+                let interval_secs = u64::from(rkn_bypass_interval.max(3600));
+                let now = unix_now();
+                if now.saturating_sub(last_bypass_update_unix) >= interval_secs {
+                    let url = if rkn_bypass_url.trim().is_empty() {
+                        RKN_BYPASS_DEFAULT_URL
+                    } else {
+                        rkn_bypass_url.trim()
+                    };
+                    let bypass_path = Path::new(&geo_asset_path)
+                        .join("rule-providers")
+                        .join("ru-bypass.list");
+                    match update_bypass_list(url, socks_port, core_running, &bypass_path) {
+                        Ok(()) => {
+                            last_bypass_update_unix = now;
+                        }
+                        Err(e) => {
+                            eprintln!("hincyray: bypass list update failed: {e}");
+                            // Still update the timestamp to avoid retrying every tick.
+                            last_bypass_update_unix = now;
+                        }
+                    }
+                }
             }
 
             bench_was_running = bench_running;

@@ -1,6 +1,6 @@
 [package]
 name = "xray-vpn-test"
-version = "0.19.6"
+version = "0.19.7"
 edition = "2024"
 authors = ["lain"]
 description = "VPN profile benchmark tool for VLESS, Hysteria2, and XHTTP nodes"

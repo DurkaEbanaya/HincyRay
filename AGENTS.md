@@ -1,4 +1,4 @@
-# Project: HincyRay v0.19.6 (crate `xray-vpn-test`)
+# Project: HincyRay v0.19.7 (crate `xray-vpn-test`)
 
 Rust crate shipping two binaries: the `hincyray` router daemon for Keenetic/Entware aarch64 and the `xray-vpn-test` desktop diagnostics app (macOS, feature `desktop`). Current router mode uses Mihomo plus iptables NAT REDIRECT/TPROXY; v0.14 adds diagnostics/recovery, Rule Trace, Sub-Store Lite, Smart Auto-Select 2.0, backups/WebDAV, scheduled maintenance, connection close control, and EC wildcard dial safety. Shared parsing/scoring lives in `src/profiles.rs`, `src/scoring.rs`, and `src/xray_config.rs`.
 
@@ -121,7 +121,7 @@ shasum -a 256 target/aarch64-unknown-linux-gnu/release/hincyray
 #   cp /tmp/hincyray-new /opt/sbin/hincyray && chmod +x /opt/sbin/hincyray
 #   sha256sum /opt/sbin/hincyray   # must match the local shasum
 #   /opt/etc/init.d/S99hincyray start
-#   curl -s http://127.0.0.1:8088/api/health   # expect {"version":"0.19.6"}
+#   curl -s http://127.0.0.1:8088/api/health   # expect {"version":"0.19.7"}
 ```
 
 Always back up the running binary to `.bak` before overwriting, and verify the on-router SHA256 matches the local build before starting the daemon.
@@ -144,10 +144,30 @@ Current gate status: all green, 359 tests, 0 clippy warnings.
 
 Release token lives at `/Users/lain/Documents/токен телега.rtf`. **NEVER write the token contents into AGENTS.md, source, or commits** — reference it only by loading at call time:
 ```
-GH_TOKEN="$(cat '/Users/lain/Documents/токен телега.rtf')" gh release create v0.19.6 \
+GH_TOKEN="$(cat '/Users/lain/Documents/токен телега.rtf')" gh release create v0.19.7 \
     target/aarch64-unknown-linux-gnu/release/hincyray \
-    --title "v0.19.6" --notes "..."
+    --title "v0.19.7" --notes "..."
 ```
+
+### v0.19.7 release status
+
+Released. Critical memory/I/O stability patch — state.json bloat + RKN bypass list memory + fallback tuning.
+
+v0.19.7 fixes a second router OOM death spiral, this time caused by **state persistence I/O** and **rule provider memory** rather than connection storms. The router would run fine for hours, then degrade to load average 35, I/O pressure 99.57%, MemAvailable 4.8MB, mihomo RSS 194-292MB, hincyray RSS 85MB, both processes in D-state — unresponsive.
+
+**Root causes fixed:**
+
+1. **state.json bloated to 4MB by undo_stack** — `UndoEntry.state_json` stored 10 full JSON snapshots of the entire state (each ~300KB). `persist_state()` serialized and wrote 4MB to USB flash every 30-60 seconds (connection log + traffic stats + undo snapshots). This caused chronic I/O pressure on the Keenetic's USB-connected ext4 partition, which in turn stalled mihomo's network I/O (both compete for the same I/O scheduler). Fix: `undo_stack`, `connection_log`, and `metrics_history` are now `#[serde(skip)]` — transient fields that are never serialized. `persist_state()` also explicitly clears them before serialization to avoid holding 3MB+ of JSON strings in memory. state.json shrank from 4MB to 660KB. hincyray RSS dropped from 85MB to 5.5MB.
+
+2. **RKN bypass list: 744K classical rules = ~150-290MB mihomo RSS** — The rule provider used `behavior: "classical"` with `type: "http"`, which made Mihomo parse 744,073 individual rule objects (DOMAIN, DOMAIN-SUFFIX, USER-AGENT, IP-CIDR, etc.) into an in-memory tree. On a 512MB router this consumed 30-57% of total RAM. Fix: Changed rule provider to `type: "file", behavior: "domain"`. Hincyray now downloads and preprocesses the bypass list itself (via `update_bypass_list()` — direct download first, SOCKS proxy fallback) — strips `DOMAIN,`/`DOMAIN-SUFFIX,` prefixes, strips trailing dots, skips unsupported rule types (USER-AGENT, IP-CIDR, DOMAIN-KEYWORD). The preprocessed file contains bare domain names that Mihomo's domain matcher loads efficiently. `preprocess_bypass_list_in_place()` migrates existing classical-format files on startup. Watchdog Phase 11 periodically refreshes the list through the SOCKS proxy. **Note:** 744K domains is still heavy for a 512MB router; bypass is disabled by default on the router and should be enabled with caution.
+
+3. **Fallback group interval 30s, timeout 5000ms** — When the upstream proxy died, the fallback group took up to 30 seconds to detect the failure and switch to DIRECT. During those 30 seconds, clients timed out and retried, creating a mini connection storm. Fix: interval 30→10 seconds, timeout 5000→3000ms. Mihomo now detects a dead proxy within 10 seconds and switches to DIRECT faster.
+
+4. **Health check log spam** — The watchdog logged every single failure (`failed 1/3`, `failed 2/3`, `failed 3/3`, `proxy unreachable`) on every 15-second cycle, producing thousands of log lines per hour. The log file grew to 556KB/10K lines, adding to the I/O pressure. Fix: Only state transitions are logged (healthy→failed, failed→recovered). `failover_fail_count` caps at the threshold instead of resetting to 0 when `auto_switch=false`, preventing repeated threshold-crossing log lines.
+
+**New functions:** `update_bypass_list()`, `preprocess_bypass_list_in_place()`. Watchdog Phase 11 (RKN bypass list update).
+
+**E2E verified on Keenetic Giga:** mihomo RSS 194-292MB → 60MB, hincyray RSS 85MB → 5.5MB, MemAvailable 4.8MB → 256MB, load 35 → 0.38, I/O pressure 99.57% → 0.06%, state.json 4MB → 660KB. 359 tests, 0 clippy warnings.
 
 ### v0.19.6 release status
 
@@ -187,6 +207,7 @@ E2E on Keenetic Giga verified: `/api/health` → `{"version":"0.19.5"}`; TCP ben
 
 ## Notes
 
+* v0.19.7 critical memory/I/O stability patch: state.json bloat + RKN bypass list memory + fallback tuning. `undo_stack`, `connection_log`, `metrics_history` are now `#[serde(skip)]` — transient fields never serialized, state.json shrank from 4MB to 660KB, hincyray RSS 85MB → 5.5MB. RKN bypass rule provider changed from `type: http, behavior: classical` (744K rules = ~150-290MB mihomo RSS) to `type: file, behavior: domain` — Hincyray downloads and preprocesses the bypass list itself (`update_bypass_list()` — strips `DOMAIN,`/`DOMAIN-SUFFIX,` prefixes, strips trailing dots, skips unsupported rule types; `preprocess_bypass_list_in_place()` migrates existing classical-format files on startup). Watchdog Phase 11 periodically refreshes the list through SOCKS proxy. Fallback group interval 30→10s, timeout 5000→3000ms. Health check logging: only state transitions logged (healthy→failed, failed→recovered), `failover_fail_count` caps at threshold when `auto_switch=false`. E2E on Keenetic Giga: mihomo RSS 194-292MB → 60MB, MemAvailable 4.8MB → 256MB, load 35 → 0.38, I/O pressure 99.57% → 0.06%. 359 tests, 0 clippy warnings.
 * v0.19.6 critical stability patch: always-on direct-fallback proxy group + always-on health check. `build_mihomo_router_config()` now always wraps the active proxy in a `fallback` group named `proxy` with `[proxy-active, DIRECT]` — Mihomo auto-switches to DIRECT when the upstream proxy is unreachable and back when it recovers, preventing connection storms that OOM the router. `PROXY_ACTIVE_NAME` ("proxy-active") constant. `FALLBACK_HEALTH_URL` (gstatic generate_204). Watchdog Phase 3 health check runs always (not just `auto_switch`); `auto_switch` controls only the action on failure (`true` → switch profile, `false` → log + rely on mihomo fallback). EC delay test probes `PROXY_ACTIVE_NAME` (outbound), not `PROXY_NAME` (group). `build_proxy_groups_json` adds DIRECT as last resort in `fallback`-type groups. E2E on Keenetic Giga: I/O pressure 99.46% → 0.03%, MemAvailable 7.8MB → 119MB, load 22 → 0.11, health check detects proxy flapping (failed 1/3 → recovered 191ms). 359 tests, 0 clippy warnings.
 * Runtime benchmarking requires `mihomo` in `PATH` (desktop only).
 * Router daemon requires `mihomo` binary and `geoip.metadb` file in the geo directory.

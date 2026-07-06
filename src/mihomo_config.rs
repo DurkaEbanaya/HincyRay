@@ -1467,8 +1467,8 @@ pub fn build_mihomo_router_config(
             "type": "fallback",
             "proxies": [active_proxy_name, DIRECT_NAME],
             "url": FALLBACK_HEALTH_URL,
-            "interval": 30,
-            "timeout": 5000,
+            "interval": 10,
+            "timeout": 3000,
         }]);
     }
 
@@ -1496,27 +1496,18 @@ pub fn build_mihomo_router_config(
     }
 
     // v0.17: RKN Bypass rule provider — auto-injected when enabled.
-    // Merged with any user-configured rule providers (user's ru-bypass
-    // takes precedence if they defined one manually).
+    // v0.19.7: Changed from `type: http, behavior: classical` to
+    // `type: file, behavior: domain`. The classical behavior parsed 744K
+    // individual rule objects (~150MB RSS on mihomo). The domain behavior
+    // uses a memory-efficient trie (~20MB). Hincyray downloads and
+    // preprocesses the bypass list (strips `DOMAIN,`/`DOMAIN-SUFFIX,`
+    // prefixes) before mihomo loads it.
     if extra.rkn_bypass_enabled {
-        let url = if extra.rkn_bypass_url.trim().is_empty() {
-            RKN_BYPASS_DEFAULT_URL
-        } else {
-            extra.rkn_bypass_url.trim()
-        };
-        let interval = if extra.rkn_bypass_interval == 0 {
-            RKN_BYPASS_DEFAULT_INTERVAL
-        } else {
-            extra.rkn_bypass_interval
-        };
         let bypass_provider = json!({
             "ru-bypass": {
-                "type": "http",
-                "behavior": "classical",
+                "type": "file",
+                "behavior": "domain",
                 "format": "text",
-                "url": url,
-                "interval": interval,
-                "proxy": PROXY_NAME,
                 "path": "./rule-providers/ru-bypass.list"
             }
         });
@@ -3302,8 +3293,8 @@ mod tests {
     use super::{
         ExternalControllerConfig, FallbackFilter, LoadBalanceStrategy, MihomoFeatures, NtpConfig,
         PROXY_NAME, PerProxyDefaults, ProxyGroupConfig, ProxyGroupType, ProxyProviderConfig,
-        REDIR_LISTENER, RKN_BYPASS_DEFAULT_URL, RuleProviderConfig, SmuxConfig, SubRuleConfig,
-        TPROXY_LISTENER, TunnelConfig, build_anytls_proxy, build_http_proxy, build_hysteria_proxy,
+        REDIR_LISTENER, RuleProviderConfig, SmuxConfig, SubRuleConfig, TPROXY_LISTENER,
+        TunnelConfig, build_anytls_proxy, build_http_proxy, build_hysteria_proxy,
         build_hysteria2_proxy, build_masque_proxy, build_mihomo_bench_config, build_mihomo_config,
         build_mihomo_router_config, build_openvpn_proxy, build_shadowsocks_proxy,
         build_shadowsocksr_proxy, build_snell_proxy, build_socks_proxy, build_ssh_proxy,
@@ -6563,12 +6554,12 @@ mod tests {
         let bypass = providers
             .get("ru-bypass")
             .expect("ru-bypass provider must exist");
-        assert_eq!(bypass["type"], "http");
-        assert_eq!(bypass["behavior"], "classical");
+        // v0.19.7: Changed from type:http/classical to type:file/domain
+        // to reduce mihomo RSS from ~150MB to ~20MB on routers.
+        assert_eq!(bypass["type"], "file");
+        assert_eq!(bypass["behavior"], "domain");
         assert_eq!(bypass["format"], "text");
-        assert_eq!(bypass["proxy"], "proxy");
-        assert_eq!(bypass["url"], RKN_BYPASS_DEFAULT_URL);
-        assert_eq!(bypass["interval"], 86400);
+        assert_eq!(bypass["path"], "./rule-providers/ru-bypass.list");
     }
 
     #[test]
@@ -6602,8 +6593,11 @@ mod tests {
             .and_then(Value::as_object)
             .and_then(|m| m.get("ru-bypass"))
             .expect("ru-bypass provider");
-        assert_eq!(bypass["url"], "https://example.com/custom.list");
-        assert_eq!(bypass["interval"], 3600);
+        // v0.19.7: URL/interval are no longer in the rule provider config.
+        // Hincyray downloads and preprocesses the bypass list; Mihomo loads
+        // the local file with type:file/behavior:domain.
+        assert_eq!(bypass["type"], "file");
+        assert_eq!(bypass["behavior"], "domain");
     }
 
     #[test]
@@ -6691,10 +6685,10 @@ mod tests {
             .and_then(Value::as_object)
             .and_then(|m| m.get("ru-bypass"))
             .expect("ru-bypass provider");
-        assert_eq!(
-            bypass["url"], RKN_BYPASS_DEFAULT_URL,
-            "empty URL should fall back to default"
-        );
+        // v0.19.7: URL is no longer in the rule provider config.
+        // The provider is always type:file/behavior:domain regardless of URL.
+        assert_eq!(bypass["type"], "file");
+        assert_eq!(bypass["behavior"], "domain");
     }
 
     #[test]
