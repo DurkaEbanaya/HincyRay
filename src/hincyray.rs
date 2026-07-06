@@ -222,7 +222,9 @@ pub fn run() -> Result<(), String> {
         let _ = inner.core.stop();
         let vpn_subnet = inner.state.split_routing.vpn_subnet.clone();
         let _ = inner.firewall.stop(&vpn_subnet);
-        let _ = persist_state(&daemon.state_path, &inner.state);
+        // v0.19.8: flush any pending dirty state from the watchdog
+        // before exiting. If nothing is dirty, this is a no-op.
+        flush_if_dirty(&mut inner, &daemon.state_path);
         eprintln!("hincyray: state persisted, children stopped, iptables cleaned");
     }
     Ok(())
@@ -326,6 +328,13 @@ struct DaemonInner {
     core: CoreManager,
     firewall: FirewallManager,
     bench: BenchRuntime,
+    /// v0.19.8: write-behind dirty flag. Set by `mark_dirty()` when the
+    /// watchdog mutates state; flushed to disk once per tick by
+    /// `flush_if_dirty()`. This eliminates write amplification —
+    /// previously the watchdog could call `persist_state()` up to 6
+    /// times per 10-second tick (6 × 660KB = 3.96MB), now it's at most
+    /// 1 write per tick.
+    dirty: bool,
     /// v0.6: consecutive health-check failures for the active profile.
     /// Reset to 0 on success. When it reaches the threshold (3), the
     /// watchdog triggers a failover to the next-best profile.
@@ -1295,6 +1304,7 @@ impl Daemon {
                 core: CoreManager::new(),
                 firewall: FirewallManager::new(),
                 bench: BenchRuntime::new(),
+                dirty: false,
                 failover_fail_count: 0,
                 prev_cpu: None,
                 prev_cpu_per_core: Vec::new(),
@@ -2496,6 +2506,19 @@ fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String>
     let tmp = state_path.with_extension("tmp");
     fs::write(&tmp, &text).map_err(|error| error.to_string())?;
     fs::rename(&tmp, state_path).map_err(|error| error.to_string())
+}
+
+/// v0.19.8: Flush state to disk only if the `dirty` flag is set.
+/// Called once at the end of each watchdog tick and during graceful
+/// shutdown. This is the "write-behind" flush point — multiple
+/// `mark_dirty()` calls within a tick collapse into a single disk write.
+fn flush_if_dirty(inner: &mut DaemonInner, state_path: &Path) {
+    if inner.dirty {
+        if let Err(error) = persist_state(state_path, &inner.state) {
+            eprintln!("hincyray: watchdog persist failed: {error}");
+        }
+        inner.dirty = false;
+    }
 }
 
 fn push_undo_snapshot(state: &mut HincyrayState, label: impl Into<String>) {
@@ -10935,7 +10958,7 @@ fn start_watchdog(daemon: Daemon) {
                         }
                         inner.state.split_routing.tproxy_available =
                             inner.firewall.tproxy_available;
-                        let _ = persist_state(&daemon.state_path, &inner.state);
+                        inner.dirty = true;
                         eprintln!("hincyray: firewall started by watchdog");
                     }
                 } else {
@@ -11128,7 +11151,7 @@ fn start_watchdog(daemon: Daemon) {
                     start_auto_benchmark(&daemon);
                     let mut inner = lock(&daemon.inner);
                     inner.state.last_auto_bench_unix = now;
-                    let _ = persist_state(&daemon.state_path, &inner.state);
+                    inner.dirty = true;
                 }
             }
 
@@ -11181,14 +11204,14 @@ fn start_watchdog(daemon: Daemon) {
                                         inner.state.mihomo_version = Some(new_version.clone());
                                         inner.state.update_available_version = None;
                                         inner.state.last_update_check_unix = now;
-                                        let _ = persist_state(&daemon.state_path, &inner.state);
+                                        inner.dirty = true;
                                         eprintln!("hincyray: Mihomo auto-updated to {new_version}");
                                     }
                                     Err(e) => {
                                         eprintln!("hincyray: auto-update install failed: {e}");
                                         let mut inner = lock(&daemon.inner);
                                         inner.state.last_update_check_unix = now;
-                                        let _ = persist_state(&daemon.state_path, &inner.state);
+                                        inner.dirty = true;
                                     }
                                 }
                             } else {
@@ -11199,14 +11222,14 @@ fn start_watchdog(daemon: Daemon) {
                                 if !current_version.is_empty() {
                                     inner.state.mihomo_version = Some(current_version);
                                 }
-                                let _ = persist_state(&daemon.state_path, &inner.state);
+                                inner.dirty = true;
                             }
                         }
                         Err(e) => {
                             eprintln!("hincyray: auto-update check failed: {e}");
                             let mut inner = lock(&daemon.inner);
                             inner.state.last_update_check_unix = now;
-                            let _ = persist_state(&daemon.state_path, &inner.state);
+                            inner.dirty = true;
                         }
                     }
                 }
@@ -11256,7 +11279,7 @@ fn start_watchdog(daemon: Daemon) {
                     }
 
                     inner.state.last_auto_refresh_unix = now;
-                    let _ = persist_state(&daemon.state_path, &inner.state);
+                    inner.dirty = true;
                 }
             }
 
@@ -11282,8 +11305,12 @@ fn start_watchdog(daemon: Daemon) {
                     .state
                     .traffic_total_down_bytes
                     .saturating_add(down_bytes);
+                // Mark dirty every 6 ticks (60s) — traffic counters are
+                // cumulative, no need to persist every 10s. The flush at
+                // the end of the tick will coalesce with any other dirty
+                // phase into a single write.
                 if watchdog_tick.is_multiple_of(6) {
-                    let _ = persist_state(&daemon.state_path, &inner.state);
+                    inner.dirty = true;
                 }
             }
 
@@ -11399,7 +11426,11 @@ fn start_watchdog(daemon: Daemon) {
                         let excess = inner.state.connection_log.len() - MAX_CONNECTION_LOG;
                         inner.state.connection_log.drain(0..excess);
                     }
-                    let _ = persist_state(&daemon.state_path, &inner.state);
+                    // connection_log is #[serde(skip)] — not persisted to
+                    // state.json. Mark dirty in case other fields changed
+                    // in the same tick; the flush is a no-op for the log
+                    // itself but coalesces with traffic counter dirty.
+                    inner.dirty = true;
                 }
             }
 
@@ -11440,6 +11471,17 @@ fn start_watchdog(daemon: Daemon) {
                         }
                     }
                 }
+            }
+
+            // --- End of tick: write-behind flush ---
+            // Coalesce all dirty-marked mutations from this tick into a
+            // single state.json write. This is the core of write-behind:
+            // instead of up to 6 persist_state() calls per tick
+            // (6 × 660KB = 3.96MB), we do at most 1 write per tick.
+            // If nothing was dirty, zero writes.
+            {
+                let mut inner = lock(&daemon.inner);
+                flush_if_dirty(&mut inner, &daemon.state_path);
             }
 
             bench_was_running = bench_running;
@@ -11491,7 +11533,9 @@ fn run_scheduled_maintenance(
             eprintln!("hincyray: maintenance core restart failed: {error}");
         }
         inner.state.maintenance.last_run_unix = unix_now();
-        let _ = persist_state(&daemon.state_path, &inner.state);
+        // Mark dirty — the watchdog tick will flush this along with any
+        // other pending changes in the same tick.
+        inner.dirty = true;
     }
 }
 
