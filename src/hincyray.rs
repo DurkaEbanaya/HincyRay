@@ -11032,64 +11032,107 @@ fn start_watchdog(daemon: Daemon) {
                         }
                     }
                 } else if let Some(ref addr) = ec_addr {
-                    // External controller enabled but no proxy groups —
-                    // use Mihomo API delay test for health check. We test
-                    // PROXY_ACTIVE_NAME (the actual outbound), not the
-                    // fallback group "proxy", so that a fallback to DIRECT
-                    // is detected as a proxy failure, not a success.
-                    let delay = mihomo_api_delay(
-                        addr,
-                        ec_secret.as_deref(),
-                        PROXY_ACTIVE_NAME,
-                        "https://www.gstatic.com/generate_204",
-                        5000,
-                    );
+                    // v0.19.9: External controller enabled — read Mihomo
+                    // fallback group state instead of triggering our own
+                    // delay test. Rationale: the auto-generated fallback
+                    // group `proxy` already runs a delay test every
+                    // `interval` seconds (default 10s) and switches to
+                    // DIRECT when proxy-active is unreachable. Triggering
+                    // a second delay test from the daemon doubles upstream
+                    // load (two `https://www.gstatic.com/generate_204`
+                    // requests every 10s) and can worsen upstream
+                    // flapping. Instead, we read `now` and `alive` from
+                    // `/proxies/proxy` — a cheap loopback EC query. The
+                    // fallback group is our source of truth: it knows
+                    // better than we do whether proxy-active is healthy.
+                    //
+                    // Health is `true` only when the fallback group is
+                    // `alive` AND currently routing through `proxy-active`
+                    // (not DIRECT). When mihomo switches to DIRECT, we
+                    // detect that as a proxy failure.
+                    let group_state =
+                        mihomo_api_get_json(addr, ec_secret.as_deref(), "/proxies/proxy");
+                    let healthy = group_state.as_ref().is_ok_and(|v| {
+                        let alive = v.get("alive").and_then(Value::as_bool).unwrap_or(false);
+                        let now = v.get("now").and_then(Value::as_str).unwrap_or("");
+                        alive && now == PROXY_ACTIVE_NAME
+                    });
+                    // Read the last known latency from proxy-active history
+                    // for logging purposes. This does not trigger a new
+                    // upstream request — `history` is populated by the
+                    // fallback group's own delay test.
+                    let latency_ms: Option<u64> = if healthy {
+                        mihomo_api_get_json(addr, ec_secret.as_deref(), "/proxies/proxy-active")
+                            .ok()
+                            .and_then(|v| {
+                                v.get("history")
+                                    .and_then(Value::as_array)
+                                    .and_then(|h| h.last())
+                                    .and_then(|last| last.get("delay"))
+                                    .and_then(Value::as_u64)
+                            })
+                    } else {
+                        None
+                    };
                     let mut inner = lock(&daemon.inner);
-                    match delay {
-                        Ok(ms) => {
-                            if inner.failover_fail_count > 0 {
-                                eprintln!("hincyray: health check recovered ({ms}ms)");
-                            }
-                            inner.failover_fail_count = 0;
-                            failover_rejected_profiles.clear();
-                        }
-                        Err(error) => {
-                            let prev_count = inner.failover_fail_count;
-                            inner.failover_fail_count += 1;
-                            const FAILOVER_THRESHOLD: u32 = 3;
-                            // Only log the first failure (transition from healthy)
-                            // to avoid spamming the log with repeated failures.
-                            if prev_count == 0 {
-                                eprintln!(
-                                    "hincyray: health check failed (1/{FAILOVER_THRESHOLD}) — {error}"
-                                );
-                            }
-                            if inner.failover_fail_count >= FAILOVER_THRESHOLD {
-                                if auto_switch {
-                                    if let Some(id) = active_profile_id {
-                                        failover_rejected_profiles.insert(id);
-                                    }
-                                    if let Some(next_id) = find_best_profile_by_score(
-                                        &inner.state,
-                                        &failover_rejected_profiles,
-                                    ) {
-                                        eprintln!("hincyray: failover to profile {next_id}");
-                                        switch_active_profile(&mut inner, &daemon, next_id);
-                                    } else {
-                                        eprintln!("hincyray: no alternative profile for failover");
-                                    }
-                                    inner.failover_fail_count = 0;
-                                } else {
-                                    // Only log once when first crossing threshold
-                                    if prev_count < FAILOVER_THRESHOLD {
-                                        eprintln!(
-                                            "hincyray: proxy unreachable, \
-                                             mihomo fallback to DIRECT (auto-switch disabled)"
-                                        );
-                                    }
-                                    // Cap at threshold — don't reset, avoid log spam
-                                    inner.failover_fail_count = FAILOVER_THRESHOLD;
+                    if healthy {
+                        if inner.failover_fail_count > 0 {
+                            match latency_ms {
+                                Some(ms) => {
+                                    eprintln!("hincyray: health check recovered ({ms}ms)");
                                 }
+                                None => {
+                                    eprintln!("hincyray: health check recovered");
+                                }
+                            }
+                        }
+                        inner.failover_fail_count = 0;
+                        failover_rejected_profiles.clear();
+                    } else {
+                        let prev_count = inner.failover_fail_count;
+                        inner.failover_fail_count += 1;
+                        const FAILOVER_THRESHOLD: u32 = 3;
+                        // Only log the first failure (transition from healthy)
+                        // to avoid spamming the log with repeated failures.
+                        if prev_count == 0 {
+                            let reason = match group_state.as_ref() {
+                                Ok(v) => {
+                                    let now = v.get("now").and_then(Value::as_str).unwrap_or("?");
+                                    let alive =
+                                        v.get("alive").and_then(Value::as_bool).unwrap_or(false);
+                                    format!("now={now} alive={alive}")
+                                }
+                                Err(error) => error.to_string(),
+                            };
+                            eprintln!(
+                                "hincyray: health check failed (1/{FAILOVER_THRESHOLD}) — fallback group: {reason}"
+                            );
+                        }
+                        if inner.failover_fail_count >= FAILOVER_THRESHOLD {
+                            if auto_switch {
+                                if let Some(id) = active_profile_id {
+                                    failover_rejected_profiles.insert(id);
+                                }
+                                if let Some(next_id) = find_best_profile_by_score(
+                                    &inner.state,
+                                    &failover_rejected_profiles,
+                                ) {
+                                    eprintln!("hincyray: failover to profile {next_id}");
+                                    switch_active_profile(&mut inner, &daemon, next_id);
+                                } else {
+                                    eprintln!("hincyray: no alternative profile for failover");
+                                }
+                                inner.failover_fail_count = 0;
+                            } else {
+                                // Only log once when first crossing threshold
+                                if prev_count < FAILOVER_THRESHOLD {
+                                    eprintln!(
+                                        "hincyray: proxy unreachable, \
+                                         mihomo fallback to DIRECT (auto-switch disabled)"
+                                    );
+                                }
+                                // Cap at threshold — don't reset, avoid log spam
+                                inner.failover_fail_count = FAILOVER_THRESHOLD;
                             }
                         }
                     }

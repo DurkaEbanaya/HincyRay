@@ -1,4 +1,4 @@
-# Project: HincyRay v0.19.8 (crate `xray-vpn-test`)
+# Project: HincyRay v0.19.9 (crate `xray-vpn-test`)
 
 Rust crate shipping two binaries: the `hincyray` router daemon for Keenetic/Entware aarch64 and the `xray-vpn-test` desktop diagnostics app (macOS, feature `desktop`). Current router mode uses Mihomo plus iptables NAT REDIRECT/TPROXY; v0.14 adds diagnostics/recovery, Rule Trace, Sub-Store Lite, Smart Auto-Select 2.0, backups/WebDAV, scheduled maintenance, connection close control, and EC wildcard dial safety. Shared parsing/scoring lives in `src/profiles.rs`, `src/scoring.rs`, and `src/xray_config.rs`.
 
@@ -121,7 +121,7 @@ shasum -a 256 target/aarch64-unknown-linux-gnu/release/hincyray
 #   cp /tmp/hincyray-new /opt/sbin/hincyray && chmod +x /opt/sbin/hincyray
 #   sha256sum /opt/sbin/hincyray   # must match the local shasum
 #   /opt/etc/init.d/S99hincyray start
-#   curl -s http://127.0.0.1:8088/api/health   # expect {"version":"0.19.8"}
+#   curl -s http://127.0.0.1:8088/api/health   # expect {"version":"0.19.9"}
 ```
 
 Always back up the running binary to `.bak` before overwriting, and verify the on-router SHA256 matches the local build before starting the daemon.
@@ -144,10 +144,28 @@ Current gate status: all green, 359 tests, 0 clippy warnings.
 
 Release token lives at `/Users/lain/Documents/токен телега.rtf`. **NEVER write the token contents into AGENTS.md, source, or commits** — reference it only by loading at call time:
 ```
-GH_TOKEN="$(cat '/Users/lain/Documents/токен телега.rtf')" gh release create v0.19.8 \
+GH_TOKEN="$(cat '/Users/lain/Documents/токен телега.rtf')" gh release create v0.19.9 \
     target/aarch64-unknown-linux-gnu/release/hincyray \
-    --title "v0.19.8" --notes "..."
+    --title "v0.19.9" --notes "..."
 ```
+
+### v0.19.9 release status
+
+Released. Watchdog health check deduplication — eliminates double upstream probing and reduces flapping-induced OOM.
+
+v0.19.9 fixes the **"VPN то работает, то нет"** instability symptom. Diagnosed via on-router log analysis: hincyray.log showed 212 `health check failed (1/3)`, 19 `proxy unreachable → fallback to DIRECT`, 203 `error sending request` (EC unreachable) events in ~30 minutes. Each fallback to DIRECT window = ~30s of "VPN не работает" for the user.
+
+**Root cause — duplicated upstream probing.** The Mihomo fallback proxy group `proxy` (auto-generated, wraps `[proxy-active, DIRECT]`) already runs a `https://www.gstatic.com/generate_204` delay test every 10 seconds on its own — that's its job, that's how it decides when to switch to DIRECT. The hincyray watchdog Phase 3 was **also** calling `mihomo_api_delay()` every 10 seconds, triggering a **second** upstream request through the same VLESS Reality outbound. Two requests every 10 seconds to a flaky Italian LTE upstream doubled the load and made flapping worse.
+
+**Fix — read state instead of probing.** Phase 3 EC branch (lines ~11034-11122) now calls `mihomo_api_get_json("/proxies/proxy")` instead of `mihomo_api_delay()`. This is a cheap loopback query (no upstream traffic) that returns `alive: bool` + `now: string` from the fallback group's own state. Health is `true` only when `alive && now == "proxy-active"`. When mihomo switches to DIRECT, we detect it via `now == "DIRECT"` — no extra probe needed. For logging latency in the "recovered" message, we read `proxy-active.history[].last().delay` — populated by the fallback group's own delay test, no new upstream traffic.
+
+**Source of truth shifted.** Mihomo fallback group is now the canonical health decider — it knows better than the daemon whether the upstream is healthy. The daemon becomes a **reactor** to mihomo's state, not a parallel prober.
+
+**Side benefit — memory.** Restart (deploy) reset hincyray RSS from 66MB → 6.9MB (undo_stack accumulated over 18h + heap fragmentation). MemAvailable went 186MB → 250MB. This is a one-time deploy effect, not a code fix — the undo_stack-on-disk architectural change is deferred to a future release since the watchdog fix already gives substantial relief.
+
+**Risk:** if mihomo EC `/proxies/proxy` returns malformed JSON or the fallback group is in a transition window (testing), the daemon may log 1-2 spurious health failures. The watchdog is robust to this — only state transitions are logged, threshold is 3 consecutive failures.
+
+**E2E verified on Keenetic Giga:** 6 minutes after deploy — `/api/health` → `{"version":"0.19.9"}`, hincomo RSS 7.1MB, mihomo RSS 71MB, MemAvailable 244MB, `/proxies/proxy` → `alive:true, now:proxy-active`, mihomo delay history stable (86, 86, 89, 85, 96, 91, 100, 89, 110 ms — no flapping), zero health check failures in the new log session (was 15-30 per 5 min before). 359 tests, 0 clippy warnings.
 
 ### v0.19.8 release status
 
@@ -231,6 +249,7 @@ E2E on Keenetic Giga verified: `/api/health` → `{"version":"0.19.5"}`; TCP ben
 
 ## Notes
 
+* v0.19.9 watchdog health check deduplication: Phase 3 EC branch (lines ~11034-11122) replaced `mihomo_api_delay()` (which triggered a second upstream `gstatic.com/generate_204` request through the VLESS Reality outbound every 10s) with `mihomo_api_get_json("/proxies/proxy")` (cheap loopback EC query, zero upstream traffic). The Mihomo fallback group `proxy` already runs its own delay test every 10s and switches to DIRECT on failure — that's its job. The daemon was duplicating this work, doubling upstream load on flaky LTE servers and worsening flapping. Now health = `alive && now == "proxy-active"` from `/proxies/proxy`. Latency for "recovered" log comes from `proxy-active.history[].last().delay` — populated by the fallback group's own delay test, no new upstream traffic. Source of truth shifted: mihomo fallback group is the canonical health decider, daemon is a reactor. E2E on Keenetic Giga 6 min after deploy: hincyray RSS 7.1MB, mihomo RSS 71MB, MemAvailable 244MB, mihomo delay history stable (86-110ms, no flapping), zero health fails in new session. 359 tests, 0 clippy warnings.
 * v0.19.8 write-behind state persistence: `DaemonInner.dirty: bool` flag — watchdog's 10 `persist_state()` call sites replaced with `inner.dirty = true` (zero I/O). `flush_if_dirty()` at end of each watchdog tick: one persist if dirty, zero if clean. `run_scheduled_maintenance()` marks dirty. Graceful shutdown calls `flush_if_dirty()`. Startup persists and all 42 API handler persists remain synchronous (write-through). Write amplification: 6 writes/tick → 1 write/tick (or 0). Traffic counters still gate on `is_multiple_of(6)` (60s cadence). Connection log phase marks dirty (log is `#[serde(skip)]`, flush coalesces with other phases). Risk: crash between mark_dirty and flush loses up to 10s of watchdog state (traffic counters, timestamps); user settings unaffected. E2E on Keenetic Giga: `/api/health` 0.19.8, mihomo 60MB, hincyray 5.5MB, MemAvailable 256MB, I/O 0.06%. 359 tests, 0 clippy warnings.
 * v0.19.7 critical memory/I/O stability patch: state.json bloat + RKN bypass list memory + fallback tuning. `undo_stack`, `connection_log`, `metrics_history` are now `#[serde(skip)]` — transient fields never serialized, state.json shrank from 4MB to 660KB, hincyray RSS 85MB → 5.5MB. RKN bypass rule provider changed from `type: http, behavior: classical` (744K rules = ~150-290MB mihomo RSS) to `type: file, behavior: domain` — Hincyray downloads and preprocesses the bypass list itself (`update_bypass_list()` — strips `DOMAIN,`/`DOMAIN-SUFFIX,` prefixes, strips trailing dots, skips unsupported rule types; `preprocess_bypass_list_in_place()` migrates existing classical-format files on startup). Watchdog Phase 11 periodically refreshes the list through SOCKS proxy. Fallback group interval 30→10s, timeout 5000→3000ms. Health check logging: only state transitions logged (healthy→failed, failed→recovered), `failover_fail_count` caps at threshold when `auto_switch=false`. E2E on Keenetic Giga: mihomo RSS 194-292MB → 60MB, MemAvailable 4.8MB → 256MB, load 35 → 0.38, I/O pressure 99.57% → 0.06%. 359 tests, 0 clippy warnings.
 * v0.19.6 critical stability patch: always-on direct-fallback proxy group + always-on health check. `build_mihomo_router_config()` now always wraps the active proxy in a `fallback` group named `proxy` with `[proxy-active, DIRECT]` — Mihomo auto-switches to DIRECT when the upstream proxy is unreachable and back when it recovers, preventing connection storms that OOM the router. `PROXY_ACTIVE_NAME` ("proxy-active") constant. `FALLBACK_HEALTH_URL` (gstatic generate_204). Watchdog Phase 3 health check runs always (not just `auto_switch`); `auto_switch` controls only the action on failure (`true` → switch profile, `false` → log + rely on mihomo fallback). EC delay test probes `PROXY_ACTIVE_NAME` (outbound), not `PROXY_NAME` (group). `build_proxy_groups_json` adds DIRECT as last resort in `fallback`-type groups. E2E on Keenetic Giga: I/O pressure 99.46% → 0.03%, MemAvailable 7.8MB → 119MB, load 22 → 0.11, health check detects proxy flapping (failed 1/3 → recovered 191ms). 359 tests, 0 clippy warnings.
