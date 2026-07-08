@@ -1,4 +1,4 @@
-# Project: HincyRay v0.19.9 (crate `xray-vpn-test`)
+# Project: HincyRay v0.20.0 (crate `xray-vpn-test`)
 
 Rust crate shipping two binaries: the `hincyray` router daemon for Keenetic/Entware aarch64 and the `xray-vpn-test` desktop diagnostics app (macOS, feature `desktop`). Current router mode uses Mihomo plus iptables NAT REDIRECT/TPROXY; v0.14 adds diagnostics/recovery, Rule Trace, Sub-Store Lite, Smart Auto-Select 2.0, backups/WebDAV, scheduled maintenance, connection close control, and EC wildcard dial safety. Shared parsing/scoring lives in `src/profiles.rs`, `src/scoring.rs`, and `src/xray_config.rs`.
 
@@ -121,7 +121,7 @@ shasum -a 256 target/aarch64-unknown-linux-gnu/release/hincyray
 #   cp /tmp/hincyray-new /opt/sbin/hincyray && chmod +x /opt/sbin/hincyray
 #   sha256sum /opt/sbin/hincyray   # must match the local shasum
 #   /opt/etc/init.d/S99hincyray start
-#   curl -s http://127.0.0.1:8088/api/health   # expect {"version":"0.19.9"}
+#   curl -s http://127.0.0.1:8088/api/health   # expect {"version":"0.20.0"}
 ```
 
 Always back up the running binary to `.bak` before overwriting, and verify the on-router SHA256 matches the local build before starting the daemon.
@@ -148,6 +148,16 @@ GH_TOKEN="$(cat '/Users/lain/Documents/токен телега.rtf')" gh release
     target/aarch64-unknown-linux-gnu/release/hincyray \
     --title "v0.19.9" --notes "..."
 ```
+
+### v0.20.0 release status
+
+Ready for release. Deep Bench + Trash Bin quality management.
+
+v0.20.0 adds long-running server quality testing and conservative automatic trash promotion for persistently bad servers. Deep Bench runs Phase A quick benchmarks, Phase B stability sampling + unlock checks, and writes compact daily snapshots to `quality-history.json` instead of bloating `state.json`. The Web UI shows a 30-day quality heatmap with score breakdown tooltips. Trash Bin promotes a server only after 3 consecutive daily `composite_score < 30` readings and restores automatically when `composite_score > 50`; manual restore/purge endpoints are available.
+
+Phase B methodology was corrected after router validation: temp Mihomo warm-up is now excluded from `loss_percent`, eliminating the artificial 16.7% one-miss-in-six pattern. Sustained download uses a dedicated 15s fallback download path and records `sustained_download_source`/`sustained_download_error`, so speed either measures successfully or reports why it did not. Real Keenetic validation produced `loss_percent=0.0`, `warmup_ok=true`, 6 measured latency samples, `sustained_download_mbps=46.53`, source `https://proof.ovh.net/files/100Mb.dat`, and `composite_score=81`.
+
+Gates before release: `cargo fmt --all --check`, `cargo check --all-targets --all-features`, both clippy profiles with `-D warnings`, `cargo test --all-targets --all-features` (359 tests), `python3 scripts/frontend-contract-test.py`, `git diff --check`. Router deploy SHA for the pre-version-bump validation build: `1e3ef1f524c21788b8e641d14056ad67914c73537db2447bb3eb0c25e8361149`.
 
 ### v0.19.9 release status
 

@@ -41,6 +41,7 @@ pub const DEFAULT_UPLOAD_URL: &str = "https://speed.cloudflare.com/__up";
 const PROBE_ATTEMPTS: usize = 3;
 const PROBE_TIMEOUT_SECS: u64 = 6;
 const DOWNLOAD_MAX_SECS: u64 = 3;
+const SUSTAINED_DOWNLOAD_MAX_SECS: u64 = 15;
 const XRAY_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -554,12 +555,16 @@ fn curl_probe(port: u16, url: &str, method: BenchMethod) -> Result<Duration, Str
 }
 
 fn curl_download(port: u16, url: &str) -> Result<f32, String> {
+    curl_download_with_timeout(port, url, DOWNLOAD_MAX_SECS)
+}
+
+fn curl_download_with_timeout(port: u16, url: &str, max_secs: u64) -> Result<f32, String> {
     let output = Command::new("curl")
         .arg("--socks5-hostname")
         .arg(format!("127.0.0.1:{port}"))
         .arg("-L")
         .arg("--max-time")
-        .arg(DOWNLOAD_MAX_SECS.to_string())
+        .arg(max_secs.to_string())
         .arg("--range")
         .arg("0-10485759")
         .arg("--silent")
@@ -735,6 +740,350 @@ impl Drop for ChildGuard {
             let _ = child.wait();
         }
     }
+}
+
+// =========================================================================
+// v0.20: Deep Bench — stability-over-time + unlock-test.
+//
+// Stability test observes one profile's SOCKS proxy for N minutes,
+// sampling latency every 10 seconds via `curl HEAD` to gstatic. This
+// gives a realistic drop/loss rate and latency variance over time, not
+// just a snapshot. Unlock test probes four commonly-blocked services
+// (github, cloudflare, google, telegram) with 2 retries each to avoid
+// false negatives from transient failures.
+//
+// Both tests reuse the temp mihomo instance spawned by the caller —
+// they take an already-bound `port` argument.
+// =========================================================================
+
+use crate::hincyray::{StabilityMetrics, UnlockStatus, UnlockTestResult};
+
+/// Number of retry attempts for each unlock-test probe. 2 was chosen
+/// to absorb transient blips without doubling the test time on
+/// genuinely-blocked servers (each retry is up to 8s timeout).
+const UNLOCK_RETRIES: u32 = 2;
+
+/// Sustained download URL — Cloudflare's 100 MB speed endpoint. Used
+/// for the 30-second sustained throughput test in Phase B.
+const SUSTAINED_DOWNLOAD_URL: &str = "https://speed.cloudflare.com/__down?bytes=100000000";
+
+const SUSTAINED_DOWNLOAD_CANDIDATES: &[&str] = &[
+    DEFAULT_DOWNLOAD_URL,
+    SUSTAINED_DOWNLOAD_URL,
+    "http://cachefly.cachefly.net/100mb.test",
+];
+
+struct StabilityAggregationInput {
+    observation_secs: u32,
+    latency_samples: Vec<u32>,
+    drop_count: u32,
+    total_attempts: u32,
+    warmup_ok: bool,
+    sustained_download_mbps: f32,
+    sustained_download_source: String,
+    sustained_download_error: String,
+    sustained_upload_mbps: f32,
+}
+
+/// Spawn a temp mihomo for `profile`, wait for SOCKS ready, return the
+/// bound port and the ChildGuard. Caller is responsible for keeping
+/// the guard alive for the duration of the tests. Returns `None` if
+/// mihomo cannot be started (config error, port exhaustion, etc.).
+fn spawn_bench_mihomo(profile: &Profile) -> Option<(u16, ChildGuard)> {
+    let port = reserve_local_port().ok()?;
+    let config_yaml = build_mihomo_bench_config(profile, "127.0.0.1", port).ok()?;
+    let mut config_file = NamedTempFile::with_suffix(".yaml").ok()?;
+    config_file.write_all(config_yaml.as_bytes()).ok()?;
+    config_file.flush().ok()?;
+    let stderr_file = NamedTempFile::new().ok()?;
+    let stderr_writer = stderr_file.reopen().ok()?;
+    let child = Command::new("mihomo")
+        .arg("-f")
+        .arg(config_file.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_writer))
+        .spawn()
+        .ok()?;
+    let mut guard = ChildGuard { child: Some(child) };
+    wait_until_socks_ready(port, guard.as_mut(), stderr_file.path()).ok()?;
+    Some((port, guard))
+}
+
+/// v0.20: Run the full Phase B observation on `profile` for `minutes`
+/// minutes. Spawns a single temp mihomo, runs the stability latency
+/// loop (10-sec samples to gstatic), then runs the unlock-test
+/// (4 services × 2 retries) on the same SOCKS port, then drops the
+/// temp mihomo. Returns `(stability, unlock)` or `None` if the temp
+/// mihomo couldn't be spawned.
+///
+/// `cancel` is checked at every sample; if set, the loop exits early
+/// and partial metrics are returned. The unlock-test always runs
+/// (even on early cancel) so we don't lose that data point.
+pub fn run_stability_and_unlock(
+    profile: &Profile,
+    minutes: u32,
+    cancel: &AtomicBool,
+) -> Option<(StabilityMetrics, UnlockTestResult)> {
+    let (port, _guard) = spawn_bench_mihomo(profile)?;
+    let observation_secs = minutes.max(1) * 60;
+    let sample_period = 10u64;
+    let expected_samples = observation_secs / sample_period as u32;
+    let mut latency_samples: Vec<u32> = Vec::with_capacity(expected_samples as usize);
+    let mut drop_count = 0u32;
+
+    let warmup_ok = warmup_bench_proxy(port, cancel);
+
+    let started = Instant::now();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let elapsed = started.elapsed().as_secs();
+        if elapsed >= u64::from(observation_secs) {
+            break;
+        }
+        match curl_probe(port, DEFAULT_PROBE_URL, BenchMethod::Head) {
+            Ok(dur) => latency_samples.push(dur.as_millis().min(u32::MAX as u128) as u32),
+            Err(_) => drop_count += 1,
+        }
+        // Sleep until next 10s tick, but keep checking cancel frequently.
+        let next_tick = started.elapsed().as_secs() / sample_period * sample_period + sample_period;
+        while started.elapsed().as_secs() < next_tick
+            && started.elapsed().as_secs() < u64::from(observation_secs)
+        {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    let total_attempts = latency_samples.len() as u32 + drop_count;
+    let (sustained_download_mbps, sustained_download_source, sustained_download_error) =
+        sustained_download_probe(port);
+    // Skip upload for stability — it doubles test time and download
+    // is the dominant signal for streaming/browsing quality.
+    let sustained_upload_mbps = 0.0;
+    let metrics = aggregate_stability(StabilityAggregationInput {
+        observation_secs,
+        latency_samples,
+        drop_count,
+        total_attempts,
+        warmup_ok,
+        sustained_download_mbps,
+        sustained_download_source,
+        sustained_download_error,
+        sustained_upload_mbps,
+    });
+    let unlock = run_unlock_test(port);
+    Some((metrics, unlock))
+}
+
+fn warmup_bench_proxy(port: u16, cancel: &AtomicBool) -> bool {
+    for attempt in 0..3 {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        if curl_probe(port, DEFAULT_PROBE_URL, BenchMethod::Head).is_ok() {
+            return true;
+        }
+        if attempt < 2 {
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+    false
+}
+
+fn sustained_download_probe(port: u16) -> (f32, String, String) {
+    let mut errors = Vec::new();
+    for url in SUSTAINED_DOWNLOAD_CANDIDATES {
+        match curl_download_with_timeout(port, url, SUSTAINED_DOWNLOAD_MAX_SECS) {
+            Ok(mbps) if mbps > 0.0 => return (mbps, (*url).to_owned(), String::new()),
+            Ok(_) => errors.push(format!("{url}: zero bytes/speed")),
+            Err(error) => errors.push(format!("{url}: {error}")),
+        }
+    }
+    (0.0, String::new(), errors.join("; "))
+}
+
+/// v0.20: Precompute min/avg/p95/stddev from raw latency samples.
+fn aggregate_stability(input: StabilityAggregationInput) -> StabilityMetrics {
+    let StabilityAggregationInput {
+        observation_secs,
+        latency_samples: mut samples,
+        drop_count,
+        total_attempts,
+        warmup_ok,
+        sustained_download_mbps,
+        sustained_download_source,
+        sustained_download_error,
+        sustained_upload_mbps,
+    } = input;
+    let total = total_attempts.max(1);
+    let loss_percent = drop_count as f32 * 100.0 / total as f32;
+    if samples.is_empty() {
+        return StabilityMetrics {
+            observation_secs,
+            latency_samples: samples,
+            latency_min: 0,
+            latency_avg: 0,
+            latency_p95: 0,
+            latency_stddev: 0,
+            drop_count,
+            loss_percent,
+            warmup_ok,
+            sustained_download_mbps,
+            sustained_download_source,
+            sustained_download_error,
+            sustained_upload_mbps,
+        };
+    }
+    samples.sort_unstable();
+    let min = samples[0];
+    let max = samples[samples.len() - 1];
+    let sum = samples.iter().map(|&x| x as u64).sum::<u64>();
+    let avg = (sum / samples.len() as u64).min(u32::MAX as u64) as u32;
+    let p95_idx = ((samples.len() as f64) * 0.95).ceil() as usize;
+    let p95 = samples
+        .get(p95_idx.saturating_sub(1))
+        .copied()
+        .unwrap_or(max);
+    let variance = samples
+        .iter()
+        .map(|&s| {
+            let d = s as f64 - avg as f64;
+            d * d
+        })
+        .sum::<f64>()
+        / samples.len() as f64;
+    let stddev = variance.sqrt() as u32;
+    StabilityMetrics {
+        observation_secs,
+        latency_samples: samples,
+        latency_min: min,
+        latency_avg: avg,
+        latency_p95: p95,
+        latency_stddev: stddev,
+        drop_count,
+        loss_percent,
+        warmup_ok,
+        sustained_download_mbps,
+        sustained_download_source,
+        sustained_download_error,
+        sustained_upload_mbps,
+    }
+}
+
+/// v0.20: Probe a single URL via SOCKS for the unlock-test. Retries
+/// up to `UNLOCK_RETRIES` times. Records HTTP status + TTFB. Returns
+/// the best (most-reachable) result observed.
+fn probe_unlock(port: u16, url: &str) -> UnlockStatus {
+    let mut best = UnlockStatus::default();
+    for _ in 0..UNLOCK_RETRIES {
+        let output = Command::new("curl")
+            .arg("--socks5-hostname")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("-L")
+            .arg("--max-time")
+            .arg("8")
+            .arg("--silent")
+            .arg("--show-error")
+            .arg("--output")
+            .arg("/dev/null")
+            .arg("--write-out")
+            .arg("%{http_code} %{time_starttransfer}")
+            .arg(url)
+            .output();
+        let Ok(out) = output else { continue };
+        let raw = String::from_utf8_lossy(&out.stdout);
+        let parts: Vec<&str> = raw.split_whitespace().collect();
+        if parts.len() >= 2
+            && let Ok(code) = parts[0].parse::<u16>()
+        {
+            let ttfb_secs: f64 = parts[1].parse().unwrap_or(0.0);
+            let ttfb_ms = (ttfb_secs * 1000.0).round() as u32;
+            let reachable = (200..400).contains(&code);
+            if reachable || !best.reachable {
+                best = UnlockStatus {
+                    reachable,
+                    http_status: code,
+                    ttfb_ms: ttfb_ms.max(best.ttfb_ms),
+                };
+            }
+            if reachable {
+                break;
+            }
+        }
+    }
+    best
+}
+
+/// v0.20: Run the unlock-test against a pre-spawned SOCKS port.
+/// Probes github, cloudflare, google, telegram. Each probe does up to
+/// `UNLOCK_RETRIES` attempts to avoid false negatives.
+pub fn run_unlock_test(port: u16) -> UnlockTestResult {
+    UnlockTestResult {
+        github: probe_unlock(port, "https://github.com"),
+        cloudflare: probe_unlock(port, "https://www.cloudflare.com"),
+        google: probe_unlock(port, "https://www.google.com"),
+        telegram: probe_unlock(port, "https://web.telegram.org"),
+    }
+}
+
+/// v0.20: Compute the composite quality score (0-100) from the
+/// available inputs. Weights:
+///   25% latency (avg ms)        — ≤50ms → 100, ≥500ms → 0, linear
+///   15% jitter (stddev)         — ≤5ms → 100, ≥100ms → 0, linear
+///   20% stability (drop rate)   — 0% → 100, ≥30% → 0, linear
+///   15% speed (sustained Mbps)  — ≥50 → 100, 0 → 0, linear
+///   25% unlock (4 services)     — 4/4 → 100, 0/4 → 0
+pub fn composite_quality_score(
+    latency_avg_ms: u32,
+    latency_stddev: u32,
+    loss_percent: f32,
+    sustained_mbps: f32,
+    unlock_count: u32,
+) -> u32 {
+    let latency_score = if latency_avg_ms == 0 {
+        0.0
+    } else if latency_avg_ms <= 50 {
+        100.0
+    } else if latency_avg_ms >= 500 {
+        0.0
+    } else {
+        100.0 - (latency_avg_ms as f64 - 50.0) * 100.0 / 450.0
+    };
+    let jitter_score = if latency_stddev <= 5 {
+        100.0
+    } else if latency_stddev >= 100 {
+        0.0
+    } else {
+        100.0 - (latency_stddev as f64 - 5.0) * 100.0 / 95.0
+    };
+    let stability_score = if loss_percent <= 0.0 {
+        100.0
+    } else if loss_percent >= 30.0 {
+        0.0
+    } else {
+        100.0 - loss_percent as f64 * 100.0 / 30.0
+    };
+    let speed_score = if sustained_mbps >= 50.0 {
+        100.0
+    } else {
+        sustained_mbps as f64 * 100.0 / 50.0
+    };
+    let unlock_score = (unlock_score_pct(unlock_count)) as f64;
+    let composite = 0.25 * latency_score
+        + 0.15 * jitter_score
+        + 0.20 * stability_score
+        + 0.15 * speed_score
+        + 0.25 * unlock_score;
+    composite.round().clamp(0.0, 100.0) as u32
+}
+
+/// Unlock-test contribution to composite (0-100). 4/4 → 100.
+fn unlock_score_pct(unlock_count: u32) -> u32 {
+    (unlock_count.min(4) * 25).min(100)
 }
 
 #[cfg(test)]

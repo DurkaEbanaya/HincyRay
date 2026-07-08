@@ -347,6 +347,22 @@ struct DaemonInner {
     /// v0.13: active session tokens for Web UI authentication.
     /// In-memory only — cleared on restart.
     sessions: std::collections::HashSet<String>,
+    /// v0.20: Deep Bench runtime — background thread + cancel flag.
+    /// Separate from `bench` so a running deep bench does not block
+    /// manual quick benches from the UI (the daemon decides which to
+    /// start based on `is_running()` checks).
+    deep_bench_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    deep_bench_handle: Option<JoinHandle<()>>,
+    /// v0.20: true while the deep bench background thread is running.
+    /// Set to true by the launcher before spawn, reset to false by
+    /// the thread on exit (success or cancel). Used by Phase 3 to
+    /// skip health check during deep bench (avoids EC contention),
+    /// and by Phase 12 to avoid double-spawn.
+    deep_bench_active: bool,
+    /// v0.20: live status of the running (or last) deep bench. Updated
+    /// by the background thread, read by `/api/deep-bench/status`.
+    /// In-memory only — a fresh daemon starts in `idle` state.
+    deep_bench_status: DeepBenchStatus,
 }
 
 /// One row of `/proc/stat` for a CPU (aggregate or per-core).
@@ -639,6 +655,26 @@ pub struct HincyrayState {
     /// v0.19: memory guard thresholds and last warning state.
     #[serde(default)]
     pub memory_guard: MemoryGuardSettings,
+    /// v0.20: Deep Bench settings (scheduled quality testing).
+    #[serde(default)]
+    pub deep_bench: DeepBenchSettings,
+    /// v0.20: Trash bin — raw share-links of servers marked as poor
+    /// quality (composite_score < 30 for 3+ consecutive days). Survives
+    /// subscription refresh because it is keyed by raw, not by profile
+    /// id. A profile whose raw is in this set is shown in the "Trash"
+    /// virtual group in the UI.
+    #[serde(default)]
+    pub trash_raws: std::collections::HashSet<String>,
+    /// v0.20: Unix timestamp when each raw was promoted to trash.
+    /// Used for garbage collection (purge entries older than 90 days
+    /// that are no longer present in any subscription).
+    #[serde(default)]
+    pub trash_promoted_at: std::collections::HashMap<String, u64>,
+    /// v0.20: Daily quality snapshots — persisted to a separate file
+    /// (`/opt/etc/hincyray/quality-history.json`) to avoid bloating
+    /// state.json. Loaded lazily by `/api/deep-bench/history`.
+    #[serde(skip)]
+    pub quality_history: Vec<DailyQualitySnapshot>,
 }
 
 impl Default for HincyrayState {
@@ -681,6 +717,10 @@ impl Default for HincyrayState {
             last_subscription_refresh_report: None,
             undo_stack: Vec::new(),
             memory_guard: MemoryGuardSettings::default(),
+            deep_bench: DeepBenchSettings::default(),
+            trash_raws: std::collections::HashSet::new(),
+            trash_promoted_at: std::collections::HashMap::new(),
+            quality_history: Vec::new(),
         }
     }
 }
@@ -745,6 +785,217 @@ fn default_memory_guard_mihomo_rss_kb() -> u64 {
 
 fn default_memory_guard_system_pct() -> f64 {
     90.0
+}
+
+// =========================================================================
+// v0.20: Deep Bench — scheduled quality testing of all profiles.
+// =========================================================================
+
+/// Default stability-test duration per server (minutes). 3 minutes was
+/// chosen so that 60 servers × 3m = 3h fits in a typical 4-hour night
+/// window (02:00–06:00) alongside the ~35 min Phase A quick bench.
+fn default_deep_bench_stability_minutes() -> u32 {
+    3
+}
+
+/// Default window: every day, 02:00–06:00. Weekdays bitmask 0x7F = all
+/// 7 days (bits 0..=6 set, where bit 0 = Sunday, bit 6 = Saturday).
+fn default_deep_bench_weekdays() -> u8 {
+    0x7F
+}
+
+fn default_deep_bench_start_hour() -> u8 {
+    2
+}
+
+fn default_deep_bench_end_hour() -> u8 {
+    6
+}
+
+/// Bitmask: bit (1 << day_of_week) where day_of_week is 0=Sunday..=6=Saturday
+/// (matches `chrono::Weekday::num_days_from_sunday`).
+pub const WEEKDAY_SUN: u8 = 1 << 0;
+pub const WEEKDAY_MON: u8 = 1 << 1;
+pub const WEEKDAY_TUE: u8 = 1 << 2;
+pub const WEEKDAY_WED: u8 = 1 << 3;
+pub const WEEKDAY_THU: u8 = 1 << 4;
+pub const WEEKDAY_FRI: u8 = 1 << 5;
+pub const WEEKDAY_SAT: u8 = 1 << 6;
+
+/// v0.20: Deep Bench settings. Schedules a two-phase quality test:
+/// Phase A runs a quick bench (latency+jitter+speed) on selected
+/// profiles, Phase B observes each server that passed Phase A for
+/// `stability_minutes` to measure drop rate, latency variance, and
+/// unlock capability. Results are persisted to
+/// `/opt/etc/hincyray/quality-history.json` for 30-day trend analysis.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DeepBenchSettings {
+    /// Master switch. When false, the watchdog never triggers a deep
+    /// bench, but manual `/api/deep-bench/start` still works.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bitmask of weekdays (1<<day). 0x7F = every day.
+    #[serde(default = "default_deep_bench_weekdays")]
+    pub weekdays: u8,
+    /// Start of the testing window (hour, 0-23). Deep bench may start
+    /// at any tick where `current_hour >= start_hour && current_hour <
+    /// end_hour`.
+    #[serde(default = "default_deep_bench_start_hour")]
+    pub start_hour: u8,
+    /// End of the testing window (exclusive). Must be > start_hour.
+    #[serde(default = "default_deep_bench_end_hour")]
+    pub end_hour: u8,
+    /// Stability-test duration per server in Phase B. Default 3 minutes
+    /// = 18 latency samples (one every 10s).
+    #[serde(default = "default_deep_bench_stability_minutes")]
+    pub stability_minutes: u32,
+    /// Which profiles to test. Empty filter = all profiles.
+    #[serde(default)]
+    pub profile_filter: ProfileFilter,
+    /// Unix timestamp of the last deep bench start (manual or auto).
+    #[serde(default)]
+    pub last_run_unix: u64,
+    /// Date (YYYYMMDD) of the last completed deep bench. Used to
+    /// enforce one-shot-per-day: if today's date matches, the
+    /// scheduler skips even if the window is active.
+    #[serde(default)]
+    pub last_completed_date: u32,
+}
+
+/// v0.20: Selector for which profiles to deep-bench.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ProfileFilter {
+    /// Test every profile in state.profiles.
+    #[default]
+    All,
+    /// Test only profiles whose `group` matches the subscription URL.
+    Subscription(String),
+    /// Test only profiles whose `raw` is in the given list.
+    Explicit(Vec<String>),
+}
+
+/// v0.20: Per-server stability metrics collected during Phase B by
+/// observing the proxy for `stability_minutes`. All latency samples
+/// are kept so the UI can plot a sparkline; aggregates are precomputed
+/// for fast sort/filter.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StabilityMetrics {
+    /// Total observation time in seconds (e.g. 180 for 3 minutes).
+    pub observation_secs: u32,
+    /// One latency sample every 10 seconds (ms). 18 entries for 3 min.
+    pub latency_samples: Vec<u32>,
+    pub latency_min: u32,
+    pub latency_avg: u32,
+    pub latency_p95: u32,
+    pub latency_stddev: u32,
+    /// Number of delay tests that returned no answer within timeout.
+    pub drop_count: u32,
+    /// drop_count / total_samples × 100.
+    pub loss_percent: f32,
+    /// Whether the post-spawn warm-up probe succeeded before measured
+    /// sampling began. Warm-up is excluded from loss statistics.
+    #[serde(default)]
+    pub warmup_ok: bool,
+    /// Average download speed over a 30-second sustained test.
+    pub sustained_download_mbps: f32,
+    /// Which URL produced the sustained download speed reading.
+    #[serde(default)]
+    pub sustained_download_source: String,
+    /// Last sustained-download error if no candidate URL succeeded.
+    #[serde(default)]
+    pub sustained_download_error: String,
+    /// Average upload speed over a 30-second sustained test.
+    pub sustained_upload_mbps: f32,
+}
+
+/// v0.20: Reachability result for one of the four unlock-test services.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UnlockStatus {
+    /// True if at least one of the 2 retry attempts returned HTTP 2xx/3xx.
+    pub reachable: bool,
+    /// Last HTTP status code observed (0 if never reached).
+    pub http_status: u16,
+    /// Time-to-first-byte in ms (0 if never reached).
+    pub ttfb_ms: u32,
+}
+
+/// v0.20: Unlock-test result — checks whether the server can reach
+/// four commonly-blocked services. Each service is probed twice to
+/// avoid false negatives from transient failures (e.g. the Italian
+/// LTE server today cannot reach github.com but its subdomains work).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UnlockTestResult {
+    pub github: UnlockStatus,
+    pub cloudflare: UnlockStatus,
+    pub google: UnlockStatus,
+    pub telegram: UnlockStatus,
+}
+
+impl UnlockTestResult {
+    /// Number of services that are reachable (0..=4).
+    pub fn reachable_count(&self) -> u32 {
+        [
+            self.github.reachable,
+            self.cloudflare.reachable,
+            self.google.reachable,
+            self.telegram.reachable,
+        ]
+        .iter()
+        .filter(|&&r| r)
+        .count() as u32
+    }
+
+    /// Unlock score for composite (0..=100). 4/4 = 100, 0/4 = 0.
+    pub fn score(&self) -> u32 {
+        (self.reachable_count() * 25).min(100)
+    }
+}
+
+/// v0.20: One row of quality history. Stored by `profile_raw` (not
+/// `profile_id`) so it survives subscription refresh — when a profile
+/// is removed and re-added by `replace_subscription_profiles`, its
+/// id changes but its raw share-link stays the same.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DailyQualitySnapshot {
+    /// YYYYMMDD (e.g. 20260707 for 2026-07-07).
+    pub date: u32,
+    /// Raw share-link — the stable identity across subscription refresh.
+    pub profile_raw: String,
+    /// Snapshot of profile name at test time (for UI display when the
+    /// profile is no longer in any subscription).
+    pub profile_name: String,
+    /// Composite score 0-100 from Phase A (quick bench).
+    pub quick_score: u32,
+    /// Stability metrics from Phase B. None if the profile did not
+    /// pass Phase A (filtered out as unavailable or low-quality).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stability: Option<StabilityMetrics>,
+    /// Unlock-test result from Phase B.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock: Option<UnlockTestResult>,
+    /// Final weighted score 0-100 combining quick_score + stability +
+    /// unlock. Used for sorting and trend display.
+    pub composite_score: u32,
+}
+
+/// v0.20: Live status of a running (or last) deep bench. Polled by
+/// the UI every 5 seconds while `state == running`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DeepBenchStatus {
+    /// "idle" | "phase_a" | "phase_b" | "completed" | "failed" | "cancelled"
+    pub state: String,
+    /// 0..=100 progress within the current phase.
+    pub phase_progress: u32,
+    /// "12/84 profiles quick-benched"
+    pub phase_detail: String,
+    /// Unix timestamp when the run started.
+    pub started_unix: u64,
+    /// Estimated total remaining seconds (0 if unknown/idle).
+    pub eta_secs: u64,
+    /// Last error message (empty if no error).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
 }
 
 /// v0.14: lightweight subscription cleanup inspired by Sub-Store.
@@ -1309,6 +1560,10 @@ impl Daemon {
                 prev_cpu: None,
                 prev_cpu_per_core: Vec::new(),
                 sessions: std::collections::HashSet::new(),
+                deep_bench_cancel: None,
+                deep_bench_handle: None,
+                deep_bench_active: false,
+                deep_bench_status: DeepBenchStatus::default(),
             })),
             state_path,
             mihomo_config_path,
@@ -3095,6 +3350,17 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/stats") => handle_stats(daemon),
         ("POST", "/api/favorites/toggle") => handle_favorites_toggle(body, daemon),
         ("GET", "/api/favorites") => handle_favorites_list(daemon),
+        // v0.20: Deep Bench endpoints.
+        ("GET", "/api/deep-bench/settings") => handle_deep_bench_settings_get(daemon),
+        ("POST", "/api/deep-bench/settings") => handle_deep_bench_settings_set(body, daemon),
+        ("POST", "/api/deep-bench/start") => handle_deep_bench_start(body, daemon),
+        ("POST", "/api/deep-bench/cancel") => handle_deep_bench_cancel(daemon),
+        ("GET", "/api/deep-bench/status") => handle_deep_bench_status(daemon),
+        ("GET", "/api/deep-bench/history") => handle_deep_bench_history(daemon),
+        // v0.20: Trash bin endpoints.
+        ("GET", "/api/trash") => handle_trash_list(daemon),
+        ("POST", "/api/trash/restore") => handle_trash_restore(body, daemon),
+        ("POST", "/api/trash/purge-gone") => handle_trash_purge_gone(daemon),
         ("POST", "/api/subscriptions/refresh") => handle_subscriptions_refresh(daemon),
         ("GET", "/api/subscriptions/refresh-report") => handle_subscriptions_refresh_report(daemon),
         ("POST", "/api/subscriptions/refresh-one") => {
@@ -4730,6 +4996,275 @@ fn handle_favorites_list(daemon: &Daemon) -> (u16, &'static str, String) {
         200,
         "application/json",
         json!({"favorites": entries, "count": entries.len()}).to_string(),
+    )
+}
+
+// =========================================================================
+// v0.20: Deep Bench API handlers.
+// =========================================================================
+
+fn handle_deep_bench_settings_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let settings = &inner.state.deep_bench;
+    let eta = estimate_deep_bench_secs(inner.state.profiles.len(), settings.stability_minutes);
+    (
+        200,
+        "application/json",
+        json!({
+            "settings": settings,
+            "estimated_total_secs": eta,
+            "profile_count": inner.state.profiles.len(),
+        })
+        .to_string(),
+    )
+}
+
+fn handle_deep_bench_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return json_error(400, "invalid JSON body");
+    };
+    let mut inner = lock(&daemon.inner);
+    let s = &mut inner.state.deep_bench;
+    if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
+        s.enabled = v;
+    }
+    if let Some(v) = value.get("weekdays").and_then(Value::as_u64) {
+        s.weekdays = v as u8;
+    }
+    if let Some(v) = value.get("start_hour").and_then(Value::as_u64) {
+        s.start_hour = (v as u8).min(23);
+    }
+    if let Some(v) = value.get("end_hour").and_then(Value::as_u64) {
+        s.end_hour = (v as u8).min(23);
+    }
+    if let Some(v) = value.get("stability_minutes").and_then(Value::as_u64) {
+        s.stability_minutes = v as u32;
+    }
+    if let Some(obj) = value.get("profile_filter").and_then(Value::as_object)
+        && let Some(kind) = obj.get("kind").and_then(Value::as_str)
+    {
+        s.profile_filter = match kind {
+            "all" => ProfileFilter::All,
+            "subscription" => {
+                let url = obj
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if url.is_empty() {
+                    ProfileFilter::All
+                } else {
+                    ProfileFilter::Subscription(url)
+                }
+            }
+            "explicit" => {
+                let raws: Vec<String> = obj
+                    .get("value")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if raws.is_empty() {
+                    ProfileFilter::All
+                } else {
+                    ProfileFilter::Explicit(raws)
+                }
+            }
+            _ => s.profile_filter.clone(),
+        };
+    }
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        return json_error(500, &format!("persist failed: {error}"));
+    }
+    (
+        200,
+        "application/json",
+        json!({"ok": true, "settings": inner.state.deep_bench}).to_string(),
+    )
+}
+
+fn handle_deep_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    // Optional body overrides the persistent settings for this run only.
+    let override_minutes: Option<u32> = serde_json::from_str::<Value>(body).ok().and_then(|v| {
+        v.get("stability_minutes")
+            .and_then(Value::as_u64)
+            .map(|x| x as u32)
+    });
+    let mut inner = lock(&daemon.inner);
+    if inner.deep_bench_active {
+        return json_error(409, "deep bench already running");
+    }
+    if inner.bench.is_running() {
+        return json_error(409, "a quick bench is running; cancel it first");
+    }
+    let profiles = select_profiles_for_deep_bench(&inner.state);
+    if profiles.is_empty() {
+        return json_error(400, "no profiles match the current filter");
+    }
+    let stability_minutes =
+        override_minutes.unwrap_or(inner.state.deep_bench.stability_minutes.max(1));
+    let mihomo_path = inner.state.mihomo_path.clone();
+    let filter = inner.state.deep_bench.profile_filter.clone();
+    let started_unix = unix_now();
+    let cancel = Arc::new(AtomicBool::new(false));
+    inner.deep_bench_active = true;
+    inner.deep_bench_cancel = Some(cancel.clone());
+    inner.deep_bench_status = DeepBenchStatus {
+        state: "phase_a".to_owned(),
+        phase_progress: 0,
+        phase_detail: format!("0/{} profiles quick-benched", profiles.len()),
+        started_unix,
+        eta_secs: estimate_deep_bench_secs(profiles.len(), stability_minutes),
+        last_error: String::new(),
+    };
+    inner.state.deep_bench.last_run_unix = started_unix;
+    inner.dirty = true;
+    drop(inner);
+
+    let daemon_clone = daemon.clone();
+    let cancel_clone = cancel.clone();
+    let handle = std::thread::Builder::new()
+        .name("hincyray-deep-bench".to_owned())
+        .spawn(move || {
+            run_deep_bench(
+                daemon_clone,
+                profiles,
+                stability_minutes,
+                filter,
+                mihomo_path,
+                cancel_clone,
+                started_unix,
+            );
+        })
+        .expect("spawn deep bench thread");
+    let mut inner = lock(&daemon.inner);
+    inner.deep_bench_handle = Some(handle);
+    (
+        200,
+        "application/json",
+        json!({"ok": true, "started_unix": started_unix}).to_string(),
+    )
+}
+
+fn handle_deep_bench_cancel(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let was_running = inner.deep_bench_active;
+    if let Some(cancel) = &inner.deep_bench_cancel {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    (
+        200,
+        "application/json",
+        json!({"ok": true, "was_running": was_running}).to_string(),
+    )
+}
+
+fn handle_deep_bench_status(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    (
+        200,
+        "application/json",
+        serde_json::to_string(&inner.deep_bench_status).unwrap_or_default(),
+    )
+}
+
+fn handle_deep_bench_history(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let history = if inner.state.quality_history.is_empty() {
+        load_quality_history(&daemon.state_path)
+    } else {
+        inner.state.quality_history.clone()
+    };
+    let today = yyyymmdd_from_unix(unix_now());
+    let cutoff_date = today.saturating_sub(30);
+    let entries: Vec<&DailyQualitySnapshot> =
+        history.iter().filter(|s| s.date >= cutoff_date).collect();
+    (
+        200,
+        "application/json",
+        json!({"history": entries, "days_kept": 30}).to_string(),
+    )
+}
+
+// =========================================================================
+// v0.20: Trash bin API handlers.
+// =========================================================================
+
+fn handle_trash_list(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let entries: Vec<Value> = inner
+        .state
+        .trash_raws
+        .iter()
+        .map(|raw| {
+            let promoted = inner.state.trash_promoted_at.get(raw).copied().unwrap_or(0);
+            // Find profile name if still in profiles list.
+            let profile = inner.state.profiles.iter().find(|p| &p.raw == raw);
+            json!({
+                "raw": raw,
+                "name": profile.map(|p| p.name.clone()).unwrap_or_else(|| "(gone)".to_owned()),
+                "profile_id": profile.map(|p| p.id),
+                "promoted_at_unix": promoted,
+                "still_in_profiles": profile.is_some(),
+            })
+        })
+        .collect();
+    (
+        200,
+        "application/json",
+        json!({"trash": entries, "count": entries.len()}).to_string(),
+    )
+}
+
+fn handle_trash_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return json_error(400, "invalid JSON body");
+    };
+    let Some(raw) = value.get("raw").and_then(Value::as_str) else {
+        return json_error(400, "missing 'raw' field");
+    };
+    let mut inner = lock(&daemon.inner);
+    let existed = inner.state.trash_raws.remove(raw);
+    inner.state.trash_promoted_at.remove(raw);
+    if existed {
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            return json_error(500, &format!("persist failed: {error}"));
+        }
+        (
+            200,
+            "application/json",
+            json!({"ok": true, "restored": raw}).to_string(),
+        )
+    } else {
+        json_error(404, &format!("raw not in trash: {raw}"))
+    }
+}
+
+fn handle_trash_purge_gone(daemon: &Daemon) -> (u16, &'static str, String) {
+    let mut inner = lock(&daemon.inner);
+    let purged = purge_stale_trash(&mut inner.state);
+    if purged > 0
+        && let Err(error) = persist_state(&daemon.state_path, &inner.state)
+    {
+        return json_error(500, &format!("persist failed: {error}"));
+    }
+    (
+        200,
+        "application/json",
+        json!({"ok": true, "purged": purged}).to_string(),
+    )
+}
+
+fn json_error(code: u16, msg: &str) -> (u16, &'static str, String) {
+    // Leak the message into 'static — small, error-path only, daemon lifetime.
+    let leaked: &'static str = Box::leak(msg.to_owned().into_boxed_str());
+    (
+        code,
+        "application/json",
+        json!({"error": leaked}).to_string(),
     )
 }
 
@@ -10861,6 +11396,8 @@ fn start_watchdog(daemon: Daemon) {
                 rkn_bypass_url,
                 rkn_bypass_interval,
                 geo_asset_path,
+                deep_bench_running,
+                deep_bench_due_now,
             ) = {
                 let mut inner = lock(&daemon.inner);
                 let ec = mihomo_controller(&inner.state.mihomo_features);
@@ -10898,6 +11435,8 @@ fn start_watchdog(daemon: Daemon) {
                     inner.state.split_routing.rkn_bypass_url.clone(),
                     inner.state.split_routing.rkn_bypass_interval,
                     inner.state.split_routing.geo_asset_path.clone(),
+                    inner.deep_bench_active,
+                    deep_bench_due(&inner.state.deep_bench, unix_now()),
                 )
             };
 
@@ -10999,7 +11538,7 @@ fn start_watchdog(daemon: Daemon) {
             // Mihomo direct-fallback proxy group already routes traffic to
             // DIRECT when the upstream proxy is unreachable, preventing
             // connection storms.
-            if !bench_running && core_running {
+            if !bench_running && !deep_bench_running && core_running {
                 // When proxy groups are enabled, Mihomo handles failover
                 // natively via url-test / fallback / load-balance groups.
                 // The daemon must NOT restart the core or switch profiles —
@@ -11516,6 +12055,101 @@ fn start_watchdog(daemon: Daemon) {
                 }
             }
 
+            // --- Phase 12: Deep Bench (v0.20) ---
+            // Two-phase quality testing on a schedule. Phase A reuses
+            // `run_bench()` for the quick scan, Phase B observes each
+            // passing server for `stability_minutes` to collect drop
+            // rate, latency variance, and unlock capability. Results
+            // land in `quality-history.json` for 30-day trend display.
+            //
+            // The actual work runs on a background thread so the
+            // watchdog keeps ticking. Memory gate (mihomo_rss +
+            // MemAvailable) is checked before launch; per-step memory
+            // checks happen inside Phase B.
+            if deep_bench_due_now && !deep_bench_running && !bench_running {
+                let mihomo_pid = read_mihomo_pid();
+                let mem_ok = memory_gate_allows_bench(mihomo_pid);
+                if !mem_ok {
+                    eprintln!("hincyray: deep bench due but memory gate closed, skipping");
+                } else {
+                    // Snapshot inputs under a short lock, then spawn.
+                    let (profiles, stability_minutes, profile_filter, mihomo_path) = {
+                        let inner = lock(&daemon.inner);
+                        (
+                            select_profiles_for_deep_bench(&inner.state),
+                            inner.state.deep_bench.stability_minutes.max(1),
+                            inner.state.deep_bench.profile_filter.clone(),
+                            inner.state.mihomo_path.clone(),
+                        )
+                    };
+                    if profiles.is_empty() {
+                        eprintln!(
+                            "hincyray: deep bench due but no profiles match filter, skipping"
+                        );
+                    } else {
+                        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let started_unix = unix_now();
+                        // Mark active + record start in state.
+                        {
+                            let mut inner = lock(&daemon.inner);
+                            inner.deep_bench_active = true;
+                            inner.deep_bench_cancel = Some(cancel.clone());
+                            inner.deep_bench_status = DeepBenchStatus {
+                                state: "phase_a".to_owned(),
+                                phase_progress: 0,
+                                phase_detail: format!(
+                                    "0/{} profiles quick-benched",
+                                    profiles.len()
+                                ),
+                                started_unix,
+                                eta_secs: estimate_deep_bench_secs(
+                                    profiles.len(),
+                                    stability_minutes,
+                                ),
+                                last_error: String::new(),
+                            };
+                            inner.state.deep_bench.last_run_unix = started_unix;
+                            inner.dirty = true;
+                        }
+                        let daemon_clone = daemon.clone();
+                        let cancel_clone = cancel.clone();
+                        let handle = std::thread::Builder::new()
+                            .name("hincyray-deep-bench".to_owned())
+                            .spawn(move || {
+                                run_deep_bench(
+                                    daemon_clone,
+                                    profiles,
+                                    stability_minutes,
+                                    profile_filter,
+                                    mihomo_path,
+                                    cancel_clone,
+                                    started_unix,
+                                );
+                            })
+                            .expect("spawn deep bench thread");
+                        let mut inner = lock(&daemon.inner);
+                        inner.deep_bench_handle = Some(handle);
+                    }
+                }
+            }
+
+            // Reap finished deep bench handle so memory is freed.
+            if deep_bench_running {
+                let finished = lock(&daemon.inner)
+                    .deep_bench_handle
+                    .as_ref()
+                    .map(|h| h.is_finished())
+                    .unwrap_or(true);
+                if finished {
+                    let mut inner = lock(&daemon.inner);
+                    if let Some(h) = inner.deep_bench_handle.take() {
+                        let _ = h.join();
+                    }
+                    inner.deep_bench_cancel = None;
+                    inner.deep_bench_active = false;
+                }
+            }
+
             // --- End of tick: write-behind flush ---
             // Coalesce all dirty-marked mutations from this tick into a
             // single state.json write. This is the core of write-behind:
@@ -11544,6 +12178,547 @@ fn maintenance_due(settings: &MaintenanceSettings, now: u64) -> bool {
         u64::from(settings.hour_utc.min(23)) * 3600 + u64::from(settings.minute_utc.min(59)) * 60;
     let seconds_today = now % 86_400;
     seconds_today >= target && seconds_today < target + 600
+}
+
+// =========================================================================
+// v0.20: Date/time helpers for Deep Bench scheduling.
+//
+// We avoid pulling in `chrono` for these few calls — Howard Hinnant's
+// civil_from_days algorithm gives us y/m/d from days-since-epoch in
+// ~10 lines, and day_of_week falls out for free (1970-01-01 = Thursday
+// ⇒ `(days + 4) % 7` with Sunday = 0).
+// =========================================================================
+
+/// Day of week from Unix timestamp. Returns 0=Sunday, 1=Monday, …, 6=Saturday.
+/// Matches `chrono::Weekday::num_days_from_sunday()`.
+fn day_of_week_from_unix(unix: u64) -> u8 {
+    let days = unix.div_euclid(86_400);
+    // 1970-01-01 was Thursday ⇒ day_of_week(0) == 4.
+    ((days + 4) % 7) as u8
+}
+
+/// Hour of day (0..=23) in UTC from Unix timestamp.
+fn hour_from_unix(unix: u64) -> u8 {
+    ((unix % 86_400) / 3600) as u8
+}
+
+/// YYYYMMDD packing (e.g. 20260707 for 2026-07-07) from Unix timestamp.
+/// Used as the unique-per-day key in `DeepBenchSettings.last_completed_date`.
+fn yyyymmdd_from_unix(unix: u64) -> u32 {
+    let days = unix.div_euclid(86_400) as i64;
+    // Howard Hinnant's civil_from_days:
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y_final = if m <= 2 { y + 1 } else { y };
+    (y_final as u32) * 10_000 + (m as u32) * 100 + d as u32
+}
+
+/// v0.20: Returns true if a deep bench should start on this tick.
+///
+/// Conditions (all must hold):
+/// 1. `enabled` is true.
+/// 2. Current weekday is in the `weekdays` bitmask.
+/// 3. Current hour is within `[start_hour, end_hour)` window.
+/// 4. `last_completed_date` != today (one-shot per day).
+/// 5. Not already running this tick — caller checks `bench_running`
+///    and `deep_bench_running` separately to keep this function pure.
+fn deep_bench_due(settings: &DeepBenchSettings, now: u64) -> bool {
+    if !settings.enabled {
+        return false;
+    }
+    if settings.end_hour <= settings.start_hour {
+        return false; // invalid window
+    }
+    let dow = day_of_week_from_unix(now);
+    if settings.weekdays & (1 << dow) == 0 {
+        return false;
+    }
+    let hour = hour_from_unix(now);
+    if hour < settings.start_hour || hour >= settings.end_hour {
+        return false;
+    }
+    let today = yyyymmdd_from_unix(now);
+    if settings.last_completed_date == today {
+        return false;
+    }
+    // If we started a run today but didn't complete it yet, let it
+    // continue (caller decides). But if `last_run_unix` is within
+    // the last hour, we treat it as "still possibly running" and
+    // don't kick off another — protects against double-spawn if the
+    // watchdog thread somehow races.
+    if settings.last_run_unix > 0 && now.saturating_sub(settings.last_run_unix) < 3600 {
+        return false;
+    }
+    true
+}
+
+/// v0.20: Get the running mihomo PID (0 if not running / not found).
+/// Used by memory gate.
+fn read_mihomo_pid() -> u32 {
+    // pgrep-style scan of /proc — avoids depending on the `pgrep`
+    // binary which may not be in PATH on Entware.
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e.flatten().collect::<Vec<_>>(),
+        Err(_) => return 0,
+    };
+    for entry in entries {
+        let name = entry.file_name();
+        let pid: u32 = match name.to_str().and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let cmdline_path = entry.path().join("cmdline");
+        if let Ok(cmdline) = std::fs::read(&cmdline_path)
+            && let Some(cmd) = cmdline
+                .split(|b| *b == 0)
+                .next()
+                .and_then(|s| std::str::from_utf8(s).ok())
+            && (cmd.ends_with("/mihomo") || cmd == "mihomo")
+        {
+            return pid;
+        }
+    }
+    0
+}
+
+/// v0.20: Memory gate — checks whether it's safe to launch a new
+/// bench right now. Returns false if:
+/// - mihomo RSS exceeds 200 MB (we'd be competing with a fat core)
+/// - MemAvailable is below 80 MB (almost OOM territory on 512 MB)
+fn memory_gate_allows_bench(mihomo_pid: u32) -> bool {
+    if mihomo_pid > 0
+        && let Ok(status) = std::fs::read_to_string(format!("/proc/{mihomo_pid}/status"))
+        && let Some(kb) = first_kv_kb(&status, "VmRSS:")
+        && kb > 200 * 1024
+    {
+        return false;
+    }
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo")
+        && let Some(kb) = first_kv_kb(&meminfo, "MemAvailable:")
+        && kb < 80 * 1024
+    {
+        return false;
+    }
+    true
+}
+
+/// v0.20: helper — read the integer after `prefix:` (kB) from a
+/// /proc-style `Key:\tVALUE kB` line. Returns `None` on miss.
+fn first_kv_kb(text: &str, prefix: &str) -> Option<u64> {
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(prefix)
+            && let Some(s) = rest.split_whitespace().next()
+            && let Ok(kb) = s.parse::<u64>()
+        {
+            return Some(kb);
+        }
+    }
+    None
+}
+
+/// v0.20: Filter the profile list according to the Deep Bench selector.
+/// `ProfileFilter::All` returns every profile; `Subscription(url)`
+/// returns profiles whose `group` matches the URL; `Explicit(raws)`
+/// returns profiles whose `raw` is in the list (preserving the order
+/// in which they appear in `state.profiles`, not the filter order).
+fn select_profiles_for_deep_bench(state: &HincyrayState) -> Vec<Profile> {
+    match &state.deep_bench.profile_filter {
+        ProfileFilter::All => state.profiles.clone(),
+        ProfileFilter::Subscription(url) => state
+            .profiles
+            .iter()
+            .filter(|p| p.group.as_deref() == Some(url.as_str()))
+            .cloned()
+            .collect(),
+        ProfileFilter::Explicit(raws) => {
+            let set: std::collections::HashSet<&String> = raws.iter().collect();
+            state
+                .profiles
+                .iter()
+                .filter(|p| set.contains(&p.raw))
+                .cloned()
+                .collect()
+        }
+    }
+}
+
+/// v0.20: Rough ETA for the full deep bench (Phase A + Phase B).
+/// Phase A: ~30 seconds per profile (parallel x2 on router).
+/// Phase B: stability_minutes × 60 seconds per profile (sequential).
+/// Returned in seconds; UI formats as `~3h 35m`.
+fn estimate_deep_bench_secs(profile_count: usize, stability_minutes: u32) -> u64 {
+    let phase_a = (profile_count as u64) * 30 / 2; // parallel x2
+    let phase_b = (profile_count as u64) * u64::from(stability_minutes) * 60;
+    phase_a + phase_b
+}
+
+/// v0.20: Deep Bench orchestrator. Runs Phase A (quick bench on all
+/// selected profiles via `run_bench`) and Phase B (stability + unlock
+/// test sequentially on each passing profile via `run_stability_and_unlock`),
+/// then writes the results to `quality-history.json`.
+///
+/// The function blocks the worker thread but never the watchdog — the
+/// watchdog launched us on a dedicated thread. `cancel` is honoured at
+/// every step so `/api/deep-bench/cancel` or graceful shutdown stops
+/// us promptly.
+fn run_deep_bench(
+    daemon: Daemon,
+    profiles: Vec<Profile>,
+    stability_minutes: u32,
+    _filter: ProfileFilter,
+    _mihomo_path: String,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    started_unix: u64,
+) {
+    eprintln!(
+        "hincyray: deep bench started ({} profiles, {}m stability)",
+        profiles.len(),
+        stability_minutes
+    );
+    let total_profiles = profiles.len();
+    let today = yyyymmdd_from_unix(started_unix);
+
+    // ===== Phase A: quick bench via run_bench =====
+    let probe_url = crate::benchmark::DEFAULT_PROBE_URL.to_owned();
+    let download_url = crate::benchmark::DEFAULT_DOWNLOAD_URL.to_owned();
+    let upload_url = crate::benchmark::DEFAULT_UPLOAD_URL.to_owned();
+    let job: SharedJob = Arc::new(Mutex::new(BenchJob {
+        running: true,
+        method: Some(BenchMethod::Tcp),
+        total: total_profiles,
+        completed: 0,
+        current_profile_id: None,
+        current_profile_name: None,
+        last_updated: started_unix,
+        cancel_requested: false,
+        results: Vec::new(),
+    }));
+    let on_result: Box<dyn Fn(crate::benchmark::BenchResult) + Send> = Box::new(|_| {});
+    // Update status to Phase A.
+    {
+        let mut inner = lock(&daemon.inner);
+        inner.deep_bench_status = DeepBenchStatus {
+            state: "phase_a".to_owned(),
+            phase_progress: 0,
+            phase_detail: format!("0/{total_profiles} profiles quick-benched"),
+            started_unix,
+            eta_secs: estimate_deep_bench_secs(total_profiles, stability_minutes),
+            last_error: String::new(),
+        };
+    }
+    let handle = crate::benchmark::run_bench(
+        profiles.clone(),
+        BenchMethod::Tcp,
+        probe_url,
+        download_url,
+        upload_url,
+        "mihomo".to_owned(),
+        /* test_download */ true,
+        /* test_upload */ false,
+        job.clone(),
+        cancel.clone(),
+        on_result,
+    );
+    if let Err(error) = handle.join() {
+        eprintln!("hincyray: deep bench phase A worker panicked: {error:?}");
+    }
+    let phase_a_results = job.lock().map(|v| v.results.clone()).unwrap_or_default();
+    eprintln!(
+        "hincyray: deep bench phase A complete ({} results)",
+        phase_a_results.len()
+    );
+
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        finish_deep_bench_cancelled(&daemon, started_unix);
+        return;
+    }
+
+    // Filter: keep profiles with success==true && score>0.
+    let passed: Vec<&Profile> = profiles
+        .iter()
+        .filter(|p| {
+            phase_a_results
+                .iter()
+                .find(|r| r.profile_raw == p.raw)
+                .map(|r| r.success && r.score > 0)
+                .unwrap_or(false)
+        })
+        .collect();
+    eprintln!(
+        "hincyray: deep bench phase B starts ({} of {} passed)",
+        passed.len(),
+        total_profiles
+    );
+
+    // ===== Phase B: stability + unlock sequentially =====
+    let mut snapshots: Vec<DailyQualitySnapshot> = Vec::with_capacity(passed.len());
+    for (idx, profile) in passed.iter().enumerate() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        // Memory gate before each step.
+        if !memory_gate_allows_bench(read_mihomo_pid()) {
+            eprintln!(
+                "hincyray: deep bench phase B paused (memory gate), retrying in 60s [{}/{}]",
+                idx + 1,
+                passed.len()
+            );
+            for _ in 0..60 {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if !memory_gate_allows_bench(read_mihomo_pid()) {
+                eprintln!("hincyray: deep bench phase B aborted (memory gate still closed)");
+                break;
+            }
+        }
+        // Update status.
+        {
+            let mut inner = lock(&daemon.inner);
+            let progress = ((idx + 1) * 100 / passed.len().max(1)).min(100) as u32;
+            inner.deep_bench_status = DeepBenchStatus {
+                state: "phase_b".to_owned(),
+                phase_progress: progress,
+                phase_detail: format!("{}/{} stability: {}", idx + 1, passed.len(), profile.name),
+                started_unix,
+                eta_secs: estimate_deep_bench_secs_remaining(
+                    idx + 1,
+                    passed.len(),
+                    stability_minutes,
+                ),
+                last_error: String::new(),
+            };
+        }
+        let quick_score = phase_a_results
+            .iter()
+            .find(|r| r.profile_raw == profile.raw)
+            .map(|r| r.score)
+            .unwrap_or(0);
+        match crate::benchmark::run_stability_and_unlock(profile, stability_minutes, &cancel) {
+            Some((stability, unlock)) => {
+                let composite = crate::benchmark::composite_quality_score(
+                    stability.latency_avg,
+                    stability.latency_stddev,
+                    stability.loss_percent,
+                    stability.sustained_download_mbps,
+                    unlock.reachable_count(),
+                );
+                snapshots.push(DailyQualitySnapshot {
+                    date: today,
+                    profile_raw: profile.raw.clone(),
+                    profile_name: profile.name.clone(),
+                    quick_score,
+                    stability: Some(stability),
+                    unlock: Some(unlock),
+                    composite_score: composite,
+                });
+            }
+            None => {
+                // Profile passed Phase A but failed Phase B spawn —
+                // record as low-score so we don't promote it.
+                snapshots.push(DailyQualitySnapshot {
+                    date: today,
+                    profile_raw: profile.raw.clone(),
+                    profile_name: profile.name.clone(),
+                    quick_score,
+                    stability: None,
+                    unlock: None,
+                    composite_score: 0,
+                });
+            }
+        }
+    }
+
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        // Still persist partial results — better than losing them.
+        eprintln!(
+            "hincyray: deep bench cancelled, persisting {}/{} phase B snapshots",
+            snapshots.len(),
+            passed.len()
+        );
+    } else {
+        eprintln!(
+            "hincyray: deep bench phase B complete ({} snapshots)",
+            snapshots.len()
+        );
+    }
+
+    // ===== Persist quality history + apply trash bin auto-promote =====
+    {
+        let mut inner = lock(&daemon.inner);
+        // Append to in-memory quality_history.
+        inner.state.quality_history.extend(snapshots.clone());
+        cap_quality_history(&mut inner.state, today);
+        // Apply trash bin auto-promote/restore for tested profiles.
+        for snap in &snapshots {
+            apply_trash_bin_rules(&mut inner.state, snap, today);
+        }
+        // Persist to dedicated file (state.json would bloat).
+        let history_path = quality_history_path(&daemon.state_path);
+        if let Err(error) = persist_quality_history(&history_path, &inner.state.quality_history) {
+            eprintln!("hincyray: quality history persist failed: {error}");
+        }
+        // Mark deep bench completed.
+        inner.state.deep_bench.last_completed_date = today;
+        let final_state = if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            "cancelled"
+        } else {
+            "completed"
+        };
+        inner.deep_bench_status = DeepBenchStatus {
+            state: final_state.to_owned(),
+            phase_progress: 100,
+            phase_detail: format!(
+                "{} snapshots written to quality-history.json",
+                snapshots.len()
+            ),
+            started_unix,
+            eta_secs: 0,
+            last_error: String::new(),
+        };
+        inner.dirty = true;
+    }
+}
+
+/// v0.20: Abort handler — marks deep bench as cancelled without
+/// touching history (no partial results on hard-cancel before any
+/// Phase A output).
+fn finish_deep_bench_cancelled(daemon: &Daemon, started_unix: u64) {
+    let mut inner = lock(&daemon.inner);
+    inner.state.deep_bench.last_completed_date = yyyymmdd_from_unix(started_unix);
+    inner.deep_bench_status = DeepBenchStatus {
+        state: "cancelled".to_owned(),
+        phase_progress: 0,
+        phase_detail: "cancelled during phase A".to_owned(),
+        started_unix,
+        eta_secs: 0,
+        last_error: String::new(),
+    };
+    inner.dirty = true;
+}
+
+/// v0.20: Compute remaining ETA for Phase B at step `idx` of `total`.
+fn estimate_deep_bench_secs_remaining(idx: usize, total: usize, stability_minutes: u32) -> u64 {
+    let remaining = total.saturating_sub(idx) as u64;
+    remaining * u64::from(stability_minutes) * 60
+}
+
+/// v0.20: Path to the quality-history file (sibling of state.json).
+fn quality_history_path(state_path: &Path) -> PathBuf {
+    let mut p = state_path.to_path_buf();
+    p.set_file_name("quality-history.json");
+    p
+}
+
+/// v0.20: Write quality history to a dedicated JSON file. Atomic
+/// (write to .tmp + rename) so a partial write never corrupts history.
+fn persist_quality_history(path: &Path, history: &[DailyQualitySnapshot]) -> Result<(), String> {
+    let json = serde_json::to_string(history).map_err(|e| format!("serialize: {e}"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
+    fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))
+}
+
+/// v0.20: Lazy-load quality history from disk into state on first
+/// access. Called by `/api/deep-bench/history` if empty.
+fn load_quality_history(state_path: &Path) -> Vec<DailyQualitySnapshot> {
+    let path = quality_history_path(state_path);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// v0.20: Cap quality history at 30 days × (current profile count + 100)
+/// to bound file growth on USB flash. Drops oldest entries first.
+fn cap_quality_history(state: &mut HincyrayState, today: u32) {
+    let keep_days = 30u32;
+    let cutoff = today.saturating_sub(keep_days);
+    state.quality_history.retain(|s| s.date >= cutoff);
+    // Hard cap on total entries as a safety net.
+    let max_entries = (state.profiles.len() + 100) * 30;
+    if state.quality_history.len() > max_entries {
+        let excess = state.quality_history.len() - max_entries;
+        state.quality_history.drain(0..excess);
+    }
+}
+
+/// v0.20: Apply trash bin auto-promote / restore rules for a single
+/// daily snapshot. Called after each profile's Phase B result is
+/// written.
+///
+/// - **Promote to trash**: if the last 3 daily entries for this raw
+///   all have `composite_score < 30`, the raw is added to
+///   `state.trash_raws` and timestamped in `trash_promoted_at`.
+/// - **Restore from trash**: if the latest entry has
+///   `composite_score > 50`, the raw is removed from trash_raws.
+fn apply_trash_bin_rules(state: &mut HincyrayState, snapshot: &DailyQualitySnapshot, _today: u32) {
+    let raw = &snapshot.profile_raw;
+    let now = unix_now();
+    // Last 3 entries for this raw (including today).
+    let recent: Vec<u32> = state
+        .quality_history
+        .iter()
+        .rev()
+        .filter(|s| &s.profile_raw == raw)
+        .take(3)
+        .map(|s| s.composite_score)
+        .collect();
+    // Promote: 3+ consecutive bad days.
+    if recent.len() >= 3 && recent.iter().all(|&s| s < 30) && state.trash_raws.insert(raw.clone()) {
+        state.trash_promoted_at.insert(raw.clone(), now);
+        eprintln!("hincyray: auto-promoted to trash: {raw}");
+    }
+    // Restore: latest score is good.
+    if let Some(latest) = recent.first()
+        && *latest > 50
+        && state.trash_raws.remove(raw)
+    {
+        state.trash_promoted_at.remove(raw);
+        eprintln!("hincyray: restored from trash: {raw}");
+    }
+}
+
+/// v0.20: Garbage-collect trash entries for raws that no longer appear
+/// in any profile AND were promoted more than 90 days ago. Returns
+/// the number of purged entries.
+fn purge_stale_trash(state: &mut HincyrayState) -> usize {
+    let now = unix_now();
+    let cutoff = now.saturating_sub(90 * 86_400);
+    let live_raws: std::collections::HashSet<String> =
+        state.profiles.iter().map(|p| p.raw.clone()).collect();
+    let before = state.trash_raws.len();
+    state.trash_raws.retain(|raw| {
+        // Keep if still in profiles OR promoted recently.
+        if live_raws.contains(raw) {
+            return true;
+        }
+        state
+            .trash_promoted_at
+            .get(raw)
+            .copied()
+            .map(|t| t > cutoff)
+            .unwrap_or(false)
+    });
+    state
+        .trash_promoted_at
+        .retain(|raw, _| state.trash_raws.contains(raw));
+    before.saturating_sub(state.trash_raws.len())
 }
 
 fn run_scheduled_maintenance(
