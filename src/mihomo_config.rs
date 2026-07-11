@@ -1353,6 +1353,17 @@ pub fn build_mihomo_router_config(
     );
     rules.extend(features.raw_rules.iter().filter(|r| !r.is_empty()).cloned());
 
+    // Auto-learned VPN exceptions override all broad direct rules,
+    // including RKN's GEOIP,RU/DIRECT and RU Direct GEOSITE/TLD rules.
+    for domain in extra
+        .auto_vpn_exceptions
+        .iter()
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+    {
+        rules.push(format!("DOMAIN-SUFFIX,{domain},{}", PROXY_NAME));
+    }
+
     // v0.17: RKN Bypass — route domains blocked in Russia through proxy.
     // The RULE-SET is emitted BEFORE GEOIP,RU so blocked domains that
     // resolve to Russian IPs still go through proxy (not direct).
@@ -6652,6 +6663,60 @@ mod tests {
         assert!(
             geosite_ru_idx < match_idx,
             "GEOSITE,category-ru must precede MATCH"
+        );
+    }
+
+    #[test]
+    fn auto_vpn_exceptions_precede_rkn_and_ru_direct() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let extra = RouterExtra {
+            rkn_bypass_enabled: true,
+            ru_direct_mode: "geosite".to_owned(),
+            auto_vpn_exceptions: vec!["blocked.example".to_owned()],
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            &profiles[0],
+            &[],
+            &[],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Block,
+            false,
+            &extra,
+            &MihomoFeatures::default(),
+        )
+        .expect("config");
+        let rules = router_rules(&yaml);
+        let auto_idx = rules
+            .iter()
+            .position(|r| r == "DOMAIN-SUFFIX,blocked.example,proxy")
+            .expect("auto vpn exception");
+        let rkn_idx = rules
+            .iter()
+            .position(|r| r == "RULE-SET,ru-bypass,proxy")
+            .expect("rkn");
+        let geoip_idx = rules
+            .iter()
+            .position(|r| r == "GEOIP,RU,DIRECT")
+            .expect("geoip ru");
+        let ru_direct_idx = rules
+            .iter()
+            .position(|r| r == "GEOSITE,category-ru,DIRECT")
+            .expect("ru direct");
+
+        assert!(auto_idx < rkn_idx, "auto VPN exception must precede RKN");
+        assert!(
+            auto_idx < geoip_idx,
+            "auto VPN exception must precede GEOIP,RU"
+        );
+        assert!(
+            auto_idx < ru_direct_idx,
+            "auto VPN exception must precede RU Direct"
         );
     }
 

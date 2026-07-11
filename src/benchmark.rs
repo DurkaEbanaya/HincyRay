@@ -1,8 +1,8 @@
 //! HincyRay benchmark runner.
 //!
-//! Background ping/benchmark job that does NOT touch the active Xray
+//! Background ping/benchmark job that does NOT touch the active Mihomo
 //! core. The TCP method probes `address:port` directly. The HEAD/GET
-//! methods spawn a temporary Xray child per VLESS profile on a random
+//! methods spawn a temporary Mihomo child per profile on a random
 //! local SOCKS port, run `curl` through it, then kill the child. Child
 //! processes are cleaned up even on cancel/error via a `Drop` guard so
 //! the router is never left with stray benchmark cores.
@@ -32,7 +32,6 @@ use crate::profiles::Profile;
 #[cfg(test)]
 use crate::profiles::Protocol;
 use crate::scoring::quality_score;
-use crate::xray_config::build_xray_config;
 
 pub const DEFAULT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 pub const DEFAULT_DOWNLOAD_URL: &str = "https://proof.ovh.net/files/100Mb.dat";
@@ -83,8 +82,10 @@ pub struct BenchResult {
     pub method: String,
     pub latency_ms: u32,
     pub jitter_ms: u32,
-    pub download_mbps: f32,
-    pub upload_mbps: f32,
+    pub download_mbps: Option<f32>,
+    pub upload_mbps: Option<f32>,
+    pub download_error: Option<String>,
+    pub upload_error: Option<String>,
     pub loss_percent: f32,
     pub score: u32,
     pub success: bool,
@@ -122,25 +123,25 @@ pub fn run_bench(
     probe_url: String,
     download_url: String,
     upload_url: String,
-    xray_path: String,
+    core_path: String,
     test_download: bool,
     test_upload: bool,
     job: SharedJob,
     cancel: Arc<AtomicBool>,
     on_result: Box<dyn Fn(BenchResult) + Send + 'static>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        {
-            let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-            state.running = true;
-            state.method = Some(method);
-            state.total = profiles.len();
-            state.completed = 0;
-            state.cancel_requested = false;
-            state.results.clear();
-            state.last_updated = unix_now();
-        }
+    {
+        let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
+        *state = BenchJob {
+            running: true,
+            method: Some(method),
+            total: profiles.len(),
+            last_updated: unix_now(),
+            ..BenchJob::default()
+        };
+    }
 
+    thread::spawn(move || {
         for profile in &profiles {
             if cancel.load(Ordering::Relaxed) {
                 break;
@@ -158,7 +159,7 @@ pub fn run_bench(
                 &probe_url,
                 &download_url,
                 &upload_url,
-                &xray_path,
+                &core_path,
                 test_download,
                 test_upload,
             );
@@ -189,7 +190,7 @@ fn benchmark_profile(
     probe_url: &str,
     download_url: &str,
     upload_url: &str,
-    xray_path: &str,
+    core_path: &str,
     test_download: bool,
     test_upload: bool,
 ) -> BenchResult {
@@ -201,8 +202,10 @@ fn benchmark_profile(
         method: method.as_str().to_owned(),
         latency_ms: 0,
         jitter_ms: 0,
-        download_mbps: 0.0,
-        upload_mbps: 0.0,
+        download_mbps: None,
+        upload_mbps: None,
+        download_error: None,
+        upload_error: None,
         loss_percent: 100.0,
         score: 0,
         success: false,
@@ -214,15 +217,14 @@ fn benchmark_profile(
     let latency_outcome = match method {
         BenchMethod::Tcp => run_tcp(profile),
         BenchMethod::Head | BenchMethod::Get => {
-            run_via_temp_xray(profile, method, probe_url, download_url, xray_path)
+            run_via_temp_mihomo(profile, method, probe_url, core_path)
         }
     };
 
-    // Step 2: If speed test requested and not already done via GET, spawn
-    // a temporary mihomo instance to run download/upload through SOCKS.
-    // This is needed for TCP and HEAD methods which don't do speed tests.
-    let need_speed =
-        (test_download || test_upload) && matches!(method, BenchMethod::Tcp | BenchMethod::Head);
+    // Step 2: Speed metrics are independent of the selected latency method.
+    // Always execute every requested speed stage through a temporary Mihomo
+    // instance; GET must not silently skip upload or bypass request flags.
+    let need_speed = test_download || test_upload;
 
     let speed_metrics = if need_speed {
         run_speed_via_mihomo(
@@ -231,33 +233,38 @@ fn benchmark_profile(
             upload_url,
             test_download,
             test_upload,
+            core_path,
         )
     } else {
-        None
+        SpeedMetrics::not_requested()
     };
 
     // Merge latency + speed results.
     match latency_outcome {
-        Ok(mut metrics) => {
+        Ok(metrics) => {
             // If speed test ran separately, merge its results.
-            if let Some(sm) = speed_metrics {
-                if test_download {
-                    metrics.download_mbps = sm.download_mbps;
-                }
-                if test_upload {
-                    metrics.upload_mbps = sm.upload_mbps;
-                }
-            }
+            let download_mbps = speed_metrics
+                .download
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .copied();
+            let upload_mbps = speed_metrics
+                .upload
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .copied();
             BenchResult {
                 latency_ms: metrics.latency_ms,
                 jitter_ms: metrics.jitter_ms,
-                download_mbps: metrics.download_mbps,
-                upload_mbps: metrics.upload_mbps,
+                download_mbps,
+                upload_mbps,
+                download_error: speed_metrics.download.and_then(Result::err),
+                upload_error: speed_metrics.upload.and_then(Result::err),
                 loss_percent: metrics.loss_percent,
                 score: quality_score(
                     metrics.latency_ms,
                     metrics.jitter_ms,
-                    metrics.download_mbps,
+                    download_mbps.unwrap_or(0.0),
                     metrics.loss_percent,
                 ),
                 success: true,
@@ -269,23 +276,21 @@ fn benchmark_profile(
             // Latency failed — but speed might still work (e.g. server
             // blocks direct TCP but works through proxy). If speed test
             // succeeded, report partial success.
-            if let Some(sm) = speed_metrics {
-                BenchResult {
-                    latency_ms: 0,
-                    jitter_ms: 0,
-                    download_mbps: if test_download { sm.download_mbps } else { 0.0 },
-                    upload_mbps: if test_upload { sm.upload_mbps } else { 0.0 },
-                    loss_percent: 100.0,
-                    score: 0,
-                    success: false,
-                    error: Some(error),
-                    ..base()
-                }
-            } else {
-                BenchResult {
-                    error: Some(error),
-                    ..base()
-                }
+            BenchResult {
+                download_mbps: speed_metrics
+                    .download
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .copied(),
+                upload_mbps: speed_metrics
+                    .upload
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
+                    .copied(),
+                download_error: speed_metrics.download.and_then(Result::err),
+                upload_error: speed_metrics.upload.and_then(Result::err),
+                error: Some(error),
+                ..base()
             }
         }
     }
@@ -294,8 +299,6 @@ fn benchmark_profile(
 struct Metrics {
     latency_ms: u32,
     jitter_ms: u32,
-    download_mbps: f32,
-    upload_mbps: f32,
     loss_percent: f32,
 }
 
@@ -320,8 +323,6 @@ fn run_tcp(profile: &Profile) -> Result<Metrics, String> {
     Ok(Metrics {
         latency_ms,
         jitter_ms,
-        download_mbps: 0.0,
-        upload_mbps: 0.0,
         loss_percent,
     })
 }
@@ -360,32 +361,33 @@ pub(crate) fn tcp_probe(host: &str, port: u16, attempts: usize) -> (Vec<Duration
     (latencies, failures)
 }
 
-fn run_via_temp_xray(
+fn run_via_temp_mihomo(
     profile: &Profile,
     method: BenchMethod,
     probe_url: &str,
-    download_url: &str,
-    xray_path: &str,
+    mihomo_path: &str,
 ) -> Result<Metrics, String> {
     let port = reserve_local_port()?;
-    let config = build_xray_config(profile, "127.0.0.1", port)?;
-    let mut config_file = NamedTempFile::new().map_err(|error| format!("temp config: {error}"))?;
-    serde_json::to_writer_pretty(&mut config_file, &config).map_err(|e| e.to_string())?;
-    config_file.flush().map_err(|e| e.to_string())?;
+    let config = build_mihomo_bench_config(profile, "127.0.0.1", port)?;
+    let mut config_file = NamedTempFile::with_suffix(".yaml")
+        .map_err(|error| format!("temp Mihomo config: {error}"))?;
+    config_file
+        .write_all(config.as_bytes())
+        .map_err(|e| format!("write Mihomo config: {e}"))?;
+    config_file
+        .flush()
+        .map_err(|e| format!("flush Mihomo config: {e}"))?;
 
     let stderr_file = NamedTempFile::new().map_err(|e| format!("temp stderr: {e}"))?;
     let stderr_writer = stderr_file.reopen().map_err(|e| e.to_string())?;
 
-    let child = Command::new(xray_path)
-        .arg("run")
-        .arg("-format")
-        .arg("json")
-        .arg("-c")
+    let child = Command::new(mihomo_path)
+        .arg("-f")
         .arg(config_file.path())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_writer))
         .spawn()
-        .map_err(|error| format!("xray spawn ({xray_path}): {error}"))?;
+        .map_err(|error| format!("Mihomo spawn ({mihomo_path}): {error}"))?;
     let mut guard = ChildGuard { child: Some(child) };
 
     wait_until_socks_ready(port, guard.as_mut(), stderr_file.path())?;
@@ -407,12 +409,6 @@ fn run_via_temp_xray(
         ));
     }
 
-    let download_mbps = if method == BenchMethod::Get && !download_url.trim().is_empty() {
-        curl_download(port, download_url).unwrap_or(0.0)
-    } else {
-        0.0
-    };
-
     let latency_ms = average_ms(&latencies);
     let jitter_ms = jitter_ms(&latencies);
     let loss_percent = failures as f32 / PROBE_ATTEMPTS as f32 * 100.0;
@@ -420,8 +416,6 @@ fn run_via_temp_xray(
     Ok(Metrics {
         latency_ms,
         jitter_ms,
-        download_mbps,
-        upload_mbps: 0.0,
         loss_percent,
     })
 }
@@ -430,54 +424,89 @@ fn run_via_temp_xray(
 /// download and/or upload speed tests through its SOCKS port. Used when
 /// the latency method is TCP or HEAD (which don't measure speed) but
 /// the user has enabled speed testing.
+struct SpeedMetrics {
+    download: Option<Result<f32, String>>,
+    upload: Option<Result<f32, String>>,
+}
+
+impl SpeedMetrics {
+    fn not_requested() -> Self {
+        Self {
+            download: None,
+            upload: None,
+        }
+    }
+}
+
 fn run_speed_via_mihomo(
     profile: &Profile,
     download_url: &str,
     upload_url: &str,
     test_download: bool,
     test_upload: bool,
-) -> Option<Metrics> {
-    let port = reserve_local_port().ok()?;
-    let config_yaml = build_mihomo_bench_config(profile, "127.0.0.1", port).ok()?;
-    let mut config_file = NamedTempFile::with_suffix(".yaml").ok()?;
-    config_file.write_all(config_yaml.as_bytes()).ok()?;
-    config_file.flush().ok()?;
+    mihomo_path: &str,
+) -> SpeedMetrics {
+    let setup = || -> Result<(u16, NamedTempFile, NamedTempFile, ChildGuard), String> {
+        let port = reserve_local_port()?;
+        let config_yaml = build_mihomo_bench_config(profile, "127.0.0.1", port)?;
+        let mut config_file =
+            NamedTempFile::with_suffix(".yaml").map_err(|e| format!("temp Mihomo config: {e}"))?;
+        config_file
+            .write_all(config_yaml.as_bytes())
+            .map_err(|e| format!("write Mihomo config: {e}"))?;
+        config_file
+            .flush()
+            .map_err(|e| format!("flush Mihomo config: {e}"))?;
 
-    let stderr_file = NamedTempFile::new().ok()?;
-    let stderr_writer = stderr_file.reopen().ok()?;
+        let stderr_file = NamedTempFile::new().map_err(|e| format!("temp Mihomo stderr: {e}"))?;
+        let stderr_writer = stderr_file
+            .reopen()
+            .map_err(|e| format!("reopen Mihomo stderr: {e}"))?;
 
-    let child = Command::new("mihomo")
-        .arg("-f")
-        .arg(config_file.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_writer))
-        .spawn()
-        .ok()?;
-    let mut guard = ChildGuard { child: Some(child) };
+        let child = Command::new(mihomo_path)
+            .arg("-f")
+            .arg(config_file.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_writer))
+            .spawn()
+            .map_err(|e| format!("spawn Mihomo at {mihomo_path}: {e}"))?;
+        let mut guard = ChildGuard { child: Some(child) };
 
-    if wait_until_socks_ready(port, guard.as_mut(), stderr_file.path()).is_err() {
-        return None;
-    }
-
-    let download_mbps = if test_download && !download_url.trim().is_empty() {
-        curl_download(port, download_url).unwrap_or(0.0)
-    } else {
-        0.0
+        wait_until_socks_ready(port, guard.as_mut(), stderr_file.path())?;
+        Ok((port, config_file, stderr_file, guard))
     };
 
-    let upload_mbps = if test_upload && !upload_url.trim().is_empty() {
-        curl_upload(port, upload_url).unwrap_or(0.0)
-    } else {
-        0.0
+    let (port, _config_file, _stderr_file, _guard) = match setup() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return SpeedMetrics {
+                download: test_download.then(|| Err(error.clone())),
+                upload: test_upload.then_some(Err(error)),
+            };
+        }
     };
 
-    Some(Metrics {
-        latency_ms: 0,
-        jitter_ms: 0,
-        download_mbps,
-        upload_mbps,
-        loss_percent: 0.0,
-    })
+    let download = if test_download {
+        Some(if download_url.trim().is_empty() {
+            Err("download URL is empty".to_owned())
+        } else {
+            curl_download(port, download_url)
+        })
+    } else {
+        None
+    };
+
+    let upload = if test_upload {
+        Some(if upload_url.trim().is_empty() {
+            Err("upload URL is empty".to_owned())
+        } else {
+            curl_upload(port, upload_url)
+        })
+    } else {
+        None
+    };
+
+    SpeedMetrics { download, upload }
 }
 
 fn reserve_local_port() -> Result<u16, String> {
@@ -493,7 +522,7 @@ fn wait_until_socks_ready(port: u16, child: &mut Child, stderr_path: &Path) -> R
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             let stderr_tail = read_tail(stderr_path, 500);
             return Err(format!(
-                "xray exited early: {status}{tail}",
+                "benchmark core exited early: {status}{tail}",
                 tail = if stderr_tail.is_empty() {
                     String::new()
                 } else {
@@ -511,7 +540,7 @@ fn wait_until_socks_ready(port: u16, child: &mut Child, stderr_path: &Path) -> R
         return Ok(());
     }
     Err(format!(
-        "xray did not open SOCKS port {port} within timeout"
+        "benchmark core did not open SOCKS port {port} within timeout"
     ))
 }
 
@@ -1131,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_profile_hysteria2_unsupported_for_head() {
+    fn benchmark_profile_hysteria2_head_uses_mihomo_backend() {
         let profile = Profile {
             id: 0,
             name: "Hy2".to_owned(),
@@ -1149,15 +1178,14 @@ mod tests {
             DEFAULT_PROBE_URL,
             DEFAULT_DOWNLOAD_URL,
             DEFAULT_UPLOAD_URL,
-            "xray",
+            "/definitely/missing/mihomo",
             false,
             false,
         );
         assert!(!result.success);
         let err = result.error.expect("error message");
-        // build_xray_config returns a Russian error for Hysteria2.
         assert!(
-            err.contains("Hysteria2") || err.contains("не поддерживает"),
+            err.contains("Mihomo spawn") && !err.contains("не поддерживает"),
             "got: {err}"
         );
     }
@@ -1191,6 +1219,48 @@ mod tests {
     }
 
     #[test]
+    fn requested_speed_setup_failure_is_explicit_not_zero() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("local listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let profile = Profile {
+            id: 8,
+            name: "local".to_owned(),
+            protocol: Protocol::Vless,
+            address: "127.0.0.1".to_owned(),
+            port: Some(port),
+            raw: format!("vless://11111111-1111-1111-1111-111111111111@127.0.0.1:{port}#local"),
+            selected: false,
+            block_quic: false,
+            group: None,
+        };
+        let result = benchmark_profile(
+            &profile,
+            BenchMethod::Tcp,
+            DEFAULT_PROBE_URL,
+            DEFAULT_DOWNLOAD_URL,
+            DEFAULT_UPLOAD_URL,
+            "/definitely/missing/mihomo",
+            true,
+            true,
+        );
+        assert!(result.success, "TCP latency should succeed");
+        assert_eq!(result.download_mbps, None);
+        assert_eq!(result.upload_mbps, None);
+        assert!(
+            result
+                .download_error
+                .as_deref()
+                .is_some_and(|e| e.contains("spawn Mihomo"))
+        );
+        assert!(
+            result
+                .upload_error
+                .as_deref()
+                .is_some_and(|e| e.contains("spawn Mihomo"))
+        );
+    }
+
+    #[test]
     fn run_bench_marks_running_and_completes_for_empty_input() {
         let job: SharedJob = Arc::new(Mutex::new(BenchJob::default()));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1216,6 +1286,11 @@ mod tests {
             cancel,
             on_result,
         );
+        {
+            let state = job.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(state.total, 0);
+            assert_eq!(state.method, Some(BenchMethod::Tcp));
+        }
         handle.join().expect("bench thread exits cleanly");
 
         let state = job.lock().unwrap_or_else(|p| p.into_inner());

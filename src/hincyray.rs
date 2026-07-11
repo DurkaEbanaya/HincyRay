@@ -10,9 +10,9 @@
 //! Mihomo config path: alongside state. Override with `HINCYRAY_MIHOMO_CONFIG`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     net::{IpAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -50,6 +50,11 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_SAMPLES: usize = 1000;
 const MAX_CONNECTION_LOG: usize = 500;
+const MAX_AUTO_VPN_EXCEPTIONS: usize = 200;
+const MAX_AUTO_VPN_PENDING_DOMAINS: usize = 200;
+const AUTO_VPN_PROBE_INTERVAL_TICKS: u64 = 3; // 30 seconds
+const AUTO_VPN_RECHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const AUTO_VPN_PROBE_CONTRACT_VERSION: u8 = 1;
 const MAX_BACKUPS: usize = 20;
 const MAX_UNDO_STACK: usize = 10;
 const MAX_REFRESH_REPORT_ENTRIES: usize = 100;
@@ -89,6 +94,8 @@ pub fn run() -> Result<(), String> {
     let mihomo_config_path = resolve_mihomo_config_path(&state_path);
     let state = load_state(&state_path);
     let daemon = Daemon::new(state, state_path, mihomo_config_path);
+    let mihomo_log_path = resolve_log_dir().join("mihomo.log");
+    let mihomo_log_cursor = MihomoLogCursor::start_at_end(&mihomo_log_path);
 
     // v0.19.7: Prepare RKN bypass list in domain format before generating
     // the Mihomo config. The rule provider uses `type: file, behavior: domain`
@@ -176,7 +183,7 @@ pub fn run() -> Result<(), String> {
     }
 
     // Start watchdog on router targets.
-    start_watchdog(daemon.clone());
+    start_watchdog(daemon.clone(), mihomo_log_path, mihomo_log_cursor);
 
     let listener = TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;
     listener
@@ -1136,6 +1143,8 @@ pub struct ConnectionLogEntry {
     pub host: String,
     pub source_ip: String,
     pub destination_ip: String,
+    #[serde(default)]
+    pub destination_port: u16,
     pub network: String,
     pub chains: Vec<String>,
     pub rule: String,
@@ -1324,6 +1333,20 @@ pub struct ProfileStats {
     pub consecutive_failures: u32,
     #[serde(default)]
     pub cooldown_until_unix: u64,
+    #[serde(default)]
+    pub has_latency: bool,
+    #[serde(default)]
+    pub has_jitter: bool,
+    #[serde(default)]
+    pub has_download: bool,
+    #[serde(default)]
+    pub has_upload: bool,
+    #[serde(default)]
+    pub has_loss: bool,
+    #[serde(default)]
+    pub has_score: bool,
+    #[serde(default)]
+    pub has_ewma: bool,
 }
 
 /// WiFi split-routing controls. Traffic from devices assigned to the
@@ -1379,6 +1402,21 @@ pub struct SplitRoutingSettings {
     /// One domain per line in the UI; stored as a Vec.
     #[serde(default)]
     pub ru_direct_exceptions: Vec<String>,
+    /// Auto-learned domains that failed direct access but succeeded via
+    /// the active VPN. Emitted before broad RKN/RU Direct rules.
+    #[serde(default)]
+    pub auto_vpn_exceptions: Vec<String>,
+    /// Per-domain last probe timestamp for auto_vpn_exceptions and recent
+    /// DIRECT candidates. This is a bounded probe cache, not a routing list.
+    #[serde(default)]
+    pub auto_vpn_last_checked_unix: HashMap<String, u64>,
+    /// Passive learning switch. Enabled by default; writes only after a
+    /// verified direct-fail/proxy-success probe.
+    #[serde(default = "default_true")]
+    pub auto_vpn_learning_enabled: bool,
+    /// Persisted migration marker for auto-VPN probe semantics.
+    #[serde(default)]
+    pub auto_vpn_probe_contract_version: u8,
     /// v0.16: Controls the final MATCH rule target.
     /// `"proxy"` = everything through VPN, `"direct"` = everything direct.
     /// Empty string (old state) is migrated in `load_state()`.
@@ -1416,6 +1454,10 @@ impl Default for SplitRoutingSettings {
             geo_asset_path: default_geo_asset_path(),
             ru_direct_mode: String::new(),
             ru_direct_exceptions: Vec::new(),
+            auto_vpn_exceptions: Vec::new(),
+            auto_vpn_last_checked_unix: HashMap::new(),
+            auto_vpn_learning_enabled: true,
+            auto_vpn_probe_contract_version: AUTO_VPN_PROBE_CONTRACT_VERSION,
             match_target: String::new(),
             rkn_bypass_enabled: true,
             rkn_bypass_url: default_rkn_bypass_url(),
@@ -2608,19 +2650,20 @@ fn resolve_log_dir() -> PathBuf {
     PathBuf::from("./hincyray-logs")
 }
 
-/// Open a log file in the daemon log directory, truncating if the
-/// existing file exceeds 1 MB to prevent unbounded growth on the
-/// router's limited flash/tmpfs. Returns a `Stdio` for passing to
-/// `Command::stderr()`.
+/// Open a log file in the daemon log directory, rotating if the existing
+/// file exceeds 1 MB. A new inode gives incremental readers an unambiguous
+/// generation boundary.
 fn open_log_file(name: &str) -> Result<Stdio, String> {
     let dir = resolve_log_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let path = dir.join(name);
-    // Truncate if file is too large (> 1 MB).
+    // Rotate if the file is too large (> 1 MB).
     if let Ok(meta) = fs::metadata(&path)
         && meta.len() > 1_048_576
     {
-        let _ = fs::write(&path, b"");
+        let rotated = path.with_extension("log.1");
+        let _ = fs::remove_file(&rotated);
+        fs::rename(&path, &rotated).map_err(|e| format!("rotate {}: {e}", path.display()))?;
     }
     let file = fs::OpenOptions::new()
         .create(true)
@@ -2677,6 +2720,22 @@ fn load_state(state_path: &Path) -> HincyrayState {
         state.dns_settings.enabled = true;
     }
 
+    // Migrate legacy numeric benchmark fields to explicit presence flags.
+    // A historical zero speed is ambiguous because speed-stage errors were
+    // previously erased to 0.0, so only positive speed values prove that a
+    // measurement actually completed.
+    for stat in &mut state.stats {
+        if stat.success_count > 0 {
+            stat.has_latency = true;
+            stat.has_jitter = true;
+            stat.has_loss = true;
+            stat.has_score = true;
+            stat.has_ewma = true;
+        }
+        stat.has_download |= stat.last_download_mbps > 0.0;
+        stat.has_upload |= stat.last_upload_mbps > 0.0;
+    }
+
     // v0.16 migration: match_target. Old state files don't have this
     // field (empty string). Preserve old MATCH behaviour:
     //   AllowList → MATCH,direct (only listed ports proxied)
@@ -2714,6 +2773,26 @@ fn load_state(state_path: &Path) -> HincyrayState {
                 port_mode: "include".to_owned(),
             },
         );
+    }
+
+    // The old generic-SOCKS probe obeyed routing rules and could cache a
+    // false negative for 24h. Invalidate non-promoted timestamps exactly
+    // once after switching to forced `proxy-active` EC probes.
+    if state.split_routing.auto_vpn_probe_contract_version < AUTO_VPN_PROBE_CONTRACT_VERSION {
+        let promoted: HashSet<String> = state
+            .split_routing
+            .auto_vpn_exceptions
+            .iter()
+            .filter_map(|domain| normalize_auto_vpn_domain(domain))
+            .collect();
+        state
+            .split_routing
+            .auto_vpn_last_checked_unix
+            .retain(|domain, _| promoted.contains(domain));
+        state.split_routing.auto_vpn_probe_contract_version = AUTO_VPN_PROBE_CONTRACT_VERSION;
+        if let Err(error) = persist_state(state_path, &state) {
+            eprintln!("hincyray: failed to persist auto-VPN probe contract migration: {error}");
+        }
     }
 
     state
@@ -2986,6 +3065,7 @@ fn build_routing_context<'a>(
         },
         ru_direct_mode: state.split_routing.ru_direct_mode.clone(),
         ru_direct_exceptions: normalize_route_items(&state.split_routing.ru_direct_exceptions),
+        auto_vpn_exceptions: normalize_route_items(&state.split_routing.auto_vpn_exceptions),
         match_target: state.split_routing.match_target.clone(),
         rkn_bypass_enabled: state.split_routing.rkn_bypass_enabled,
         rkn_bypass_url: state.split_routing.rkn_bypass_url.clone(),
@@ -3021,6 +3101,101 @@ fn normalize_route_items(items: &[String]) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn normalize_auto_vpn_domain(input: &str) -> Option<String> {
+    let mut host = input.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    if let Some(rest) = host.strip_prefix("http://") {
+        host = rest.to_owned();
+    } else if let Some(rest) = host.strip_prefix("https://") {
+        host = rest.to_owned();
+    }
+    if let Some((before_path, _)) = host.split_once('/') {
+        host = before_path.to_owned();
+    }
+    host = host
+        .trim_start_matches("*.")
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_owned();
+
+    if let Some(stripped) = host.strip_prefix('[').and_then(|v| v.strip_suffix(']'))
+        && stripped.parse::<IpAddr>().is_ok()
+    {
+        return None;
+    }
+    if host.matches(':').count() == 1
+        && let Some((candidate, port)) = host.rsplit_once(':')
+        && !candidate.is_empty()
+        && port.parse::<u16>().is_ok()
+    {
+        host = candidate.to_owned();
+    }
+    if host.parse::<IpAddr>().is_ok() || host.contains(':') {
+        return None;
+    }
+    if host == "localhost"
+        || host.ends_with(".local")
+        || host.ends_with(".lan")
+        || host.ends_with(".home")
+    {
+        return None;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 {
+        return None;
+    }
+    for label in &labels {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return None;
+        }
+    }
+    Some(host)
+}
+
+fn dedup_limited_domains(items: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        let Some(domain) = normalize_auto_vpn_domain(&item) else {
+            continue;
+        };
+        if seen.insert(domain.clone()) {
+            out.push(domain);
+        }
+    }
+    if out.len() > MAX_AUTO_VPN_EXCEPTIONS {
+        out.drain(0..out.len() - MAX_AUTO_VPN_EXCEPTIONS);
+    }
+    out
+}
+
+fn prune_auto_vpn_metadata(split: &mut SplitRoutingSettings) {
+    let domains: HashSet<String> = split.auto_vpn_exceptions.iter().cloned().collect();
+    if split.auto_vpn_last_checked_unix.len() <= MAX_AUTO_VPN_EXCEPTIONS * 2 {
+        return;
+    }
+    let mut candidates: Vec<(String, u64)> = split
+        .auto_vpn_last_checked_unix
+        .iter()
+        .filter(|(domain, _)| !domains.contains(*domain))
+        .map(|(domain, timestamp)| (domain.clone(), *timestamp))
+        .collect();
+    candidates.sort_by_key(|(_, timestamp)| *timestamp);
+    let remove_count = split.auto_vpn_last_checked_unix.len() - MAX_AUTO_VPN_EXCEPTIONS * 2;
+    for (domain, _) in candidates.into_iter().take(remove_count) {
+        split.auto_vpn_last_checked_unix.remove(&domain);
+    }
 }
 
 fn normalize_route_network(network: &str) -> Option<String> {
@@ -4061,7 +4236,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
                     .collect()
             });
 
-    let profiles = {
+    let (profiles, core_path) = {
         let inner = lock(&daemon.inner);
         if inner.bench.is_running() {
             return (
@@ -4081,7 +4256,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
                 .collect(),
             _ => inner.state.profiles.clone(),
         };
-        profiles
+        (profiles, inner.state.mihomo_path.clone())
     };
 
     if profiles.is_empty() {
@@ -4105,7 +4280,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         probe_url,
         download_url,
         upload_url,
-        "xray".to_owned(),
+        core_path,
         test_download,
         test_upload,
         Arc::clone(&job),
@@ -4186,11 +4361,24 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
         if result.success {
             stats_entry.last_latency_ms = result.latency_ms;
             stats_entry.last_jitter_ms = result.jitter_ms;
-            stats_entry.last_download_mbps = result.download_mbps;
-            stats_entry.last_upload_mbps = result.upload_mbps;
+            stats_entry.has_latency = true;
+            stats_entry.has_jitter = true;
+            if let Some(download_mbps) = result.download_mbps {
+                stats_entry.last_download_mbps = download_mbps;
+                stats_entry.has_download = true;
+            }
+            if let Some(upload_mbps) = result.upload_mbps {
+                stats_entry.last_upload_mbps = upload_mbps;
+                stats_entry.has_upload = true;
+            }
             stats_entry.last_loss_percent = result.loss_percent;
             stats_entry.last_score = result.score;
-            stats_entry.last_error = None;
+            stats_entry.has_loss = true;
+            stats_entry.has_score = true;
+            stats_entry.last_error = result
+                .download_error
+                .clone()
+                .or_else(|| result.upload_error.clone());
             stats_entry.success_count = stats_entry.success_count.saturating_add(1);
             stats_entry.consecutive_failures = 0;
             stats_entry.cooldown_until_unix = 0;
@@ -4211,7 +4399,7 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
         score: result.score,
         passed: result.success,
         latency_ms: result.latency_ms,
-        download_mbps: result.download_mbps,
+        download_mbps: result.download_mbps.unwrap_or(0.0),
     });
     if inner.state.metrics_history.len() > MAX_HISTORY_SAMPLES {
         let excess = inner.state.metrics_history.len() - MAX_HISTORY_SAMPLES;
@@ -4243,19 +4431,19 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
                 "active": active_id == Some(profile.id),
                 "favorite": favorite,
                 "group": profile.group,
-                "last_latency_ms": stat.map(|s| s.last_latency_ms).unwrap_or(0),
-                "last_jitter_ms": stat.map(|s| s.last_jitter_ms).unwrap_or(0),
-                "last_download_mbps": stat.map(|s| s.last_download_mbps).unwrap_or(0.0),
-                "last_upload_mbps": stat.map(|s| s.last_upload_mbps).unwrap_or(0.0),
-                "last_loss_percent": stat.map(|s| s.last_loss_percent).unwrap_or(0.0),
-                "score": stat.map(|s| s.last_score).unwrap_or(0),
+                "last_latency_ms": stat.filter(|s| s.has_latency).map(|s| s.last_latency_ms),
+                "last_jitter_ms": stat.filter(|s| s.has_jitter).map(|s| s.last_jitter_ms),
+                "last_download_mbps": stat.filter(|s| s.has_download).map(|s| s.last_download_mbps),
+                "last_upload_mbps": stat.filter(|s| s.has_upload).map(|s| s.last_upload_mbps),
+                "last_loss_percent": stat.filter(|s| s.has_loss).map(|s| s.last_loss_percent),
+                "score": stat.filter(|s| s.has_score).map(|s| s.last_score),
                 "success_count": stat.map(|s| s.success_count).unwrap_or(0),
                 "failure_count": stat.map(|s| s.failure_count).unwrap_or(0),
                 "last_error": stat.and_then(|s| s.last_error.clone()),
                 "last_checked": stat.map(|s| s.last_checked_unix).unwrap_or(0),
-                "ewma_score": stat.map(|s| s.ewma_score).unwrap_or(0.0),
-                "ewma_latency_ms": stat.map(|s| s.ewma_latency_ms).unwrap_or(0.0),
-                "ewma_download_mbps": stat.map(|s| s.ewma_download_mbps).unwrap_or(0.0),
+                "ewma_score": stat.filter(|s| s.has_ewma).map(|s| s.ewma_score),
+                "ewma_latency_ms": stat.filter(|s| s.has_ewma).map(|s| s.ewma_latency_ms),
+                "ewma_download_mbps": stat.filter(|s| s.has_download).map(|s| s.ewma_download_mbps),
                 "consecutive_failures": stat.map(|s| s.consecutive_failures).unwrap_or(0),
                 "cooldown_until_unix": stat.map(|s| s.cooldown_until_unix).unwrap_or(0),
             })
@@ -4280,7 +4468,10 @@ fn update_smart_ewma(stats: &mut ProfileStats, result: &BenchResult) {
     const ALPHA: f32 = 0.35;
     stats.ewma_score = ewma(stats.ewma_score, result.score as f32, ALPHA);
     stats.ewma_latency_ms = ewma(stats.ewma_latency_ms, result.latency_ms as f32, ALPHA);
-    stats.ewma_download_mbps = ewma(stats.ewma_download_mbps, result.download_mbps, ALPHA);
+    if let Some(download_mbps) = result.download_mbps {
+        stats.ewma_download_mbps = ewma(stats.ewma_download_mbps, download_mbps, ALPHA);
+    }
+    stats.has_ewma = true;
 }
 
 fn ewma(previous: f32, sample: f32, alpha: f32) -> f32 {
@@ -6030,6 +6221,20 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
             .filter(|s| !s.is_empty())
             .collect();
     }
+    if let Some(v) = value
+        .get("auto_vpn_learning_enabled")
+        .and_then(Value::as_bool)
+    {
+        inner.state.split_routing.auto_vpn_learning_enabled = v;
+    }
+    if let Some(v) = value.get("auto_vpn_exceptions").and_then(Value::as_array) {
+        let items: Vec<String> = v
+            .iter()
+            .filter_map(|item| normalize_auto_vpn_domain(item.as_str()?))
+            .collect();
+        inner.state.split_routing.auto_vpn_exceptions = dedup_limited_domains(items);
+        prune_auto_vpn_metadata(&mut inner.state.split_routing);
+    }
     if let Some(v) = value.get("match_target").and_then(Value::as_str) {
         let target = v.trim().to_ascii_lowercase();
         // Validate: when no routing rules exist, can't set to "direct"
@@ -6248,6 +6453,9 @@ fn handle_routing_reset(daemon: &Daemon) -> (u16, &'static str, String) {
     s.rkn_bypass_interval = default_rkn_bypass_interval();
     s.ru_direct_mode = "geosite".to_owned();
     s.ru_direct_exceptions = Vec::new();
+    s.auto_vpn_exceptions = Vec::new();
+    s.auto_vpn_last_checked_unix.clear();
+    s.auto_vpn_learning_enabled = true;
     s.match_target = "proxy".to_owned();
     s.port_mode = PortMode::AllowList;
     s.proxy_ports = vec!["80".to_owned(), "443".to_owned()];
@@ -8818,6 +9026,331 @@ fn run_unlock_probe(client: &reqwest::blocking::Client, probe: &UnlockProbe) -> 
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct AutoVpnCandidate {
+    domain: String,
+    port: Option<u16>,
+}
+
+fn auto_vpn_probe_urls(candidate: &AutoVpnCandidate) -> [String; 2] {
+    let schemes = if candidate.port == Some(80) {
+        ["http", "https"]
+    } else {
+        ["https", "http"]
+    };
+    let authority = match candidate.port {
+        Some(port) => format!("{}:{port}", candidate.domain),
+        None => candidate.domain.clone(),
+    };
+    [
+        format!("{}://{authority}/", schemes[0]),
+        format!("{}://{authority}/", schemes[1]),
+    ]
+}
+
+fn probe_domain_reachable(
+    client: &reqwest::blocking::Client,
+    candidate: &AutoVpnCandidate,
+) -> bool {
+    for url in auto_vpn_probe_urls(candidate) {
+        if let Ok(resp) = client.get(&url).send()
+            && resp.status().as_u16() < 500
+            && resp.status().as_u16() != 451
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn proxy_domain_reachable_via_mihomo(
+    addr: &str,
+    secret: Option<&str>,
+    candidate: &AutoVpnCandidate,
+) -> bool {
+    for url in auto_vpn_probe_urls(candidate) {
+        if mihomo_api_delay(addr, secret, PROXY_ACTIVE_NAME, &url, 8000).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn auto_vpn_candidate_from_mihomo_log_payload(payload: &str) -> Option<AutoVpnCandidate> {
+    if !payload.contains("dial DIRECT") || !payload.contains(" error:") {
+        return None;
+    }
+    let (_, after_arrow) = payload.split_once(" --> ")?;
+    let (target, _) = after_arrow.split_once(" error:")?;
+    let domain = normalize_auto_vpn_domain(target)?;
+    let (_, port) = target.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    Some(AutoVpnCandidate {
+        domain,
+        port: Some(port),
+    })
+}
+
+#[derive(Debug, Default)]
+struct MihomoLogCursor {
+    identity: Option<(u64, u64)>,
+    offset: u64,
+}
+
+impl MihomoLogCursor {
+    fn start_at_end(path: &Path) -> Self {
+        match fs::metadata(path) {
+            Ok(metadata) => Self {
+                identity: Some(file_identity(&metadata)),
+                offset: metadata.len(),
+            },
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn read_new_domains(&mut self, path: &Path) -> Result<Vec<AutoVpnCandidate>, String> {
+        let mut file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("metadata {}: {e}", path.display()))?;
+        let identity = file_identity(&metadata);
+        match self.identity {
+            None => {
+                self.identity = Some(identity);
+                self.offset = 0;
+            }
+            Some(previous) if previous != identity => {
+                self.identity = Some(identity);
+                self.offset = 0;
+            }
+            Some(_) if metadata.len() < self.offset => {
+                self.offset = 0;
+            }
+            Some(_) => {}
+        }
+
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(|e| format!("seek {}: {e}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.take(1_048_576)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+            return Ok(Vec::new());
+        };
+        let complete_len = last_newline + 1;
+        self.offset = self.offset.saturating_add(complete_len as u64);
+        Ok(auto_vpn_log_candidate_domains_from_text(
+            &String::from_utf8_lossy(&bytes[..complete_len]),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    (metadata.len(), 0)
+}
+
+fn auto_vpn_log_candidate_domains_from_text(text: &str) -> Vec<AutoVpnCandidate> {
+    let mut seen = HashSet::new();
+    let mut domains = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Some(candidate) = auto_vpn_candidate_from_mihomo_log_payload(line) else {
+            continue;
+        };
+        if seen.insert(candidate.clone()) {
+            domains.push(candidate);
+        }
+    }
+    domains
+}
+
+fn auto_vpn_candidate_domains(
+    state: &HincyrayState,
+    now: u64,
+    observed_direct_failures: &[AutoVpnCandidate],
+) -> Vec<AutoVpnCandidate> {
+    let known_auto: HashSet<String> = state
+        .split_routing
+        .auto_vpn_exceptions
+        .iter()
+        .filter_map(|domain| normalize_auto_vpn_domain(domain))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+
+    for observed in observed_direct_failures {
+        let domain = &observed.domain;
+        if known_auto.contains(domain) {
+            continue;
+        }
+        let last_checked = state
+            .split_routing
+            .auto_vpn_last_checked_unix
+            .get(domain)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last_checked) < AUTO_VPN_RECHECK_INTERVAL_SECS {
+            continue;
+        }
+        if seen.insert(domain.clone()) {
+            candidates.push(observed.clone());
+            if candidates.len() >= 3 {
+                return candidates;
+            }
+        }
+    }
+
+    for entry in state.connection_log.iter().rev() {
+        if !entry.chains.iter().any(|chain| chain == DIRECT_NAME) {
+            continue;
+        }
+        let Some(domain) = normalize_auto_vpn_domain(&entry.host) else {
+            continue;
+        };
+        if known_auto.contains(&domain) {
+            continue;
+        }
+        let last_checked = state
+            .split_routing
+            .auto_vpn_last_checked_unix
+            .get(&domain)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last_checked) < AUTO_VPN_RECHECK_INTERVAL_SECS {
+            continue;
+        }
+        if seen.insert(domain.clone()) {
+            candidates.push(AutoVpnCandidate {
+                domain,
+                port: (entry.destination_port != 0).then_some(entry.destination_port),
+            });
+            if candidates.len() >= 3 {
+                break;
+            }
+        }
+    }
+
+    for domain in &state.split_routing.auto_vpn_exceptions {
+        let Some(domain) = normalize_auto_vpn_domain(domain) else {
+            continue;
+        };
+        let last_checked = state
+            .split_routing
+            .auto_vpn_last_checked_unix
+            .get(&domain)
+            .copied()
+            .unwrap_or(0);
+        if now.saturating_sub(last_checked) >= AUTO_VPN_RECHECK_INTERVAL_SECS
+            && seen.insert(domain.clone())
+        {
+            candidates.push(AutoVpnCandidate { domain, port: None });
+            if candidates.len() >= 3 {
+                break;
+            }
+        }
+    }
+
+    candidates
+}
+
+fn run_auto_vpn_learning(
+    daemon: &Daemon,
+    ec_addr: Option<&str>,
+    ec_secret: Option<&str>,
+    observed_direct_failures: &[AutoVpnCandidate],
+) -> bool {
+    let Some(ec_addr) = ec_addr else {
+        return false;
+    };
+    let now = unix_now();
+    let candidates = {
+        let inner = lock(&daemon.inner);
+        if !inner.state.split_routing.auto_vpn_learning_enabled {
+            return true;
+        }
+        auto_vpn_candidate_domains(&inner.state, now, observed_direct_failures)
+    };
+    if candidates.is_empty() {
+        return true;
+    }
+
+    let Ok(direct_client) = direct_http_client(Duration::from_secs(5)) else {
+        return false;
+    };
+    let mut add = Vec::new();
+    let mut remove = Vec::new();
+    let mut checked = HashMap::new();
+    for candidate in candidates {
+        let direct_ok = probe_domain_reachable(&direct_client, &candidate);
+        let proxy_ok = proxy_domain_reachable_via_mihomo(ec_addr, ec_secret, &candidate);
+        let domain = candidate.domain;
+        checked.insert(domain.clone(), now);
+        if direct_ok {
+            remove.push(domain);
+        } else if proxy_ok {
+            add.push(domain);
+        }
+    }
+
+    if add.is_empty() && remove.is_empty() && checked.is_empty() {
+        return true;
+    }
+
+    let mut inner = lock(&daemon.inner);
+    let mut changed = false;
+    for (domain, timestamp) in checked {
+        inner
+            .state
+            .split_routing
+            .auto_vpn_last_checked_unix
+            .insert(domain, timestamp);
+    }
+    if !remove.is_empty() {
+        let remove_set: HashSet<String> = remove.iter().cloned().collect();
+        let before = inner.state.split_routing.auto_vpn_exceptions.len();
+        inner
+            .state
+            .split_routing
+            .auto_vpn_exceptions
+            .retain(|domain| !remove_set.contains(domain));
+        changed |= before != inner.state.split_routing.auto_vpn_exceptions.len();
+    }
+    for domain in add {
+        if !inner
+            .state
+            .split_routing
+            .auto_vpn_exceptions
+            .iter()
+            .any(|existing| existing == &domain)
+        {
+            eprintln!("hincyray: auto VPN exception learned: {domain}");
+            inner.state.split_routing.auto_vpn_exceptions.push(domain);
+            changed = true;
+        }
+    }
+    let deduped = dedup_limited_domains(inner.state.split_routing.auto_vpn_exceptions.clone());
+    if deduped != inner.state.split_routing.auto_vpn_exceptions {
+        inner.state.split_routing.auto_vpn_exceptions = deduped;
+        changed = true;
+    }
+    prune_auto_vpn_metadata(&mut inner.state.split_routing);
+    inner.dirty = true;
+    if changed
+        && inner.core.is_running()
+        && let Err(error) = restart_core_locked(&mut inner, daemon)
+    {
+        eprintln!("hincyray: auto VPN exception apply failed: {error}");
+    }
+    true
+}
+
 fn direct_http_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .no_proxy()
@@ -11353,13 +11886,18 @@ fn update_bypass_list(
 ///    TCP benchmark on all profiles on a schedule.
 /// 5. **Auto-select (auto_select)** — when a benchmark finishes,
 ///    switch to the highest-scoring profile.
-fn start_watchdog(daemon: Daemon) {
+fn start_watchdog(
+    daemon: Daemon,
+    mihomo_log_path: PathBuf,
+    mut mihomo_log_cursor: MihomoLogCursor,
+) {
     thread::spawn(move || {
         let mut bench_was_running = false;
         let mut restart_backoff_secs: u64 = 0;
         let mut failover_rejected_profiles = HashSet::new();
         let mut watchdog_tick: u64 = 0;
         let mut last_bypass_update_unix: u64 = 0;
+        let mut pending_auto_vpn_domains: VecDeque<AutoVpnCandidate> = VecDeque::new();
 
         loop {
             thread::sleep(Duration::from_secs(10));
@@ -11396,6 +11934,7 @@ fn start_watchdog(daemon: Daemon) {
                 rkn_bypass_url,
                 rkn_bypass_interval,
                 geo_asset_path,
+                auto_vpn_learning_enabled,
                 deep_bench_running,
                 deep_bench_due_now,
             ) = {
@@ -11435,6 +11974,7 @@ fn start_watchdog(daemon: Daemon) {
                     inner.state.split_routing.rkn_bypass_url.clone(),
                     inner.state.split_routing.rkn_bypass_interval,
                     inner.state.split_routing.geo_asset_path.clone(),
+                    inner.state.split_routing.auto_vpn_learning_enabled,
                     inner.deep_bench_active,
                     deep_bench_due(&inner.state.deep_bench, unix_now()),
                 )
@@ -11897,8 +12437,8 @@ fn start_watchdog(daemon: Daemon) {
             }
 
             // --- Phase 9: Connection log ---
-            // Poll Mihomo /connections every 3 ticks (30s) and log
-            // new connections not seen in the previous poll.
+            // Poll Mihomo /connections every 30s for the UI connection log.
+            // Auto-VPN learning has its own lossless incremental file source.
             if core_running
                 && watchdog_tick.is_multiple_of(3)
                 && let Some(ref addr) = ec_addr
@@ -11939,6 +12479,11 @@ fn start_watchdog(daemon: Daemon) {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_owned();
+                        let destination_port = metadata
+                            .and_then(|m| m.get("destinationPort"))
+                            .and_then(Value::as_str)
+                            .and_then(|port| port.parse::<u16>().ok())
+                            .unwrap_or(0);
                         let network = metadata
                             .and_then(|m| m.get("network"))
                             .and_then(Value::as_str)
@@ -11975,6 +12520,7 @@ fn start_watchdog(daemon: Daemon) {
                             host,
                             source_ip,
                             destination_ip,
+                            destination_port,
                             network,
                             chains,
                             rule,
@@ -12055,7 +12601,48 @@ fn start_watchdog(daemon: Daemon) {
                 }
             }
 
-            // --- Phase 12: Deep Bench (v0.20) ---
+            // --- Phase 12: Auto VPN exceptions ---
+            // Mihomo's EC /logs endpoint is live-only, so periodic stream
+            // sampling loses events. Consume every completed line appended
+            // to Mihomo's local log instead; the cursor handles rotation and
+            // truncation, while the bounded queue bridges 10s reads to 30s
+            // probe cycles.
+            if core_running && split_enabled && auto_vpn_learning_enabled {
+                match mihomo_log_cursor.read_new_domains(&mihomo_log_path) {
+                    Ok(domains) => {
+                        for candidate in domains {
+                            if !pending_auto_vpn_domains
+                                .iter()
+                                .any(|pending| pending.domain == candidate.domain)
+                            {
+                                if pending_auto_vpn_domains.len() >= MAX_AUTO_VPN_PENDING_DOMAINS {
+                                    pending_auto_vpn_domains.pop_front();
+                                }
+                                pending_auto_vpn_domains.push_back(candidate);
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("hincyray: auto VPN log read failed: {error}"),
+                }
+            } else {
+                pending_auto_vpn_domains.clear();
+                mihomo_log_cursor = MihomoLogCursor::start_at_end(&mihomo_log_path);
+            }
+
+            if core_running
+                && split_enabled
+                && auto_vpn_learning_enabled
+                && watchdog_tick.is_multiple_of(AUTO_VPN_PROBE_INTERVAL_TICKS)
+            {
+                let batch: Vec<AutoVpnCandidate> =
+                    pending_auto_vpn_domains.iter().take(3).cloned().collect();
+                if run_auto_vpn_learning(&daemon, ec_addr.as_deref(), ec_secret.as_deref(), &batch)
+                {
+                    pending_auto_vpn_domains.drain(..batch.len());
+                }
+            }
+
+            // --- Phase 13: Deep Bench (v0.20) ---
             // Two-phase quality testing on a schedule. Phase A reuses
             // `run_bench()` for the quick scan, Phase B observes each
             // passing server for `stability_minutes` to collect drop
@@ -12937,6 +13524,13 @@ mod tests {
         (dir, daemon)
     }
 
+    fn auto_candidate(domain: &str, port: Option<u16>) -> AutoVpnCandidate {
+        AutoVpnCandidate {
+            domain: domain.to_owned(),
+            port,
+        }
+    }
+
     #[test]
     fn proxy_info_for_daemon_uses_state_socks_port() {
         let (_dir, daemon) = test_daemon();
@@ -13222,6 +13816,58 @@ mod tests {
         let loaded = load_state(Path::new("/nonexistent/hincyray-state-test.json"));
         assert!(loaded.profiles.is_empty());
         assert_eq!(loaded.socks_port, 10808);
+    }
+
+    #[test]
+    fn auto_vpn_probe_contract_migration_clears_stale_metadata_once() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let mut state = HincyrayState::default();
+        state.split_routing.auto_vpn_probe_contract_version = 0;
+        state.split_routing.auto_vpn_exceptions = vec!["promoted.example".to_owned()];
+        state
+            .split_routing
+            .auto_vpn_last_checked_unix
+            .insert("promoted.example".to_owned(), 10);
+        state
+            .split_routing
+            .auto_vpn_last_checked_unix
+            .insert("stale.example".to_owned(), 20);
+        persist_state(&state_path, &state).expect("persist old contract");
+
+        let migrated = load_state(&state_path);
+        assert_eq!(
+            migrated.split_routing.auto_vpn_probe_contract_version,
+            AUTO_VPN_PROBE_CONTRACT_VERSION
+        );
+        assert_eq!(
+            migrated
+                .split_routing
+                .auto_vpn_last_checked_unix
+                .get("promoted.example"),
+            Some(&10)
+        );
+        assert!(
+            !migrated
+                .split_routing
+                .auto_vpn_last_checked_unix
+                .contains_key("stale.example")
+        );
+
+        let mut persisted = migrated;
+        persisted
+            .split_routing
+            .auto_vpn_last_checked_unix
+            .insert("fresh.example".to_owned(), 30);
+        persist_state(&state_path, &persisted).expect("persist new contract");
+        let reloaded = load_state(&state_path);
+        assert_eq!(
+            reloaded
+                .split_routing
+                .auto_vpn_last_checked_unix
+                .get("fresh.example"),
+            Some(&30)
+        );
     }
 
     #[test]
@@ -13940,7 +14586,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_endpoint_lists_imported_profile_with_zeroes() {
+    fn stats_endpoint_marks_never_measured_metrics_as_null() {
         let (_dir, daemon) = test_daemon();
         handle_import(
             "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
@@ -13952,7 +14598,17 @@ mod tests {
         let stats = response["stats"].as_array().expect("stats array");
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0]["name"], "Demo");
-        assert_eq!(stats[0]["score"], 0);
+        for field in [
+            "score",
+            "last_latency_ms",
+            "last_jitter_ms",
+            "last_download_mbps",
+            "last_upload_mbps",
+            "last_loss_percent",
+            "ewma_score",
+        ] {
+            assert!(stats[0][field].is_null(), "{field} must be null");
+        }
         assert_eq!(stats[0]["favorite"], false);
         assert_eq!(stats[0]["active"], false);
     }
@@ -14101,8 +14757,10 @@ mod tests {
             method: "tcp".to_owned(),
             latency_ms: 80,
             jitter_ms: 4,
-            download_mbps: 0.0,
-            upload_mbps: 0.0,
+            download_mbps: Some(25.0),
+            upload_mbps: Some(8.0),
+            download_error: None,
+            upload_error: None,
             loss_percent: 0.0,
             score: 70,
             success: true,
@@ -14116,6 +14774,10 @@ mod tests {
         let stat = &inner.state.stats[0];
         assert_eq!(stat.profile_raw, raw);
         assert_eq!(stat.last_latency_ms, 80);
+        assert_eq!(stat.last_download_mbps, 25.0);
+        assert_eq!(stat.last_upload_mbps, 8.0);
+        assert!(stat.has_download);
+        assert!(stat.has_upload);
         assert_eq!(stat.last_score, 70);
         assert_eq!(stat.success_count, 1);
         assert_eq!(stat.failure_count, 0);
@@ -14130,8 +14792,10 @@ mod tests {
             method: "tcp".to_owned(),
             latency_ms: 0,
             jitter_ms: 0,
-            download_mbps: 0.0,
-            upload_mbps: 0.0,
+            download_mbps: None,
+            upload_mbps: None,
+            download_error: None,
+            upload_error: None,
             loss_percent: 100.0,
             score: 0,
             success: false,
@@ -14145,6 +14809,42 @@ mod tests {
         assert_eq!(stat.failure_count, 1);
         assert_eq!(stat.last_error.as_deref(), Some("tcp connect failed"));
         assert_eq!(inner.state.metrics_history.len(), 2);
+    }
+
+    #[test]
+    fn latency_only_bench_preserves_previous_speed_measurements() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
+            &daemon,
+        );
+        let raw = lock(&daemon.inner).state.profiles[0].raw.clone();
+        let result = |download_mbps, upload_mbps, timestamp| BenchResult {
+            profile_id: 0,
+            profile_name: "Demo".to_owned(),
+            profile_raw: raw.clone(),
+            method: "tcp".to_owned(),
+            latency_ms: 50,
+            jitter_ms: 2,
+            download_mbps,
+            upload_mbps,
+            download_error: None,
+            upload_error: None,
+            loss_percent: 0.0,
+            score: 80,
+            success: true,
+            error: None,
+            timestamp,
+        };
+        apply_bench_result(&daemon, result(Some(40.0), Some(12.0), 1));
+        apply_bench_result(&daemon, result(None, None, 2));
+
+        let inner = lock(&daemon.inner);
+        let stat = &inner.state.stats[0];
+        assert_eq!(stat.last_download_mbps, 40.0);
+        assert_eq!(stat.last_upload_mbps, 12.0);
+        assert!(stat.has_download);
+        assert!(stat.has_upload);
     }
 
     #[test]
@@ -14165,8 +14865,10 @@ mod tests {
                     method: "tcp".to_owned(),
                     latency_ms: 10 + i as u32,
                     jitter_ms: 0,
-                    download_mbps: 0.0,
-                    upload_mbps: 0.0,
+                    download_mbps: None,
+                    upload_mbps: None,
+                    download_error: None,
+                    upload_error: None,
                     loss_percent: 0.0,
                     score: 50,
                     success: true,
@@ -15200,6 +15902,7 @@ mod tests {
                 host: "example.com".to_owned(),
                 source_ip: "192.168.2.35".to_owned(),
                 destination_ip: "1.2.3.4".to_owned(),
+                destination_port: 443,
                 network: "tcp".to_owned(),
                 chains: vec!["proxy-active".to_owned()],
                 rule: "DOMAIN-SUFFIX".to_owned(),
@@ -16181,6 +16884,198 @@ mod tests {
     }
 
     #[test]
+    fn routing_settings_accepts_auto_vpn_exceptions() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, _body) = handle_routing_settings(
+            r#"{"auto_vpn_learning_enabled":false,"auto_vpn_exceptions":["HTTPS://Blocked.Example/path","192.168.1.1","*.ok.example."]}"#,
+            &daemon,
+        );
+        assert_eq!(status, 200);
+        let inner = lock(&daemon.inner);
+        assert!(!inner.state.split_routing.auto_vpn_learning_enabled);
+        assert_eq!(
+            inner.state.split_routing.auto_vpn_exceptions,
+            vec!["blocked.example".to_owned(), "ok.example".to_owned()]
+        );
+    }
+
+    #[test]
+    fn auto_vpn_candidate_domains_use_direct_connections_only() {
+        let mut state = HincyrayState::default();
+        state.connection_log.push(ConnectionLogEntry {
+            timestamp: 1,
+            host: "proxied.example".to_owned(),
+            chains: vec![PROXY_NAME.to_owned()],
+            ..Default::default()
+        });
+        state.connection_log.push(ConnectionLogEntry {
+            timestamp: 2,
+            host: "Direct.Example:443".to_owned(),
+            destination_port: 443,
+            chains: vec![DIRECT_NAME.to_owned()],
+            ..Default::default()
+        });
+        assert_eq!(
+            auto_vpn_candidate_domains(&state, AUTO_VPN_RECHECK_INTERVAL_SECS + 1, &[]),
+            vec![auto_candidate("direct.example", Some(443))]
+        );
+    }
+
+    #[test]
+    fn auto_vpn_log_payload_extracts_direct_failure_endpoint_only() {
+        assert_eq!(
+            auto_vpn_candidate_from_mihomo_log_payload(
+                "[TCP] dial DIRECT (match GeoSite/category-ru) 192.168.2.100:45542 --> Rutube.Ru:8443 error: connect failed"
+            ),
+            Some(auto_candidate("rutube.ru", Some(8443)))
+        );
+        assert_eq!(
+            auto_vpn_candidate_from_mihomo_log_payload(
+                "[TCP] dial proxy-active 192.168.2.100:1 --> blocked.example:443 error: upstream failed"
+            ),
+            None
+        );
+        assert_eq!(
+            auto_vpn_candidate_from_mihomo_log_payload(
+                "[TCP] dial DIRECT 192.168.2.100:1 --> 192.0.2.1:443 error: failed"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_vpn_log_text_extracts_unique_direct_failure_domains() {
+        let body = r#"time="2026-07-10T13:39:02Z" level=warning msg="[TCP] dial DIRECT (match GeoSite/category-ru) 192.168.2.100:45542 --> rutube.ru:8443 error: connect failed"
+time="2026-07-10T13:39:03Z" level=warning msg="[TCP] dial DIRECT 192.168.2.100:45543 --> Rutube.Ru:443 error: connect failed"
+time="2026-07-10T13:39:04Z" level=warning msg="[TCP] dial DIRECT 192.168.2.100:45544 --> seller.ozon.ru:443 error: connect failed"
+time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2.100:45545 --> ignored.example:443 error: upstream failed""#;
+        assert_eq!(
+            auto_vpn_log_candidate_domains_from_text(body),
+            vec![
+                auto_candidate("rutube.ru", Some(8443)),
+                auto_candidate("rutube.ru", Some(443)),
+                auto_candidate("seller.ozon.ru", Some(443))
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_vpn_probe_urls_preserve_observed_port() {
+        assert_eq!(
+            auto_vpn_probe_urls(&auto_candidate("rutube.ru", Some(8443))),
+            [
+                "https://rutube.ru:8443/".to_owned(),
+                "http://rutube.ru:8443/".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn mihomo_log_cursor_reads_appends_without_replaying_or_losing_partial_lines() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("mihomo.log");
+        fs::write(
+            &path,
+            "old dial DIRECT --> old.example:443 error: ignored\n",
+        )
+        .expect("old log");
+        let mut cursor = MihomoLogCursor::start_at_end(&path);
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append log");
+        write!(
+            file,
+            "new dial DIRECT --> first.example:443 error: failed\npartial dial DIRECT --> second.example:443 error: failed"
+        )
+        .expect("append records");
+        file.flush().expect("flush records");
+
+        assert_eq!(
+            cursor.read_new_domains(&path).expect("read append"),
+            vec![auto_candidate("first.example", Some(443))]
+        );
+        writeln!(file).expect("complete partial record");
+        file.flush().expect("flush completed record");
+        assert_eq!(
+            cursor.read_new_domains(&path).expect("read completed line"),
+            vec![auto_candidate("second.example", Some(443))]
+        );
+        assert!(
+            cursor
+                .read_new_domains(&path)
+                .expect("read no append")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mihomo_log_cursor_reads_new_file_after_rotation() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("mihomo.log");
+        fs::write(&path, "old\n").expect("old log");
+        let mut cursor = MihomoLogCursor::start_at_end(&path);
+        fs::rename(&path, dir.path().join("mihomo.log.1")).expect("rotate");
+        fs::write(
+            &path,
+            "new dial DIRECT --> rotated.example:443 error: failed\n",
+        )
+        .expect("new log");
+        assert_eq!(
+            cursor.read_new_domains(&path).expect("read rotated log"),
+            vec![auto_candidate("rotated.example", Some(443))]
+        );
+    }
+
+    #[test]
+    fn mihomo_log_cursor_reads_first_file_created_after_startup() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("mihomo.log");
+        let mut cursor = MihomoLogCursor::start_at_end(&path);
+        fs::write(
+            &path,
+            "new dial DIRECT --> created.example:8443 error: failed\n",
+        )
+        .expect("created log");
+        assert_eq!(
+            cursor.read_new_domains(&path).expect("read created log"),
+            vec![auto_candidate("created.example", Some(8443))]
+        );
+    }
+
+    #[test]
+    fn auto_vpn_candidate_domains_prioritize_log_failures_and_throttle_all_sources() {
+        let mut state = HincyrayState::default();
+        state
+            .split_routing
+            .auto_vpn_last_checked_unix
+            .insert("fresh.example".to_owned(), AUTO_VPN_RECHECK_INTERVAL_SECS);
+        state.connection_log.push(ConnectionLogEntry {
+            timestamp: 1,
+            host: "connection.example".to_owned(),
+            destination_port: 443,
+            chains: vec![DIRECT_NAME.to_owned()],
+            ..Default::default()
+        });
+        let candidates = auto_vpn_candidate_domains(
+            &state,
+            AUTO_VPN_RECHECK_INTERVAL_SECS + 10,
+            &[
+                auto_candidate("log.example", Some(8443)),
+                auto_candidate("fresh.example", Some(443)),
+            ],
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                auto_candidate("log.example", Some(8443)),
+                auto_candidate("connection.example", Some(443))
+            ]
+        );
+    }
+
+    #[test]
     fn routing_reset_restores_factory_defaults() {
         let (_dir, daemon) = test_daemon();
         handle_import(
@@ -16197,6 +17092,13 @@ mod tests {
             inner.state.split_routing.port_mode = PortMode::All;
             inner.state.split_routing.proxy_ports = Vec::new();
             inner.state.split_routing.ru_direct_exceptions = vec!["example.ru".to_owned()];
+            inner.state.split_routing.auto_vpn_exceptions = vec!["blocked.example".to_owned()];
+            inner
+                .state
+                .split_routing
+                .auto_vpn_last_checked_unix
+                .insert("blocked.example".to_owned(), 123);
+            inner.state.split_routing.auto_vpn_learning_enabled = false;
             inner.state.routing_rules.push(RoutingRule {
                 enabled: true,
                 name: "Custom".to_owned(),
@@ -16230,6 +17132,18 @@ mod tests {
             assert!(
                 s.ru_direct_exceptions.is_empty(),
                 "ru_direct_exceptions should be cleared"
+            );
+            assert!(
+                s.auto_vpn_exceptions.is_empty(),
+                "auto_vpn_exceptions should be cleared"
+            );
+            assert!(
+                s.auto_vpn_last_checked_unix.is_empty(),
+                "auto_vpn metadata should be cleared"
+            );
+            assert!(
+                s.auto_vpn_learning_enabled,
+                "auto_vpn_learning_enabled should reset to true"
             );
             // Routing rules should be just QUIC Block.
             assert_eq!(

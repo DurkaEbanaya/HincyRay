@@ -101,6 +101,10 @@ pub struct RouterExtra {
     pub ru_direct_mode: String,
     /// v0.16: Domains exempt from RU Direct (go through VPN).
     pub ru_direct_exceptions: Vec<String>,
+    /// Auto-learned high-priority VPN exceptions. These must be emitted
+    /// before broad RKN/RU Direct rules so direct GEOIP/GEOSITE rules
+    /// cannot shadow them.
+    pub auto_vpn_exceptions: Vec<String>,
     /// v0.16: MATCH rule target — `"proxy"` (default) or `"direct"`.
     /// Controls the final fallback rule: `MATCH,proxy` or `MATCH,direct`.
     pub match_target: String,

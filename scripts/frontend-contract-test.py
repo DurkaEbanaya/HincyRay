@@ -9,6 +9,7 @@ not serve, or uses the wrong HTTP method.
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -56,6 +57,12 @@ REQUIRED_MARKERS = [
     "hrStatusRefreshInterval",
     ".btn, .chip, .section-header,",
     "addEventListener('pointermove'",
+    "if (va.missing !== vb.missing) return va.missing ? 1 : -1;",
+    "const favorites = applyProfileSort(data.filter(p => p.favorite));",
+    "last_download_mbps: st.last_download_mbps ?? null",
+    "last_upload_mbps: st.last_upload_mbps ?? null",
+    "if (r.download_mbps != null) p.last_download_mbps = r.download_mbps;",
+    "if (r.upload_mbps != null) p.last_upload_mbps = r.upload_mbps;",
 ]
 
 FORBIDDEN_MARKERS = [
@@ -106,6 +113,69 @@ def dom_id_exists(html_text: str, dom_id: str) -> bool:
     return f'id="{dom_id}"' in html_text or f"id='{dom_id}'" in html_text
 
 
+def js_function(html_text: str, name: str) -> str:
+    start = html_text.find(f"function {name}(")
+    if start < 0:
+        raise ValueError(f"missing JavaScript function {name}")
+    brace = html_text.find("{", start)
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(brace, len(html_text)):
+        char = html_text[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in "'\"`":
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return html_text[start : index + 1]
+    raise ValueError(f"unterminated JavaScript function {name}")
+
+
+def verify_nullable_sort(html_text: str) -> str | None:
+    try:
+        functions = "\n".join(
+            js_function(html_text, name) for name in ("getSortValue", "applyProfileSort")
+        )
+    except ValueError as error:
+        return str(error)
+    program = f"""
+let profileSortState = {{key:'last_download_mbps', dir:'asc'}};
+{functions}
+const data = [
+  {{id:'missing', name:null, address:null, last_download_mbps:null}},
+  {{id:'fast', name:'Zulu', address:'z.example', last_download_mbps:100}},
+  {{id:'zero', name:'Alpha', address:'a.example', last_download_mbps:0}}
+];
+function ids() {{ return applyProfileSort(data).map(p => p.id).join(','); }}
+if (ids() !== 'zero,fast,missing') throw new Error('numeric asc: '+ids());
+profileSortState.dir = 'desc';
+if (ids() !== 'fast,zero,missing') throw new Error('numeric desc: '+ids());
+profileSortState = {{key:'name', dir:'asc'}};
+if (ids() !== 'zero,fast,missing') throw new Error('string asc: '+ids());
+profileSortState.dir = 'desc';
+if (ids() !== 'fast,zero,missing') throw new Error('string desc: '+ids());
+profileSortState = {{key:'address', dir:'desc'}};
+if (ids() !== 'fast,zero,missing') throw new Error('address desc: '+ids());
+"""
+    result = subprocess.run(
+        ["node", "-e", program], capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        return (result.stderr or result.stdout).strip()
+    return None
+
+
 def main() -> int:
     html_text = HTML.read_text(encoding="utf-8")
     missing_markers = [marker for marker in REQUIRED_MARKERS if marker not in html_text]
@@ -121,7 +191,8 @@ def main() -> int:
     used = ui_routes()
     missing_routes = sorted(used - served)
     missing_routes = [(method, path) for method, path in missing_routes if not path.endswith("/")]
-    if missing_markers or forbidden_markers or missing_system_ids or nav_without_panel or nav_without_map or map_without_panel or missing_routes:
+    sort_error = verify_nullable_sort(html_text)
+    if missing_markers or forbidden_markers or missing_system_ids or nav_without_panel or nav_without_map or map_without_panel or missing_routes or sort_error:
         if missing_markers:
             print("Missing required UI markers:")
             for marker in missing_markers:
@@ -150,6 +221,8 @@ def main() -> int:
             print("UI calls endpoints not served by daemon:")
             for method, path in missing_routes:
                 print(f"  - {method} {path}")
+        if sort_error:
+            print(f"Nullable profile sorting contract failed: {sort_error}")
         return 1
     print(f"frontend contract ok: {len(used)} UI routes checked")
     return 0

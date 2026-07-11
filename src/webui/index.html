@@ -1098,6 +1098,15 @@ https://sub.example.com/…"></textarea>
             </div>
             <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить</button>
           </div>
+          <div class="feature-card" style="margin-bottom:16px">
+            <h4>Авто-обход заблокированных сайтов</h4>
+            <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Пассивно учиться из DIRECT-соединений</label><label class="toggle"><input type="checkbox" id="rAutoVpnLearning"><span class="slider"></span></label></div>
+            <div style="font-size:var(--fs-sm);color:var(--muted);margin:8px 0">Домен добавляется только если прямой доступ не работает, а через VPN работает. Эти правила имеют приоритет выше RKN/RU Direct.</div>
+            <div class="form-row">
+              <div class="form-group" style="flex:1"><label>Авто-исключения VPN (по одному на строку)</label><textarea id="rAutoVpnExceptions" class="mono" rows="4" placeholder="auto-learned.example"></textarea></div>
+            </div>
+            <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить</button>
+          </div>
           <h3 style="margin:20px 0 8px;font-size:var(--fs-h3)">Правила маршрутизации</h3>
           <div class="feature-card" style="margin-bottom:16px">
             <h4 id="ruleFormTitle">Добавить правило</h4>
@@ -1496,6 +1505,10 @@ OR,((DOMAIN-SUFFIX,google.com),(DOMAIN-KEYword,google)),PROXY"></textarea>
         </div>
         <div class="section-body">
           <h3 style="font-size:var(--fs-h3);margin:0 0 8px">Проверка разблокировки</h3>
+          <div class="feature-card" style="margin-bottom:12px">
+            <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Авто-обход: учиться из DIRECT-соединений</label><label class="toggle"><input type="checkbox" id="rAutoVpnLearningDiag" onchange="setAutoVpnLearning(this.checked)"><span class="slider"></span></label></div>
+            <div style="font-size:var(--fs-sm);color:var(--muted);margin-top:8px">Если сайт напрямую не открывается, но открывается через VPN, HincyRay добавит домен в высокоприоритетные VPN-исключения.</div>
+          </div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
             <span class="chip" data-svc="YouTube" onclick="checkUnlock('YouTube')">YouTube</span>
             <span class="chip" data-svc="Netflix" onclick="checkUnlock('Netflix')">Netflix</span>
@@ -2898,28 +2911,35 @@ const PROFILE_SORT_KEYS = [
 ];
 
 function getSortValue(p, key) {
-  if (key === 'address') return (p.address || '') + ':' + (p.port || '');
-  if (key === 'consecutive_failures') return p.consecutive_failures ?? p.failure_count ?? 0;
-  const v = p[key];
-  // cooldown_until_unix: 0 means "no cooldown" — treat as missing.
-  // last_loss_percent: 0 is a valid value (0% loss), keep it.
-  if (v == null || (key === 'cooldown_until_unix' && !v)) {
-    return profileSortState.dir === 'asc' ? Infinity : -Infinity;
+  let value;
+  if (key === 'address') {
+    if (!p.address) return { missing:true, value:null };
+    value = p.address + (p.port != null ? ':' + p.port : '');
+  } else if (key === 'consecutive_failures') {
+    value = p.consecutive_failures ?? p.failure_count;
+  } else {
+    value = p[key];
   }
-  return v;
+  const missing = value == null || (key === 'cooldown_until_unix' && !value);
+  return { missing, value: missing ? null : value };
 }
 
 function applyProfileSort(data) {
   if (!profileSortState.key) return data;
   const dir = profileSortState.dir === 'asc' ? 1 : -1;
-  return [...data].sort((a, b) => {
-    const va = getSortValue(a, profileSortState.key);
-    const vb = getSortValue(b, profileSortState.key);
-    if (typeof va === 'string' || typeof vb === 'string') {
-      return String(va).localeCompare(String(vb)) * dir;
+  return data.map((profile, index) => ({profile, index})).sort((a, b) => {
+    const va = getSortValue(a.profile, profileSortState.key);
+    const vb = getSortValue(b.profile, profileSortState.key);
+    if (va.missing !== vb.missing) return va.missing ? 1 : -1;
+    if (va.missing) return a.index - b.index;
+    let compared;
+    if (typeof va.value === 'string' || typeof vb.value === 'string') {
+      compared = String(va.value).localeCompare(String(vb.value), undefined, {numeric:true, sensitivity:'base'});
+    } else {
+      compared = va.value - vb.value;
     }
-    return (va - vb) * dir;
-  });
+    return compared ? compared * dir : a.index - b.index;
+  }).map(item => item.profile);
 }
 
 function sortByColumn(colIdx) {
@@ -3000,9 +3020,9 @@ function renderProfiles(data) {
       <button class="btn-icon btn-sm" onclick="editProfileName(${p.id})" title="${t('Переименовать')}">✎</button>
       <button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button>
     </td>
-    <td class="mono">${p.last_latency_ms ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
-    <td class="mono">${p.last_download_mbps ? p.last_download_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
-    <td class="mono">${p.last_upload_mbps ? p.last_upload_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
+    <td class="mono">${p.last_latency_ms != null ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
+    <td class="mono">${p.last_download_mbps != null ? p.last_download_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
+    <td class="mono">${p.last_upload_mbps != null ? p.last_upload_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
     <td class="mono" style="font-size:11px;line-height:1.35">${p.ewma_score != null ? p.ewma_score.toFixed(0) : '—'}<br><span style="color:var(--muted)">${p.ewma_latency_ms != null ? p.ewma_latency_ms.toFixed(0)+'ms' : '—'} · ${p.ewma_download_mbps != null ? p.ewma_download_mbps.toFixed(1)+'Mb' : '—'}</span></td>
     <td class="mono">${p.last_jitter_ms ?? '—'}</td>
     <td class="mono">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
@@ -3021,25 +3041,23 @@ function renderProfiles(data) {
 }
 
 function updateSortArrows() {
-  const table = document.getElementById('profilesTable');
-  if (!table) return;
-  const ths = table.querySelectorAll('thead th');
-  ths.forEach((th, i) => {
-    const key = PROFILE_SORT_KEYS[i];
-    if (!key) return;
-    // Remove old arrow.
-    const base = th.textContent.replace(/[▲▼]\s*$/, '').trim();
-    if (profileSortState.key === key) {
-      th.innerHTML = base + ' <span class="sort-arrow">' + (profileSortState.dir === 'asc' ? '▲' : '▼') + '</span>';
-    } else {
-      th.innerHTML = base;
-    }
+  ['profilesTable','favoritesTable'].forEach(tableId => {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    table.querySelectorAll('thead th').forEach((th, i) => {
+      const key = PROFILE_SORT_KEYS[i];
+      if (!key) return;
+      const base = th.textContent.replace(/[▲▼]\s*$/, '').trim();
+      th.innerHTML = profileSortState.key === key
+        ? base + ' <span class="sort-arrow">' + (profileSortState.dir === 'asc' ? '▲' : '▼') + '</span>'
+        : base;
+    });
   });
 }
 function renderFavorites(data) {
   const body = document.getElementById('favoritesBody');
   if (!body) return;
-  const favorites = data.filter(p => p.favorite);
+  const favorites = applyProfileSort(data.filter(p => p.favorite));
   if (!favorites.length) {
     body.innerHTML = `<tr><td colspan="16" style="color:var(--muted);text-align:center;padding:12px">${t('Нет избранных профилей')}</td></tr>`;
     return;
@@ -3055,9 +3073,9 @@ function renderFavorites(data) {
       <button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="${t('Тест сервера')}">⚡</button>
       <button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button>
     </td>
-    <td class="mono">${p.last_latency_ms ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
-    <td class="mono">${p.last_download_mbps ? p.last_download_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
-    <td class="mono">${p.last_upload_mbps ? p.last_upload_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
+    <td class="mono">${p.last_latency_ms != null ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
+    <td class="mono">${p.last_download_mbps != null ? p.last_download_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
+    <td class="mono">${p.last_upload_mbps != null ? p.last_upload_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
     <td class="mono" style="font-size:11px;line-height:1.35">${p.ewma_score != null ? p.ewma_score.toFixed(0) : '—'}<br><span style="color:var(--muted)">${p.ewma_latency_ms != null ? p.ewma_latency_ms.toFixed(0)+'ms' : '—'} · ${p.ewma_download_mbps != null ? p.ewma_download_mbps.toFixed(1)+'Mb' : '—'}</span></td>
     <td class="mono">${p.last_jitter_ms ?? '—'}</td>
     <td class="mono">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
@@ -3868,18 +3886,18 @@ function updateBenchStatus(data) {
 /// sliders are updated — disabled metrics keep their previous value.
 function mergeBenchResultsIntoProfiles(results) {
   if (!results || !results.length) return;
-  const tog = metricToggles();
   let changed = false;
   for (const r of results) {
     const p = MOCK.profiles.find(p => p.id === r.profile_id);
     if (!p) continue;
     if (r.success) {
-      if (tog.latency) p.last_latency_ms = r.latency_ms || p.last_latency_ms;
-      if (tog.jitter) p.last_jitter_ms = r.jitter_ms ?? p.last_jitter_ms;
-      if (tog.download) p.last_download_mbps = r.download_mbps || p.last_download_mbps;
-      if (tog.upload) p.last_upload_mbps = r.upload_mbps || p.last_upload_mbps;
+      p.last_latency_ms = r.latency_ms ?? p.last_latency_ms;
+      p.last_jitter_ms = r.jitter_ms ?? p.last_jitter_ms;
+      if (r.download_mbps != null) p.last_download_mbps = r.download_mbps;
+      if (r.upload_mbps != null) p.last_upload_mbps = r.upload_mbps;
       p.last_loss_percent = r.loss_percent ?? p.last_loss_percent;
       p.score = r.score ?? p.score;
+      p.last_error = r.download_error || r.upload_error || null;
     }
     changed = true;
   }
@@ -4386,12 +4404,24 @@ function saveRoutingSettings() {
     bypass_ports: (document.getElementById('rBypassPorts')?.value || '').split(/[,\n]/).map(s=>s.trim()).filter(Boolean),
     ru_direct_mode: document.getElementById('rRuDirectMode')?.value || 'off',
     ru_direct_exceptions: (document.getElementById('rRuDirectExceptions')?.value || '').split('\n').map(s=>s.trim()).filter(Boolean),
+    auto_vpn_learning_enabled: document.getElementById('rAutoVpnLearning')?.checked ?? document.getElementById('rAutoVpnLearningDiag')?.checked ?? true,
+    auto_vpn_exceptions: (document.getElementById('rAutoVpnExceptions')?.value || '').split('\n').map(s=>s.trim()).filter(Boolean),
     match_target: sr.match_target || 'proxy',
     rkn_bypass_enabled: document.getElementById('rRknBypass')?.checked ?? false,
     rkn_bypass_url: document.getElementById('rRknBypassUrl')?.value || '',
     rkn_bypass_interval: +(document.getElementById('rRknBypassInterval')?.value || 86400),
   };
   apiAction('POST','/api/routing/settings',body,t('Настройки маршрутизации сохранены'),refreshDashboard);
+}
+
+function syncAutoVpnLearningToggles(enabled) {
+  safeChecked('rAutoVpnLearning', enabled);
+  safeChecked('rAutoVpnLearningDiag', enabled);
+}
+
+function setAutoVpnLearning(enabled) {
+  syncAutoVpnLearningToggles(enabled);
+  apiAction('POST','/api/routing/settings',{auto_vpn_learning_enabled: !!enabled},t('Настройки маршрутизации сохранены'),loadRouting);
 }
 
 function resetRoutingDefaults() {
@@ -4646,17 +4676,17 @@ function normalizeProfiles(statsData, profilesData) {
       if (!st) return p;
       return Object.assign({}, p, {
         favorite: st.favorite ?? p.favorite ?? false,
-        last_latency_ms: st.last_latency_ms || 0,
-        last_jitter_ms: st.last_jitter_ms || 0,
-        last_download_mbps: st.last_download_mbps || 0,
-        last_upload_mbps: st.last_upload_mbps || 0,
-        last_loss_percent: st.last_loss_percent || 0,
-        score: st.score || 0,
+        last_latency_ms: st.last_latency_ms ?? null,
+        last_jitter_ms: st.last_jitter_ms ?? null,
+        last_download_mbps: st.last_download_mbps ?? null,
+        last_upload_mbps: st.last_upload_mbps ?? null,
+        last_loss_percent: st.last_loss_percent ?? null,
+        score: st.score ?? null,
         success_count: st.success_count || 0,
         failure_count: st.failure_count || 0,
-        ewma_score: st.ewma_score || 0,
-        ewma_latency_ms: st.ewma_latency_ms || 0,
-        ewma_download_mbps: st.ewma_download_mbps || 0,
+        ewma_score: st.ewma_score ?? null,
+        ewma_latency_ms: st.ewma_latency_ms ?? null,
+        ewma_download_mbps: st.ewma_download_mbps ?? null,
         consecutive_failures: st.consecutive_failures || 0,
         cooldown_until_unix: st.cooldown_until_unix || 0,
       });
@@ -4694,6 +4724,8 @@ function updateRoutingForm(sr) {
   safeValue('rBypassPorts', Array.isArray(sr.bypass_ports) ? sr.bypass_ports.join(',') : (sr.bypass_ports || ''));
   safeValue('rRuDirectMode', sr.ru_direct_mode || 'off');
   safeValue('rRuDirectExceptions', Array.isArray(sr.ru_direct_exceptions) ? sr.ru_direct_exceptions.join('\n') : (sr.ru_direct_exceptions || ''));
+  syncAutoVpnLearningToggles(sr.auto_vpn_learning_enabled !== false);
+  safeValue('rAutoVpnExceptions', Array.isArray(sr.auto_vpn_exceptions) ? sr.auto_vpn_exceptions.join('\n') : (sr.auto_vpn_exceptions || ''));
   safeChecked('rRknBypass', sr.rkn_bypass_enabled !== false);
   safeValue('rRknBypassUrl', sr.rkn_bypass_url || '');
   safeValue('rRknBypassInterval', sr.rkn_bypass_interval || 86400);
