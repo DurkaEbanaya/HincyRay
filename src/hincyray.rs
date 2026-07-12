@@ -13,15 +13,16 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
-    net::{IpAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -30,10 +31,16 @@ use serde_json::{Value, json};
 use percent_encoding::NON_ALPHANUMERIC;
 use percent_encoding::utf8_percent_encode;
 use qrcode::{QrCode, render::svg};
+use tempfile::NamedTempFile;
 
 use crate::benchmark::{
     BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL,
     DEFAULT_UPLOAD_URL, SharedJob, run_bench,
+};
+use crate::geobase::{
+    self, Classification, DomainClassification, GeoBaseArtifactKind, GeoBaseGenerationInput,
+    GeoBaseListMetadata, GeoBaseSource, GeoBaseSourceKind, GeoBaseStatus, GeoBaseStore,
+    GeoBaseUpsertRequest, StaticRouteEntry,
 };
 use crate::mihomo_config::{
     DIRECT_NAME, MihomoFeatures, PROXY_ACTIVE_NAME, PROXY_NAME, REJECT_NAME,
@@ -45,9 +52,11 @@ use crate::profiles::{
     parse_input,
 };
 use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule};
+use crate::xray_config::{GeoBaseRuleBehavior, GeoBaseRuleProvider, GeoBaseRuleTarget};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_GEOBASE_ANALYZE_BODY_BYTES: usize = 9 * 1024 * 1024;
 const MAX_HISTORY_SAMPLES: usize = 1000;
 const MAX_CONNECTION_LOG: usize = 500;
 const MAX_AUTO_VPN_EXCEPTIONS: usize = 200;
@@ -60,6 +69,9 @@ const MAX_UNDO_STACK: usize = 10;
 const MAX_REFRESH_REPORT_ENTRIES: usize = 100;
 const MIHOMO_VALIDATE_TIMEOUT: Duration = Duration::from_secs(8);
 const COMMAND_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024;
+const GEOBASE_JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const GEOBASE_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+const GEOBASE_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Global shutdown flag set by the SIGTERM/SIGINT handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -222,8 +234,10 @@ pub fn run() -> Result<(), String> {
         }
     }
 
-    // Graceful shutdown: stop child processes and clean up kernel state.
+    // GeoBase may be using the controller or store. Stop and join it before
+    // tearing either the core or its filesystem dependencies down.
     eprintln!("hincyray: shutting down...");
+    cancel_and_join_geobase(&daemon);
     {
         let mut inner = lock(&daemon.inner);
         let _ = inner.core.stop();
@@ -326,8 +340,11 @@ fn cli_doctor() -> Result<(), String> {
 #[derive(Clone)]
 pub struct Daemon {
     inner: Arc<Mutex<DaemonInner>>,
+    apply: Arc<Mutex<()>>,
     state_path: PathBuf,
     mihomo_config_path: PathBuf,
+    geobase_store_root: PathBuf,
+    geobase_store: GeoBaseStore,
 }
 
 struct DaemonInner {
@@ -370,6 +387,59 @@ struct DaemonInner {
     /// by the background thread, read by `/api/deep-bench/status`.
     /// In-memory only — a fresh daemon starts in `idle` state.
     deep_bench_status: DeepBenchStatus,
+    geobase: GeoBaseRuntime,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GeoBaseRuntimeStatus {
+    job_id: u64,
+    phase: String,
+    total: usize,
+    completed: usize,
+    direct: usize,
+    active: usize,
+    unresolved: usize,
+    error: Option<String>,
+    id: Option<String>,
+    running: bool,
+    progress_percent: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_diff: Option<geobase::SourceDiff>,
+    removed_static_entries: usize,
+}
+
+impl Default for GeoBaseRuntimeStatus {
+    fn default() -> Self {
+        Self {
+            phase: "idle".to_owned(),
+            job_id: 0,
+            total: 0,
+            completed: 0,
+            direct: 0,
+            active: 0,
+            unresolved: 0,
+            error: None,
+            id: None,
+            running: false,
+            progress_percent: 0,
+            source_diff: None,
+            removed_static_entries: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+type GeoBaseAnalyzer = Arc<dyn Fn(&str) -> Classification + Send + Sync>;
+
+#[derive(Default)]
+struct GeoBaseRuntime {
+    next_job_id: u64,
+    current_job_id: Option<u64>,
+    cancel: Option<Arc<AtomicBool>>,
+    handle: Option<JoinHandle<()>>,
+    status: GeoBaseRuntimeStatus,
+    #[cfg(test)]
+    analyzer: Option<GeoBaseAnalyzer>,
 }
 
 /// One row of `/proc/stat` for a CPU (aggregate or per-core).
@@ -1410,9 +1480,9 @@ pub struct SplitRoutingSettings {
     /// DIRECT candidates. This is a bounded probe cache, not a routing list.
     #[serde(default)]
     pub auto_vpn_last_checked_unix: HashMap<String, u64>,
-    /// Passive learning switch. Enabled by default; writes only after a
+    /// Passive learning switch. Disabled by default; writes only after a
     /// verified direct-fail/proxy-success probe.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub auto_vpn_learning_enabled: bool,
     /// Persisted migration marker for auto-VPN probe semantics.
     #[serde(default)]
@@ -1425,7 +1495,7 @@ pub struct SplitRoutingSettings {
     /// v0.17: RKN Bypass — injects a RULE-SET provider with domains
     /// blocked in Russia, routing them through proxy. Also injects
     /// GEOIP,RU,DIRECT and GEOIP,CN,DIRECT.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub rkn_bypass_enabled: bool,
     /// v0.17: URL for the RKN bypass rule provider.
     #[serde(default = "default_rkn_bypass_url")]
@@ -1452,14 +1522,14 @@ impl Default for SplitRoutingSettings {
             proxy_ports: Vec::new(),
             bypass_ports: Vec::new(),
             geo_asset_path: default_geo_asset_path(),
-            ru_direct_mode: String::new(),
+            ru_direct_mode: "off".to_owned(),
             ru_direct_exceptions: Vec::new(),
             auto_vpn_exceptions: Vec::new(),
             auto_vpn_last_checked_unix: HashMap::new(),
-            auto_vpn_learning_enabled: true,
+            auto_vpn_learning_enabled: false,
             auto_vpn_probe_contract_version: AUTO_VPN_PROBE_CONTRACT_VERSION,
             match_target: String::new(),
-            rkn_bypass_enabled: true,
+            rkn_bypass_enabled: false,
             rkn_bypass_url: default_rkn_bypass_url(),
             rkn_bypass_interval: default_rkn_bypass_interval(),
         }
@@ -1591,6 +1661,11 @@ fn default_auto_update_interval_hours() -> u32 {
 
 impl Daemon {
     fn new(state: HincyrayState, state_path: PathBuf, mihomo_config_path: PathBuf) -> Self {
+        let geobase_store_root = state_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("geobases");
+        let geobase_store = GeoBaseStore::new(&geobase_store_root);
         Self {
             inner: Arc::new(Mutex::new(DaemonInner {
                 state,
@@ -1606,10 +1681,18 @@ impl Daemon {
                 deep_bench_handle: None,
                 deep_bench_active: false,
                 deep_bench_status: DeepBenchStatus::default(),
+                geobase: GeoBaseRuntime::default(),
             })),
+            apply: Arc::new(Mutex::new(())),
             state_path,
             mihomo_config_path,
+            geobase_store_root,
+            geobase_store,
         }
+    }
+
+    fn geobase_store(&self) -> &GeoBaseStore {
+        &self.geobase_store
     }
 }
 
@@ -2700,7 +2783,7 @@ fn load_state(state_path: &Path) -> HincyrayState {
     let Ok(text) = fs::read_to_string(state_path) else {
         return HincyrayState::default();
     };
-    let mut state = match serde_json::from_str(&text) {
+    let mut state = match deserialize_persisted_state(&text) {
         Ok(state) => state,
         Err(error) => {
             eprintln!(
@@ -2798,6 +2881,25 @@ fn load_state(state_path: &Path) -> HincyrayState {
     state
 }
 
+fn deserialize_persisted_state(text: &str) -> Result<HincyrayState, String> {
+    let mut value: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    if let Some(split) = value
+        .get_mut("split_routing")
+        .and_then(Value::as_object_mut)
+    {
+        split
+            .entry("auto_vpn_learning_enabled")
+            .or_insert(Value::Bool(true));
+        split
+            .entry("rkn_bypass_enabled")
+            .or_insert(Value::Bool(true));
+        split
+            .entry("ru_direct_mode")
+            .or_insert_with(|| Value::String("geosite".to_owned()));
+    }
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
 fn compact_state_for_persist(state: &mut HincyrayState) {
     if state.metrics_history.len() > MAX_HISTORY_SAMPLES {
         let start = state
@@ -2870,17 +2972,43 @@ fn push_undo_snapshot(state: &mut HincyrayState, label: impl Into<String>) {
     }
 }
 
-fn write_config_file(path: &Path, config_yaml: &str) -> Result<(), String> {
+fn atomic_write_config(path: &Path, config_yaml: &[u8]) -> Result<(), String> {
+    atomic_write_config_with(path, config_yaml, |temp, destination| {
+        temp.persist(destination)
+            .map(|_| ())
+            .map_err(|error| error.error.to_string())
+    })
+}
+
+fn atomic_write_config_with(
+    path: &Path,
+    config_yaml: &[u8],
+    publish: impl FnOnce(NamedTempFile, &Path) -> Result<(), String>,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let mut temp = NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+        temp.write_all(config_yaml)
+            .map_err(|error| error.to_string())?;
+        temp.as_file()
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        publish(temp, path)?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| error.to_string())?;
+        return Ok(());
     }
-    fs::write(path, config_yaml).map_err(|error| error.to_string())
+    Err(format!("config path {} has no parent", path.display()))
 }
 
 /// Build the single Mihomo config (YAML) for the current active profile.
 /// Returns the YAML string so callers can write it to the daemon's
 /// config path.
-fn build_daemon_config(state: &HincyrayState) -> Result<String, String> {
+fn build_daemon_config(
+    state: &HincyrayState,
+    geobase_rule_providers: &[GeoBaseRuleProvider],
+) -> Result<String, String> {
     let Some(active_id) = state.active_profile_id else {
         return Err("no active profile".to_owned());
     };
@@ -2903,7 +3031,7 @@ fn build_daemon_config(state: &HincyrayState) -> Result<String, String> {
 
     // Split routing: build the full router config.
     let (mut extra_profiles, mut routes, active_block_quic, extra) =
-        build_routing_context(state, active_id, active_profile);
+        build_routing_context(state, active_id, active_profile, geobase_rule_providers);
 
     // Prepend per-device routing rules (SRC-IP-CIDR) BEFORE general
     // routing rules so device-specific rules match first.
@@ -2972,6 +3100,7 @@ fn build_routing_context<'a>(
     state: &'a HincyrayState,
     active_id: usize,
     active_profile: &'a Profile,
+    geobase_rule_providers: &[GeoBaseRuleProvider],
 ) -> (
     Vec<(&'a Profile, String)>,
     Vec<XrayRouteRule>,
@@ -3070,6 +3199,8 @@ fn build_routing_context<'a>(
         rkn_bypass_enabled: state.split_routing.rkn_bypass_enabled,
         rkn_bypass_url: state.split_routing.rkn_bypass_url.clone(),
         rkn_bypass_interval: state.split_routing.rkn_bypass_interval,
+        mihomo_home: geo_dir_from_state(state),
+        geobase_rule_providers: geobase_rule_providers.to_vec(),
     };
     (extra_profiles, routes, active_block_quic, extra)
 }
@@ -3365,7 +3496,7 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
         return Ok(());
     }
 
-    let mut content_length = 0usize;
+    let mut content_length = None;
     let mut auth_header: Option<String> = None;
     loop {
         let mut line = String::new();
@@ -3381,19 +3512,21 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
         }
         let lower = trimmed.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("content-length:") {
-            content_length = rest.trim().parse::<usize>().unwrap_or(0);
+            match rest.trim().parse::<usize>() {
+                Ok(value) if content_length.is_none() => content_length = Some(value),
+                _ => {
+                    write_response(
+                        &mut stream,
+                        400,
+                        "application/json",
+                        &json!({"error": "invalid Content-Length"}).to_string(),
+                    )?;
+                    return Ok(());
+                }
+            }
         } else if let Some(rest) = lower.strip_prefix("authorization:") {
             auth_header = Some(rest.trim().to_owned());
         }
-    }
-
-    let mut body = Vec::new();
-    if content_length > 0 {
-        let limited = content_length.min(MAX_BODY_BYTES);
-        body.resize(limited, 0u8);
-        reader
-            .read_exact(&mut body)
-            .map_err(|error| error.to_string())?;
     }
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
@@ -3409,7 +3542,35 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
     let method = parts[0];
     let raw_path = parts[1];
     let (path, _query) = split_query(raw_path);
-    let body_text = String::from_utf8_lossy(&body).to_string();
+    let body_limit = request_body_limit(method, path);
+    let content_length = content_length.unwrap_or(0);
+    if content_length > body_limit {
+        write_response(
+            &mut stream,
+            413,
+            "application/json",
+            &json!({"error": "request body too large", "limit": body_limit}).to_string(),
+        )?;
+        return Ok(());
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader
+            .read_exact(&mut body)
+            .map_err(|error| error.to_string())?;
+    }
+    let body_text = match String::from_utf8(body) {
+        Ok(text) => text,
+        Err(_) => {
+            write_response(
+                &mut stream,
+                400,
+                "application/json",
+                &json!({"error": "request body must be valid UTF-8"}).to_string(),
+            )?;
+            return Ok(());
+        }
+    };
 
     // v0.13: Web UI authentication middleware.
     if !check_auth(daemon, &auth_header, path, method) {
@@ -3420,6 +3581,14 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
 
     let (status, content_type, response_body) = dispatch(method, path, &body_text, daemon);
     write_response(&mut stream, status, content_type, &response_body)
+}
+
+fn request_body_limit(method: &str, path: &str) -> usize {
+    if method == "POST" && path == "/api/geobases/analyze" {
+        MAX_GEOBASE_ANALYZE_BODY_BYTES
+    } else {
+        MAX_BODY_BYTES
+    }
 }
 
 fn split_query(raw_path: &str) -> (&str, Option<&str>) {
@@ -3515,6 +3684,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/profiles/block-quic") => handle_profile_block_quic(body, daemon),
         ("POST", "/api/active-profile") => handle_set_active(body, daemon),
         ("GET", "/api/mihomo-config") => handle_get_mihomo_config(daemon),
+        ("GET", "/api/mihomo-config/preview") => handle_get_mihomo_config_preview(daemon),
         ("POST", "/api/mihomo-config/validate") => handle_mihomo_config_validate(daemon),
         ("POST", "/api/core/start") => handle_core_start(daemon),
         ("POST", "/api/core/stop") => handle_core_stop(daemon),
@@ -3556,6 +3726,14 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/geo/providers") => handle_geo_providers(),
         ("POST", "/api/geo/download") => handle_geo_download(body, daemon),
         ("GET", "/api/geo/status") => handle_geo_status(daemon),
+        ("GET", "/api/geobases") => handle_geobases_get(daemon),
+        ("POST", "/api/geobases/analyze") => handle_geobases_analyze(body, daemon),
+        ("POST", "/api/geobases/sync") => handle_geobases_sync(body, daemon),
+        ("POST", "/api/geobases/details") => handle_geobases_details(body, daemon),
+        ("POST", "/api/geobases/static") => handle_geobases_static(body, daemon),
+        ("POST", "/api/geobases/cancel") => handle_geobases_cancel(daemon),
+        ("POST", "/api/geobases/delete") => handle_geobases_delete(body, daemon),
+        ("POST", "/api/geobases/enabled") => handle_geobases_enabled(body, daemon),
         ("POST", "/api/routing/trace") => handle_routing_trace(body, daemon),
         ("GET", "/api/routing/chain-check") => handle_routing_chain_check("", daemon),
         ("POST", "/api/routing/chain-check") => handle_routing_chain_check(body, daemon),
@@ -3852,8 +4030,16 @@ fn handle_set_active(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
 
 fn handle_get_mihomo_config(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
-    match build_daemon_config(&inner.state) {
-        Ok(config_yaml) => (200, "text/yaml; charset=utf-8", config_yaml),
+    let projection = GeoBaseProjection::Applied;
+    match build_authoritative_daemon_config(&inner.state, daemon) {
+        Ok(config_yaml) => (
+            200,
+            "text/yaml; charset=utf-8",
+            format!(
+                "# geobase-projection: {}\n{config_yaml}",
+                projection.label()
+            ),
+        ),
         Err(error) => (
             400,
             "application/json",
@@ -3862,11 +4048,31 @@ fn handle_get_mihomo_config(daemon: &Daemon) -> (u16, &'static str, String) {
     }
 }
 
+fn handle_get_mihomo_config_preview(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let projection = GeoBaseProjection::Desired;
+    let providers = match project_geobase_rule_providers(daemon, projection) {
+        Ok(providers) => providers,
+        Err(error) => return json_error(400, &error),
+    };
+    match build_daemon_config(&inner.state, &providers) {
+        Ok(config_yaml) => (
+            200,
+            "text/yaml; charset=utf-8",
+            format!(
+                "# geobase-projection: {}\n{config_yaml}",
+                projection.label()
+            ),
+        ),
+        Err(error) => json_error(400, &error),
+    }
+}
+
 fn handle_mihomo_config_validate(daemon: &Daemon) -> (u16, &'static str, String) {
     let (config_result, mihomo_path, geo_dir) = {
         let inner = lock(&daemon.inner);
         (
-            build_daemon_config(&inner.state),
+            build_authoritative_daemon_config(&inner.state, daemon),
             inner.state.mihomo_path.clone(),
             geo_dir_from_state(&inner.state),
         )
@@ -4060,37 +4266,513 @@ fn read_limited_trimmed(path: &Path) -> String {
     String::from_utf8_lossy(&output).trim().to_owned()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeoBaseProjection {
+    Desired,
+    Applied,
+}
+
+impl GeoBaseProjection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Desired => "desired",
+            Self::Applied => "applied",
+        }
+    }
+}
+
+fn project_geobase_rule_providers(
+    daemon: &Daemon,
+    projection: GeoBaseProjection,
+) -> Result<Vec<GeoBaseRuleProvider>, String> {
+    let manifest = daemon
+        .geobase_store()
+        .load_manifest()
+        .map_err(|error| format!("GeoBase manifest: {error}"))?;
+    project_geobase_manifest(daemon, &manifest, projection)
+}
+
+fn project_geobase_manifest(
+    daemon: &Daemon,
+    manifest: &geobase::GeoBaseManifest,
+    projection: GeoBaseProjection,
+) -> Result<Vec<GeoBaseRuleProvider>, String> {
+    let bases = match projection {
+        GeoBaseProjection::Desired => &manifest.bases,
+        GeoBaseProjection::Applied => &manifest.applied_bases,
+    };
+    if !bases.iter().any(|record| record.enabled) {
+        return Ok(Vec::new());
+    }
+
+    let canonical_root = fs::canonicalize(&daemon.geobase_store_root)
+        .map_err(|error| format!("GeoBase store root: {error}"))?;
+    let mut providers = Vec::new();
+    for record in bases.iter().filter(|record| record.enabled) {
+        if record.status != GeoBaseStatus::Ready {
+            return Err(format!(
+                "enabled GeoBase {} is not ready ({:?})",
+                record.id, record.status
+            ));
+        }
+
+        let active = resolve_geobase_artifact(
+            &canonical_root,
+            &daemon.geobase_store_root,
+            &record.lists.active,
+            GeoBaseArtifactKind::Domain,
+        )?;
+        let direct = resolve_geobase_artifact(
+            &canonical_root,
+            &daemon.geobase_store_root,
+            &record.lists.direct,
+            GeoBaseArtifactKind::Domain,
+        )?;
+        let _unresolved = resolve_geobase_artifact(
+            &canonical_root,
+            &daemon.geobase_store_root,
+            &record.lists.unresolved,
+            GeoBaseArtifactKind::Domain,
+        )?;
+
+        if record.lists.active.count > 0 {
+            providers.push(GeoBaseRuleProvider {
+                enabled: true,
+                name: geobase_provider_name(&record.id, "a"),
+                path: active,
+                behavior: GeoBaseRuleBehavior::Domain,
+                target: GeoBaseRuleTarget::Active,
+            });
+        }
+        if record.lists.direct.count > 0 {
+            providers.push(GeoBaseRuleProvider {
+                enabled: true,
+                name: geobase_provider_name(&record.id, "d"),
+                path: direct,
+                behavior: GeoBaseRuleBehavior::Domain,
+                target: GeoBaseRuleTarget::Direct,
+            });
+        }
+        for (metadata, suffix, target) in [
+            (
+                record.lists.static_active.as_ref(),
+                "sa",
+                GeoBaseRuleTarget::Active,
+            ),
+            (
+                record.lists.static_direct.as_ref(),
+                "sd",
+                GeoBaseRuleTarget::Direct,
+            ),
+        ] {
+            let Some(metadata) = metadata else {
+                continue;
+            };
+            let path = resolve_geobase_artifact(
+                &canonical_root,
+                &daemon.geobase_store_root,
+                metadata,
+                GeoBaseArtifactKind::Ipcidr,
+            )?;
+            if metadata.count > 0 {
+                providers.push(GeoBaseRuleProvider {
+                    enabled: true,
+                    name: geobase_provider_name(&record.id, suffix),
+                    path,
+                    behavior: GeoBaseRuleBehavior::Ipcidr,
+                    target,
+                });
+            }
+        }
+    }
+    Ok(providers)
+}
+
+fn geobase_provider_name(record_id: &str, suffix: &str) -> String {
+    format!("{}-{suffix}", geobase::stable_id(record_id))
+}
+
+fn resolve_geobase_artifact(
+    canonical_root: &Path,
+    store_root: &Path,
+    metadata: &GeoBaseListMetadata,
+    kind: GeoBaseArtifactKind,
+) -> Result<String, String> {
+    let configured_path = store_root.join(&metadata.file);
+    let canonical_path = fs::canonicalize(&configured_path).map_err(|error| {
+        format!(
+            "GeoBase artifact {} is missing or inaccessible: {error}",
+            metadata.file
+        )
+    })?;
+    if !canonical_path.starts_with(canonical_root) || !canonical_path.is_file() {
+        return Err(format!(
+            "GeoBase artifact {} resolves outside the store or is not a file",
+            metadata.file
+        ));
+    }
+    let content = fs::read(&canonical_path)
+        .map_err(|error| format!("GeoBase artifact {}: {error}", metadata.file))?;
+    if metadata.fingerprint.is_empty() {
+        return Err(format!(
+            "GeoBase artifact {} has no required fnv1a64 fingerprint",
+            metadata.file
+        ));
+    }
+    let actual_fingerprint = geobase::artifact_fingerprint(&content);
+    if actual_fingerprint != metadata.fingerprint {
+        return Err(format!(
+            "GeoBase artifact {} fingerprint mismatch: got {actual_fingerprint}, expected {}",
+            metadata.file, metadata.fingerprint
+        ));
+    }
+    let actual_count = geobase::validate_artifact(&content, kind)
+        .map_err(|error| format!("GeoBase artifact {} is invalid: {error}", metadata.file))?;
+    if actual_count != metadata.count {
+        return Err(format!(
+            "GeoBase artifact {} has {actual_count} entries, manifest expects {}",
+            metadata.file, metadata.count
+        ));
+    }
+    canonical_path.to_str().map(str::to_owned).ok_or_else(|| {
+        format!(
+            "GeoBase artifact path is not valid UTF-8: {}",
+            metadata.file
+        )
+    })
+}
+
+fn build_authoritative_daemon_config(
+    state: &HincyrayState,
+    daemon: &Daemon,
+) -> Result<String, String> {
+    let providers = project_geobase_rule_providers(daemon, GeoBaseProjection::Applied)?;
+    build_daemon_config(state, &providers)
+}
+
+fn config_plan(
+    state: &HincyrayState,
+    daemon: &Daemon,
+    projection: GeoBaseProjection,
+) -> Result<(String, u64, Vec<geobase::GeoBaseRecord>), String> {
+    let manifest = daemon
+        .geobase_store()
+        .load_manifest()
+        .map_err(|error| format!("GeoBase manifest: {error}"))?;
+    let (generation, bases) = match projection {
+        GeoBaseProjection::Desired => (manifest.generation, manifest.bases.clone()),
+        GeoBaseProjection::Applied => (manifest.applied_generation, manifest.applied_bases.clone()),
+    };
+    let providers = project_geobase_manifest(daemon, &manifest, projection)?;
+    let config = build_daemon_config(state, &providers)?;
+    Ok((config, generation, bases))
+}
+
 /// Regenerate the Mihomo config and write it to the daemon's config
 /// path. Returns the binary path and config path so the caller can start
 /// the core.
 fn regenerate_config(state: &HincyrayState, daemon: &Daemon) -> Result<(String, PathBuf), String> {
-    let config_yaml = build_daemon_config(state)?;
+    let config_yaml = build_authoritative_daemon_config(state, daemon)?;
     let config_path = daemon.mihomo_config_path.clone();
-    write_config_file(&config_path, &config_yaml)?;
+    atomic_write_config(&config_path, config_yaml.as_bytes())?;
     Ok((state.mihomo_path.clone(), config_path))
 }
 
-fn handle_core_start(daemon: &Daemon) -> (u16, &'static str, String) {
-    let mut inner = lock(&daemon.inner);
-    let geo_dir = geo_dir_from_state(&inner.state);
-    let (binary_path, config_path) = match regenerate_config(&inner.state, daemon) {
-        Ok(pair) => pair,
-        Err(error) => {
-            return (
-                500,
-                "application/json",
-                json!({"error": format!("config regeneration: {error}")}).to_string(),
-            );
+#[derive(Clone, Debug)]
+struct ActivationResult {
+    core_status: String,
+    firewall_status: String,
+    generation: u64,
+    gc_warning: Option<String>,
+}
+
+fn validation_error(result: &Value) -> String {
+    result
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| result.get("stderr").and_then(Value::as_str))
+        .filter(|message| !message.is_empty())
+        .unwrap_or("mihomo rejected config")
+        .to_owned()
+}
+
+fn wait_for_core_readiness(
+    daemon: &Daemon,
+    controller: Option<&(String, Option<String>)>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(6);
+    let mut controller_ready = controller.is_none();
+    loop {
+        {
+            let mut inner = lock(&daemon.inner);
+            if !inner.core.is_running() {
+                return Err("mihomo exited during readiness observation".to_owned());
+            }
+        }
+        if !controller_ready
+            && let Some((address, secret)) = controller
+            && mihomo_api_get(address, secret.as_deref(), "/version").is_ok()
+        {
+            controller_ready = true;
+        }
+        if started.elapsed() >= Duration::from_secs(2) && controller_ready {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(if controller_ready {
+                "mihomo did not remain running for 2 seconds".to_owned()
+            } else {
+                "mihomo external controller did not become ready".to_owned()
+            });
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn restore_previous_activation(
+    daemon: &Daemon,
+    previous_config: Option<&[u8]>,
+    previous_running: bool,
+    state: &HincyrayState,
+    firewall_was_running: bool,
+) -> String {
+    let config_result = match previous_config {
+        Some(bytes) => atomic_write_config(&daemon.mihomo_config_path, bytes),
+        None => match fs::remove_file(&daemon.mihomo_config_path) {
+            Ok(()) => daemon
+                .mihomo_config_path
+                .parent()
+                .ok_or_else(|| "config path has no parent".to_owned())
+                .and_then(|parent| {
+                    fs::File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|error| error.to_string())
+                }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        },
+    };
+    let geo_dir = geo_dir_from_state(state);
+    let core_result = {
+        let mut inner = lock(&daemon.inner);
+        if previous_running && previous_config.is_some() {
+            inner.core.restart(
+                &state.mihomo_path,
+                &daemon.mihomo_config_path,
+                geo_dir.as_deref(),
+            )
+        } else {
+            inner.core.stop()
         }
     };
-    match inner
-        .core
-        .start(&binary_path, &config_path, geo_dir.as_deref())
-    {
-        Ok(()) => (
+    let firewall_result = {
+        let mut inner = lock(&daemon.inner);
+        let _ = inner.firewall.stop(&state.split_routing.vpn_subnet);
+        if firewall_was_running && state.split_routing.enabled {
+            inner.firewall.start(
+                state.split_routing.redirect_port,
+                &state.split_routing.vpn_subnet,
+                &state.split_routing.policy_name,
+                state.split_routing.policy_mark.as_deref(),
+            )
+        } else {
+            Ok(())
+        }
+    };
+    format!(
+        "config={}, core={}, firewall={}",
+        result_label(&config_result),
+        result_label(&core_result),
+        result_label(&firewall_result)
+    )
+}
+
+fn result_label(result: &Result<(), String>) -> String {
+    match result {
+        Ok(()) => "restored".to_owned(),
+        Err(error) => format!("failed ({error})"),
+    }
+}
+
+fn acknowledge_activation(
+    daemon: &Daemon,
+    generation: u64,
+    activated_bases: Vec<geobase::GeoBaseRecord>,
+) -> Result<Option<String>, String> {
+    daemon
+        .geobase_store()
+        .commit_applied_snapshot(generation, activated_bases)
+        .map_err(|error| format!("mark GeoBase generation {generation} applied: {error}"))?;
+    Ok(daemon
+        .geobase_store()
+        .garbage_collect()
+        .err()
+        .map(|error| format!("GeoBase garbage collection: {error}")))
+}
+
+fn activate_current_config(
+    daemon: &Daemon,
+    start_if_stopped: bool,
+    configure_firewall: bool,
+    projection: GeoBaseProjection,
+) -> Result<ActivationResult, String> {
+    let _apply = daemon
+        .apply
+        .lock()
+        .map_err(|_| "config apply lock is poisoned".to_owned())?;
+    let (state, previous_running, firewall_was_running) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            inner.state.clone(),
+            inner.core.is_running(),
+            inner.firewall.is_running(),
+        )
+    };
+    let (mut config_yaml, generation, activated_bases) = config_plan(&state, daemon, projection)?;
+    let geo_dir = geo_dir_from_state(&state);
+    let validation =
+        validate_mihomo_config_yaml(&state.mihomo_path, &config_yaml, geo_dir.as_deref());
+    if validation.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "config validation failed: {}",
+            validation_error(&validation)
+        ));
+    }
+    let previous_config = match fs::read(&daemon.mihomo_config_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("read previous config: {error}")),
+    };
+    atomic_write_config(&daemon.mihomo_config_path, config_yaml.as_bytes())?;
+
+    let should_run = previous_running || start_if_stopped;
+    let controller = mihomo_controller(&state.mihomo_features);
+    let activation = (|| -> Result<(String, String), String> {
+        if should_run {
+            {
+                let mut inner = lock(&daemon.inner);
+                inner.core.restart(
+                    &state.mihomo_path,
+                    &daemon.mihomo_config_path,
+                    geo_dir.as_deref(),
+                )?;
+            }
+            wait_for_core_readiness(daemon, controller.as_ref())?;
+        }
+
+        let firewall_status = if configure_firewall {
+            let mut final_state = state.clone();
+            {
+                let mut inner = lock(&daemon.inner);
+                let _ = inner.firewall.stop(&state.split_routing.vpn_subnet);
+                if state.split_routing.enabled {
+                    inner.firewall.start(
+                        state.split_routing.redirect_port,
+                        &state.split_routing.vpn_subnet,
+                        &state.split_routing.policy_name,
+                        state.split_routing.policy_mark.as_deref(),
+                    )?;
+                    final_state.split_routing.policy_mark = inner.firewall.policy_mark.clone();
+                    final_state.split_routing.tproxy_available = inner.firewall.tproxy_available;
+                    inner.state.split_routing.policy_mark =
+                        final_state.split_routing.policy_mark.clone();
+                    inner.state.split_routing.tproxy_available =
+                        final_state.split_routing.tproxy_available;
+                    inner.dirty = true;
+                }
+            }
+            if final_state.split_routing.enabled
+                && final_state.split_routing.tproxy_available
+                    != state.split_routing.tproxy_available
+            {
+                let providers = project_geobase_rule_providers(daemon, projection)?;
+                config_yaml = build_daemon_config(&final_state, &providers)?;
+                let validation = validate_mihomo_config_yaml(
+                    &final_state.mihomo_path,
+                    &config_yaml,
+                    geo_dir.as_deref(),
+                );
+                if validation.get("ok").and_then(Value::as_bool) != Some(true) {
+                    return Err(format!(
+                        "final firewall config validation failed: {}",
+                        validation_error(&validation)
+                    ));
+                }
+                atomic_write_config(&daemon.mihomo_config_path, config_yaml.as_bytes())?;
+                if should_run {
+                    {
+                        let mut inner = lock(&daemon.inner);
+                        inner.core.restart(
+                            &final_state.mihomo_path,
+                            &daemon.mihomo_config_path,
+                            geo_dir.as_deref(),
+                        )?;
+                    }
+                    wait_for_core_readiness(daemon, controller.as_ref())?;
+                }
+            }
+            if state.split_routing.enabled {
+                "running".to_owned()
+            } else {
+                "stopped".to_owned()
+            }
+        } else {
+            let inner = lock(&daemon.inner);
+            if inner.firewall.active {
+                "running".to_owned()
+            } else {
+                "stopped".to_owned()
+            }
+        };
+        let core_status = if should_run { "running" } else { "stopped" }.to_owned();
+        Ok((core_status, firewall_status))
+    })();
+
+    let (core_status, firewall_status) = match activation {
+        Ok(result) => result,
+        Err(error) => {
+            let rollback = restore_previous_activation(
+                daemon,
+                previous_config.as_deref(),
+                previous_running,
+                &state,
+                firewall_was_running,
+            );
+            return Err(format!("{error}; rollback: {rollback}"));
+        }
+    };
+    let gc_warning = if projection == GeoBaseProjection::Desired {
+        match acknowledge_activation(daemon, generation, activated_bases) {
+            Ok(warning) => warning,
+            Err(error) => {
+                let rollback = restore_previous_activation(
+                    daemon,
+                    previous_config.as_deref(),
+                    previous_running,
+                    &state,
+                    firewall_was_running,
+                );
+                return Err(format!("{error}; rollback: {rollback}"));
+            }
+        }
+    } else {
+        None
+    };
+    Ok(ActivationResult {
+        core_status,
+        firewall_status,
+        generation,
+        gc_warning,
+    })
+}
+
+fn handle_core_start(daemon: &Daemon) -> (u16, &'static str, String) {
+    match activate_current_config(daemon, true, false, GeoBaseProjection::Applied) {
+        Ok(result) => (
             200,
             "application/json",
-            json!({"core_status": inner.core.status()}).to_string(),
+            json!({"core_status": result.core_status, "generation": result.generation}).to_string(),
         ),
         Err(error) => (500, "application/json", json!({"error": error}).to_string()),
     }
@@ -4109,26 +4791,11 @@ fn handle_core_stop(daemon: &Daemon) -> (u16, &'static str, String) {
 }
 
 fn handle_core_restart(daemon: &Daemon) -> (u16, &'static str, String) {
-    let mut inner = lock(&daemon.inner);
-    let geo_dir = geo_dir_from_state(&inner.state);
-    let (binary_path, config_path) = match regenerate_config(&inner.state, daemon) {
-        Ok(pair) => pair,
-        Err(error) => {
-            return (
-                500,
-                "application/json",
-                json!({"error": format!("config regeneration: {error}")}).to_string(),
-            );
-        }
-    };
-    match inner
-        .core
-        .restart(&binary_path, &config_path, geo_dir.as_deref())
-    {
-        Ok(()) => (
+    match activate_current_config(daemon, true, false, GeoBaseProjection::Applied) {
+        Ok(result) => (
             200,
             "application/json",
-            json!({"core_status": inner.core.status()}).to_string(),
+            json!({"core_status": result.core_status, "generation": result.generation}).to_string(),
         ),
         Err(error) => (500, "application/json", json!({"error": error}).to_string()),
     }
@@ -6030,7 +6697,7 @@ fn handle_undo_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, Strin
         );
     };
     let entry = inner.state.undo_stack.remove(pos);
-    let mut restored: HincyrayState = match serde_json::from_str(&entry.state_json) {
+    let mut restored: HincyrayState = match deserialize_persisted_state(&entry.state_json) {
         Ok(state) => state,
         Err(error) => {
             return (
@@ -6060,15 +6727,91 @@ fn handle_undo_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, Strin
     )
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct ManagedRoutingRule {
+    id: String,
+    source: &'static str,
+    geobase_id: String,
+    name: String,
+    enabled: bool,
+    applied: bool,
+    target: &'static str,
+    outbound: &'static str,
+    domain_count: usize,
+    network_count: usize,
+    total_count: usize,
+    revision: u64,
+}
+
+fn managed_geobase_routing_rules(manifest: &geobase::GeoBaseManifest) -> Vec<ManagedRoutingRule> {
+    manifest
+        .applied_bases
+        .iter()
+        .flat_map(|base| {
+            let applied = base.enabled && base.status == GeoBaseStatus::Ready;
+            [
+                (
+                    "active",
+                    "серый список",
+                    "proxy-active",
+                    base.counts.active,
+                    base.counts.static_active,
+                ),
+                (
+                    "direct",
+                    "белый список",
+                    "DIRECT",
+                    base.counts.direct,
+                    base.counts.static_direct,
+                ),
+            ]
+            .map(|(target, label, outbound, domain_count, network_count)| {
+                ManagedRoutingRule {
+                    id: format!("geobase:{}:{target}", base.id),
+                    source: "geobase",
+                    geobase_id: base.id.clone(),
+                    name: format!("{} — {label}", base.name),
+                    enabled: base.enabled,
+                    applied,
+                    target,
+                    outbound,
+                    domain_count,
+                    network_count,
+                    total_count: domain_count + network_count,
+                    revision: base.revision,
+                }
+            })
+        })
+        .collect()
+}
+
 fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
-    let inner = lock(&daemon.inner);
-    let conflicts = detect_routing_conflicts(&inner.state);
+    let (settings, rules, conflicts) = {
+        let inner = lock(&daemon.inner);
+        (
+            inner.state.split_routing.clone(),
+            inner.state.routing_rules.clone(),
+            detect_routing_conflicts(&inner.state),
+        )
+    };
+    let manifest = match daemon.geobase_store().load_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("GeoBase manifest: {error}")}).to_string(),
+            );
+        }
+    };
     let response = json!({
-        "settings": inner.state.split_routing,
-        "rules": inner.state.routing_rules,
+        "settings": settings,
+        "rules": rules,
         "catalog": popular_service_catalog(),
         "sources": rule_sources(),
         "conflicts": conflicts,
+        "managed_rules": managed_geobase_routing_rules(&manifest),
+        "geobase_requires_apply": manifest.requires_apply(),
     });
     (200, "application/json", response.to_string())
 }
@@ -6357,82 +7100,21 @@ fn handle_routing_catalog_refresh(body: &str, daemon: &Daemon) -> (u16, &'static
 }
 
 fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
-    let mut inner = lock(&daemon.inner);
-    let config_yaml = match build_daemon_config(&inner.state) {
-        Ok(yaml) => yaml,
-        Err(error) => return (400, "application/json", json!({"error": error}).to_string()),
-    };
-    let config_path = daemon.mihomo_config_path.clone();
-    let binary_path = inner.state.mihomo_path.clone();
-    if let Err(error) = write_config_file(&config_path, &config_yaml) {
-        return (
-            500,
+    match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
+        Ok(result) => (
+            200,
             "application/json",
-            json!({"error": format!("write config: {error}")}).to_string(),
-        );
-    }
-    let was_running = inner.core.is_running();
-    let split = inner.state.split_routing.clone();
-    let geo_dir = geo_dir_from_state(&inner.state);
-    let core_status = if was_running {
-        match inner
-            .core
-            .restart(&binary_path, &config_path, geo_dir.as_deref())
-        {
-            Ok(()) => inner.core.status().to_owned(),
-            Err(error) => return (500, "application/json", json!({"error": error}).to_string()),
-        }
-    } else {
-        inner.core.status().to_owned()
-    };
-
-    let firewall_status = if split.enabled {
-        // Restart firewall with current settings.
-        let vpn_subnet = split.vpn_subnet.clone();
-        let _ = inner.firewall.stop(&vpn_subnet);
-        let redirect_port = split.redirect_port;
-        let policy_name = split.policy_name.clone();
-        let cached_mark = split.policy_mark.clone();
-        match inner.firewall.start(
-            redirect_port,
-            &vpn_subnet,
-            &policy_name,
-            cached_mark.as_deref(),
-        ) {
-            Ok(()) => {
-                // Persist discovered policy mark + tproxy availability.
-                if let Some(ref mark) = inner.firewall.policy_mark {
-                    inner.state.split_routing.policy_mark = Some(mark.clone());
-                }
-                inner.state.split_routing.tproxy_available = inner.firewall.tproxy_available;
-                let _ = persist_state(&daemon.state_path, &inner.state);
-                // Regenerate config with correct tproxy_available flag.
-                if let Err(e) = regenerate_config(&inner.state, daemon) {
-                    eprintln!("hincyray: config regen after firewall start: {e}");
-                }
-                "running".to_owned()
-            }
-            Err(error) => {
-                return (
-                    500,
-                    "application/json",
-                    json!({"applied": true, "core_status": core_status, "firewall_error": error})
-                        .to_string(),
-                );
-            }
-        }
-    } else {
-        let vpn_subnet = split.vpn_subnet.clone();
-        let _ = inner.firewall.stop(&vpn_subnet);
-        "stopped".to_owned()
-    };
-
-    (
-        200,
-        "application/json",
-        json!({"applied": true, "core_status": core_status, "firewall_status": firewall_status})
+            json!({
+                "applied": true,
+                "core_status": result.core_status,
+                "firewall_status": result.firewall_status,
+                "generation": result.generation,
+                "gc_warning": result.gc_warning,
+            })
             .to_string(),
-    )
+        ),
+        Err(error) => json_error(500, &error),
+    }
 }
 
 /// v0.17: Reset routing policy to factory defaults.
@@ -6448,14 +7130,14 @@ fn handle_routing_reset(daemon: &Daemon) -> (u16, &'static str, String) {
 
     // Reset routing policy fields to factory defaults.
     let s = &mut inner.state.split_routing;
-    s.rkn_bypass_enabled = true;
+    s.rkn_bypass_enabled = false;
     s.rkn_bypass_url = default_rkn_bypass_url();
     s.rkn_bypass_interval = default_rkn_bypass_interval();
-    s.ru_direct_mode = "geosite".to_owned();
+    s.ru_direct_mode = "off".to_owned();
     s.ru_direct_exceptions = Vec::new();
     s.auto_vpn_exceptions = Vec::new();
     s.auto_vpn_last_checked_unix.clear();
-    s.auto_vpn_learning_enabled = true;
+    s.auto_vpn_learning_enabled = false;
     s.match_target = "proxy".to_owned();
     s.port_mode = PortMode::AllowList;
     s.proxy_ports = vec!["80".to_owned(), "443".to_owned()];
@@ -9360,6 +10042,1009 @@ fn direct_http_client(timeout: Duration) -> Result<reqwest::blocking::Client, St
         .map_err(|e| format!("client build: {e}"))
 }
 
+#[derive(Deserialize)]
+struct GeoBaseAnalyzeRequest {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    source: GeoBaseSource,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    static_entries: Vec<StaticRouteEntry>,
+}
+
+#[derive(Deserialize)]
+struct GeoBaseIdRequest {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct GeoBaseEnabledRequest {
+    id: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct GeoBaseStaticRequest {
+    id: String,
+    expected_revision: u64,
+    static_entries: Vec<StaticRouteEntry>,
+}
+
+#[derive(Clone)]
+struct GeoBaseJob {
+    id: String,
+    name: String,
+    source: GeoBaseSource,
+    content: Option<Vec<u8>>,
+    static_entries: Vec<StaticRouteEntry>,
+    expected_revision: Option<u64>,
+    enabled: bool,
+    sync_only: bool,
+    controller: Option<(String, Option<String>)>,
+    source_proxy_url: Option<String>,
+    #[cfg(test)]
+    analyzer: Option<GeoBaseAnalyzer>,
+}
+
+fn geobase_store(daemon: &Daemon) -> &GeoBaseStore {
+    daemon.geobase_store()
+}
+
+fn geobase_error_status(error: &geobase::GeoBaseError) -> u16 {
+    match error {
+        geobase::GeoBaseError::NotFound(_) => 404,
+        geobase::GeoBaseError::AlreadyExists(_) | geobase::GeoBaseError::Conflict(_) => 409,
+        geobase::GeoBaseError::Io(_) | geobase::GeoBaseError::Json(_) => 500,
+        _ => 400,
+    }
+}
+
+fn handle_geobases_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let status = lock(&daemon.inner).geobase.status.clone();
+    match geobase_store(daemon).load_manifest() {
+        Ok(manifest) => {
+            let requires_apply = manifest.requires_apply();
+            let bases = manifest.bases.clone();
+            (
+                200,
+                "application/json",
+                json!({
+                    "manifest": manifest,
+                    "bases": bases,
+                    "runtime": status,
+                    "requires_apply": requires_apply,
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => json_error(
+            geobase_error_status(&error),
+            &format!("GeoBase manifest: {error}"),
+        ),
+    }
+}
+
+fn handle_geobases_analyze(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request: GeoBaseAnalyzeRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid JSON body: {error}")),
+    };
+    let content = match request.source.kind {
+        GeoBaseSourceKind::Url => {
+            if request.content.is_some() {
+                return json_error(400, "URL source must not include content");
+            }
+            None
+        }
+        GeoBaseSourceKind::Upload | GeoBaseSourceKind::Manual => {
+            let Some(content) = request.content else {
+                return json_error(400, "upload/manual source requires content");
+            };
+            if content.len() > geobase::MAX_SOURCE_BYTES {
+                return json_error(413, "GeoBase source exceeds 8 MiB");
+            }
+            Some(content.into_bytes())
+        }
+    };
+    let id = request.id.unwrap_or_else(|| {
+        geobase::stable_id(&format!("{}\0{}", request.name, request.source.value))
+    });
+    start_geobase_job(
+        daemon,
+        id,
+        request.name,
+        request.source,
+        content,
+        request.static_entries,
+        false,
+    )
+}
+
+fn handle_geobases_sync(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request: GeoBaseIdRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid JSON body: {error}")),
+    };
+    if geobase_id_is_running(daemon, &request.id) {
+        return json_error(409, "GeoBase is being analyzed");
+    }
+    let store = geobase_store(daemon);
+    let manifest = match store.load_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) => return json_error(geobase_error_status(&error), &error.to_string()),
+    };
+    let Some(record) = manifest
+        .bases
+        .into_iter()
+        .find(|record| record.id == request.id)
+    else {
+        return json_error(404, "GeoBase not found");
+    };
+    if record.source.kind != GeoBaseSourceKind::Url {
+        return json_error(400, "only stored URL sources can be synced");
+    }
+    let static_entries = match store.load_lists(&record.id) {
+        Ok(generation) => generation.static_entries,
+        Err(error) => return json_error(geobase_error_status(&error), &error.to_string()),
+    };
+    start_geobase_job(
+        daemon,
+        record.id,
+        record.name,
+        record.source,
+        None,
+        static_entries,
+        true,
+    )
+}
+
+fn handle_geobases_details(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request: GeoBaseIdRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid JSON body: {error}")),
+    };
+    let store = geobase_store(daemon);
+    let manifest = match store.load_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) => return json_error(geobase_error_status(&error), &error.to_string()),
+    };
+    let Some(record) = manifest
+        .bases
+        .into_iter()
+        .find(|record| record.id == request.id)
+    else {
+        return json_error(404, "GeoBase not found");
+    };
+    let source = match store.load_source(&record.id) {
+        Ok(source) => source,
+        Err(error) => return json_error(geobase_error_status(&error), &error.to_string()),
+    };
+    let parsed = match geobase::parse_source(&source) {
+        Ok(parsed) => parsed,
+        Err(error) => return json_error(geobase_error_status(&error), &error.to_string()),
+    };
+    let lists = match store.load_lists(&record.id) {
+        Ok(lists) => lists,
+        Err(error) => return json_error(geobase_error_status(&error), &error.to_string()),
+    };
+    (
+        200,
+        "application/json",
+        json!({"base": record, "source_networks": parsed.networks, "lists": lists}).to_string(),
+    )
+}
+
+fn handle_geobases_static(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request: GeoBaseStaticRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid JSON body: {error}")),
+    };
+    if geobase_id_is_running(daemon, &request.id) {
+        return json_error(409, "GeoBase is being analyzed");
+    }
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    let store = geobase_store(daemon);
+    let manifest = match store.load_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) => return json_error(geobase_error_status(&error), &error.to_string()),
+    };
+    let Some(record) = manifest
+        .bases
+        .into_iter()
+        .find(|record| record.id == request.id)
+    else {
+        return json_error(404, "GeoBase not found");
+    };
+    let source = match store.load_source(&record.id) {
+        Ok(source) => source,
+        Err(error) => return json_error(geobase_error_status(&error), &error.to_string()),
+    };
+    let mut generation = match store.load_lists(&record.id) {
+        Ok(generation) => generation,
+        Err(error) => return json_error(geobase_error_status(&error), &error.to_string()),
+    };
+    generation.static_entries = request.static_entries;
+    let upsert = GeoBaseUpsertRequest {
+        id: record.id,
+        name: record.name,
+        source: record.source,
+        enabled: record.enabled,
+    };
+    match store.update(upsert, request.expected_revision, &source, generation) {
+        Ok(record) => (
+            200,
+            "application/json",
+            json!({"base": record, "requires_apply": true}).to_string(),
+        ),
+        Err(error) => json_error(geobase_error_status(&error), &error.to_string()),
+    }
+}
+
+fn handle_geobases_cancel(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let Some(cancel) = inner
+        .geobase
+        .cancel
+        .as_ref()
+        .filter(|_| inner.geobase.status.running)
+    else {
+        return json_error(409, "no GeoBase analysis is running");
+    };
+    cancel.store(true, Ordering::Release);
+    (
+        200,
+        "application/json",
+        json!({"runtime": inner.geobase.status}).to_string(),
+    )
+}
+
+fn handle_geobases_delete(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request: GeoBaseIdRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid JSON body: {error}")),
+    };
+    if geobase_id_is_running(daemon, &request.id) {
+        return json_error(409, "GeoBase is being analyzed");
+    }
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    match geobase_store(daemon).delete(&request.id) {
+        Ok(record) => (
+            200,
+            "application/json",
+            json!({"deleted": record}).to_string(),
+        ),
+        Err(error) => json_error(geobase_error_status(&error), &error.to_string()),
+    }
+}
+
+fn handle_geobases_enabled(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request: GeoBaseEnabledRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid JSON body: {error}")),
+    };
+    if geobase_id_is_running(daemon, &request.id) {
+        return json_error(409, "GeoBase is being analyzed");
+    }
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    match geobase_store(daemon).set_enabled(&request.id, request.enabled, None) {
+        Ok(record) => (200, "application/json", json!({"base": record}).to_string()),
+        Err(error) => json_error(geobase_error_status(&error), &error.to_string()),
+    }
+}
+
+fn geobase_id_is_running(daemon: &Daemon, id: &str) -> bool {
+    let inner = lock(&daemon.inner);
+    inner.geobase.status.running && inner.geobase.status.id.as_deref() == Some(id)
+}
+
+fn start_geobase_job(
+    daemon: &Daemon,
+    id: String,
+    name: String,
+    source: GeoBaseSource,
+    content: Option<Vec<u8>>,
+    static_entries: Vec<StaticRouteEntry>,
+    sync_only: bool,
+) -> (u16, &'static str, String) {
+    if let Err(error) = geobase::validate_id(&id) {
+        return json_error(400, &error.to_string());
+    }
+    if name.trim().is_empty() || name.len() > 128 || source.value.len() > 2048 {
+        return json_error(400, "invalid GeoBase name or source metadata");
+    }
+    if let Err(error) = validate_geobase_static_entries(&static_entries) {
+        return json_error(400, &error);
+    }
+
+    let previous_handle = {
+        let mut inner = lock(&daemon.inner);
+        if inner.geobase.status.running {
+            return json_error(409, "a GeoBase analysis is already running");
+        }
+        inner.geobase.handle.take()
+    };
+    if let Some(handle) = previous_handle {
+        let _ = handle.join();
+    }
+
+    let store = geobase_store(daemon);
+    let existing = match store.load_manifest() {
+        Ok(manifest) => manifest.bases.into_iter().find(|record| record.id == id),
+        Err(error) => return json_error(geobase_error_status(&error), &error.to_string()),
+    };
+    if sync_only && existing.is_none() {
+        return json_error(404, "GeoBase not found");
+    }
+    let expected_revision = existing.as_ref().map(|record| record.revision);
+    let enabled = existing.as_ref().is_none_or(|record| record.enabled);
+    let (controller, source_proxy_url) = {
+        let mut inner = lock(&daemon.inner);
+        let controller = mihomo_controller(&inner.state.mihomo_features);
+        let source_proxy_url = geobase_source_proxy_url(&mut inner);
+        (controller, source_proxy_url)
+    };
+    #[cfg(test)]
+    let analyzer = lock(&daemon.inner).geobase.analyzer.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let job = GeoBaseJob {
+        id: id.clone(),
+        name,
+        source,
+        content,
+        static_entries,
+        expected_revision,
+        enabled,
+        sync_only,
+        controller,
+        source_proxy_url,
+        #[cfg(test)]
+        analyzer,
+    };
+    let worker_daemon = daemon.clone();
+    let worker_cancel = cancel.clone();
+    {
+        let mut inner = lock(&daemon.inner);
+        if inner.geobase.status.running {
+            return json_error(409, "a GeoBase analysis is already running");
+        }
+        let Some(next_job_id) = inner.geobase.next_job_id.checked_add(1) else {
+            return json_error(500, "GeoBase job id space exhausted");
+        };
+        inner.geobase.next_job_id = next_job_id;
+        let job_id = inner.geobase.next_job_id;
+        inner.geobase.current_job_id = Some(job_id);
+        inner.geobase.cancel = Some(cancel);
+        inner.geobase.status = GeoBaseRuntimeStatus {
+            job_id,
+            phase: "loading".to_owned(),
+            id: Some(id),
+            running: true,
+            ..GeoBaseRuntimeStatus::default()
+        };
+        inner.geobase.handle = Some(thread::spawn(move || {
+            run_geobase_job(worker_daemon, worker_cancel, job_id, job)
+        }));
+        (
+            202,
+            "application/json",
+            json!({"runtime": inner.geobase.status}).to_string(),
+        )
+    }
+}
+
+fn geobase_source_proxy_url(inner: &mut DaemonInner) -> Option<String> {
+    inner.core.is_running().then(|| {
+        format!(
+            "socks5h://{}:{}",
+            inner.state.listen_host, inner.state.socks_port
+        )
+    })
+}
+
+fn validate_geobase_static_entries(entries: &[StaticRouteEntry]) -> Result<(), String> {
+    let mut targets = HashMap::new();
+    for entry in entries {
+        if entry.target == Classification::Unresolved {
+            return Err("static route target must be direct or active".to_owned());
+        }
+        let parsed = geobase::parse_source(entry.network.as_bytes()).map_err(|e| e.to_string())?;
+        if parsed.networks.len() != 1 || !parsed.domains.is_empty() {
+            return Err(format!("invalid static network: {}", entry.network));
+        }
+        if let Some(previous) = targets.insert(parsed.networks[0].clone(), entry.target)
+            && previous != entry.target
+        {
+            return Err(format!(
+                "static route has conflicting targets: {}",
+                entry.network
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn run_geobase_job(daemon: Daemon, cancel: Arc<AtomicBool>, job_id: u64, job: GeoBaseJob) {
+    let mut completion = GeoBaseJobCompletion::new(daemon.clone(), job_id);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_geobase_job_inner(
+            &daemon,
+            &cancel,
+            job_id,
+            Instant::now() + GEOBASE_JOB_TIMEOUT,
+            &job,
+        )
+    }));
+    let outcome = match result {
+        Ok(Ok(())) => ("complete", None),
+        Ok(Err(_)) if cancel.load(Ordering::Acquire) => ("cancelled", None),
+        Ok(Err(error)) => ("error", Some(error)),
+        Err(payload) => ("panic", Some(panic_message(payload))),
+    };
+    completion.finish(outcome.0, outcome.1);
+}
+
+struct GeoBaseJobCompletion {
+    daemon: Daemon,
+    job_id: u64,
+    finished: bool,
+}
+
+impl GeoBaseJobCompletion {
+    fn new(daemon: Daemon, job_id: u64) -> Self {
+        Self {
+            daemon,
+            job_id,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, phase: &str, error: Option<String>) {
+        let mut inner = lock(&self.daemon.inner);
+        if inner.geobase.current_job_id == Some(self.job_id) {
+            inner.geobase.cancel = None;
+            inner.geobase.current_job_id = None;
+            inner.geobase.status.running = false;
+            inner.geobase.status.phase = phase.to_owned();
+            inner.geobase.status.error = error;
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for GeoBaseJobCompletion {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(
+                "panic",
+                Some("GeoBase worker terminated without completion".to_owned()),
+            );
+        }
+    }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .map_or_else(
+            || "GeoBase worker panicked".to_owned(),
+            |message| format!("GeoBase worker panicked: {message}"),
+        )
+}
+
+fn run_geobase_job_inner(
+    daemon: &Daemon,
+    cancel: &Arc<AtomicBool>,
+    job_id: u64,
+    deadline: Instant,
+    job: &GeoBaseJob,
+) -> Result<(), String> {
+    check_geobase_job(cancel, deadline)?;
+    let source = match job.source.kind {
+        GeoBaseSourceKind::Url => download_geobase_url(
+            &job.source.value,
+            job.source_proxy_url.as_deref(),
+            cancel,
+            deadline,
+        )?,
+        GeoBaseSourceKind::Upload | GeoBaseSourceKind::Manual => job
+            .content
+            .clone()
+            .ok_or_else(|| "source content is missing".to_owned())?,
+    };
+    check_geobase_job(cancel, deadline)?;
+    let parsed = geobase::parse_source(&source).map_err(|error| error.to_string())?;
+    let source_diff = if job.sync_only {
+        Some(
+            geobase_store(daemon)
+                .diff_with_stored(&job.id, &source)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    let source_networks: HashSet<&str> = parsed.networks.iter().map(String::as_str).collect();
+    let static_entries: Vec<_> = job
+        .static_entries
+        .iter()
+        .filter(|entry| source_networks.contains(entry.network.as_str()))
+        .cloned()
+        .collect();
+    let removed_static_entries = job
+        .static_entries
+        .len()
+        .saturating_sub(static_entries.len());
+    update_geobase_status(daemon, job_id, |status| {
+        status.phase = "analyzing".to_owned();
+        status.total = parsed.domains.len();
+        status.source_diff = source_diff.clone();
+        status.removed_static_entries = removed_static_entries;
+    });
+    let classifications =
+        classify_geobase_domains(daemon, cancel, job_id, deadline, job, parsed.domains)?;
+    check_geobase_job(cancel, deadline)?;
+    update_geobase_status(daemon, job_id, |status| status.phase = "saving".to_owned());
+    let request = GeoBaseUpsertRequest {
+        id: job.id.clone(),
+        name: job.name.clone(),
+        source: job.source.clone(),
+        enabled: job.enabled,
+    };
+    let generation = GeoBaseGenerationInput {
+        classifications,
+        static_entries,
+    };
+    let _apply = daemon
+        .apply
+        .lock()
+        .map_err(|_| "config apply lock is poisoned".to_owned())?;
+    let store = geobase_store(daemon);
+    match job.expected_revision {
+        Some(revision) => store.update(request, revision, &source, generation),
+        None => store.create(request, &source, generation),
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn update_geobase_status(
+    daemon: &Daemon,
+    job_id: u64,
+    update: impl FnOnce(&mut GeoBaseRuntimeStatus),
+) {
+    let mut inner = lock(&daemon.inner);
+    if inner.geobase.current_job_id == Some(job_id) {
+        update(&mut inner.geobase.status);
+    }
+}
+
+fn classify_geobase_domains(
+    daemon: &Daemon,
+    cancel: &Arc<AtomicBool>,
+    job_id: u64,
+    deadline: Instant,
+    job: &GeoBaseJob,
+    domains: Vec<String>,
+) -> Result<Vec<DomainClassification>, String> {
+    let total = domains.len();
+    let domains = Arc::new(domains);
+    let index = Arc::new(AtomicUsize::new(0));
+    let results = Arc::new(Mutex::new(Vec::with_capacity(total)));
+    let worker_count = total.min(4);
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let domains = domains.clone();
+        let index = index.clone();
+        let results = results.clone();
+        let cancel = cancel.clone();
+        let daemon = daemon.clone();
+        let controller = job.controller.clone();
+        #[cfg(test)]
+        let analyzer = job.analyzer.clone();
+        handles.push(thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                loop {
+                    check_geobase_job(&cancel, deadline)?;
+                    let current = index.fetch_add(1, Ordering::Relaxed);
+                    let Some(domain) = domains.get(current) else {
+                        break;
+                    };
+                    #[cfg(test)]
+                    let classification = if let Some(analyzer) = &analyzer {
+                        analyzer(domain)
+                    } else {
+                        classify_geobase_domain(&cancel, deadline, controller.as_ref(), domain)?
+                    };
+                    #[cfg(not(test))]
+                    let classification =
+                        classify_geobase_domain(&cancel, deadline, controller.as_ref(), domain)?;
+                    lock(&results).push(DomainClassification {
+                        domain: domain.clone(),
+                        classification,
+                    });
+                    update_geobase_status(&daemon, job_id, |status| {
+                        status.completed += 1;
+                        status.progress_percent = status
+                            .completed
+                            .saturating_mul(100)
+                            .checked_div(status.total)
+                            .map_or(100, |percent| percent.min(100) as u8);
+                        match classification {
+                            Classification::Direct => status.direct += 1,
+                            Classification::Active => status.active += 1,
+                            Classification::Unresolved => status.unresolved += 1,
+                        }
+                    });
+                }
+                Ok::<(), String>(())
+            }));
+            match result {
+                Ok(result) => result,
+                Err(payload) => Err(panic_message(payload)),
+            }
+        }));
+    }
+    let mut errors = Vec::new();
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error),
+            Err(payload) => errors.push(panic_message(payload)),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    check_geobase_job(cancel, deadline)?;
+    let mut output = lock(&results).clone();
+    output.sort_by(|left, right| left.domain.cmp(&right.domain));
+    Ok(output)
+}
+
+fn classify_geobase_domain(
+    cancel: &AtomicBool,
+    deadline: Instant,
+    controller: Option<&(String, Option<String>)>,
+    domain: &str,
+) -> Result<Classification, String> {
+    let candidate = AutoVpnCandidate {
+        domain: domain.to_owned(),
+        port: None,
+    };
+    if probe_geobase_domain_direct(domain, cancel, deadline)? {
+        return Ok(Classification::Direct);
+    }
+    check_geobase_job(cancel, deadline)?;
+    if match controller {
+        Some((addr, secret)) => {
+            proxy_geobase_domain_reachable(addr, secret.as_deref(), &candidate, cancel, deadline)?
+        }
+        None => false,
+    } {
+        Ok(Classification::Active)
+    } else {
+        Ok(Classification::Unresolved)
+    }
+}
+
+fn probe_geobase_domain_direct(
+    domain: &str,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<bool, String> {
+    let addresses = match resolve_public_addrs_bounded(domain, 443, cancel, deadline) {
+        Ok(addresses) => addresses,
+        Err(error) if is_systemic_geobase_probe_error(&error) => return Err(error),
+        Err(_) => return Ok(false),
+    };
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Ok(false);
+    }
+    for attempt in 0..2 {
+        check_geobase_job(cancel, deadline)?;
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .connect_timeout(GEOBASE_PROBE_TIMEOUT)
+            .timeout(GEOBASE_PROBE_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(domain, &addresses)
+            .build()
+            .map_err(|error| format!("GeoBase probe client: {error}"))?;
+        if let Ok(response) = client.get(format!("https://{domain}/")).send() {
+            let status = response.status().as_u16();
+            if status < 500 && status != 451 {
+                return Ok(true);
+            }
+        }
+        if attempt == 0 {
+            check_geobase_job(cancel, deadline)?;
+            thread::sleep(Duration::from_millis(150));
+        }
+    }
+    Ok(false)
+}
+
+fn is_systemic_geobase_probe_error(error: &str) -> bool {
+    error == "cancelled"
+        || error == "GeoBase job exceeded 30 minute deadline"
+        || error.starts_with("GeoBase probe client:")
+}
+
+fn proxy_geobase_domain_reachable(
+    addr: &str,
+    secret: Option<&str>,
+    candidate: &AutoVpnCandidate,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<bool, String> {
+    for url in auto_vpn_probe_urls(candidate) {
+        check_geobase_job(cancel, deadline)?;
+        if mihomo_api_delay(addr, secret, PROXY_ACTIVE_NAME, &url, 4000).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn check_geobase_job(cancel: &AtomicBool, deadline: Instant) -> Result<(), String> {
+    if cancel.load(Ordering::Acquire) {
+        Err("cancelled".to_owned())
+    } else if Instant::now() >= deadline {
+        Err("GeoBase job exceeded 30 minute deadline".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn download_geobase_url(
+    url: &str,
+    source_proxy_url: Option<&str>,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let mut current = url::Url::parse(url).map_err(|error| format!("invalid URL: {error}"))?;
+    for redirects in 0..=5 {
+        check_geobase_job(cancel, deadline)?;
+        let (host, addresses) = resolve_geobase_url(&current, cancel, deadline)?;
+        // Pin this request to the validated DNS answers. This closes the
+        // validation/request DNS-rebinding window while preserving TLS SNI.
+        let direct_client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(&host, &addresses)
+            .build()
+            .map_err(|error| format!("client build: {error}"))?;
+        check_geobase_job(cancel, deadline)?;
+        let mut response = request_geobase_hop(source_proxy_url, |transport| match transport {
+            GeoBaseTransport::Direct => direct_client
+                .get(current.clone())
+                .send()
+                .map_err(|error| format!("download {}: {error}", current)),
+            GeoBaseTransport::Socks5h(proxy_url) => geobase_proxy_client(proxy_url)?
+                .get(current.clone())
+                .send()
+                .map_err(|error| format!("download {}: {error}", current)),
+        })?;
+        if response.status().is_redirection() {
+            if redirects == 5 {
+                return Err("GeoBase URL exceeds 5 redirects".to_owned());
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| "redirect has no Location header".to_owned())?
+                .to_str()
+                .map_err(|_| "redirect Location is not valid text".to_owned())?;
+            let next = current
+                .join(location)
+                .map_err(|error| format!("invalid redirect URL: {error}"))?;
+            resolve_geobase_url(&next, cancel, deadline)?;
+            current = next;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(format!(
+                "GeoBase download returned HTTP {}",
+                response.status()
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > geobase::MAX_SOURCE_BYTES as u64)
+        {
+            return Err("GeoBase source exceeds 8 MiB".to_owned());
+        }
+        let mut body = Vec::new();
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            check_geobase_job(cancel, deadline)?;
+            let read = response
+                .read(&mut chunk)
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                std::str::from_utf8(&body)
+                    .map_err(|_| "GeoBase HTTP body must be valid UTF-8".to_owned())?;
+                return Ok(body);
+            }
+            if body.len() + read > geobase::MAX_SOURCE_BYTES {
+                return Err("GeoBase source exceeds 8 MiB".to_owned());
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+    }
+    unreachable!()
+}
+
+fn geobase_proxy_client(proxy_url: &str) -> Result<reqwest::blocking::Client, String> {
+    let proxy = reqwest::Proxy::all(proxy_url).map_err(|error| format!("proxy setup: {error}"))?;
+    reqwest::blocking::Client::builder()
+        .proxy(proxy)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("proxy client build: {error}"))
+}
+
+#[derive(Clone, Copy)]
+enum GeoBaseTransport<'a> {
+    Direct,
+    Socks5h(&'a str),
+}
+
+fn request_geobase_hop<T>(
+    source_proxy_url: Option<&str>,
+    mut request: impl FnMut(GeoBaseTransport<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    match request(GeoBaseTransport::Direct) {
+        Ok(response) => Ok(response),
+        Err(direct_error) => {
+            let Some(proxy_url) = source_proxy_url else {
+                return Err(direct_error);
+            };
+            request(GeoBaseTransport::Socks5h(proxy_url))
+                .map_err(|proxy_error| format!("[direct] {direct_error}; [socks5h] {proxy_error}"))
+        }
+    }
+}
+
+#[cfg(test)]
+fn validate_geobase_url(url: &url::Url) -> Result<(), String> {
+    let cancel = AtomicBool::new(false);
+    resolve_geobase_url(url, &cancel, Instant::now() + GEOBASE_DNS_TIMEOUT).map(|_| ())
+}
+
+fn resolve_geobase_url(
+    url: &url::Url,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<(String, Vec<std::net::SocketAddr>), String> {
+    if url.scheme() != "https" {
+        return Err("GeoBase URL must use HTTPS".to_owned());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("GeoBase URL must not contain credentials".to_owned());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "GeoBase URL has no host".to_owned())?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses = resolve_public_addrs_bounded(host, port, cancel, deadline)?;
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Err(format!(
+            "GeoBase URL host {host} resolves to a non-public address"
+        ));
+    }
+    Ok((host.to_owned(), addresses))
+}
+
+fn resolve_public_addrs_bounded(
+    host: &str,
+    port: u16,
+    cancel: &AtomicBool,
+    deadline: Instant,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
+    }
+    let host_owned = host.to_owned();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = (host_owned.as_str(), port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect::<Vec<_>>())
+            .map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+    let dns_deadline = deadline.min(Instant::now() + GEOBASE_DNS_TIMEOUT);
+    loop {
+        check_geobase_job(cancel, deadline)?;
+        let remaining = dns_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("DNS lookup timed out for {host}"));
+        }
+        let wait = remaining.min(Duration::from_millis(50));
+        match receiver.recv_timeout(wait) {
+            Ok(result) => {
+                return result.map_err(|error| format!("DNS lookup failed for {host}: {error}"));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!("DNS lookup worker failed for {host}"));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn cancel_and_join_geobase(daemon: &Daemon) {
+    let handle = {
+        let mut inner = lock(&daemon.inner);
+        if let Some(cancel) = inner.geobase.cancel.as_ref() {
+            cancel.store(true, Ordering::Release);
+        }
+        inner.geobase.handle.take()
+    };
+    if let Some(handle) = handle
+        && let Err(payload) = handle.join()
+    {
+        eprintln!("hincyray: {}", panic_message(payload));
+    }
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let value = u32::from(ip);
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_multicast()
+                && !ip.is_unspecified()
+                && !ip.is_broadcast()
+                && ip.octets()[0] < 224
+                && value & 0xff00_0000 != u32::from(Ipv4Addr::new(0, 0, 0, 0))
+                && value & 0xffc0_0000 != u32::from(Ipv4Addr::new(100, 64, 0, 0))
+                && value & 0xffff_ff00 != u32::from(Ipv4Addr::new(192, 0, 0, 0))
+                && value & 0xffff_ff00 != u32::from(Ipv4Addr::new(192, 0, 2, 0))
+                && value & 0xfffe_0000 != u32::from(Ipv4Addr::new(198, 18, 0, 0))
+                && value & 0xffff_ff00 != u32::from(Ipv4Addr::new(198, 51, 100, 0))
+                && value & 0xffff_ff00 != u32::from(Ipv4Addr::new(203, 0, 113, 0))
+        }
+        IpAddr::V6(ip) => {
+            let global_unicast = ip.segments()[0] & 0xe000 == 0x2000;
+            global_unicast
+                && !ip.is_loopback()
+                && !ip.is_multicast()
+                && !ip.is_unspecified()
+                && !ip.is_unique_local()
+                && !ip.is_unicast_link_local()
+                && !is_ipv6_documentation(ip)
+                && ip
+                    .to_ipv4_mapped()
+                    .is_none_or(|mapped| is_public_ip(IpAddr::V4(mapped)))
+        }
+    }
+}
+
+fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0db8
+}
+
 fn socks_client(socks_url: &str, timeout: Duration) -> Result<reqwest::blocking::Client, String> {
     let proxy = reqwest::Proxy::all(socks_url).map_err(|e| format!("proxy setup: {e}"))?;
     reqwest::blocking::Client::builder()
@@ -9894,7 +11579,7 @@ fn handle_backup_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
             );
         }
     };
-    let mut restored: HincyrayState = match serde_json::from_str(&text) {
+    let mut restored: HincyrayState = match deserialize_persisted_state(&text) {
         Ok(state) => state,
         Err(error) => {
             return (
@@ -10029,7 +11714,7 @@ fn handle_backup_webdav_download(body: &str, daemon: &Daemon) -> (u16, &'static 
         value.get("password").and_then(Value::as_str),
     ) {
         Ok(text) => {
-            let mut restored: HincyrayState = match serde_json::from_str(&text) {
+            let mut restored: HincyrayState = match deserialize_persisted_state(&text) {
                 Ok(state) => state,
                 Err(error) => {
                     return (
@@ -11655,7 +13340,7 @@ fn apply_active_profile(
     let geo_dir = geo_dir_from_state(&inner.state);
 
     inner.state.active_profile_id = Some(profile_id);
-    let config_yaml = match build_daemon_config(&inner.state) {
+    let config_yaml = match build_authoritative_daemon_config(&inner.state, daemon) {
         Ok(yaml) => yaml,
         Err(error) => {
             inner.state.active_profile_id = previous_profile_id;
@@ -11666,7 +13351,7 @@ fn apply_active_profile(
     let config_path = daemon.mihomo_config_path.clone();
     let binary_path = inner.state.mihomo_path.clone();
 
-    let apply_result = write_config_file(&config_path, &config_yaml)
+    let apply_result = atomic_write_config(&config_path, config_yaml.as_bytes())
         .and_then(|()| {
             inner
                 .core
@@ -11991,24 +13676,14 @@ fn start_watchdog(
                     // Still process auto-switch / bench state below.
                 } else {
                     eprintln!("hincyray: core not running, restarting...");
-                    let mut inner = lock(&daemon.inner);
-                    match regenerate_config(&inner.state, &daemon) {
-                        Ok((binary_path, config_path)) => {
-                            let geo_dir = geo_dir_from_state(&inner.state);
-                            if let Err(error) =
-                                inner
-                                    .core
-                                    .start(&binary_path, &config_path, geo_dir.as_deref())
-                            {
-                                eprintln!("hincyray: watchdog core restart failed: {error}");
-                                restart_backoff_secs = restart_backoff_secs.clamp(10, 150) * 2;
-                            } else {
-                                restart_backoff_secs = 0;
-                                eprintln!("hincyray: core restarted by watchdog");
-                            }
+                    match activate_current_config(&daemon, true, false, GeoBaseProjection::Applied)
+                    {
+                        Ok(_) => {
+                            restart_backoff_secs = 0;
+                            eprintln!("hincyray: core restarted by watchdog");
                         }
                         Err(error) => {
-                            eprintln!("hincyray: watchdog config regeneration failed: {error}");
+                            eprintln!("hincyray: watchdog core restart failed: {error}");
                             restart_backoff_secs = restart_backoff_secs.clamp(10, 150) * 2;
                         }
                     }
@@ -13492,9 +15167,11 @@ fn write_response(
 fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         _ => "OK",
     }
@@ -13507,6 +15184,8 @@ fn index_html() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn test_daemon() -> (TempDir, Daemon) {
@@ -13522,6 +15201,755 @@ mod tests {
         };
         let daemon = Daemon::new(state, state_path, mihomo_config_path);
         (dir, daemon)
+    }
+
+    fn wait_for_geobase(daemon: &Daemon) -> GeoBaseRuntimeStatus {
+        for _ in 0..200 {
+            let status = lock(&daemon.inner).geobase.status.clone();
+            if !status.running {
+                return status;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("GeoBase job did not finish");
+    }
+
+    fn set_geobase_analyzer(
+        daemon: &Daemon,
+        analyzer: impl Fn(&str) -> Classification + Send + Sync + 'static,
+    ) {
+        lock(&daemon.inner).geobase.analyzer = Some(Arc::new(analyzer));
+    }
+
+    fn http_request(daemon: Daemon, request: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            handle_connection(stream, &daemon).expect("handle request");
+        });
+        let mut client = TcpStream::connect(address).expect("connect");
+        client.write_all(request.as_bytes()).expect("write request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
+        let mut response = String::new();
+        client.read_to_string(&mut response).expect("read response");
+        worker.join().expect("server thread");
+        response
+    }
+
+    #[test]
+    fn split_routing_new_defaults_are_conservative() {
+        let defaults = SplitRoutingSettings::default();
+        assert!(!defaults.auto_vpn_learning_enabled);
+        assert!(!defaults.rkn_bypass_enabled);
+        assert_eq!(defaults.ru_direct_mode, "off");
+
+        let absent: SplitRoutingSettings = serde_json::from_str("{}").expect("deserialize");
+        assert!(!absent.auto_vpn_learning_enabled);
+        assert!(!absent.rkn_bypass_enabled);
+        let explicit: SplitRoutingSettings =
+            serde_json::from_str(r#"{"auto_vpn_learning_enabled":true,"rkn_bypass_enabled":true}"#)
+                .expect("deserialize explicit values");
+        assert!(explicit.auto_vpn_learning_enabled);
+        assert!(explicit.rkn_bypass_enabled);
+    }
+
+    #[test]
+    fn persisted_legacy_split_routing_missing_experimental_fields_keeps_old_true_defaults() {
+        let mut value = serde_json::to_value(HincyrayState::default()).expect("state JSON");
+        {
+            let split = value["split_routing"]
+                .as_object_mut()
+                .expect("split routing object");
+            split.remove("auto_vpn_learning_enabled");
+            split.remove("rkn_bypass_enabled");
+            split.remove("ru_direct_mode");
+        }
+        let state = deserialize_persisted_state(&value.to_string()).expect("legacy state");
+        assert!(state.split_routing.auto_vpn_learning_enabled);
+        assert!(state.split_routing.rkn_bypass_enabled);
+        assert_eq!(state.split_routing.ru_direct_mode, "geosite");
+
+        let split = value["split_routing"]
+            .as_object_mut()
+            .expect("split routing object");
+        split.insert("auto_vpn_learning_enabled".to_owned(), Value::Bool(false));
+        split.insert("rkn_bypass_enabled".to_owned(), Value::Bool(false));
+        split.insert("ru_direct_mode".to_owned(), Value::String("off".to_owned()));
+        let explicit = deserialize_persisted_state(&value.to_string()).expect("explicit state");
+        assert!(!explicit.split_routing.auto_vpn_learning_enabled);
+        assert!(!explicit.split_routing.rkn_bypass_enabled);
+        assert_eq!(explicit.split_routing.ru_direct_mode, "off");
+    }
+
+    #[test]
+    fn geobase_probe_error_classification_only_aborts_systemic_failures() {
+        assert!(is_systemic_geobase_probe_error("cancelled"));
+        assert!(is_systemic_geobase_probe_error(
+            "GeoBase job exceeded 30 minute deadline"
+        ));
+        assert!(is_systemic_geobase_probe_error(
+            "GeoBase probe client: TLS backend unavailable"
+        ));
+        assert!(!is_systemic_geobase_probe_error(
+            "DNS lookup failed for blocked.example: not found"
+        ));
+        assert!(!is_systemic_geobase_probe_error(
+            "DNS lookup timed out for blocked.example"
+        ));
+    }
+
+    #[test]
+    fn geobase_manual_analysis_reports_coherent_status_and_persists() {
+        let (_dir, daemon) = test_daemon();
+        set_geobase_analyzer(&daemon, |domain| {
+            if domain.starts_with("direct") {
+                Classification::Direct
+            } else {
+                Classification::Active
+            }
+        });
+        let (code, _, body) = handle_geobases_analyze(
+            r#"{"id":"regional","name":"Regional","source":{"kind":"manual","value":"test list"},"content":"direct.example\nactive.example\n"}"#,
+            &daemon,
+        );
+        assert_eq!(code, 202);
+        let started: Value = serde_json::from_str(&body).expect("start JSON");
+        assert_eq!(started["runtime"]["running"], true);
+        assert_eq!(started["runtime"]["id"], "regional");
+        assert!(started["runtime"]["job_id"].as_u64().unwrap_or(0) > 0);
+
+        let status = wait_for_geobase(&daemon);
+        assert_eq!(status.phase, "complete");
+        assert_eq!(status.total, 2);
+        assert_eq!(status.completed, 2);
+        assert_eq!(status.direct, 1);
+        assert_eq!(status.active, 1);
+        assert_eq!(status.unresolved, 0);
+        assert_eq!(status.progress_percent, 100);
+        let (code, _, body) = handle_geobases_get(&daemon);
+        assert_eq!(code, 200);
+        let response: Value = serde_json::from_str(&body).expect("GET JSON");
+        assert_eq!(response["manifest"]["bases"][0]["id"], "regional");
+        assert_eq!(response["bases"][0]["id"], "regional");
+        assert_eq!(response["requires_apply"], true);
+        assert_eq!(response["runtime"]["running"], false);
+    }
+
+    #[test]
+    fn geobase_source_wire_contract_matches_ui_payloads() {
+        let (_dir, daemon) = test_daemon();
+        set_geobase_analyzer(&daemon, |_| Classification::Direct);
+        let upload = r#"{"id":"upload","name":"Upload","source":{"kind":"upload","value":"routes.txt"},"content":"upload.example\n"}"#;
+        assert_eq!(handle_geobases_analyze(upload, &daemon).0, 202);
+        assert_eq!(wait_for_geobase(&daemon).phase, "complete");
+        let manual = r#"{"id":"manual","name":"Manual","source":{"kind":"manual","value":"editor"},"content":"manual.example\n"}"#;
+        assert_eq!(handle_geobases_analyze(manual, &daemon).0, 202);
+        assert_eq!(wait_for_geobase(&daemon).phase, "complete");
+        let url_with_content = r#"{"name":"URL","source":{"kind":"url","value":"https://127.0.0.1/routes.txt"},"content":"forbidden.example\n"}"#;
+        assert_eq!(handle_geobases_analyze(url_with_content, &daemon).0, 400);
+        let missing_content = r#"{"name":"Manual","source":{"kind":"manual","value":"editor"}}"#;
+        assert_eq!(handle_geobases_analyze(missing_content, &daemon).0, 400);
+        let ssrf =
+            r#"{"name":"URL","source":{"kind":"url","value":"https://127.0.0.1/routes.txt"}}"#;
+        assert_eq!(handle_geobases_analyze(ssrf, &daemon).0, 202);
+        let status = wait_for_geobase(&daemon);
+        assert_eq!(status.phase, "error");
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("non-public"))
+        );
+    }
+
+    #[test]
+    fn geobase_panicking_analyzer_cleans_up_after_joining_all_workers() {
+        let (_dir, daemon) = test_daemon();
+        let finished = Arc::new(AtomicUsize::new(0));
+        let observed = finished.clone();
+        set_geobase_analyzer(&daemon, move |domain| {
+            if domain == "panic.example" {
+                panic!("analyzer boom");
+            }
+            thread::sleep(Duration::from_millis(20));
+            observed.fetch_add(1, Ordering::SeqCst);
+            Classification::Direct
+        });
+        let request = r#"{"id":"panic-base","name":"Panic","source":{"kind":"manual","value":"test"},"content":"a.example\nb.example\nc.example\npanic.example\n"}"#;
+        assert_eq!(handle_geobases_analyze(request, &daemon).0, 202);
+        let status = wait_for_geobase(&daemon);
+        assert_eq!(status.phase, "error");
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("analyzer boom"))
+        );
+        assert_eq!(finished.load(Ordering::SeqCst), 3);
+        let inner = lock(&daemon.inner);
+        assert!(inner.geobase.cancel.is_none());
+        assert!(inner.geobase.current_job_id.is_none());
+    }
+
+    #[test]
+    fn geobase_shutdown_requests_cancel_and_joins_worker() {
+        let (_dir, daemon) = test_daemon();
+        set_geobase_analyzer(&daemon, |_| {
+            thread::sleep(Duration::from_millis(25));
+            Classification::Direct
+        });
+        let request = r#"{"id":"shutdown","name":"Shutdown","source":{"kind":"manual","value":"test"},"content":"a.example\nb.example\nc.example\nd.example\ne.example\n"}"#;
+        assert_eq!(handle_geobases_analyze(request, &daemon).0, 202);
+        cancel_and_join_geobase(&daemon);
+        let inner = lock(&daemon.inner);
+        assert!(!inner.geobase.status.running);
+        assert_eq!(inner.geobase.status.phase, "cancelled");
+        assert!(inner.geobase.handle.is_none());
+        assert!(inner.geobase.cancel.is_none());
+    }
+
+    #[test]
+    fn geobase_allows_only_one_job_and_cancel_is_observable() {
+        let (_dir, daemon) = test_daemon();
+        set_geobase_analyzer(&daemon, |_| {
+            thread::sleep(Duration::from_millis(100));
+            Classification::Direct
+        });
+        let request = r#"{"id":"slow","name":"Slow","source":{"kind":"manual","value":"test"},"content":"one.example\ntwo.example\nthree.example\nfour.example\nfive.example\n"}"#;
+        assert_eq!(handle_geobases_analyze(request, &daemon).0, 202);
+        assert_eq!(handle_geobases_analyze(request, &daemon).0, 409);
+        assert_eq!(handle_geobases_cancel(&daemon).0, 200);
+        let status = wait_for_geobase(&daemon);
+        assert_eq!(status.phase, "cancelled");
+        assert!(
+            geobase_store(&daemon)
+                .load_manifest()
+                .expect("manifest")
+                .bases
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn geobase_enable_and_delete_update_manifest() {
+        let (_dir, daemon) = test_daemon();
+        set_geobase_analyzer(&daemon, |_| Classification::Direct);
+        let request = r#"{"id":"managed","name":"Managed","source":{"kind":"manual","value":"test"},"content":"one.example\n"}"#;
+        assert_eq!(handle_geobases_analyze(request, &daemon).0, 202);
+        assert_eq!(wait_for_geobase(&daemon).phase, "complete");
+        assert_eq!(
+            handle_geobases_enabled(r#"{"id":"managed","enabled":false}"#, &daemon).0,
+            200
+        );
+        let manifest = geobase_store(&daemon).load_manifest().expect("manifest");
+        assert!(!manifest.bases[0].enabled);
+        assert_eq!(manifest.bases[0].status, GeoBaseStatus::Disabled);
+        assert_eq!(
+            handle_geobases_delete(r#"{"id":"managed"}"#, &daemon).0,
+            200
+        );
+        assert!(
+            geobase_store(&daemon)
+                .load_manifest()
+                .expect("manifest")
+                .bases
+                .is_empty()
+        );
+    }
+
+    fn geobase_config_state() -> HincyrayState {
+        let mut state = HincyrayState {
+            profiles: vec![Profile {
+                id: 0,
+                name: "active".to_owned(),
+                protocol: crate::profiles::Protocol::Vless,
+                address: "proxy.example".to_owned(),
+                port: Some(443),
+                raw: "vless://11111111-1111-1111-1111-111111111111@proxy.example:443#active"
+                    .to_owned(),
+                selected: true,
+                block_quic: false,
+                group: None,
+            }],
+            active_profile_id: Some(0),
+            ..HincyrayState::default()
+        };
+        state.split_routing.enabled = true;
+        state.routing_rules = vec![RoutingRule {
+            enabled: true,
+            name: "user-first".to_owned(),
+            target: "direct".to_owned(),
+            domains: vec!["user.example".to_owned()],
+            port_mode: "include".to_owned(),
+            ..RoutingRule::default()
+        }];
+        state
+    }
+
+    fn geobase_config_state_for(daemon: &Daemon) -> HincyrayState {
+        let mut state = geobase_config_state();
+        state.split_routing.geo_asset_path = daemon
+            .state_path
+            .parent()
+            .expect("state parent")
+            .to_string_lossy()
+            .into_owned();
+        state
+    }
+
+    fn create_geobase_config_generation(daemon: &Daemon, id: &str, enabled: bool) {
+        geobase_store(daemon)
+            .create(
+                GeoBaseUpsertRequest {
+                    id: id.to_owned(),
+                    name: id.to_owned(),
+                    source: GeoBaseSource {
+                        kind: GeoBaseSourceKind::Manual,
+                        value: "integration test".to_owned(),
+                    },
+                    enabled,
+                },
+                b"active.example\ndirect.example\n1.1.1.0/24\n8.8.8.0/24\n",
+                GeoBaseGenerationInput {
+                    classifications: vec![
+                        DomainClassification {
+                            domain: "active.example".to_owned(),
+                            classification: Classification::Active,
+                        },
+                        DomainClassification {
+                            domain: "direct.example".to_owned(),
+                            classification: Classification::Direct,
+                        },
+                    ],
+                    static_entries: vec![
+                        StaticRouteEntry {
+                            network: "1.1.1.0/24".to_owned(),
+                            target: Classification::Active,
+                        },
+                        StaticRouteEntry {
+                            network: "8.8.8.0/24".to_owned(),
+                            target: Classification::Direct,
+                        },
+                    ],
+                },
+            )
+            .expect("create GeoBase generation");
+    }
+
+    #[test]
+    fn geobase_generation_projects_into_authoritative_daemon_config() {
+        let (_dir, daemon) = test_daemon();
+        create_geobase_config_generation(&daemon, "regional", true);
+        create_geobase_config_generation(&daemon, "disabled", false);
+
+        let providers = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired)
+            .expect("project providers");
+        let base = geobase::stable_id("regional");
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.name.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                format!("{base}-a"),
+                format!("{base}-d"),
+                format!("{base}-sa"),
+                format!("{base}-sd"),
+            ]
+        );
+        let canonical_store_root =
+            fs::canonicalize(&daemon.geobase_store_root).expect("store root");
+        assert!(providers.iter().all(|provider| {
+            Path::new(&provider.path).is_absolute()
+                && Path::new(&provider.path).starts_with(&canonical_store_root)
+        }));
+        assert!(
+            providers
+                .iter()
+                .all(|provider| !provider.name.starts_with("disabled"))
+        );
+
+        let state = geobase_config_state_for(&daemon);
+        let desired_yaml = build_daemon_config(&state, &providers).expect("desired config");
+        for provider in &providers {
+            assert!(desired_yaml.contains(&format!("{}:", provider.name)));
+            assert!(desired_yaml.contains(&provider.path));
+        }
+        assert!(desired_yaml.contains("behavior: domain"));
+        assert!(desired_yaml.contains("behavior: ipcidr"));
+        assert!(desired_yaml.contains(&format!("RULE-SET,{base}-a,proxy")));
+        assert!(desired_yaml.contains(&format!("RULE-SET,{base}-d,DIRECT")));
+        assert!(desired_yaml.contains(&format!("RULE-SET,{base}-sa,proxy")));
+        assert!(desired_yaml.contains(&format!("RULE-SET,{base}-sd,DIRECT")));
+        let user_rule = desired_yaml
+            .find("DOMAIN-SUFFIX,user.example,DIRECT")
+            .expect("user rule");
+        let managed_rule = desired_yaml
+            .find(&format!("RULE-SET,{base}-a,proxy"))
+            .expect("managed rule");
+        assert!(
+            user_rule < managed_rule,
+            "ordinary user rule must remain first"
+        );
+    }
+
+    #[test]
+    fn pending_geobase_mutations_do_not_change_applied_restart_projection() {
+        let (_dir, daemon) = test_daemon();
+        create_geobase_config_generation(&daemon, "regional", true);
+        let store = geobase_store(&daemon);
+        let desired = store.load_manifest().expect("desired manifest");
+        assert!(desired.requires_apply());
+        assert!(
+            project_geobase_rule_providers(&daemon, GeoBaseProjection::Applied)
+                .expect("applied projection")
+                .is_empty()
+        );
+
+        store
+            .mark_applied(desired.generation)
+            .expect("explicit apply snapshot");
+        assert!(
+            !project_geobase_rule_providers(&daemon, GeoBaseProjection::Applied)
+                .expect("applied projection")
+                .is_empty()
+        );
+        store.delete("regional").expect("pending delete");
+        assert!(
+            store
+                .load_manifest()
+                .expect("pending manifest")
+                .requires_apply()
+        );
+        assert!(
+            !project_geobase_rule_providers(&daemon, GeoBaseProjection::Applied)
+                .expect("deleted base remains applied")
+                .is_empty()
+        );
+        assert!(
+            project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired)
+                .expect("desired projection")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn geobase_provider_names_are_bounded_and_collision_safe() {
+        let first = geobase_provider_name(&format!("a{}", "x".repeat(62)), "sa");
+        let second = geobase_provider_name(&format!("a{}", "x".repeat(61)), "sa");
+        assert_ne!(first, second);
+        assert!(first.len() <= 64);
+        assert_ne!(
+            geobase_provider_name("base-static", "a"),
+            geobase_provider_name("base", "sa")
+        );
+    }
+
+    #[test]
+    fn geobase_projection_uses_actual_mihomo_home() {
+        let (_dir, daemon) = test_daemon();
+        create_geobase_config_generation(&daemon, "regional", true);
+        let mut outside = geobase_config_state();
+        outside.split_routing.geo_asset_path = "/definitely/not/the/geobase/store".to_owned();
+        let desired = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired)
+            .expect("desired providers");
+        let error = build_daemon_config(&outside, &desired)
+            .expect_err("provider outside actual -d home must fail");
+        assert!(error.contains("outside Mihomo home"), "{error}");
+
+        build_daemon_config(&geobase_config_state_for(&daemon), &desired)
+            .expect("store below actual home should work");
+    }
+
+    #[test]
+    fn geobase_tamper_with_same_line_count_is_rejected() {
+        let (_dir, daemon) = test_daemon();
+        create_geobase_config_generation(&daemon, "regional", true);
+        let manifest = geobase_store(&daemon).load_manifest().expect("manifest");
+        let path = daemon
+            .geobase_store_root
+            .join(&manifest.bases[0].lists.active.file);
+        fs::write(path, b"other.example\n").expect("tamper artifact");
+        let error = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired)
+            .expect_err("same-count tamper must fail fingerprint verification");
+        assert!(error.contains("fingerprint mismatch"), "{error}");
+    }
+
+    #[test]
+    fn failed_atomic_publish_preserves_previous_config() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, b"old bytes").expect("old config");
+        let error = atomic_write_config_with(&path, b"new bytes", |_temp, _destination| {
+            Err("injected publish failure".to_owned())
+        })
+        .expect_err("publish must fail");
+        assert!(error.contains("injected"));
+        assert_eq!(fs::read(path).expect("preserved config"), b"old bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_readiness_rolls_back_exact_config_and_generation() {
+        let dir = TempDir::new().expect("temp dir");
+        let script = dir.path().join("fake-mihomo.sh");
+        fs::write(
+            &script,
+            b"#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then exit 0; fi\nwhile [ $# -gt 0 ]; do if [ \"$1\" = \"-f\" ]; then shift; cfg=$1; fi; shift; done\nif grep -q OLD \"$cfg\"; then sleep 30; else exit 1; fi\n",
+        )
+        .expect("fake mihomo");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut state = geobase_config_state();
+        state.split_routing.enabled = false;
+        state.mihomo_path = script.to_string_lossy().into_owned();
+        let daemon = Daemon::new(
+            state,
+            dir.path().join("state.json"),
+            dir.path().join("mihomo-config.yaml"),
+        );
+        create_geobase_config_generation(&daemon, "rollback", false);
+        atomic_write_config(&daemon.mihomo_config_path, b"OLD exact bytes\n").expect("old config");
+        {
+            let mut inner = lock(&daemon.inner);
+            inner
+                .core
+                .start(
+                    script.to_str().expect("script path"),
+                    &daemon.mihomo_config_path,
+                    None,
+                )
+                .expect("old core");
+        }
+        let error = activate_current_config(&daemon, false, false, GeoBaseProjection::Desired)
+            .expect_err("new runtime config exits immediately");
+        assert!(error.contains("rollback:"), "{error}");
+        assert_eq!(
+            fs::read(&daemon.mihomo_config_path).expect("rolled back config"),
+            b"OLD exact bytes\n"
+        );
+        assert!(lock(&daemon.inner).core.is_running());
+        let manifest = geobase_store(&daemon).load_manifest().expect("manifest");
+        assert_ne!(manifest.applied_generation, manifest.generation);
+        let _ = lock(&daemon.inner).core.stop();
+    }
+
+    #[test]
+    fn enabled_geobase_with_missing_artifact_fails_config_generation() {
+        let (_dir, daemon) = test_daemon();
+        create_geobase_config_generation(&daemon, "regional", true);
+        let manifest = geobase_store(&daemon).load_manifest().expect("manifest");
+        let active_path = daemon
+            .geobase_store_root
+            .join(&manifest.bases[0].lists.active.file);
+        fs::remove_file(active_path).expect("remove active artifact");
+
+        let error = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired)
+            .expect_err("missing enabled artifact must fail");
+        assert!(error.contains("missing or inaccessible"), "{error}");
+    }
+
+    #[test]
+    fn http_parser_rejects_invalid_and_oversized_content_length() {
+        let (_dir, daemon) = test_daemon();
+        let invalid = http_request(
+            daemon.clone(),
+            "POST /api/profiles/import HTTP/1.1\r\nContent-Length: nope\r\n\r\n",
+        );
+        assert!(invalid.starts_with("HTTP/1.1 400"));
+        let oversized = http_request(
+            daemon,
+            &format!(
+                "POST /api/profiles/import HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_BODY_BYTES + 1
+            ),
+        );
+        assert!(oversized.starts_with("HTTP/1.1 413"));
+        assert_eq!(
+            request_body_limit("POST", "/api/geobases/analyze"),
+            MAX_GEOBASE_ANALYZE_BODY_BYTES
+        );
+    }
+
+    #[test]
+    fn http_parser_rejects_invalid_utf8_body() {
+        let (_dir, daemon) = test_daemon();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            handle_connection(stream, &daemon).expect("handle request");
+        });
+        let mut client = TcpStream::connect(address).expect("connect");
+        client
+            .write_all(b"POST /api/geobases/analyze HTTP/1.1\r\nContent-Length: 1\r\n\r\n\xff")
+            .expect("write request");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
+        let mut response = String::new();
+        client.read_to_string(&mut response).expect("response");
+        worker.join().expect("server thread");
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("valid UTF-8"));
+    }
+
+    #[test]
+    fn geobase_generations_advance_transactionally_and_require_apply() {
+        let (_dir, daemon) = test_daemon();
+        create_geobase_config_generation(&daemon, "generation", true);
+        let store = geobase_store(&daemon);
+        let desired = store.load_manifest().expect("manifest");
+        assert!(desired.requires_apply());
+        let before_failed_apply = desired.applied_generation;
+        let (code, _, _) = handle_routing_apply(&daemon);
+        assert_ne!(code, 200, "default test state has no active profile");
+        assert_eq!(
+            store
+                .load_manifest()
+                .expect("failed apply manifest")
+                .applied_generation,
+            before_failed_apply
+        );
+        store
+            .mark_applied(desired.generation)
+            .expect("authoritative generation acknowledgement");
+        assert!(
+            !store
+                .load_manifest()
+                .expect("applied manifest")
+                .requires_apply()
+        );
+
+        let revision = store.load_manifest().expect("manifest").bases[0].revision;
+        store
+            .set_enabled("generation", false, Some(revision))
+            .expect("transactional disable");
+        assert!(
+            store
+                .load_manifest()
+                .expect("disabled manifest")
+                .requires_apply()
+        );
+    }
+
+    #[test]
+    fn stopped_core_successful_apply_marks_authoritative_generation() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut state = geobase_config_state();
+        state.mihomo_path = "/usr/bin/true".to_owned();
+        state.split_routing.enabled = false;
+        let daemon = Daemon::new(
+            state,
+            dir.path().join("state.json"),
+            dir.path().join("mihomo-config.yaml"),
+        );
+        create_geobase_config_generation(&daemon, "authoritative", true);
+        let desired = geobase_store(&daemon)
+            .load_manifest()
+            .expect("desired manifest")
+            .generation;
+        assert_eq!(handle_routing_apply(&daemon).0, 200);
+        let applied = geobase_store(&daemon)
+            .load_manifest()
+            .expect("applied manifest");
+        assert_eq!(applied.applied_generation, desired);
+        assert!(!applied.requires_apply());
+    }
+
+    #[test]
+    fn geobase_url_validation_rejects_ssrf_targets() {
+        for raw in [
+            "http://example.com/list.txt",
+            "https://user:pass@example.com/list.txt",
+            "https://127.0.0.1/list.txt",
+            "https://[::1]/list.txt",
+        ] {
+            let url = url::Url::parse(raw).expect("URL");
+            assert!(validate_geobase_url(&url).is_err(), "accepted {raw}");
+        }
+        for ip in [
+            "10.0.0.1",
+            "100.64.0.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "2001:db8::1",
+            "ff02::1",
+        ] {
+            assert!(!is_public_ip(ip.parse().expect("IP")), "accepted {ip}");
+        }
+        assert!(is_public_ip("1.1.1.1".parse().expect("IP")));
+        assert!(is_public_ip("2606:4700:4700::1111".parse().expect("IP")));
+    }
+
+    #[test]
+    fn geobase_transport_falls_back_and_aggregates_errors() {
+        let mut attempts = Vec::new();
+        let error = request_geobase_hop(Some("not a proxy URL"), |transport| {
+            attempts.push(match transport {
+                GeoBaseTransport::Direct => "direct".to_owned(),
+                GeoBaseTransport::Socks5h(url) => url.to_owned(),
+            });
+            Err::<(), _>(match transport {
+                GeoBaseTransport::Direct => "send failed".to_owned(),
+                GeoBaseTransport::Socks5h(_) => "proxy setup failed".to_owned(),
+            })
+        })
+        .expect_err("both transports must fail");
+        assert_eq!(attempts, ["direct", "not a proxy URL"]);
+        assert_eq!(error, "[direct] send failed; [socks5h] proxy setup failed");
+    }
+
+    #[test]
+    fn geobase_malformed_proxy_fails_after_direct_transport_failure() {
+        let error = request_geobase_hop(Some("://malformed"), |transport| match transport {
+            GeoBaseTransport::Direct => Err("send failed".to_owned()),
+            GeoBaseTransport::Socks5h(url) => geobase_proxy_client(url).map(|_| ()),
+        })
+        .expect_err("malformed proxy must fail");
+        assert!(error.starts_with("[direct] send failed; [socks5h] proxy setup:"));
+    }
+
+    #[test]
+    fn geobase_job_proxy_is_captured_only_while_core_runs() {
+        let (_dir, daemon) = test_daemon();
+        let mut inner = lock(&daemon.inner);
+        assert_eq!(geobase_source_proxy_url(&mut inner), None);
+
+        inner.core.child = Some(
+            Command::new("/bin/sleep")
+                .arg("10")
+                .spawn()
+                .expect("spawn test core"),
+        );
+        assert_eq!(
+            geobase_source_proxy_url(&mut inner).as_deref(),
+            Some("socks5h://127.0.0.1:10808")
+        );
+        let _ = inner.core.stop();
+        assert_eq!(geobase_source_proxy_url(&mut inner), None);
+    }
+
+    #[test]
+    fn geobase_http_response_does_not_try_proxy() {
+        let mut attempts = 0;
+        let status = request_geobase_hop(Some("socks5h://127.0.0.1:10808"), |_| {
+            attempts += 1;
+            Ok(503)
+        })
+        .expect("HTTP response is a completed transport request");
+        assert_eq!(status, 503);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn geobase_redirect_target_is_revalidated() {
+        let current = url::Url::parse("https://example.com/list.txt").expect("URL");
+        let next = current.join("https://127.0.0.1/private").expect("redirect");
+        assert!(validate_geobase_url(&next).is_err());
     }
 
     fn auto_candidate(domain: &str, port: Option<u16>) -> AutoVpnCandidate {
@@ -16838,11 +19266,52 @@ mod tests {
     }
 
     #[test]
-    fn rkn_bypass_enabled_by_default() {
+    fn routing_get_exposes_applied_geobase_as_two_immutable_rows() {
+        let (_dir, daemon) = test_daemon();
+        create_geobase_config_generation(&daemon, "regional", true);
+        let store = geobase_store(&daemon);
+        let desired = store.load_manifest().expect("desired manifest");
+        store
+            .mark_applied(desired.generation)
+            .expect("apply GeoBase snapshot");
+
+        let (status, _, body) = handle_routing_get(&daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("routing response");
+        let rows = response["managed_rules"].as_array().expect("managed rules");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["source"], "geobase");
+        assert_eq!(rows[0]["geobase_id"], "regional");
+        assert_eq!(rows[0]["name"], "regional — серый список");
+        assert_eq!(rows[0]["target"], "active");
+        assert_eq!(rows[0]["outbound"], "proxy-active");
+        assert_eq!(rows[0]["domain_count"], 1);
+        assert_eq!(rows[0]["network_count"], 1);
+        assert_eq!(rows[0]["total_count"], 2);
+        assert_eq!(rows[1]["name"], "regional — белый список");
+        assert_eq!(rows[1]["target"], "direct");
+        assert_eq!(rows[1]["outbound"], "DIRECT");
+        assert_eq!(rows[1]["domain_count"], 1);
+        assert_eq!(rows[1]["network_count"], 1);
+        assert_eq!(rows[1]["total_count"], 2);
+        assert!(rows.iter().all(|row| row["enabled"] == true));
+        assert!(rows.iter().all(|row| row["applied"] == true));
+        assert_eq!(response["geobase_requires_apply"], false);
+
+        store.delete("regional").expect("pending desired delete");
+        let (status, _, pending_body) = handle_routing_get(&daemon);
+        assert_eq!(status, 200);
+        let pending: Value = serde_json::from_str(&pending_body).expect("pending response");
+        assert_eq!(pending["managed_rules"], response["managed_rules"]);
+        assert_eq!(pending["geobase_requires_apply"], true);
+    }
+
+    #[test]
+    fn rkn_bypass_disabled_by_default() {
         let s = SplitRoutingSettings::default();
         assert!(
-            s.rkn_bypass_enabled,
-            "rkn_bypass_enabled should default to true"
+            !s.rkn_bypass_enabled,
+            "rkn_bypass_enabled should default to false"
         );
         assert!(
             !s.rkn_bypass_url.is_empty(),
@@ -17113,21 +19582,18 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         {
             let inner = lock(&daemon.inner);
             let s = &inner.state.split_routing;
-            assert!(s.rkn_bypass_enabled, "rkn_bypass should be re-enabled");
-            assert_eq!(
-                s.ru_direct_mode, "geosite",
-                "ru_direct_mode should be geosite"
-            );
+            assert!(!s.rkn_bypass_enabled, "rkn_bypass should be disabled");
+            assert_eq!(s.ru_direct_mode, "off", "ru_direct_mode should be off");
             assert_eq!(s.match_target, "proxy", "match_target should be proxy");
             assert_eq!(
                 s.port_mode,
                 PortMode::AllowList,
-                "port_mode should be AllowList"
+                "port_mode should preserve the previous reset default"
             );
             assert_eq!(
                 s.proxy_ports,
                 vec!["80".to_owned(), "443".to_owned()],
-                "proxy_ports should be 80,443"
+                "proxy_ports should preserve the previous reset default"
             );
             assert!(
                 s.ru_direct_exceptions.is_empty(),
@@ -17141,10 +19607,7 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
                 s.auto_vpn_last_checked_unix.is_empty(),
                 "auto_vpn metadata should be cleared"
             );
-            assert!(
-                s.auto_vpn_learning_enabled,
-                "auto_vpn_learning_enabled should reset to true"
-            );
+            assert!(!s.auto_vpn_learning_enabled);
             // Routing rules should be just QUIC Block.
             assert_eq!(
                 inner.state.routing_rules.len(),

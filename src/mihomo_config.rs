@@ -11,7 +11,9 @@
 //! daemon. The desktop benchmark tool (`tester.rs`) still uses
 //! `xray_config` for its own config generation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,8 +21,8 @@ use url::Url;
 
 use crate::profiles::{Profile, Protocol, decode_vmess_json};
 use crate::xray_config::{
-    DNS_INBOUND_PORT, PortMode, QuicMode, RouterExtra, XrayRouteRule, extract_ss_credentials,
-    percent_decode, query_value,
+    DNS_INBOUND_PORT, GeoBaseRuleBehavior, GeoBaseRuleProvider, GeoBaseRuleTarget, PortMode,
+    QuicMode, RouterExtra, XrayRouteRule, extract_ss_credentials, percent_decode, query_value,
 };
 
 // ---------------------------------------------------------------------------
@@ -1029,9 +1031,12 @@ fn build_proxy_providers_json(providers: &[ProxyProviderConfig]) -> Value {
 }
 
 /// Build the `rule-providers` JSON object from a list of configs.
-fn build_rule_providers_json(providers: &[RuleProviderConfig]) -> Value {
+fn build_rule_providers_json(providers: &[RuleProviderConfig]) -> Result<Value, String> {
     let mut map = serde_json::Map::new();
     for r in providers {
+        if map.contains_key(&r.name) {
+            return Err(format!("duplicate rule provider name {:?}", r.name));
+        }
         let mut entry = json!({
             "type": r.provider_type,
             "behavior": r.behavior,
@@ -1061,7 +1066,198 @@ fn build_rule_providers_json(providers: &[RuleProviderConfig]) -> Value {
         }
         map.insert(r.name.clone(), entry);
     }
-    Value::Object(map)
+    Ok(Value::Object(map))
+}
+
+fn merge_router_rule_providers(
+    providers: &[RuleProviderConfig],
+    managed: &[GeoBaseRuleProvider],
+    rkn_bypass_enabled: bool,
+    mihomo_home: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let mut map = build_rule_providers_json(providers)?
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let mut names: HashSet<String> = map.keys().cloned().collect();
+    let enabled_managed: Vec<&GeoBaseRuleProvider> =
+        managed.iter().filter(|provider| provider.enabled).collect();
+    let lexical_home =
+        match mihomo_home {
+            Some(home) => Some(lexical_absolute_path(Path::new(home)).ok_or_else(|| {
+                format!("invalid Mihomo home {home:?}: expected an absolute path")
+            })?),
+            None => None,
+        };
+    let home =
+        match mihomo_home {
+            Some(home) => Some(normalize_absolute_path(Path::new(home)).ok_or_else(|| {
+                format!("invalid Mihomo home {home:?}: expected an absolute path")
+            })?),
+            None if !enabled_managed.is_empty() => {
+                return Err("Mihomo home is required for managed rule providers".to_owned());
+            }
+            None => None,
+        };
+    let mut effective_paths = HashMap::<PathBuf, String>::new();
+
+    for provider in providers
+        .iter()
+        .filter(|provider| provider.provider_type == "file")
+    {
+        let Some(path) = provider.path.as_deref() else {
+            continue;
+        };
+        if let Some(effective) =
+            effective_provider_path(path, home.as_deref(), lexical_home.as_deref())
+        {
+            insert_effective_provider_path(&mut effective_paths, effective, &provider.name)?;
+        }
+    }
+
+    if (rkn_bypass_enabled || !enabled_managed.is_empty())
+        && let Some(home) = home.as_deref()
+    {
+        let effective = effective_provider_path(
+            "./rule-providers/ru-bypass.list",
+            Some(home),
+            lexical_home.as_deref(),
+        )
+        .expect("absolute Mihomo home makes the RKN path normalizable");
+        insert_effective_provider_path(&mut effective_paths, effective, "ru-bypass")?;
+    }
+
+    for provider in enabled_managed {
+        provider.validate()?;
+        let home = home
+            .as_deref()
+            .expect("managed providers require Mihomo home");
+        let effective =
+            effective_provider_path(&provider.path, Some(home), lexical_home.as_deref())
+                .expect("validated managed provider path is absolute");
+        if !effective.starts_with(home) {
+            return Err(format!(
+                "managed rule provider {:?} path {:?} is outside Mihomo home {:?}",
+                provider.name, provider.path, home
+            ));
+        }
+        insert_effective_provider_path(&mut effective_paths, effective, &provider.name)?;
+        if !names.insert(provider.name.clone()) {
+            return Err(format!("duplicate rule provider name {:?}", provider.name));
+        }
+        let behavior = match provider.behavior {
+            GeoBaseRuleBehavior::Domain => "domain",
+            GeoBaseRuleBehavior::Ipcidr => "ipcidr",
+        };
+        map.insert(
+            provider.name.clone(),
+            json!({
+                "type": "file",
+                "behavior": behavior,
+                "format": "text",
+                "path": provider.path,
+            }),
+        );
+    }
+
+    if rkn_bypass_enabled {
+        if !names.insert("ru-bypass".to_owned()) {
+            return Err("duplicate rule provider name \"ru-bypass\"".to_owned());
+        }
+        map.insert(
+            "ru-bypass".to_owned(),
+            json!({
+                "type": "file",
+                "behavior": "domain",
+                "format": "text",
+                "path": "./rule-providers/ru-bypass.list",
+            }),
+        );
+    }
+
+    Ok((!map.is_empty()).then_some(Value::Object(map)))
+}
+
+fn normalize_absolute_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return Some(canonical);
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
+fn effective_provider_path(
+    path: &str,
+    mihomo_home: Option<&Path>,
+    lexical_mihomo_home: Option<&Path>,
+) -> Option<PathBuf> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        let normalized = normalize_absolute_path(path)?;
+        let Some(home) = mihomo_home else {
+            return Some(normalized);
+        };
+        let lexical_home = lexical_mihomo_home?;
+        let lexical_path = lexical_absolute_path(path)?;
+        match lexical_path.strip_prefix(lexical_home) {
+            Ok(relative) => normalize_absolute_path(&home.join(relative)),
+            Err(_) => Some(normalized),
+        }
+    } else {
+        normalize_absolute_path(&mihomo_home?.join(path))
+    }
+}
+
+fn lexical_absolute_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
+fn insert_effective_provider_path(
+    paths: &mut HashMap<PathBuf, String>,
+    path: PathBuf,
+    name: &str,
+) -> Result<(), String> {
+    if let Some(existing) = paths.insert(path.clone(), name.to_owned()) {
+        return Err(format!(
+            "duplicate effective rule provider path {:?} for {:?} and {:?}",
+            path, existing, name
+        ));
+    }
+    Ok(())
 }
 
 /// Build the `sub-rules` JSON object from a list of `SubRuleConfig`.
@@ -1364,11 +1560,26 @@ pub fn build_mihomo_router_config(
         rules.push(format!("DOMAIN-SUFFIX,{domain},{}", PROXY_NAME));
     }
 
+    // GeoBase ACTIVE providers must take precedence over broad DIRECT sets.
+    for target in [GeoBaseRuleTarget::Active, GeoBaseRuleTarget::Direct] {
+        for provider in extra
+            .geobase_rule_providers
+            .iter()
+            .filter(|provider| provider.enabled && provider.target == target)
+        {
+            let target_name = match target {
+                GeoBaseRuleTarget::Active => PROXY_ACTIVE_NAME,
+                GeoBaseRuleTarget::Direct => DIRECT_NAME,
+            };
+            rules.push(format!("RULE-SET,{},{}", provider.name, target_name));
+        }
+    }
+
     // v0.17: RKN Bypass — route domains blocked in Russia through proxy.
     // The RULE-SET is emitted BEFORE GEOIP,RU so blocked domains that
     // resolve to Russian IPs still go through proxy (not direct).
     // GEOIP,CN keeps Chinese IPs direct (better latency, avoids blocking).
-    // Order: raw_rules → RKN bypass → RU Direct → port-mode → MATCH.
+    // Order: raw rules → GeoBase → RKN bypass → RU Direct → port mode → MATCH.
     if extra.rkn_bypass_enabled {
         rules.push(format!("RULE-SET,ru-bypass,{}", PROXY_NAME));
         rules.push(format!("GEOIP,RU,{}", DIRECT_NAME));
@@ -1501,11 +1712,7 @@ pub fn build_mihomo_router_config(
         }
     }
 
-    // Rule providers — external rule sets loaded from HTTP/file/inline.
-    if !features.rule_providers.is_empty() {
-        config["rule-providers"] = build_rule_providers_json(&features.rule_providers);
-    }
-
+    // Rule providers — user-defined entries plus validated local GeoBase sets.
     // v0.17: RKN Bypass rule provider — auto-injected when enabled.
     // v0.19.7: Changed from `type: http, behavior: classical` to
     // `type: file, behavior: domain`. The classical behavior parsed 744K
@@ -1513,27 +1720,13 @@ pub fn build_mihomo_router_config(
     // uses a memory-efficient trie (~20MB). Hincyray downloads and
     // preprocesses the bypass list (strips `DOMAIN,`/`DOMAIN-SUFFIX,`
     // prefixes) before mihomo loads it.
-    if extra.rkn_bypass_enabled {
-        let bypass_provider = json!({
-            "ru-bypass": {
-                "type": "file",
-                "behavior": "domain",
-                "format": "text",
-                "path": "./rule-providers/ru-bypass.list"
-            }
-        });
-        if let Some(existing) = config
-            .get_mut("rule-providers")
-            .and_then(|v| v.as_object_mut())
-        {
-            if let Some(bypass_obj) = bypass_provider.as_object() {
-                for (key, val) in bypass_obj {
-                    existing.entry(key.clone()).or_insert(val.clone());
-                }
-            }
-        } else {
-            config["rule-providers"] = bypass_provider;
-        }
+    if let Some(providers) = merge_router_rule_providers(
+        &features.rule_providers,
+        &extra.geobase_rule_providers,
+        extra.rkn_bypass_enabled,
+        extra.mihomo_home.as_deref(),
+    )? {
+        config["rule-providers"] = providers;
     }
 
     // Sub-rules — named rule groups referenced via SUB-RULE rule type.
@@ -3313,7 +3506,10 @@ mod tests {
         build_vmess_proxy, build_wireguard_proxy, domain_rule_body, ip_rule_body,
     };
     use crate::profiles::parse_profiles;
-    use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule};
+    use crate::xray_config::{
+        DnsSettings, GeoBaseRuleBehavior, GeoBaseRuleProvider, GeoBaseRuleTarget, PortMode,
+        QuicMode, RouterExtra, XrayRouteRule,
+    };
     use base64::Engine as _;
     use serde_json::{Value, json};
 
@@ -6254,6 +6450,324 @@ mod tests {
             .iter()
             .filter_map(|r| r.as_str().map(ToOwned::to_owned))
             .collect()
+    }
+
+    fn managed_provider(
+        name: &str,
+        path: &str,
+        behavior: GeoBaseRuleBehavior,
+        target: GeoBaseRuleTarget,
+    ) -> GeoBaseRuleProvider {
+        GeoBaseRuleProvider {
+            enabled: true,
+            name: name.to_owned(),
+            path: path.to_owned(),
+            behavior,
+            target,
+        }
+    }
+
+    fn build_router_with_extra(
+        extra: &RouterExtra,
+        route_rules: &[XrayRouteRule],
+        tproxy_available: bool,
+        features: &MihomoFeatures,
+    ) -> Result<String, String> {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        build_mihomo_router_config(
+            &profiles[0],
+            &[],
+            route_rules,
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            tproxy_available,
+            QuicMode::Proxy,
+            false,
+            extra,
+            features,
+        )
+    }
+
+    #[test]
+    fn geobase_providers_emit_safe_file_config_and_rules() {
+        let extra = RouterExtra {
+            geobase_rule_providers: vec![
+                managed_provider(
+                    "geobase-vpn",
+                    "/opt/etc/hincyray/geobase/vpn.txt",
+                    GeoBaseRuleBehavior::Domain,
+                    GeoBaseRuleTarget::Active,
+                ),
+                managed_provider(
+                    "geobase-static",
+                    "/opt/etc/hincyray/geobase/static.txt",
+                    GeoBaseRuleBehavior::Ipcidr,
+                    GeoBaseRuleTarget::Direct,
+                ),
+            ],
+            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
+            ..RouterExtra::default()
+        };
+        let yaml = build_router_with_extra(&extra, &[], true, &MihomoFeatures::default())
+            .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let providers = config["rule-providers"].as_object().expect("providers");
+
+        assert_eq!(
+            providers["geobase-vpn"],
+            json!({
+                "type": "file",
+                "behavior": "domain",
+                "format": "text",
+                "path": "/opt/etc/hincyray/geobase/vpn.txt",
+            })
+        );
+        assert_eq!(providers["geobase-static"]["behavior"], "ipcidr");
+        assert_eq!(
+            providers["geobase-static"]["path"],
+            "/opt/etc/hincyray/geobase/static.txt"
+        );
+        let rules = router_rules(&yaml);
+        assert!(rules.contains(&"RULE-SET,geobase-vpn,proxy-active".to_owned()));
+        assert!(rules.contains(&"RULE-SET,geobase-static,DIRECT".to_owned()));
+    }
+
+    #[test]
+    fn geobase_rule_order_is_active_before_direct_in_full_pipeline() {
+        let route_rule = XrayRouteRule {
+            domains: vec!["ordinary.example".to_owned()],
+            ips: vec![],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec![],
+            network: None,
+            port_mode: "include".to_owned(),
+        };
+        let extra = RouterExtra {
+            geobase_rule_providers: vec![
+                managed_provider(
+                    "direct-first-in-input",
+                    "/opt/etc/hincyray/geobase/direct.txt",
+                    GeoBaseRuleBehavior::Domain,
+                    GeoBaseRuleTarget::Direct,
+                ),
+                managed_provider(
+                    "active-second-in-input",
+                    "/opt/etc/hincyray/geobase/active.txt",
+                    GeoBaseRuleBehavior::Domain,
+                    GeoBaseRuleTarget::Active,
+                ),
+            ],
+            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
+            auto_vpn_exceptions: vec!["auto.example".to_owned()],
+            rkn_bypass_enabled: true,
+            ru_direct_mode: "tld".to_owned(),
+            port_mode: PortMode::AllowList,
+            proxy_ports: vec!["443".to_owned()],
+            ..RouterExtra::default()
+        };
+        let features = MihomoFeatures {
+            typed_rules: vec![super::MihomoRuleConfig {
+                rule_type: "DSCP".to_owned(),
+                value: "4".to_owned(),
+                target: "direct".to_owned(),
+                options: vec![],
+            }],
+            raw_rules: vec!["DOMAIN,raw.example,DIRECT".to_owned()],
+            ..MihomoFeatures::default()
+        };
+        let yaml = build_router_with_extra(&extra, &[route_rule], false, &features)
+            .expect("router config");
+        let rules = router_rules(&yaml);
+        assert_eq!(
+            rules,
+            [
+                "DOMAIN-SUFFIX,ordinary.example,DIRECT",
+                "AND,((NETWORK,udp),(DST-PORT,443)),REJECT",
+                "DSCP,4,DIRECT",
+                "DOMAIN,raw.example,DIRECT",
+                "DOMAIN-SUFFIX,auto.example,proxy",
+                "RULE-SET,active-second-in-input,proxy-active",
+                "RULE-SET,direct-first-in-input,DIRECT",
+                "RULE-SET,ru-bypass,proxy",
+                "GEOIP,RU,DIRECT",
+                "GEOIP,CN,DIRECT",
+                "DOMAIN-SUFFIX,ru,DIRECT",
+                "DOMAIN-SUFFIX,xn--p1ai,DIRECT",
+                "DST-PORT,443,proxy",
+                "MATCH,proxy",
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_geobase_descriptors_are_rejected() {
+        for provider in [
+            managed_provider(
+                &"x".repeat(65),
+                "/opt/etc/hincyray/geobase/list.txt",
+                GeoBaseRuleBehavior::Domain,
+                GeoBaseRuleTarget::Active,
+            ),
+            managed_provider(
+                "relative-path",
+                "geobase/list.txt",
+                GeoBaseRuleBehavior::Domain,
+                GeoBaseRuleTarget::Active,
+            ),
+            managed_provider(
+                "traversal-path",
+                "/opt/etc/hincyray/../state.json",
+                GeoBaseRuleBehavior::Ipcidr,
+                GeoBaseRuleTarget::Direct,
+            ),
+        ] {
+            let extra = RouterExtra {
+                geobase_rule_providers: vec![provider],
+                mihomo_home: Some("/opt/etc/hincyray".to_owned()),
+                ..RouterExtra::default()
+            };
+            assert!(
+                build_router_with_extra(&extra, &[], true, &MihomoFeatures::default()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_rule_provider_names_are_rejected() {
+        let extra = RouterExtra {
+            geobase_rule_providers: vec![managed_provider(
+                "shared-name",
+                "/opt/etc/hincyray/geobase/list.txt",
+                GeoBaseRuleBehavior::Domain,
+                GeoBaseRuleTarget::Active,
+            )],
+            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
+            ..RouterExtra::default()
+        };
+        let features = MihomoFeatures {
+            rule_providers: vec![RuleProviderConfig {
+                name: "shared-name".to_owned(),
+                ..RuleProviderConfig::default()
+            }],
+            ..MihomoFeatures::default()
+        };
+        let error = build_router_with_extra(&extra, &[], true, &features)
+            .expect_err("duplicate provider must fail");
+        assert!(error.contains("duplicate rule provider name"));
+    }
+
+    #[test]
+    fn managed_provider_requires_mihomo_home_and_stays_below_it() {
+        let provider = managed_provider(
+            "geobase-active",
+            "/srv/geobases/active.txt",
+            GeoBaseRuleBehavior::Domain,
+            GeoBaseRuleTarget::Active,
+        );
+        let missing_home = RouterExtra {
+            geobase_rule_providers: vec![provider.clone()],
+            ..RouterExtra::default()
+        };
+        let error = build_router_with_extra(&missing_home, &[], true, &MihomoFeatures::default())
+            .expect_err("managed provider without home must fail");
+        assert!(error.contains("Mihomo home is required"));
+
+        let outside_home = RouterExtra {
+            geobase_rule_providers: vec![provider],
+            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
+            ..RouterExtra::default()
+        };
+        let error = build_router_with_extra(&outside_home, &[], true, &MihomoFeatures::default())
+            .expect_err("managed provider outside home must fail");
+        assert!(error.contains("outside Mihomo home"));
+    }
+
+    #[test]
+    fn duplicate_effective_provider_paths_are_rejected() {
+        let extra = RouterExtra {
+            geobase_rule_providers: vec![
+                managed_provider(
+                    "geobase-active",
+                    "/opt/etc/hincyray/geobases/shared.txt",
+                    GeoBaseRuleBehavior::Domain,
+                    GeoBaseRuleTarget::Active,
+                ),
+                managed_provider(
+                    "geobase-direct",
+                    "/opt/etc/hincyray/geobases/shared.txt",
+                    GeoBaseRuleBehavior::Domain,
+                    GeoBaseRuleTarget::Direct,
+                ),
+            ],
+            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
+            ..RouterExtra::default()
+        };
+        let error = build_router_with_extra(&extra, &[], true, &MihomoFeatures::default())
+            .expect_err("duplicate managed paths must fail");
+        assert!(error.contains("duplicate effective rule provider path"));
+    }
+
+    #[test]
+    fn managed_provider_path_cannot_collide_with_user_or_ru_bypass_path() {
+        let extra = RouterExtra {
+            geobase_rule_providers: vec![managed_provider(
+                "geobase-active",
+                "/opt/etc/hincyray/rule-providers/ru-bypass.list",
+                GeoBaseRuleBehavior::Domain,
+                GeoBaseRuleTarget::Active,
+            )],
+            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
+            rkn_bypass_enabled: true,
+            ..RouterExtra::default()
+        };
+        let error = build_router_with_extra(&extra, &[], true, &MihomoFeatures::default())
+            .expect_err("RKN path collision must fail");
+        assert!(error.contains("duplicate effective rule provider path"));
+
+        let extra = RouterExtra {
+            geobase_rule_providers: vec![managed_provider(
+                "geobase-active",
+                "/opt/etc/hincyray/geobases/shared.txt",
+                GeoBaseRuleBehavior::Domain,
+                GeoBaseRuleTarget::Active,
+            )],
+            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
+            ..RouterExtra::default()
+        };
+        let features = MihomoFeatures {
+            rule_providers: vec![RuleProviderConfig {
+                name: "user-file".to_owned(),
+                provider_type: "file".to_owned(),
+                path: Some("./geobases/../geobases/shared.txt".to_owned()),
+                ..RuleProviderConfig::default()
+            }],
+            ..MihomoFeatures::default()
+        };
+        let error = build_router_with_extra(&extra, &[], true, &features)
+            .expect_err("user file path collision must fail");
+        assert!(error.contains("duplicate effective rule provider path"));
+    }
+
+    #[test]
+    fn empty_geobase_providers_emit_nothing() {
+        let yaml = build_router_with_extra(
+            &RouterExtra::default(),
+            &[],
+            true,
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        assert!(config.get("rule-providers").is_none());
+        assert!(
+            !router_rules(&yaml)
+                .iter()
+                .any(|rule| rule.starts_with("RULE-SET,"))
+        );
     }
 
     #[test]

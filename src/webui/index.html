@@ -671,6 +671,38 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .feature-card{padding:16px}
 .feature-card h4{margin:0 0 12px;font-size:var(--fs-h3);font-weight:600}
 .feature-card .field{margin-bottom:12px;display:flex;flex-direction:column;gap:6px}
+.experimental-card{margin:16px 0;border:1px solid color-mix(in srgb,var(--warning) 42%,var(--border));background:linear-gradient(135deg,color-mix(in srgb,var(--warning) 7%,var(--surface)),var(--surface))}
+.experimental-card>summary{display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;list-style:none;font-weight:600;color:var(--warning);user-select:none}
+.experimental-card>summary::-webkit-details-marker{display:none}
+.experimental-card>summary::before{content:'›';font-size:20px;line-height:1;transition:transform .15s ease}
+.experimental-card[open]>summary::before{transform:rotate(90deg)}
+.experimental-body{padding:0 16px 16px}
+.experimental-body>.feature-card{border-top:1px solid var(--border);padding:16px 0}
+.geobase-source-fields{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(180px,1fr) minmax(240px,2fr);gap:var(--gap-sm);align-items:end}
+.geobase-runtime{display:none;margin:12px 0;padding:10px 12px;border-left:3px solid var(--accent);background:var(--accent-soft)}
+.geobase-runtime.error{border-left-color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,var(--surface))}
+.geobase-static-editor{display:none;margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:var(--radius)}
+.geobase-static-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--gap-sm)}
+.geobase-rule{min-width:250px}
+.geobase-rule-title{font-weight:600;line-height:1.35}
+.geobase-rule-count{margin-top:4px;font-family:var(--font-mono)}
+.geobase-rule-static{margin-top:3px;color:var(--muted);font-size:10px}
+.geobase-diff{margin-top:5px;color:var(--warning);font-size:10px}
+.geobase-apply-warning{display:none;margin-top:12px;padding:10px 12px;color:var(--warning);background:color-mix(in srgb,var(--warning) 10%,var(--surface));border-left:3px solid var(--warning)}
+.managed-routing-rule{background:color-mix(in srgb,var(--accent) 6%,var(--surface));box-shadow:inset 3px 0 0 color-mix(in srgb,var(--accent) 55%,transparent)}
+.managed-routing-warning td{color:var(--warning);background:color-mix(in srgb,var(--warning) 10%,var(--surface))}
+.geobase-table-wrap{overflow-x:auto;margin-top:12px}
+@media(max-width:760px){
+  .geobase-source-fields,.geobase-static-grid{grid-template-columns:1fr}
+  .geobase-table-wrap{overflow:visible}
+  #geobaseTable,#geobaseTable tbody,#geobaseTable tr,#geobaseTable td{display:block;width:100%}
+  #geobaseTable thead{display:none}
+  #geobaseTable tr{margin-bottom:10px;padding:10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface)}
+  #geobaseTable td{display:grid;grid-template-columns:minmax(110px,40%) 1fr;gap:8px;align-items:center;padding:6px 0!important;border:0}
+  #geobaseTable td::before{content:attr(data-label);color:var(--muted);font-size:var(--fs-sm)}
+  #geobaseTable td.geobase-actions{display:flex;justify-content:flex-end;flex-wrap:wrap}
+  #geobaseTable td.geobase-actions::before{display:none}
+}
 </style>
 </head>
 <body>
@@ -707,6 +739,23 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
     <div id="resultBody"></div>
     <div class="modal-actions" style="margin-top:16px">
       <button class="btn btn-accent" onclick="closeResultModal()">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<div id="geobaseEditModal" class="modal-backdrop" style="display:none">
+  <div class="modal modal-wide">
+    <h3 id="geobaseEditTitle">Edit IP/CIDR</h3>
+    <p class="hint">Сети можно назначить только одной цели. Доступные сети взяты из текущего источника базы.</p>
+    <div class="geobase-static-grid">
+      <div class="form-group"><label>Доступные сети источника</label><textarea id="geobaseEditAvailable" class="mono" rows="12" readonly></textarea></div>
+      <div class="form-group"><label>Static DIRECT</label><textarea id="geobaseEditDirect" class="mono" rows="12"></textarea></div>
+      <div class="form-group"><label>Static ACTIVE</label><textarea id="geobaseEditActive" class="mono" rows="12"></textarea></div>
+    </div>
+    <div id="geobaseEditDiff" class="geobase-diff"></div>
+    <div class="modal-actions" style="margin-top:16px">
+      <button class="btn" onclick="closeGeoBaseEditor()">Отмена</button>
+      <button class="btn btn-accent" id="geobaseEditSave" onclick="saveGeoBaseStatic()">Сохранить</button>
     </div>
   </div>
 </div>
@@ -1062,15 +1111,6 @@ https://sub.example.com/…"></textarea>
             <button class="btn btn-danger" onclick="resetRoutingDefaults()">↺ Штатные настройки</button>
           </div>
           <div class="feature-card" style="margin-bottom:16px">
-            <h4>RKN Bypass — обход блокировок РКН</h4>
-            <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Включить обход блокировок РКН (список itworksig/rublacklist)</label><label class="toggle"><input type="checkbox" id="rRknBypass" onchange="toggleRknBypassDetails()"><span class="slider"></span></label></div>
-            <div class="form-row" id="rknBypassDetails" style="display:none">
-              <div class="form-group" style="flex:2"><label>URL списка</label><input id="rRknBypassUrl" class="mono" style="font-size:var(--fs-sm)"></div>
-              <div class="form-group" style="flex:1"><label>Интервал обновления (сек)</label><input id="rRknBypassInterval" type="number" value="86400" class="mono"></div>
-            </div>
-            <div style="font-size:var(--fs-sm);color:var(--muted);margin-top:8px" id="rknBypassHint">Сайты, заблокированные в РФ, идут через прокси. Российские и китайские IP — напрямую. Список обновляется автоматически.</div>
-          </div>
-          <div class="feature-card" style="margin-bottom:16px">
             <h4>Геобаза</h4>
             <div class="form-row">
               <div class="form-group"><label>Поставщик</label><select id="geoProvider"><option value="metacubex-lite">MetaCubeX meta-rules-dat</option><option value="loyalsoldier">Loyalsoldier v2ray-rules-dat</option><option value="v2fly">v2fly domain-list-community</option></select></div>
@@ -1078,6 +1118,75 @@ https://sub.example.com/…"></textarea>
               <div class="form-group" style="display:flex;align-items:flex-end"><button class="btn btn-accent" onclick="downloadGeo()">↻ Загрузить/обновить</button></div>
             </div>
           </div>
+          <details class="feature-card experimental-card" id="experimentalFeatures">
+            <summary><span>Экспериментальные функции</span></summary>
+            <div class="experimental-body">
+              <div class="feature-card">
+                <h4>RKN Bypass — обход блокировок РКН</h4>
+                <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Включить обход блокировок РКН (список itworksig/rublacklist)</label><label class="toggle"><input type="checkbox" id="rRknBypass" onchange="toggleRknBypassDetails()"><span class="slider"></span></label></div>
+                <div class="form-row" id="rknBypassDetails" style="display:none">
+                  <div class="form-group" style="flex:2"><label>URL списка</label><input id="rRknBypassUrl" class="mono" style="font-size:var(--fs-sm)"></div>
+                  <div class="form-group" style="flex:1"><label>Интервал обновления (сек)</label><input id="rRknBypassInterval" type="number" value="86400" class="mono"></div>
+                </div>
+                <div style="font-size:var(--fs-sm);color:var(--muted);margin-top:8px" id="rknBypassHint">Сайты, заблокированные в РФ, идут через прокси. Российские и китайские IP — напрямую. Список обновляется автоматически.</div>
+              </div>
+              <div class="feature-card">
+                <h4>RU Direct — русские сайты напрямую</h4>
+                <div class="form-row">
+                  <div class="form-group"><label>Режим</label><select id="rRuDirectMode"><option value="off">Выключено</option><option value="tld">.ru и .рф (TLD)</option><option value="geosite">Все русские сайты (GEOSITE)</option></select></div>
+                </div>
+                <div class="form-row">
+                  <div class="form-group" style="flex:1"><label>Исключения (через VPN, по одному на строку)</label><textarea id="rRuDirectExceptions" class="mono" rows="3" placeholder="2ip.ru&#10;blocked-site.ru"></textarea></div>
+                </div>
+                <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить</button>
+              </div>
+              <div class="feature-card">
+                <h4>Авто-обход заблокированных сайтов</h4>
+                <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Пассивно учиться из DIRECT-соединений</label><label class="toggle"><input type="checkbox" id="rAutoVpnLearning"><span class="slider"></span></label></div>
+                <div style="font-size:var(--fs-sm);color:var(--muted);margin:8px 0">Домен добавляется только если прямой доступ не работает, а через VPN работает. Эти правила имеют приоритет выше RKN/RU Direct.</div>
+                <div class="form-row">
+                  <div class="form-group" style="flex:1"><label>Авто-исключения VPN (по одному на строку)</label><textarea id="rAutoVpnExceptions" class="mono" rows="4" placeholder="auto-learned.example"></textarea></div>
+                </div>
+                <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить</button>
+              </div>
+              <div class="feature-card" id="geobaseConstructor">
+                <h4>GeoBase Constructor</h4>
+                <p style="font-size:var(--fs-sm);color:var(--muted);margin:0 0 12px">Домены анализируются автоматически. Для IP/CIDR можно назначить Static DIRECT или Static ACTIVE. Неназначенные сети игнорируются.</p>
+                <div class="geobase-source-fields">
+                  <div class="form-group"><label>Источник</label><select id="geobaseSourceKind" onchange="updateGeoBaseSourceMode()"><option value="url">URL</option><option value="upload">Файл</option><option value="manual">Вручную</option></select></div>
+                  <div class="form-group"><label>Имя базы</label><input id="geobaseName" placeholder="Мой белый список"></div>
+                  <div class="form-group" id="geobaseUrlField"><label>URL источника</label><input id="geobaseSourceUrl" class="mono" placeholder="https://example.com/list.txt"></div>
+                  <div class="form-group" id="geobaseFileField" style="display:none"><label>UTF-8 файл</label><input id="geobaseFile" type="file" accept="text/plain,.txt,.list" onchange="handleGeoBaseFile(event)"><span class="hint" id="geobaseFileStatus">Файл не выбран</span></div>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0">
+                  <button class="btn btn-sm" id="geobaseOfficialPreset" onclick="useOfficialGeoBasePreset()">Официальный whitelist preset</button>
+                </div>
+                <div class="form-group" id="geobaseContentField" style="display:none"><label>Домены / IP / CIDR, по одному на строку</label><textarea id="geobaseContent" class="mono" rows="7" placeholder="example.ru&#10;203.0.113.0/24" oninput="updateGeoBaseStaticEditor(this.value)"></textarea><span class="hint">Домены будут проверены автоматически.</span></div>
+                <div class="geobase-static-editor" id="geobaseStaticEditor">
+                  <div style="font-weight:600;margin-bottom:4px">Статические цели IP/CIDR</div>
+                  <div class="hint" style="margin-bottom:10px">Перенесите нужные сети из неназначенных в DIRECT или ACTIVE. Неназначенные сети игнорируются.</div>
+                  <div class="geobase-static-grid">
+                    <div class="form-group"><label>Не назначено</label><textarea id="geobaseStaticUnassigned" class="mono" rows="5" readonly></textarea></div>
+                    <div class="form-group"><label>Static DIRECT</label><textarea id="geobaseStaticDirect" class="mono" rows="5" oninput="refreshGeoBaseUnassigned()"></textarea></div>
+                    <div class="form-group"><label>Static ACTIVE</label><textarea id="geobaseStaticActive" class="mono" rows="5" oninput="refreshGeoBaseUnassigned()"></textarea></div>
+                  </div>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+                  <button class="btn btn-accent" id="geobaseAnalyze" onclick="analyzeGeoBase()">Анализировать</button>
+                  <button class="btn btn-danger" id="geobaseCancel" style="display:none" onclick="cancelGeoBase()">Отменить анализ</button>
+                </div>
+                <div class="geobase-runtime" id="geobaseRuntime"><div id="geobaseRuntimeText"></div><div class="progress"><div class="progress-fill accent" id="geobaseProgress" style="width:0%"></div></div><div id="geobaseRuntimeError" style="display:none;color:var(--danger);margin-top:6px"></div></div>
+                <div class="geobase-table-wrap">
+                  <table class="tbl tbl-compact" id="geobaseTable">
+                    <thead><tr><th>Имя</th><th>Источник</th><th>Direct</th><th>Active</th><th>Не определено</th><th>Сети источника</th><th>Ревизия</th><th>Вкл</th><th></th></tr></thead>
+                    <tbody id="geobaseList"><tr><td colspan="9" style="color:var(--muted)">Нет баз</td></tr></tbody>
+                  </table>
+                </div>
+                <div class="geobase-apply-warning" id="geobaseApplyWarning">GeoBase изменена. Примените маршрутизацию, чтобы изменения вступили в силу.</div>
+                <div style="margin-top:12px"><button class="btn" id="geobaseApplyRouting" onclick="applyGeoBaseRouting()">Применить маршрутизацию</button></div>
+              </div>
+            </div>
+          </details>
           <h3 style="margin:20px 0 8px;font-size:var(--fs-h3)">Быстрые шаблоны</h3>
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;align-items:center">
             <span class="chip" onclick="applyPresetWithTarget('all-vpn')">Без пресетов / Всё VPN</span>
@@ -1087,25 +1196,6 @@ https://sub.example.com/…"></textarea>
             <span class="chip" onclick="applyPresetWithTarget('block-social')">Block Social</span>
             <span class="chip" onclick="applyPresetWithTarget('ru-direct-ad-block')">RU + AdBlock</span>
             <button class="btn btn-sm" onclick="apiAction('POST','/api/routing/catalog/refresh',null,t('Каталог обновляется'))">↻ Обновить каталог</button>
-          </div>
-          <div class="feature-card" style="margin-bottom:16px">
-            <h4>RU Direct — русские сайты напрямую</h4>
-            <div class="form-row">
-              <div class="form-group"><label>Режим</label><select id="rRuDirectMode"><option value="off">Выключено</option><option value="tld">.ru и .рф (TLD)</option><option value="geosite">Все русские сайты (GEOSITE)</option></select></div>
-            </div>
-            <div class="form-row">
-              <div class="form-group" style="flex:1"><label>Исключения (через VPN, по одному на строку)</label><textarea id="rRuDirectExceptions" class="mono" rows="3" placeholder="2ip.ru&#10;blocked-site.ru"></textarea></div>
-            </div>
-            <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить</button>
-          </div>
-          <div class="feature-card" style="margin-bottom:16px">
-            <h4>Авто-обход заблокированных сайтов</h4>
-            <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Пассивно учиться из DIRECT-соединений</label><label class="toggle"><input type="checkbox" id="rAutoVpnLearning"><span class="slider"></span></label></div>
-            <div style="font-size:var(--fs-sm);color:var(--muted);margin:8px 0">Домен добавляется только если прямой доступ не работает, а через VPN работает. Эти правила имеют приоритет выше RKN/RU Direct.</div>
-            <div class="form-row">
-              <div class="form-group" style="flex:1"><label>Авто-исключения VPN (по одному на строку)</label><textarea id="rAutoVpnExceptions" class="mono" rows="4" placeholder="auto-learned.example"></textarea></div>
-            </div>
-            <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить</button>
           </div>
           <h3 style="margin:20px 0 8px;font-size:var(--fs-h3)">Правила маршрутизации</h3>
           <div class="feature-card" style="margin-bottom:16px">
@@ -1505,10 +1595,6 @@ OR,((DOMAIN-SUFFIX,google.com),(DOMAIN-KEYword,google)),PROXY"></textarea>
         </div>
         <div class="section-body">
           <h3 style="font-size:var(--fs-h3);margin:0 0 8px">Проверка разблокировки</h3>
-          <div class="feature-card" style="margin-bottom:12px">
-            <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Авто-обход: учиться из DIRECT-соединений</label><label class="toggle"><input type="checkbox" id="rAutoVpnLearningDiag" onchange="setAutoVpnLearning(this.checked)"><span class="slider"></span></label></div>
-            <div style="font-size:var(--fs-sm);color:var(--muted);margin-top:8px">Если сайт напрямую не открывается, но открывается через VPN, HincyRay добавит домен в высокоприоритетные VPN-исключения.</div>
-          </div>
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
             <span class="chip" data-svc="YouTube" onclick="checkUnlock('YouTube')">YouTube</span>
             <span class="chip" data-svc="Netflix" onclick="checkUnlock('Netflix')">Netflix</span>
@@ -1983,6 +2069,7 @@ const MOCK = {
     { enabled:true, name:"Ad Block", target:"reject", domains:[], ips:[], services:["ad-service"], ports:[], network:"" },
     { enabled:false, name:"YouTube via proxy", target:"active", domains:["youtube.com","googlevideo.com"], ips:[], services:["youtube"], ports:[], network:"tcp" },
   ],
+  managed_routing_rules: [],
   subscriptions: [
     { url:"https://sub.example.com/link1", profile_count:20, last_loaded_unix:1719900000, last_error:null },
     { url:"https://sub.example.com/link2", profile_count:22, last_loaded_unix:1719800000, last_error:"timeout" },
@@ -2642,6 +2729,23 @@ const I18N = {
   'Всё через VPN':'All through VPN','Всё напрямую':'All direct','MATCH цель изменена':'MATCH target changed',
   'только эти':'only these','кроме этих':'except these','Режим портов':'Port mode',
   'Геобаза':'Geo database','Загрузка геобазы…':'Downloading geo database…','Геобаза обновлена':'Geo database updated',
+  'Экспериментальные функции':'Experimental features','GeoBase Constructor':'GeoBase Constructor',
+  'Домены анализируются автоматически. Для IP/CIDR можно назначить Static DIRECT или Static ACTIVE. Неназначенные сети игнорируются.':'Domains are analyzed automatically. IP/CIDR can be assigned to Static DIRECT or Static ACTIVE. Unassigned networks are ignored.',
+  'Источник':'Source','URL источника':'Source URL','Имя базы':'Base name','Мой белый список':'My allowlist',
+  'Файл':'File','Вручную':'Manual','UTF-8 файл':'UTF-8 file','Файл не выбран':'No file selected',
+  'Официальный whitelist preset':'Official whitelist preset','Домены / IP / CIDR, по одному на строку':'Domains / IP / CIDR, one per line',
+  'Домены будут проверены автоматически.':'Domains will be checked automatically.','Статические цели IP/CIDR':'Static IP/CIDR targets',
+  'Перенесите нужные сети из неназначенных в DIRECT или ACTIVE. Неназначенные сети игнорируются.':'Move required networks from unassigned to DIRECT or ACTIVE. Unassigned networks are ignored.','Не назначено':'Unassigned',
+  'Анализировать':'Analyze','Отменить анализ':'Cancel analysis','Не определено':'Unresolved','Сети источника':'Source networks','Ревизия':'Revision',
+  'Применить маршрутизацию':'Apply routing','Нет баз':'No bases','Укажите имя базы':'Enter a base name','Укажите URL источника':'Enter a source URL',
+  'Выберите UTF-8 файл':'Choose a UTF-8 file','Добавьте домены, IP или CIDR':'Add domains, IP, or CIDR',
+  'GeoBase отправлена на анализ':'GeoBase submitted for analysis','Анализ GeoBase отменён':'GeoBase analysis cancelled',
+  'GeoBase синхронизируется':'GeoBase syncing','GeoBase удалена':'GeoBase deleted','Статус GeoBase изменён':'GeoBase status changed',
+  'Маршрутизация GeoBase применена':'GeoBase routing applied','Ожидание статуса…':'Waiting for status…','Анализ выполняется':'Analysis running',
+  'Запрошена отмена анализа; ожидание завершения…':'Cancellation requested; waiting for completion…','GeoBase изменена. Примените маршрутизацию, чтобы изменения вступили в силу.':'GeoBase changed. Apply routing for the changes to take effect.',
+  'Удалить GeoBase':'Delete GeoBase','Файл превышает лимит 8 МиБ':'File exceeds the 8 MiB limit','Одна сеть не может быть одновременно DIRECT и ACTIVE':'A network cannot be both DIRECT and ACTIVE',
+  'loading':'Loading','analyzing':'Analyzing','saving':'Saving','complete':'Complete','cancelled':'Cancelled','error':'Error','idle':'Idle','url':'URL','upload':'File','manual':'Manual',
+  'Синхронизировать':'Sync','Применить маршруты':'Apply routes','Загружен UTF-8 файл':'UTF-8 file loaded',
   'Нажми для редактирования':'Click to edit','только':'only','кроме':'except',
  };
 
@@ -3394,6 +3498,40 @@ function saveRoutingRulesToBackend(afterFn) {
   });
 }
 
+function openManagedGeoBaseRule(button) {
+  navTo('routing');
+  const details = document.getElementById('experimentalFeatures');
+  if (!details) return;
+  details.open = true;
+  const geobaseId = button?.dataset?.geobaseId || '';
+  details.scrollIntoView({behavior:'smooth', block:'start'});
+  if (geobaseId) showToast('info', `GeoBase: ${geobaseId}`);
+}
+
+function renderManagedRoutingRules(rules, requiresApply) {
+  const warning = requiresApply ? `<tr class="managed-routing-warning"><td colspan="7">GeoBase изменена. Примените маршрутизацию; ниже показаны фактически применённые правила.</td></tr>` : '';
+  const rows = (rules || []).map(r => {
+    const name = htmlEscape(r.name || 'GeoBase');
+    const geobaseId = attrEscape(r.geobase_id || '');
+    const domains = Number(r.domain_count) || 0;
+    const networks = Number(r.network_count) || 0;
+    const target = r.target === 'direct' ? 'direct' : 'active';
+    const outbound = target === 'direct' ? 'DIRECT' : 'proxy-active';
+    const targetBadge = target === 'direct' ? 'success' : 'info';
+    const state = r.applied ? (r.enabled ? 'применено' : 'отключено') : 'не применено';
+    return `<tr class="managed-routing-rule" data-managed-rule-id="${attrEscape(r.id || '')}">
+      <td><span class="badge">🔒 managed</span></td>
+      <td><strong>${name}</strong><div style="font-size:10px;color:var(--muted)">${htmlEscape(state)}</div></td>
+      <td class="mono" style="font-size:12px">${domains} доменов · ${networks} IP/CIDR</td>
+      <td><span class="badge badge-${targetBadge}">${target} / ${outbound}</span></td>
+      <td>—</td>
+      <td>—</td>
+      <td><button class="btn btn-sm" data-geobase-id="${geobaseId}" onclick="openManagedGeoBaseRule(this)">GeoBase ↗</button></td>
+    </tr>`;
+  }).join('');
+  return warning + rows;
+}
+
 function renderRoutingRules(data) {
   const body = document.getElementById('routingRulesBody');
   if(!body) return;
@@ -3458,6 +3596,7 @@ function renderRoutingRules(data) {
       <button class="btn-icon btn-sm" onclick="deleteRoutingRule(${i})" title="${t('Удалить')}">✕</button>
     </td>
   </tr>`}).join('');
+  html += renderManagedRoutingRules(MOCK.managed_routing_rules, MOCK.geobase_requires_apply === true);
   body.innerHTML = html;
 }
 
@@ -3661,6 +3800,353 @@ function loadGeoStatus() {
     el.textContent = parts.join(' | ') || 'не найдено';
   }).catch(() => {});
 }
+
+const GEOBASE_OFFICIAL_URL = 'https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/whitelist.txt';
+const GEOBASE_MAX_FILE_BYTES = 8 * 1024 * 1024;
+let geobaseFileContent = '';
+let geobaseSourceNetworks = [];
+let geobaseFileReader = null;
+let geobaseFileGeneration = 0;
+let geobasePollTimer = null;
+let geobaseJobExpected = false;
+let geobaseRuntimeRunning = false;
+let geobasePollFailures = 0;
+let geobaseLastError = '';
+let geobaseEditState = null;
+
+function updateGeoBaseSourceMode() {
+  const kind = document.getElementById('geobaseSourceKind')?.value || 'url';
+  const urlField = document.getElementById('geobaseUrlField');
+  const fileField = document.getElementById('geobaseFileField');
+  const contentField = document.getElementById('geobaseContentField');
+  if (urlField) urlField.style.display = kind === 'url' ? '' : 'none';
+  if (fileField) fileField.style.display = kind === 'upload' ? '' : 'none';
+  if (contentField) contentField.style.display = kind === 'manual' ? '' : 'none';
+  const staticEditor = document.getElementById('geobaseStaticEditor');
+  if (staticEditor) staticEditor.style.display = kind === 'url' ? 'none' : 'block';
+  updateGeoBaseStaticEditor(kind === 'manual' ? (document.getElementById('geobaseContent')?.value || '') : geobaseFileContent);
+  refreshCustomSelects();
+}
+
+function isGeoBaseIpv4(value) {
+  const [address, prefix] = value.split('/');
+  if (value.split('/').length > 2 || (prefix !== undefined && (!/^\d+$/.test(prefix) || Number(prefix) > 32))) return false;
+  const parts = address.split('.');
+  return parts.length === 4 && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+function isGeoBaseIpv6(value) {
+  const [address, prefix] = value.split('/');
+  if (value.split('/').length > 2 || (prefix !== undefined && (!/^\d+$/.test(prefix) || Number(prefix) > 128))) return false;
+  if (!address.includes(':') || !/^[0-9a-f:.]+$/i.test(address) || address.includes(':::')) return false;
+  const halves = address.split('::');
+  if (halves.length > 2) return false;
+  const groups = halves.flatMap(half => half ? half.split(':') : []);
+  let count = 0;
+  for (const group of groups) {
+    if (group.includes('.')) {
+      if (group !== groups[groups.length - 1] || !isGeoBaseIpv4(group)) return false;
+      count += 2;
+    } else {
+      if (!/^[0-9a-f]{1,4}$/i.test(group)) return false;
+      count += 1;
+    }
+  }
+  return halves.length === 2 ? count < 8 : count === 8;
+}
+function geoBaseNetworkToken(line) {
+  const clean = String(line || '').trim();
+  if (!clean || clean.startsWith('#')) return '';
+  const tokens = clean.split(',').map(token => token.trim());
+  let candidate = clean;
+  if (/^IP-CIDR6?$/i.test(tokens[0] || '')) candidate = tokens[1] || '';
+  else if (tokens.length > 1 || /\s/.test(clean)) return '';
+  return isGeoBaseIpv4(candidate) || isGeoBaseIpv6(candidate) ? candidate : '';
+}
+function geoBaseNetworkLines(content) {
+  return [...new Set(String(content || '').split(/\r?\n/).map(geoBaseNetworkToken).filter(Boolean))];
+}
+function geoBaseTextareaLines(id) {
+  return [...new Set((document.getElementById(id)?.value || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean))];
+}
+function updateGeoBaseStaticEditor(content) {
+  geobaseSourceNetworks = geoBaseNetworkLines(content);
+  refreshGeoBaseUnassigned();
+}
+function refreshGeoBaseUnassigned() {
+  const assigned = new Set([...geoBaseTextareaLines('geobaseStaticDirect'), ...geoBaseTextareaLines('geobaseStaticActive')]);
+  safeValue('geobaseStaticUnassigned', geobaseSourceNetworks.filter(network => !assigned.has(network)).join('\n'));
+}
+function geoBaseStaticEntries(directId = 'geobaseStaticDirect', activeId = 'geobaseStaticActive', available = geobaseSourceNetworks) {
+  const direct = geoBaseTextareaLines(directId);
+  const active = geoBaseTextareaLines(activeId);
+  const activeSet = new Set(active);
+  const availableSet = new Set(available);
+  const invalid = [...direct, ...active].find(network => geoBaseNetworkToken(network) !== network);
+  if (invalid) throw new Error(`${t('Некорректный IP/CIDR')}: ${invalid}`);
+  const unavailable = [...direct, ...active].find(network => !availableSet.has(network));
+  if (unavailable) throw new Error(`${t('Сеть отсутствует в источнике')}: ${unavailable}`);
+  if (direct.some(network => activeSet.has(network))) throw new Error(t('Одна сеть не может быть одновременно DIRECT и ACTIVE'));
+  return [...direct.map(network => ({network,target:'direct'})), ...active.map(network => ({network,target:'active'}))];
+}
+
+function handleGeoBaseFile(event) {
+  const input = event && event.target;
+  const file = input && input.files && input.files[0];
+  const generation = ++geobaseFileGeneration;
+  if (geobaseFileReader) geobaseFileReader.abort();
+  geobaseFileReader = null;
+  geobaseFileContent = '';
+  updateGeoBaseStaticEditor('');
+  safeSet('geobaseFileStatus', file ? t('Ожидание статуса…') : t('Файл не выбран'));
+  if (!file) return;
+  if (file.size > GEOBASE_MAX_FILE_BYTES) {
+    if (input) input.value = '';
+    safeSet('geobaseFileStatus', t('Файл не выбран'));
+    showToast('error', t('Файл превышает лимит 8 МиБ'));
+    return;
+  }
+  const reader = new FileReader();
+  geobaseFileReader = reader;
+  reader.onload = () => {
+    if (generation !== geobaseFileGeneration) return;
+    geobaseFileContent = typeof reader.result === 'string' ? reader.result : '';
+    geobaseFileReader = null;
+    updateGeoBaseStaticEditor(geobaseFileContent);
+    safeSet('geobaseFileStatus', `${t('Загружен UTF-8 файл')}: ${file.name}`);
+  };
+  reader.onerror = () => {
+    if (generation !== geobaseFileGeneration) return;
+    geobaseFileContent = '';
+    geobaseFileReader = null;
+    updateGeoBaseStaticEditor('');
+    safeSet('geobaseFileStatus', t('Файл не выбран'));
+    showToast('error', reader.error?.message || t('Ошибка'));
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+function resetGeoBaseFile() {
+  geobaseFileGeneration += 1;
+  if (geobaseFileReader) geobaseFileReader.abort();
+  geobaseFileReader = null;
+  geobaseFileContent = '';
+  updateGeoBaseStaticEditor('');
+  const input = document.getElementById('geobaseFile');
+  if (input) input.value = '';
+  safeSet('geobaseFileStatus', t('Файл не выбран'));
+}
+
+function useOfficialGeoBasePreset() {
+  safeValue('geobaseSourceKind', 'url');
+  safeValue('geobaseName', 'Russia mobile internet whitelist');
+  safeValue('geobaseSourceUrl', GEOBASE_OFFICIAL_URL);
+  updateGeoBaseSourceMode();
+}
+
+function analyzeGeoBase() {
+  const kind = document.getElementById('geobaseSourceKind')?.value || 'url';
+  const name = document.getElementById('geobaseName')?.value?.trim() || '';
+  const file = document.getElementById('geobaseFile')?.files?.[0];
+  let value = '';
+  let content = '';
+  if (!name) return showToast('error', t('Укажите имя базы'));
+  if (kind === 'url') {
+    value = document.getElementById('geobaseSourceUrl')?.value?.trim() || '';
+    if (!value) return showToast('error', t('Укажите URL источника'));
+  } else if (kind === 'upload') {
+    value = file?.name || '';
+    content = geobaseFileContent;
+    if (!value || !content) return showToast('error', t('Выберите UTF-8 файл'));
+  } else {
+    value = 'manual';
+    content = document.getElementById('geobaseContent')?.value || '';
+    if (!content.trim()) return showToast('error', t('Добавьте домены, IP или CIDR'));
+  }
+  let static_entries = [];
+  if (kind !== 'url') {
+    try { static_entries = geoBaseStaticEntries(); }
+    catch (error) { return showToast('error', error.message); }
+  }
+  const payload = {name,source:{kind,value},static_entries};
+  if (kind !== 'url') payload.content = content;
+  const request = api('POST','/api/geobases/analyze',payload);
+  request.then(() => {
+    geobaseJobExpected = true;
+    showToast('success', t('GeoBase отправлена на анализ'));
+    loadGeoBases();
+  }).catch(() => {}).finally(() => {
+    if (kind === 'upload') resetGeoBaseFile();
+  });
+}
+
+function loadGeoBases() {
+  return api('GET','/api/geobases',undefined,true).then(data => {
+    renderGeoBases(data);
+    updateGeoBaseRuntime(data.runtime || {});
+    updateGeoBaseApplyState(data.requires_apply === true);
+    geobasePollFailures = 0;
+  }).catch(() => {
+    geobasePollFailures = Math.min(geobasePollFailures + 1, 5);
+  }).finally(() => {
+    if (geobaseJobExpected || geobaseRuntimeRunning) scheduleGeoBasePoll();
+  });
+}
+
+function updateGeoBaseRuntime(runtime) {
+  const running = runtime.running === true;
+  const phase = String(runtime.phase || 'idle');
+  const terminal = ['complete','cancelled','error'].includes(phase);
+  geobaseRuntimeRunning = running;
+  if (running) geobaseJobExpected = true;
+  if (!running && terminal) geobaseJobExpected = false;
+  const box = document.getElementById('geobaseRuntime');
+  const cancel = document.getElementById('geobaseCancel');
+  const analyze = document.getElementById('geobaseAnalyze');
+  if (box) {
+    box.style.display = (running || terminal) ? 'block' : 'none';
+    box.classList.toggle('error', phase === 'error');
+  }
+  if (cancel) cancel.style.display = running ? '' : 'none';
+  if (analyze) analyze.disabled = running;
+  const completed = Number(runtime.completed || 0);
+  const total = Number(runtime.total || 0);
+  const progress = total > 0 ? Math.max(0, Math.min(100, completed * 100 / total)) : (phase === 'complete' ? 100 : 0);
+  const diff = geoBaseDiffSummary(runtime.sync_diff || runtime.diff || runtime);
+  safeSet('geobaseRuntimeText', `${t(phase)} · ${completed}/${total}${diff ? ` · ${diff}` : ''}`);
+  const bar = document.getElementById('geobaseProgress');
+  if (bar) bar.style.width = progress + '%';
+  const runtimeError = runtime.error || '';
+  safeSet('geobaseRuntimeError', runtimeError);
+  const errorBox = document.getElementById('geobaseRuntimeError');
+  if (errorBox) errorBox.style.display = runtimeError ? 'block' : 'none';
+  if (runtimeError && runtimeError !== geobaseLastError) showToast('error', runtimeError);
+  geobaseLastError = runtimeError;
+  if (!running && terminal && geobasePollTimer) {
+    clearTimeout(geobasePollTimer);
+    geobasePollTimer = null;
+  }
+}
+
+function scheduleGeoBasePoll() {
+  if (geobasePollTimer) return;
+  const delay = Math.min(15000, 2000 * (2 ** geobasePollFailures));
+  geobasePollTimer = setTimeout(() => {
+    geobasePollTimer = null;
+    loadGeoBases();
+  }, delay);
+}
+
+function renderGeoBases(data) {
+  const body = document.getElementById('geobaseList');
+  if (!body) return;
+  const bases = Array.isArray(data.manifest?.bases) ? data.manifest.bases : [];
+  body.innerHTML = bases.map(base => {
+    const counts = base.counts || {};
+    const source = base.source || {};
+    const syncDisabled = source.kind !== 'url' ? 'disabled' : '';
+    const name = base.name || base.id || '—';
+    const activeStatic = Number(counts.static_active || 0);
+    const directStatic = Number(counts.static_direct || 0);
+    const activeTotal = Number(counts.active || 0) + activeStatic;
+    const directTotal = Number(counts.direct || 0) + directStatic;
+    const diff = geoBaseDiffSummary(base.sync_diff || base.last_sync_diff || base.diff);
+    return `<tr data-geobase-id="${attrEscape(base.id || '')}" data-geobase-name="${attrEscape(base.name || base.id || '')}">
+      <td data-label="${attrEscape(t('Имя базы'))}">${htmlEscape(name)}${diff ? `<div class="geobase-diff">${htmlEscape(diff)}</div>` : ''}</td>
+      <td data-label="${attrEscape(t('Источник'))}"><span class="badge badge-info">${htmlEscape(t(source.kind || '—'))}</span><div class="mono" style="font-size:10px;color:var(--muted);max-width:260px;overflow:hidden;text-overflow:ellipsis" title="${attrEscape(source.value || '')}">${htmlEscape(source.value || '—')}</div></td>
+      <td data-label="${attrEscape(t('Серый список'))}" class="geobase-rule"><div class="geobase-rule-title">${htmlEscape(name)} — серый список → ACTIVE (proxy-active)</div><div class="geobase-rule-count">${activeTotal}</div><div class="geobase-rule-static">IP/CIDR: ${activeStatic}</div></td>
+      <td data-label="${attrEscape(t('Белый список'))}" class="geobase-rule"><div class="geobase-rule-title">${htmlEscape(name)} — белый список → DIRECT</div><div class="geobase-rule-count">${directTotal}</div><div class="geobase-rule-static">IP/CIDR: ${directStatic}</div></td>
+      <td data-label="${attrEscape(t('Не определено'))}" class="mono">${counts.unresolved ?? 0}</td><td data-label="${attrEscape(t('Сети источника'))}" class="mono">${counts.source_networks ?? 0}</td><td data-label="${attrEscape(t('Ревизия'))}" class="mono">${base.revision ?? 0}</td>
+      <td data-label="${attrEscape(t('Вкл'))}"><label class="toggle"><input type="checkbox" data-geobase-action="enabled" ${base.enabled === true ? 'checked' : ''}><span class="slider"></span></label></td>
+      <td class="geobase-actions"><button class="btn btn-sm" data-geobase-action="edit-static">${t('Edit IP/CIDR')}</button> <button class="btn btn-sm" data-geobase-action="sync" ${syncDisabled}>${t('Синхронизировать')}</button> <button class="btn btn-sm btn-danger" data-geobase-action="delete">${t('Удалить')}</button></td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="9" style="color:var(--muted)">${t('Нет баз')}</td></tr>`;
+}
+
+function geoBaseDiffSummary(value) {
+  if (!value || typeof value !== 'object') return '';
+  const removedStatic = value.removed_static || value.removed_static_entries || value.static_removed || [];
+  const added = value.added_networks || value.added || [];
+  const removed = value.removed_networks || value.removed || [];
+  const count = entries => Array.isArray(entries) ? entries.length : Math.max(0, Number(entries) || 0);
+  const parts = [];
+  if (count(added)) parts.push(`+${count(added)} IP/CIDR`);
+  if (count(removed)) parts.push(`−${count(removed)} IP/CIDR`);
+  if (count(removedStatic)) parts.push(`${t('удалено static')}: ${count(removedStatic)}`);
+  return parts.join(' · ');
+}
+
+function openGeoBaseEditor(id, name) {
+  api('POST','/api/geobases/details',{id}).then(data => {
+    const base = data.base || data.record || {};
+    const entries = Array.isArray(data.lists?.static_entries) ? data.lists.static_entries : (Array.isArray(data.static_entries) ? data.static_entries : []);
+    const sourceNetworks = Array.isArray(data.source_networks) ? data.source_networks : (Array.isArray(data.networks) ? data.networks : []);
+    geobaseEditState = {id, expected_revision:data.revision ?? base.revision, source_networks:sourceNetworks};
+    safeSet('geobaseEditTitle', `${t('Edit IP/CIDR')}: ${name || base.name || id}`);
+    safeValue('geobaseEditAvailable', sourceNetworks.join('\n'));
+    safeValue('geobaseEditDirect', entries.filter(entry => entry.target === 'direct').map(entry => entry.network).join('\n'));
+    safeValue('geobaseEditActive', entries.filter(entry => entry.target === 'active').map(entry => entry.network).join('\n'));
+    safeSet('geobaseEditDiff', geoBaseDiffSummary(data.sync_diff || data.last_sync_diff || data.diff || data.runtime));
+    document.getElementById('geobaseEditModal').style.display = 'flex';
+  }).catch(() => {});
+}
+function closeGeoBaseEditor() {
+  const modal = document.getElementById('geobaseEditModal');
+  if (modal) modal.style.display = 'none';
+  geobaseEditState = null;
+}
+function saveGeoBaseStatic() {
+  if (!geobaseEditState) return;
+  let static_entries;
+  try { static_entries = geoBaseStaticEntries('geobaseEditDirect','geobaseEditActive',geobaseEditState.source_networks); }
+  catch (error) { return showToast('error', error.message); }
+  const payload = {id:geobaseEditState.id,expected_revision:geobaseEditState.expected_revision,static_entries};
+  api('POST','/api/geobases/static',payload).then(data => {
+    const diff = geoBaseDiffSummary(data.sync_diff || data.diff || data.runtime);
+    showToast('success', diff || t('Static IP/CIDR сохранены'));
+    closeGeoBaseEditor();
+    loadGeoBases();
+  }).catch(() => {});
+}
+
+function cancelGeoBase() {
+  geobaseJobExpected = true;
+  safeSet('geobaseRuntimeText', t('Запрошена отмена анализа; ожидание завершения…'));
+  api('POST','/api/geobases/cancel',{}).then(() => showToast('info', t('Запрошена отмена анализа; ожидание завершения…'))).catch(() => {}).finally(loadGeoBases);
+}
+function setGeoBaseEnabled(id, enabled) {
+  apiAction('POST','/api/geobases/enabled',{id,enabled},t('Статус GeoBase изменён'),loadGeoBases);
+}
+function syncGeoBase(id) {
+  apiAction('POST','/api/geobases/sync',{id},t('GeoBase синхронизируется'),loadGeoBases);
+}
+function deleteGeoBase(id, name) {
+  document.getElementById('confirmText').textContent = `${t('Удалить GeoBase')}: ${name}?`;
+  document.getElementById('confirmModal').style.display = 'flex';
+  _confirmCb = () => api('POST','/api/geobases/delete',{id}).then(() => { showToast('success',t('GeoBase удалена')); loadGeoBases(); });
+}
+function applyGeoBaseRouting() {
+  apiAction('POST','/api/routing/apply',null,t('Маршрутизация GeoBase применена'),loadGeoBases);
+}
+function updateGeoBaseApplyState(requiresApply) {
+  const warning = document.getElementById('geobaseApplyWarning');
+  const button = document.getElementById('geobaseApplyRouting');
+  if (warning) warning.style.display = requiresApply ? 'block' : 'none';
+  if (button) button.classList.toggle('btn-accent', requiresApply);
+}
+function handleGeoBaseListEvent(event) {
+  const control = event.target.closest('[data-geobase-action]');
+  const row = control?.closest('[data-geobase-id]');
+  if (!control || !row) return;
+  const id = row.dataset.geobaseId || '';
+  const action = control.dataset.geobaseAction;
+  if (action === 'enabled' && event.type === 'change') setGeoBaseEnabled(id, control.checked);
+  if (event.type !== 'click') return;
+  if (action === 'edit-static') openGeoBaseEditor(id, row.dataset.geobaseName || id);
+  if (action === 'sync') syncGeoBase(id);
+  if (action === 'delete') deleteGeoBase(id, row.dataset.geobaseName || id);
+}
+document.getElementById('geobaseList')?.addEventListener('click', handleGeoBaseListEvent);
+document.getElementById('geobaseList')?.addEventListener('change', handleGeoBaseListEvent);
 
 // ─── TYPED RULES / PROVIDERS / TUNNELS (Features) ────────────────────
 function addTypedRule() {
@@ -4404,10 +4890,10 @@ function saveRoutingSettings() {
     bypass_ports: (document.getElementById('rBypassPorts')?.value || '').split(/[,\n]/).map(s=>s.trim()).filter(Boolean),
     ru_direct_mode: document.getElementById('rRuDirectMode')?.value || 'off',
     ru_direct_exceptions: (document.getElementById('rRuDirectExceptions')?.value || '').split('\n').map(s=>s.trim()).filter(Boolean),
-    auto_vpn_learning_enabled: document.getElementById('rAutoVpnLearning')?.checked ?? document.getElementById('rAutoVpnLearningDiag')?.checked ?? true,
+    auto_vpn_learning_enabled: document.getElementById('rAutoVpnLearning')?.checked === true,
     auto_vpn_exceptions: (document.getElementById('rAutoVpnExceptions')?.value || '').split('\n').map(s=>s.trim()).filter(Boolean),
     match_target: sr.match_target || 'proxy',
-    rkn_bypass_enabled: document.getElementById('rRknBypass')?.checked ?? false,
+    rkn_bypass_enabled: document.getElementById('rRknBypass')?.checked === true,
     rkn_bypass_url: document.getElementById('rRknBypassUrl')?.value || '',
     rkn_bypass_interval: +(document.getElementById('rRknBypassInterval')?.value || 86400),
   };
@@ -4416,12 +4902,6 @@ function saveRoutingSettings() {
 
 function syncAutoVpnLearningToggles(enabled) {
   safeChecked('rAutoVpnLearning', enabled);
-  safeChecked('rAutoVpnLearningDiag', enabled);
-}
-
-function setAutoVpnLearning(enabled) {
-  syncAutoVpnLearningToggles(enabled);
-  apiAction('POST','/api/routing/settings',{auto_vpn_learning_enabled: !!enabled},t('Настройки маршрутизации сохранены'),loadRouting);
 }
 
 function resetRoutingDefaults() {
@@ -4724,9 +5204,9 @@ function updateRoutingForm(sr) {
   safeValue('rBypassPorts', Array.isArray(sr.bypass_ports) ? sr.bypass_ports.join(',') : (sr.bypass_ports || ''));
   safeValue('rRuDirectMode', sr.ru_direct_mode || 'off');
   safeValue('rRuDirectExceptions', Array.isArray(sr.ru_direct_exceptions) ? sr.ru_direct_exceptions.join('\n') : (sr.ru_direct_exceptions || ''));
-  syncAutoVpnLearningToggles(sr.auto_vpn_learning_enabled !== false);
+  syncAutoVpnLearningToggles(sr.auto_vpn_learning_enabled === true);
   safeValue('rAutoVpnExceptions', Array.isArray(sr.auto_vpn_exceptions) ? sr.auto_vpn_exceptions.join('\n') : (sr.auto_vpn_exceptions || ''));
-  safeChecked('rRknBypass', sr.rkn_bypass_enabled !== false);
+  safeChecked('rRknBypass', sr.rkn_bypass_enabled === true);
   safeValue('rRknBypassUrl', sr.rkn_bypass_url || '');
   safeValue('rRknBypassInterval', sr.rkn_bypass_interval || 86400);
   toggleRknBypassDetails();
@@ -4859,6 +5339,8 @@ function normalizeConnections(data) {
 function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>null), api('GET','/api/profiles').catch(()=>null)]).then(([stats,profiles]) => { MOCK.profiles = normalizeProfiles(stats, profiles); renderProfiles(MOCK.profiles); }); }
 function loadRouting() { return api('GET','/api/routing').then(d => {
   MOCK.routing_rules = d.rules || d.routing_rules || [];
+  MOCK.managed_routing_rules = d.managed_rules || [];
+  MOCK.geobase_requires_apply = d.geobase_requires_apply === true;
   MOCK.split_routing = d.settings || d.split_routing || MOCK.split_routing;
   renderRoutingRules(MOCK.routing_rules);
   renderRuleChips(d.catalog || []);
@@ -4974,7 +5456,7 @@ function loadAuthSettings() { return api('GET','/api/auth-settings').then(d => {
 function refreshDashboard() {
   refreshStatus();
   refreshSystem();
-  loadProfiles().catch(()=>{}); loadRouting().catch(()=>{}); loadSubscriptions().catch(()=>{}); loadBackups().catch(()=>{}); loadTrafficAndConnections(); loadDns().catch(()=>{}); loadHwid().catch(()=>{}); loadAuthSettings().catch(()=>{}); loadUpdateStatus().catch(()=>{}); pollBenchStatus(); loadGeoStatus().catch(()=>{});
+  loadProfiles().catch(()=>{}); loadRouting().catch(()=>{}); loadSubscriptions().catch(()=>{}); loadBackups().catch(()=>{}); loadTrafficAndConnections(); loadDns().catch(()=>{}); loadHwid().catch(()=>{}); loadAuthSettings().catch(()=>{}); loadUpdateStatus().catch(()=>{}); pollBenchStatus(); loadGeoStatus().catch(()=>{}); loadGeoBases();
 }
 
 function startAutoRefreshLoops() {
@@ -5026,6 +5508,7 @@ function init() {
   applyAcrylic();
 
   updatePortModeFields();
+  updateGeoBaseSourceMode();
 
   // Restore current section
   const savedSection = localStorage.getItem('hr_current_section');

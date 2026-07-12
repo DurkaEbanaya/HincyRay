@@ -10,6 +10,7 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::{Component, Path};
 use url::Url;
 
 use crate::profiles::{Profile, Protocol, decode_vmess_json};
@@ -88,6 +89,57 @@ fn default_query_strategy() -> String {
     "UseIPv4".to_owned()
 }
 
+/// Mihomo file-provider matching mode for a managed GeoBase rule set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GeoBaseRuleBehavior {
+    Domain,
+    Ipcidr,
+}
+
+/// Routing target for a managed GeoBase rule set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GeoBaseRuleTarget {
+    Active,
+    Direct,
+}
+
+/// A locally managed rule provider consumed by Mihomo router mode.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeoBaseRuleProvider {
+    pub enabled: bool,
+    pub name: String,
+    pub path: String,
+    pub behavior: GeoBaseRuleBehavior,
+    pub target: GeoBaseRuleTarget,
+}
+
+impl GeoBaseRuleProvider {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.is_empty() || self.name.len() > 64 {
+            return Err(format!(
+                "invalid managed rule provider name {:?}: expected 1-64 bytes",
+                self.name
+            ));
+        }
+
+        let path = Path::new(&self.path);
+        if !path.is_absolute()
+            || self.path.split('/').any(|part| part == "." || part == "..")
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        {
+            return Err(format!(
+                "invalid managed rule provider path {:?}: expected an absolute path without traversal components",
+                self.path
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Extra router-level config passed to `build_xray_router_config` for
 /// DNS anti-leak, port-based routing, and GeoIP/GeoSite asset paths.
 #[derive(Clone, Debug, Default)]
@@ -119,6 +171,10 @@ pub struct RouterExtra {
     /// v0.17: Update interval for the RKN bypass rule provider (seconds).
     /// Default: 86400 (24 hours).
     pub rkn_bypass_interval: u32,
+    /// Mihomo's home directory. Managed provider paths must resolve below it.
+    pub mihomo_home: Option<String>,
+    /// Local GeoBase providers are Mihomo-only; legacy Xray ignores them.
+    pub geobase_rule_providers: Vec<GeoBaseRuleProvider>,
 }
 
 /// A daemon-level Xray routing rule after HincyRay has resolved UI targets
@@ -154,6 +210,10 @@ pub fn build_xray_router_config(
     active_block_quic: bool,
     extra: &RouterExtra,
 ) -> Result<Value, String> {
+    // Xray has no Mihomo RULE-SET/file-provider equivalent. This legacy
+    // desktop builder intentionally leaves managed GeoBase providers unused.
+    let _ = &extra.geobase_rule_providers;
+
     let mut inbounds = vec![json!({
         "tag": "socks-in",
         "listen": listen_host,

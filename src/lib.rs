@@ -1,6 +1,7 @@
 // Shared modules: available in every build, including the lightweight
 // `hincyray` router daemon built with `--no-default-features`.
 pub mod benchmark;
+pub mod geobase;
 pub mod hincyray;
 pub mod mihomo_config;
 pub mod profiles;
