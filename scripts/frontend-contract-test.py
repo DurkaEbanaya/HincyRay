@@ -118,6 +118,21 @@ REQUIRED_MARKERS = [
     "function routingTargetPresentation(target)",
     "Сервер удалён или недоступен",
     "routingTargetOptions(r.target)",
+    "data-action=\"routing-visual\"",
+    "function openVisualRoutingWindow()",
+    "function buildVisualRoutingTableHtml(connections, routingData, status)",
+    "normalizeConnections(connectionsData, null)",
+    "observed Mihomo chain",
+    "let visualRoutingRefreshTimer = null;",
+    "function startVisualRoutingAutoRefresh()",
+    "function stopVisualRoutingAutoRefresh()",
+    "function setVisualRoutingInterval(value)",
+    "function isVisualRoutingWindowOpen()",
+    "function syncVisualRoutingTheme()",
+    "html.theme-dark",
+    "syncVisualRoutingTheme();",
+    "id=\"routingVisualInterval\"",
+    "Автообновление работает только пока это окно открыто",
 ]
 
 FORBIDDEN_MARKERS = [
