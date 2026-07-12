@@ -43,7 +43,7 @@ use crate::geobase::{
     GeoBaseUpsertRequest, StaticRouteEntry,
 };
 use crate::mihomo_config::{
-    DIRECT_NAME, MihomoFeatures, PROXY_ACTIVE_NAME, PROXY_NAME, REJECT_NAME,
+    DIRECT_NAME, MihomoFeatures, PROXY_ACTIVE_NAME, PROXY_NAME, PinnedServerRoute, REJECT_NAME,
     RKN_BYPASS_DEFAULT_INTERVAL, RKN_BYPASS_DEFAULT_URL, build_mihomo_config,
     build_mihomo_router_config,
 };
@@ -388,6 +388,7 @@ struct DaemonInner {
     /// In-memory only — a fresh daemon starts in `idle` state.
     deep_bench_status: DeepBenchStatus,
     geobase: GeoBaseRuntime,
+    pinned_route_now: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -633,6 +634,8 @@ pub struct HincyrayState {
     #[serde(default)]
     pub routing_rules: Vec<RoutingRule>,
     #[serde(default)]
+    server_route_registry: Vec<ServerRouteRegistryEntry>,
+    #[serde(default)]
     pub split_routing: SplitRoutingSettings,
     /// v0.2: saved subscription sources so `/api/subscriptions/refresh`
     /// can re-fetch them without re-entering URLs.
@@ -766,6 +769,7 @@ impl Default for HincyrayState {
             mihomo_path: default_mihomo_path(),
             metrics_history: Vec::new(),
             routing_rules: Vec::new(),
+            server_route_registry: Vec::new(),
             split_routing: SplitRoutingSettings::default(),
             subscriptions: Vec::new(),
             favorites: Vec::new(),
@@ -1233,7 +1237,7 @@ pub struct DeviceRoute {
     pub ip: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
-    /// "direct", "active", "best", or "profile:<id>".
+    /// "direct", "active", "best", "reject", or "server:<ref>".
     #[serde(default = "default_routing_target")]
     pub target: String,
 }
@@ -1575,7 +1579,7 @@ fn default_rkn_bypass_interval() -> u32 {
 /// Policy-routing rule. `kind`/`pattern`/`target` existed as a v0.1
 /// placeholder, so they remain strings for safe state migration. New UI uses
 /// `domains`/`ips`/`services`; `target` is one of: `direct`, `active`,
-/// `best`, or `profile:<id>`.
+/// `best`, `reject`, or `server:<ref>`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RoutingRule {
     #[serde(default)]
@@ -1608,6 +1612,204 @@ pub struct RoutingRule {
 
 fn default_routing_target() -> String {
     "active".to_owned()
+}
+
+const MAX_PINNED_SERVERS: usize = 16;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ServerRouteRegistryEntry {
+    server_ref: String,
+    canonical_raw: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RoutingTarget {
+    Direct,
+    Active,
+    Reject,
+    Server(String),
+    LegacyProfile(usize),
+}
+
+impl RoutingTarget {
+    fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        match value {
+            "" | "active" | "best" => Ok(Self::Active),
+            "direct" => Ok(Self::Direct),
+            "reject" => Ok(Self::Reject),
+            _ if value.starts_with("server:") => {
+                let server_ref = &value[7..];
+                if valid_server_ref(server_ref) {
+                    Ok(Self::Server(server_ref.to_owned()))
+                } else {
+                    Err(format!("malformed server target {value:?}"))
+                }
+            }
+            _ if value.starts_with("profile:") => value[8..]
+                .parse::<usize>()
+                .map(Self::LegacyProfile)
+                .map_err(|_| format!("malformed legacy profile target {value:?}")),
+            _ => Err(format!("unsupported routing target {value:?}")),
+        }
+    }
+}
+
+fn valid_server_ref(value: &str) -> bool {
+    value.len() == 39
+        && value.starts_with("srv-v1-")
+        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn canonical_profile_raw(profile: &Profile) -> String {
+    let raw = profile.raw.trim();
+    let Some((scheme, payload)) = raw.split_once("://") else {
+        return raw.split('#').next().unwrap_or(raw).to_owned();
+    };
+    if scheme.eq_ignore_ascii_case("vmess") {
+        use base64::Engine as _;
+        let encoded = payload.split('#').next().unwrap_or(payload);
+        for engine in [
+            &base64::engine::general_purpose::STANDARD,
+            &base64::engine::general_purpose::URL_SAFE,
+            &base64::engine::general_purpose::STANDARD_NO_PAD,
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        ] {
+            if let Ok(bytes) = engine.decode(encoded)
+                && let Ok(mut value) = serde_json::from_slice::<Value>(&bytes)
+            {
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("ps");
+                }
+                if let Ok(canonical) = serde_json::to_string(&value) {
+                    return format!("vmess-json:{canonical}");
+                }
+            }
+        }
+    }
+    raw.split('#').next().unwrap_or(raw).to_owned()
+}
+
+fn server_ref_for_canonical(canonical: &str) -> String {
+    let digest = sha256(canonical.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in &digest[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!("srv-v1-{hex}")
+}
+
+fn sync_server_route_registry(state: &mut HincyrayState) {
+    for profile in &state.profiles {
+        let canonical_raw = canonical_profile_raw(profile);
+        if !state
+            .server_route_registry
+            .iter()
+            .any(|entry| entry.canonical_raw == canonical_raw)
+        {
+            state.server_route_registry.push(ServerRouteRegistryEntry {
+                server_ref: server_ref_for_canonical(&canonical_raw),
+                canonical_raw,
+            });
+        }
+    }
+    let current: HashSet<String> = state.profiles.iter().map(canonical_profile_raw).collect();
+    let referenced: HashSet<String> = state
+        .routing_rules
+        .iter()
+        .map(|rule| rule.target.as_str())
+        .chain(
+            state
+                .device_routes
+                .iter()
+                .map(|route| route.target.as_str()),
+        )
+        .filter_map(|target| match RoutingTarget::parse(target).ok()? {
+            RoutingTarget::Server(server_ref) => Some(server_ref),
+            _ => None,
+        })
+        .collect();
+    state.server_route_registry.retain(|entry| {
+        current.contains(&entry.canonical_raw) || referenced.contains(&entry.server_ref)
+    });
+}
+
+fn sha256(input: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let bit_len = (input.len() as u64) * 8;
+    let mut data = input.to_vec();
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bit_len.to_be_bytes());
+    let mut h = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    for chunk in data.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(word);
+            w[i] = u32::from_be_bytes(bytes);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, value) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (chunk, value) in out.chunks_exact_mut(4).zip(h) {
+        chunk.copy_from_slice(&value.to_be_bytes());
+    }
+    out
 }
 
 fn default_rule_port_mode() -> String {
@@ -1682,6 +1884,7 @@ impl Daemon {
                 deep_bench_active: false,
                 deep_bench_status: DeepBenchStatus::default(),
                 geobase: GeoBaseRuntime::default(),
+                pinned_route_now: HashMap::new(),
             })),
             apply: Arc::new(Mutex::new(())),
             state_path,
@@ -2858,9 +3061,39 @@ fn load_state(state_path: &Path) -> HincyrayState {
         );
     }
 
+    let routing_identity_before = serde_json::to_string(&(
+        &state.server_route_registry,
+        &state.routing_rules,
+        &state.device_routes,
+    ))
+    .unwrap_or_default();
+    sync_server_route_registry(&mut state);
+    for rule in &mut state.routing_rules {
+        migrate_legacy_target(
+            &state.profiles,
+            &state.server_route_registry,
+            &mut rule.target,
+        );
+    }
+    for route in &mut state.device_routes {
+        migrate_legacy_target(
+            &state.profiles,
+            &state.server_route_registry,
+            &mut route.target,
+        );
+    }
+    let routing_identity_changed = routing_identity_before
+        != serde_json::to_string(&(
+            &state.server_route_registry,
+            &state.routing_rules,
+            &state.device_routes,
+        ))
+        .unwrap_or_default();
+
     // The old generic-SOCKS probe obeyed routing rules and could cache a
     // false negative for 24h. Invalidate non-promoted timestamps exactly
     // once after switching to forced `proxy-active` EC probes.
+    let mut migration_changed = routing_identity_changed;
     if state.split_routing.auto_vpn_probe_contract_version < AUTO_VPN_PROBE_CONTRACT_VERSION {
         let promoted: HashSet<String> = state
             .split_routing
@@ -2873,12 +3106,33 @@ fn load_state(state_path: &Path) -> HincyrayState {
             .auto_vpn_last_checked_unix
             .retain(|domain, _| promoted.contains(domain));
         state.split_routing.auto_vpn_probe_contract_version = AUTO_VPN_PROBE_CONTRACT_VERSION;
-        if let Err(error) = persist_state(state_path, &state) {
-            eprintln!("hincyray: failed to persist auto-VPN probe contract migration: {error}");
-        }
+        migration_changed = true;
+    }
+    if migration_changed && let Err(error) = persist_state(state_path, &state) {
+        eprintln!("hincyray: failed to persist state migration: {error}");
     }
 
     state
+}
+
+fn migrate_legacy_target(
+    profiles: &[Profile],
+    registry: &[ServerRouteRegistryEntry],
+    target: &mut String,
+) {
+    let Ok(RoutingTarget::LegacyProfile(id)) = RoutingTarget::parse(target) else {
+        return;
+    };
+    let Some(profile) = profiles.iter().find(|profile| profile.id == id) else {
+        return;
+    };
+    let canonical = canonical_profile_raw(profile);
+    if let Some(entry) = registry
+        .iter()
+        .find(|entry| entry.canonical_raw == canonical)
+    {
+        *target = format!("server:{}", entry.server_ref);
+    }
 }
 
 fn deserialize_persisted_state(text: &str) -> Result<HincyrayState, String> {
@@ -3030,8 +3284,9 @@ fn build_daemon_config(
     }
 
     // Split routing: build the full router config.
-    let (mut extra_profiles, mut routes, active_block_quic, extra) =
-        build_routing_context(state, active_id, active_profile, geobase_rule_providers);
+    validate_routing_targets(state, &state.routing_rules, &state.device_routes)?;
+    let (extra_profiles, mut pinned_routes, mut routes, active_block_quic, extra) =
+        build_routing_context(state, active_profile, geobase_rule_providers)?;
 
     // Prepend per-device routing rules (SRC-IP-CIDR) BEFORE general
     // routing rules so device-specific rules match first.
@@ -3040,30 +3295,7 @@ fn build_daemon_config(
         if !dr.enabled || dr.ip.trim().is_empty() {
             continue;
         }
-        let outbound_tag = match dr.target.as_str() {
-            "reject" => REJECT_NAME.to_owned(),
-            "direct" => DIRECT_NAME.to_owned(),
-            "active" | "best" | "" => PROXY_NAME.to_owned(),
-            target if target.starts_with("profile:") => {
-                let id = target.trim_start_matches("profile:").parse::<usize>().ok();
-                if let Some(id) = id {
-                    if id == active_id {
-                        PROXY_NAME.to_owned()
-                    } else if let Some(profile) = state.profiles.iter().find(|p| p.id == id) {
-                        let tag = format!("profile-{id}");
-                        if !extra_profiles.iter().any(|(_, existing)| existing == &tag) {
-                            extra_profiles.push((profile, tag.clone()));
-                        }
-                        tag
-                    } else {
-                        PROXY_NAME.to_owned()
-                    }
-                } else {
-                    PROXY_NAME.to_owned()
-                }
-            }
-            _ => PROXY_NAME.to_owned(),
-        };
+        let outbound_tag = resolve_target(state, active_profile, &dr.target, &mut pinned_routes)?.0;
         device_rules.push(XrayRouteRule {
             domains: vec![],
             ips: vec![format!("src-ip-cidr:{}/32", dr.ip.trim())],
@@ -3080,6 +3312,7 @@ fn build_daemon_config(
     build_mihomo_router_config(
         active_profile,
         &extra_profiles,
+        &pinned_routes,
         &routes,
         &state.listen_host,
         state.socks_port,
@@ -3096,19 +3329,22 @@ fn build_daemon_config(
 /// Returns the list of extra profile/outbound-name pairs, the routing
 /// rules, whether the active profile should block QUIC, and the extra
 /// router options.
-fn build_routing_context<'a>(
-    state: &'a HincyrayState,
-    active_id: usize,
-    active_profile: &'a Profile,
-    geobase_rule_providers: &[GeoBaseRuleProvider],
-) -> (
+type RoutingContext<'a> = (
     Vec<(&'a Profile, String)>,
+    Vec<PinnedServerRoute<'a>>,
     Vec<XrayRouteRule>,
     bool,
     RouterExtra,
-) {
-    let mut extra_profiles: Vec<(&Profile, String)> = Vec::new();
-    let mut routes = Vec::new();
+);
+
+fn build_routing_context<'a>(
+    state: &'a HincyrayState,
+    active_profile: &'a Profile,
+    geobase_rule_providers: &[GeoBaseRuleProvider],
+) -> Result<RoutingContext<'a>, String> {
+    let extra_profiles: Vec<(&Profile, String)> = Vec::new();
+    let mut pinned_routes = Vec::new();
+    let mut routes: Vec<XrayRouteRule> = Vec::new();
     for rule in state.routing_rules.iter().filter(|rule| rule.enabled) {
         let mut domains = normalize_route_items(&rule.domains);
         let mut ips = normalize_route_items(&rule.ips);
@@ -3130,39 +3366,8 @@ fn build_routing_context<'a>(
             continue;
         }
 
-        let outbound_tag = match rule.target.as_str() {
-            "reject" => REJECT_NAME.to_owned(),
-            "direct" => DIRECT_NAME.to_owned(),
-            "active" | "best" | "" => PROXY_NAME.to_owned(),
-            target if target.starts_with("profile:") => {
-                let id = target.trim_start_matches("profile:").parse::<usize>().ok();
-                if let Some(id) = id {
-                    if id == active_id {
-                        PROXY_NAME.to_owned()
-                    } else if let Some(profile) = state.profiles.iter().find(|p| p.id == id) {
-                        let tag = format!("profile-{id}");
-                        if !extra_profiles.iter().any(|(_, existing)| existing == &tag) {
-                            extra_profiles.push((profile, tag.clone()));
-                        }
-                        tag
-                    } else {
-                        PROXY_NAME.to_owned()
-                    }
-                } else {
-                    PROXY_NAME.to_owned()
-                }
-            }
-            _ => PROXY_NAME.to_owned(),
-        };
-
-        let profile_for_quic = match rule.target.as_str() {
-            "active" | "best" | "" => Some(active_profile),
-            target if target.starts_with("profile:") => {
-                let id = target.trim_start_matches("profile:").parse::<usize>().ok();
-                id.and_then(|id| state.profiles.iter().find(|p| p.id == id))
-            }
-            _ => None,
-        };
+        let (outbound_tag, profile_for_quic) =
+            resolve_target(state, active_profile, &rule.target, &mut pinned_routes)?;
         let profile_quic = profile_for_quic
             .map(|profile| profile.block_quic)
             .unwrap_or(false);
@@ -3202,7 +3407,218 @@ fn build_routing_context<'a>(
         mihomo_home: geo_dir_from_state(state),
         geobase_rule_providers: geobase_rule_providers.to_vec(),
     };
-    (extra_profiles, routes, active_block_quic, extra)
+    Ok((
+        extra_profiles,
+        pinned_routes,
+        routes,
+        active_block_quic,
+        extra,
+    ))
+}
+
+fn resolve_target<'a>(
+    state: &'a HincyrayState,
+    active: &'a Profile,
+    value: &str,
+    routes: &mut Vec<PinnedServerRoute<'a>>,
+) -> Result<(String, Option<&'a Profile>), String> {
+    match RoutingTarget::parse(value)? {
+        RoutingTarget::Direct => Ok((DIRECT_NAME.to_owned(), None)),
+        RoutingTarget::Reject => Ok((REJECT_NAME.to_owned(), None)),
+        RoutingTarget::Active => Ok((PROXY_NAME.to_owned(), Some(active))),
+        RoutingTarget::LegacyProfile(_) => Err(format!("unmigrated legacy target {value:?}")),
+        RoutingTarget::Server(server_ref) => {
+            let entry = state
+                .server_route_registry
+                .iter()
+                .find(|e| e.server_ref == server_ref)
+                .ok_or_else(|| format!("unknown server ref {server_ref}"))?;
+            let profile = state
+                .profiles
+                .iter()
+                .find(|p| canonical_profile_raw(p) == entry.canonical_raw)
+                .ok_or_else(|| format!("server ref {server_ref} is stale"))?;
+            if canonical_profile_raw(active) == entry.canonical_raw {
+                return Ok((PROXY_ACTIVE_NAME.to_owned(), Some(profile)));
+            }
+            let suffix = &server_ref[7..];
+            let outbound = format!("srv-out-{suffix}");
+            let group = format!("srv-route-{suffix}");
+            if !routes.iter().any(|route| route.group_name == group) {
+                routes.push(PinnedServerRoute {
+                    outbound_name: outbound,
+                    group_name: group.clone(),
+                    profile,
+                });
+            }
+            Ok((group, Some(profile)))
+        }
+    }
+}
+
+fn validate_routing_targets(
+    state: &HincyrayState,
+    rules: &[RoutingRule],
+    devices: &[DeviceRoute],
+) -> Result<(), String> {
+    let mut refs = HashSet::new();
+    for target in rules
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.target.as_str())
+        .chain(
+            devices
+                .iter()
+                .filter(|r| r.enabled)
+                .map(|r| r.target.as_str()),
+        )
+    {
+        match RoutingTarget::parse(target)? {
+            RoutingTarget::Server(server_ref) => {
+                let entry = state
+                    .server_route_registry
+                    .iter()
+                    .find(|e| e.server_ref == server_ref)
+                    .ok_or_else(|| format!("unknown server ref {server_ref}"))?;
+                if !state
+                    .profiles
+                    .iter()
+                    .any(|p| canonical_profile_raw(p) == entry.canonical_raw)
+                {
+                    return Err(format!("server ref {server_ref} is stale"));
+                }
+                refs.insert(server_ref);
+            }
+            RoutingTarget::LegacyProfile(_) => {
+                return Err(format!("unmigrated legacy target {target:?}"));
+            }
+            _ => {}
+        }
+    }
+    if refs.len() > MAX_PINNED_SERVERS {
+        return Err(format!(
+            "at most {MAX_PINNED_SERVERS} pinned servers may be enabled"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PinnedRouteTransition {
+    Fallback,
+    Recovery,
+}
+
+fn detect_pinned_route_transition(
+    previous: Option<&str>,
+    current: &str,
+    pinned_outbound: &str,
+) -> Option<PinnedRouteTransition> {
+    match (previous, current) {
+        (Some(old), PROXY_ACTIVE_NAME) if old == pinned_outbound => {
+            Some(PinnedRouteTransition::Fallback)
+        }
+        (Some(PROXY_ACTIVE_NAME), now) if now == pinned_outbound => {
+            Some(PinnedRouteTransition::Recovery)
+        }
+        _ => None,
+    }
+}
+
+fn pinned_route_observer_catalog(state: &HincyrayState) -> Vec<(String, String, String, String)> {
+    let Ok(active) = state
+        .active_profile_id
+        .and_then(|id| state.profiles.iter().find(|profile| profile.id == id))
+        .ok_or(())
+    else {
+        return Vec::new();
+    };
+    let mut routes: Vec<(String, String, String, String)> = Vec::new();
+    for target in state
+        .routing_rules
+        .iter()
+        .filter(|rule| rule.enabled)
+        .map(|rule| rule.target.as_str())
+        .chain(
+            state
+                .device_routes
+                .iter()
+                .filter(|route| route.enabled)
+                .map(|route| route.target.as_str()),
+        )
+    {
+        let Ok(RoutingTarget::Server(server_ref)) = RoutingTarget::parse(target) else {
+            continue;
+        };
+        let Some(entry) = state
+            .server_route_registry
+            .iter()
+            .find(|entry| entry.server_ref == server_ref)
+        else {
+            continue;
+        };
+        let Some(profile) = state
+            .profiles
+            .iter()
+            .find(|profile| canonical_profile_raw(profile) == entry.canonical_raw)
+        else {
+            continue;
+        };
+        if canonical_profile_raw(active) == entry.canonical_raw {
+            continue;
+        }
+        let suffix = &server_ref[7..];
+        let item = (
+            format!("srv-route-{suffix}"),
+            format!("srv-out-{suffix}"),
+            profile.name.clone(),
+            active.name.clone(),
+        );
+        if !routes.iter().any(|existing| existing.0 == item.0) {
+            routes.push(item);
+        }
+    }
+    routes
+}
+
+fn observe_pinned_routes(daemon: &Daemon, ec_addr: &str, ec_secret: Option<&str>) {
+    let catalog = {
+        let inner = lock(&daemon.inner);
+        pinned_route_observer_catalog(&inner.state)
+    };
+    let active_groups: HashSet<String> = catalog.iter().map(|item| item.0.clone()).collect();
+    let mut observations = Vec::new();
+    for (group, outbound, display, active_display) in catalog {
+        let encoded = utf8_percent_encode(&group, NON_ALPHANUMERIC).to_string();
+        if let Ok(value) = mihomo_api_get_json(ec_addr, ec_secret, &format!("/proxies/{encoded}"))
+            && let Some(now) = value.get("now").and_then(Value::as_str)
+        {
+            observations.push((group, outbound, display, active_display, now.to_owned()));
+        }
+    }
+    let mut inner = lock(&daemon.inner);
+    inner
+        .pinned_route_now
+        .retain(|group, _| active_groups.contains(group));
+    for (group, outbound, display, active_display, now) in observations {
+        let transition = detect_pinned_route_transition(
+            inner.pinned_route_now.get(&group).map(String::as_str),
+            &now,
+            &outbound,
+        );
+        inner.pinned_route_now.insert(group, now);
+        match transition {
+            Some(PinnedRouteTransition::Fallback) => eprintln!(
+                "hincyray: pinned server {display} unavailable, switched to active server {active_display}"
+            ),
+            Some(PinnedRouteTransition::Recovery) => {
+                eprintln!(
+                    "hincyray: pinned server {display} recovered, restored preferred route from active server {active_display}"
+                )
+            }
+            None => {}
+        }
+    }
 }
 
 /// Extract the parent directory of the configured geo asset path to pass
@@ -6786,12 +7202,40 @@ fn managed_geobase_routing_rules(manifest: &geobase::GeoBaseManifest) -> Vec<Man
 }
 
 fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
-    let (settings, rules, conflicts) = {
+    let (settings, rules, conflicts, servers) = {
         let inner = lock(&daemon.inner);
+        let active_canonical = inner
+            .state
+            .active_profile_id
+            .and_then(|id| inner.state.profiles.iter().find(|p| p.id == id))
+            .map(canonical_profile_raw);
+        let servers: Vec<Value> = inner
+            .state
+            .profiles
+            .iter()
+            .filter_map(|profile| {
+                let canonical = canonical_profile_raw(profile);
+                let entry = inner
+                    .state
+                    .server_route_registry
+                    .iter()
+                    .find(|entry| entry.canonical_raw == canonical)?;
+                Some(json!({
+                    "ref": entry.server_ref,
+                    "id": profile.id,
+                    "name": profile.name,
+                    "protocol": profile.protocol.to_string(),
+                    "address": profile.address,
+                    "group": profile.group,
+                    "active": active_canonical.as_deref() == Some(canonical.as_str()),
+                }))
+            })
+            .collect();
         (
             inner.state.split_routing.clone(),
             inner.state.routing_rules.clone(),
             detect_routing_conflicts(&inner.state),
+            servers,
         )
     };
     let manifest = match daemon.geobase_store().load_manifest() {
@@ -6811,6 +7255,7 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
         "sources": rule_sources(),
         "conflicts": conflicts,
         "managed_rules": managed_geobase_routing_rules(&manifest),
+        "servers": servers,
         "geobase_requires_apply": manifest.requires_apply(),
     });
     (200, "application/json", response.to_string())
@@ -7052,6 +7497,10 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         return (400, "application/json", json!({"error": error}).to_string());
     }
     let mut inner = lock(&daemon.inner);
+    sync_server_route_registry(&mut inner.state);
+    if let Err(error) = validate_routing_targets(&inner.state, &rules, &inner.state.device_routes) {
+        return (400, "application/json", json!({"error": error}).to_string());
+    }
     push_undo_snapshot(&mut inner.state, "Replace routing rules");
     inner.state.routing_rules = rules;
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
@@ -12108,14 +12557,16 @@ fn handle_device_routes_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
         .unwrap_or(true);
 
     let mut inner = lock(&daemon.inner);
+    let mut candidate = inner.state.clone();
+    sync_server_route_registry(&mut candidate);
     // Upsert: find existing by IP, or push new.
-    if let Some(existing) = inner.state.device_routes.iter_mut().find(|dr| dr.ip == ip) {
+    if let Some(existing) = candidate.device_routes.iter_mut().find(|dr| dr.ip == ip) {
         existing.enabled = enabled;
         existing.name = name.clone();
         existing.mac = mac.clone();
         existing.target = target.clone();
     } else {
-        inner.state.device_routes.push(DeviceRoute {
+        candidate.device_routes.push(DeviceRoute {
             enabled,
             name,
             ip,
@@ -12123,6 +12574,15 @@ fn handle_device_routes_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
             target,
         });
     }
+
+    if let Err(error) = validate_routing_targets(
+        &candidate,
+        &candidate.routing_rules,
+        &candidate.device_routes,
+    ) {
+        return (400, "application/json", json!({"error": error}).to_string());
+    }
+    inner.state = candidate;
 
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         return (
@@ -13743,6 +14203,12 @@ fn start_watchdog(
                         eprintln!("hincyray: iptables rules reinstalled");
                     }
                 }
+            }
+
+            // Observe pinned fallback groups through cheap EC state reads only.
+            // This is independent of Phase 3 and never triggers an upstream probe.
+            if core_running && let Some(ref addr) = ec_addr {
+                observe_pinned_routes(&daemon, addr, ec_secret.as_deref());
             }
 
             // --- Phase 3: Health check (always) + failover (auto_switch) ---
@@ -16369,6 +16835,16 @@ mod tests {
             let mut inner = lock(&daemon.inner);
             inner.state.active_profile_id = Some(0);
             inner.state.split_routing.enabled = true;
+            sync_server_route_registry(&mut inner.state);
+            let pinned_canonical = canonical_profile_raw(&inner.state.profiles[1]);
+            let pinned_ref = inner
+                .state
+                .server_route_registry
+                .iter()
+                .find(|entry| entry.canonical_raw == pinned_canonical)
+                .expect("pinned ref")
+                .server_ref
+                .clone();
             inner.state.routing_rules.push(RoutingRule {
                 enabled: true,
                 name: "RU direct".to_owned(),
@@ -16381,7 +16857,7 @@ mod tests {
             inner.state.routing_rules.push(RoutingRule {
                 enabled: true,
                 name: "YouTube".to_owned(),
-                target: "profile:1".to_owned(),
+                target: format!("server:{pinned_ref}"),
                 services: vec!["youtube".to_owned()],
                 ..Default::default()
             });
@@ -16402,7 +16878,10 @@ mod tests {
                 .as_array()
                 .expect("proxies array")
                 .iter()
-                .any(|proxy| proxy["name"] == "profile-1" && proxy["type"] == "vless")
+                .any(|proxy| proxy["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("srv-out-"))
+                    && proxy["type"] == "vless")
         );
         let rules = config["rules"].as_array().expect("routing rules");
         assert!(rules.iter().any(|rule| {
@@ -16449,10 +16928,20 @@ mod tests {
             let mut inner = lock(&daemon.inner);
             inner.state.active_profile_id = Some(0);
             inner.state.split_routing.enabled = true;
+            sync_server_route_registry(&mut inner.state);
+            let pinned_canonical = canonical_profile_raw(&inner.state.profiles[1]);
+            let pinned_ref = inner
+                .state
+                .server_route_registry
+                .iter()
+                .find(|entry| entry.canonical_raw == pinned_canonical)
+                .expect("pinned ref")
+                .server_ref
+                .clone();
             inner.state.routing_rules.push(RoutingRule {
                 enabled: true,
                 name: "YouTube".to_owned(),
-                target: "profile:1".to_owned(),
+                target: format!("server:{pinned_ref}"),
                 services: vec!["youtube".to_owned()],
                 ..Default::default()
             });
@@ -19692,5 +20181,268 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
                 "ru-bypass provider must NOT exist when disabled"
             );
         }
+    }
+
+    #[test]
+    fn server_routing_sha256_matches_known_vector() {
+        let digest = sha256(b"abc");
+        let actual = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            actual,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn server_ref_ignores_display_name_but_not_connection_config() {
+        let first = sample_profile(0, "First", "one.example");
+        let renamed = sample_profile(0, "Renamed", "one.example");
+        let changed = sample_profile(0, "First", "two.example");
+        assert_eq!(
+            server_ref_for_canonical(&canonical_profile_raw(&first)),
+            server_ref_for_canonical(&canonical_profile_raw(&renamed))
+        );
+        assert_ne!(
+            server_ref_for_canonical(&canonical_profile_raw(&first)),
+            server_ref_for_canonical(&canonical_profile_raw(&changed))
+        );
+    }
+
+    #[test]
+    fn server_routing_legacy_target_migrates_before_reindex() {
+        let mut state = HincyrayState {
+            profiles: vec![
+                sample_profile(7, "Pinned", "pinned.example"),
+                sample_profile(9, "Other", "other.example"),
+            ],
+            ..Default::default()
+        };
+        state.routing_rules.push(RoutingRule {
+            enabled: true,
+            name: "Pinned".to_owned(),
+            domains: vec!["example.com".to_owned()],
+            target: "profile:7".to_owned(),
+            ..Default::default()
+        });
+        sync_server_route_registry(&mut state);
+        migrate_legacy_target(
+            &state.profiles,
+            &state.server_route_registry,
+            &mut state.routing_rules[0].target,
+        );
+        let migrated = state.routing_rules[0].target.clone();
+        assert!(migrated.starts_with("server:srv-v1-"));
+        state.profiles.swap(0, 1);
+        reassign_profile_ids(&mut state.profiles);
+        assert!(validate_routing_targets(&state, &state.routing_rules, &[]).is_ok());
+        let RoutingTarget::Server(reference) = RoutingTarget::parse(&migrated).expect("target")
+        else {
+            panic!("expected server target");
+        };
+        let entry = state
+            .server_route_registry
+            .iter()
+            .find(|entry| entry.server_ref == reference)
+            .expect("registry entry");
+        assert!(entry.canonical_raw.contains("pinned.example"));
+    }
+
+    #[test]
+    fn server_routing_rejects_stale_target_without_mutating_rules() {
+        let (_dir, daemon) = test_daemon();
+        let before = {
+            let inner = lock(&daemon.inner);
+            inner.state.routing_rules.clone()
+        };
+        let body = json!({"rules": [{
+            "enabled": true,
+            "name": "Stale",
+            "target": "server:srv-v1-00000000000000000000000000000000",
+            "domains": ["example.com"]
+        }]})
+        .to_string();
+        let (status, _, response) = handle_routing_rules(&body, &daemon);
+        assert_eq!(status, 400, "{response}");
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.routing_rules.len(), before.len());
+        assert_eq!(inner.state.undo_stack.len(), 0);
+    }
+
+    #[test]
+    fn server_routing_limits_unique_enabled_servers() {
+        let mut state = HincyrayState::default();
+        for id in 0..=MAX_PINNED_SERVERS {
+            state.profiles.push(sample_profile(
+                id,
+                &format!("Server {id}"),
+                &format!("server-{id}.example"),
+            ));
+        }
+        sync_server_route_registry(&mut state);
+        let rules: Vec<RoutingRule> = state
+            .server_route_registry
+            .iter()
+            .map(|entry| RoutingRule {
+                enabled: true,
+                name: entry.server_ref.clone(),
+                target: format!("server:{}", entry.server_ref),
+                domains: vec!["example.com".to_owned()],
+                ..Default::default()
+            })
+            .collect();
+        let error = validate_routing_targets(&state, &rules, &[]).expect_err("limit");
+        assert!(error.contains("at most 16"), "{error}");
+    }
+
+    #[test]
+    fn server_routing_api_exposes_metadata_without_secrets() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@safe.example:443#Safe",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            sync_server_route_registry(&mut inner.state);
+        }
+        let (status, _, body) = handle_routing_get(&daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("routing response");
+        let server = &response["servers"][0];
+        assert_eq!(server["name"], "Safe");
+        assert!(server["ref"].as_str().is_some_and(valid_server_ref));
+        assert!(server.get("raw").is_none());
+        assert!(server.get("canonical_raw").is_none());
+        assert!(!body.contains("11111111-1111-1111-1111-111111111111"));
+    }
+
+    #[test]
+    fn server_routing_config_deduplicates_group_and_falls_back_only_to_active() {
+        let mut state = HincyrayState {
+            profiles: vec![
+                sample_profile(0, "Active", "active.example"),
+                sample_profile(1, "Pinned", "pinned.example"),
+            ],
+            active_profile_id: Some(0),
+            ..Default::default()
+        };
+        state.split_routing.enabled = true;
+        sync_server_route_registry(&mut state);
+        let pinned_ref = state
+            .server_route_registry
+            .iter()
+            .find(|entry| entry.canonical_raw.contains("pinned.example"))
+            .expect("pinned ref")
+            .server_ref
+            .clone();
+        for domain in ["one.example", "two.example"] {
+            state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: domain.to_owned(),
+                target: format!("server:{pinned_ref}"),
+                domains: vec![domain.to_owned()],
+                ..Default::default()
+            });
+        }
+        let yaml = build_daemon_config(&state, &[]).expect("config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("yaml");
+        let suffix = &pinned_ref[7..];
+        let group_name = format!("srv-route-{suffix}");
+        let groups = config["proxy-groups"].as_array().expect("groups");
+        let matching: Vec<&Value> = groups
+            .iter()
+            .filter(|group| group["name"] == group_name)
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(
+            matching[0]["proxies"],
+            json!([format!("srv-out-{suffix}"), PROXY_ACTIVE_NAME])
+        );
+        assert!(
+            !matching[0]["proxies"]
+                .as_array()
+                .expect("members")
+                .iter()
+                .any(|member| member == DIRECT_NAME || member == PROXY_NAME)
+        );
+    }
+
+    #[test]
+    fn server_routing_active_target_uses_proxy_active_without_extra_group() {
+        let mut state = HincyrayState {
+            profiles: vec![sample_profile(0, "Active", "active.example")],
+            active_profile_id: Some(0),
+            ..Default::default()
+        };
+        state.split_routing.enabled = true;
+        sync_server_route_registry(&mut state);
+        let server_ref = state.server_route_registry[0].server_ref.clone();
+        state.routing_rules.push(RoutingRule {
+            enabled: true,
+            name: "Same server".to_owned(),
+            target: format!("server:{server_ref}"),
+            domains: vec!["same.example".to_owned()],
+            ..Default::default()
+        });
+        let yaml = build_daemon_config(&state, &[]).expect("config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("yaml");
+        assert!(
+            config["rules"]
+                .as_array()
+                .expect("rules")
+                .iter()
+                .any(|rule| rule == "DOMAIN-SUFFIX,same.example,proxy-active")
+        );
+        assert!(
+            !config["proxy-groups"]
+                .as_array()
+                .expect("groups")
+                .iter()
+                .any(|group| group["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("srv-route-")))
+        );
+    }
+
+    #[test]
+    fn server_routing_device_route_rejects_stale_target_atomically() {
+        let (_dir, daemon) = test_daemon();
+        let body = json!({
+            "enabled": true,
+            "name": "TV",
+            "ip": "192.168.2.20",
+            "target": "server:srv-v1-00000000000000000000000000000000"
+        })
+        .to_string();
+        let (status, _, response) = handle_device_routes_set(&body, &daemon);
+        assert_eq!(status, 400, "{response}");
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.device_routes.is_empty());
+    }
+
+    #[test]
+    fn server_routing_transition_logs_only_real_switches() {
+        let pinned = "srv-out-deadbeef";
+        assert_eq!(detect_pinned_route_transition(None, pinned, pinned), None);
+        assert_eq!(
+            detect_pinned_route_transition(Some(pinned), pinned, pinned),
+            None
+        );
+        assert_eq!(
+            detect_pinned_route_transition(Some(pinned), PROXY_ACTIVE_NAME, pinned),
+            Some(PinnedRouteTransition::Fallback)
+        );
+        assert_eq!(
+            detect_pinned_route_transition(Some(PROXY_ACTIVE_NAME), PROXY_ACTIVE_NAME, pinned),
+            None
+        );
+        assert_eq!(
+            detect_pinned_route_transition(Some(PROXY_ACTIVE_NAME), pinned, pinned),
+            Some(PinnedRouteTransition::Recovery)
+        );
     }
 }

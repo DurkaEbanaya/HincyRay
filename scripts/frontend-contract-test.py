@@ -110,6 +110,14 @@ REQUIRED_MARKERS = [
     "'DIRECT'",
     "data-geobase-id=",
     "api('POST','/api/routing/rules',{rules:MOCK.routing_rules})",
+    "Маршрутизация по серверам",
+    "MOCK.routing_servers = Array.isArray(d.servers) ? d.servers : [];",
+    "`server:${String(server.ref)}`",
+    "если выбранный сервер недоступен — текущий активный VPN; DIRECT не используется",
+    "function routingTargetOptions(selectedTarget)",
+    "function routingTargetPresentation(target)",
+    "Сервер удалён или недоступен",
+    "routingTargetOptions(r.target)",
 ]
 
 FORBIDDEN_MARKERS = [
@@ -125,6 +133,8 @@ FORBIDDEN_MARKERS = [
     "onclick=\"syncGeoBase(",
     "onclick=\"deleteGeoBase(",
     "{rules:MOCK.managed_routing_rules}",
+    'value="profile:0"',
+    "server.raw",
 ]
 
 GEOBASE_DOM_IDS = [
@@ -338,7 +348,9 @@ def main() -> int:
     missing_routes = [(method, path) for method, path in missing_routes if not path.endswith("/")]
     sort_error = verify_nullable_sort(html_text)
     geobase_parser_error = verify_geobase_network_parser(html_text)
-    if missing_markers or forbidden_markers or missing_system_ids or missing_geobase_ids or duplicate_geobase_ids or missing_geobase_routes or nav_without_panel or nav_without_map or map_without_panel or missing_routes or sort_error or geobase_parser_error:
+    rule_target_markup = re.search(r'<select id="ruleTarget">(?P<body>.*?)</select>', html_text, re.S)
+    numeric_profile_targets = re.findall(r"profile:\d+", rule_target_markup.group("body") if rule_target_markup else "")
+    if missing_markers or forbidden_markers or numeric_profile_targets or missing_system_ids or missing_geobase_ids or duplicate_geobase_ids or missing_geobase_routes or nav_without_panel or nav_without_map or map_without_panel or missing_routes or sort_error or geobase_parser_error:
         if missing_markers:
             print("Missing required UI markers:")
             for marker in missing_markers:
@@ -346,6 +358,10 @@ def main() -> int:
         if forbidden_markers:
             print("Forbidden heavyweight auto-refresh markers found:")
             for marker in forbidden_markers:
+                print(f"  - {marker}")
+        if numeric_profile_targets:
+            print("Legacy numeric profile UI targets found:")
+            for marker in sorted(set(numeric_profile_targets)):
                 print(f"  - {marker}")
         if missing_system_ids:
             print("System renderer writes to missing DOM ids:")

@@ -1198,11 +1198,16 @@ https://sub.example.com/…"></textarea>
             <button class="btn btn-sm" onclick="apiAction('POST','/api/routing/catalog/refresh',null,t('Каталог обновляется'))">↻ Обновить каталог</button>
           </div>
           <h3 style="margin:20px 0 8px;font-size:var(--fs-h3)">Правила маршрутизации</h3>
+          <div class="server-routing-note" id="serverRoutingSection">
+            <h3>Маршрутизация по серверам</h3>
+            <div>Назначьте доменам, IP и портам конкретный сервер в обычном правиле маршрутизации.</div>
+            <div class="server-target-detail">если выбранный сервер недоступен — текущий активный VPN; DIRECT не используется</div>
+          </div>
           <div class="feature-card" style="margin-bottom:16px">
             <h4 id="ruleFormTitle">Добавить правило</h4>
             <div class="form-row">
               <div class="form-group"><label>Имя</label><input id="ruleName" placeholder="YouTube via proxy"></div>
-              <div class="form-group"><label>Цель</label><select id="ruleTarget"><option value="active">active</option><option value="direct">direct</option><option value="best">best</option><option value="reject">reject</option><option value="profile:0">profile:0</option></select></div>
+              <div class="form-group"><label>Цель</label><select id="ruleTarget"><option value="active">active</option><option value="direct">direct</option><option value="reject">reject</option></select></div>
               <div class="form-group"><label>Протокол</label><select id="ruleNetwork"><option value="any">any</option><option value="tcp">tcp</option><option value="udp">udp</option></select></div>
               <div class="form-group"><label>Порты</label><input id="rulePorts" class="mono" placeholder="80,443"></div>
               <div class="form-group"><label>Режим портов</label><select id="rulePortMode"><option value="include">только эти</option><option value="exclude">кроме этих</option></select></div>
@@ -3404,9 +3409,66 @@ function collectRuleFromForm() {
   };
 }
 
+function routingServerByTarget(target) {
+  if (!String(target || '').startsWith('server:')) return null;
+  const ref = String(target).slice(7);
+  return (MOCK.routing_servers || []).find(server => String(server.ref) === ref) || null;
+}
+
+function routingServerLabel(server) {
+  const name = String(server?.name || server?.address || t('Сервер'));
+  const protocol = String(server?.protocol || '');
+  const active = server?.active === true ? ` · ${t('Активный сервер')}` : '';
+  return `${name}${protocol ? ` · ${protocol}` : ''}${active}`;
+}
+
+function routingTargetOptions(selectedTarget) {
+  const selected = String(selectedTarget || 'active');
+  const base = [['active',t('Текущий активный VPN')],['direct','DIRECT'],['reject','REJECT']];
+  let html = base.map(([value,label]) => `<option value="${attrEscape(value)}" ${selected===value?'selected':''}>${htmlEscape(label)}</option>`).join('');
+  const groups = new Map();
+  (Array.isArray(MOCK.routing_servers) ? MOCK.routing_servers : []).forEach(server => {
+    if (server == null || server.ref == null) return;
+    const group = String(server.group || t('Без группы'));
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(server);
+  });
+  groups.forEach((items, group) => {
+    const options = items.map(server => {
+      const value = `server:${String(server.ref)}`;
+      return `<option value="${attrEscape(value)}" ${selected===value?'selected':''}>${htmlEscape(routingServerLabel(server))}</option>`;
+    }).join('');
+    html += `<optgroup label="${attrEscape(group)}">${options}</optgroup>`;
+  });
+  if (selected.startsWith('server:') && !routingServerByTarget(selected)) {
+    html += `<optgroup label="${attrEscape(t('нет в каталоге'))}"><option value="${attrEscape(selected)}" selected>${htmlEscape(t('Сервер удалён или недоступен'))}</option></optgroup>`;
+  }
+  return html;
+}
+
+function refreshRoutingTargetSelect(selectedTarget) {
+  const select = document.getElementById('ruleTarget');
+  if (!select) return;
+  const selected = selectedTarget || select.value || 'active';
+  select.innerHTML = routingTargetOptions(selected);
+  select.value = selected;
+}
+
+function routingTargetPresentation(target) {
+  const value = String(target || 'active');
+  if (!value.startsWith('server:')) {
+    const labels = {active:t('Текущий активный VPN'),direct:'DIRECT',reject:'REJECT'};
+    return {label:labels[value] || value, detail:'', stale:false};
+  }
+  const server = routingServerByTarget(value);
+  if (!server) return {label:t('Сервер удалён или недоступен'),detail:`${t('нет в каталоге')} · ${t('резерв: текущий активный VPN')}`,stale:true};
+  const status = server.active === true ? t('Активный сервер') : t('резерв: текущий активный VPN');
+  return {label:routingServerLabel(server),detail:status,stale:false};
+}
+
 function populateFormFromRule(rule) {
   safeValue('ruleName', rule.name || '');
-  safeValue('ruleTarget', rule.target || 'active');
+  refreshRoutingTargetSelect(rule.target || 'active');
   safeValue('ruleNetwork', rule.network || 'any');
   safeValue('rulePorts', (rule.ports || []).join(','));
   safeValue('rulePortMode', rule.port_mode || 'include');
@@ -3448,7 +3510,7 @@ function cancelEditRule() {
 function resetRuleForm() {
   editingRuleIndex = null;
   safeValue('ruleName', '');
-  safeValue('ruleTarget', 'active');
+  refreshRoutingTargetSelect('active');
   safeValue('ruleNetwork', 'any');
   safeValue('rulePorts', '');
   safeValue('rulePortMode', 'include');
@@ -3561,17 +3623,18 @@ function renderRoutingRules(data) {
     const portMode = r.port_mode || 'include';
     const portLabel = ports.length ? `${ports.join(',')} ${portMode==='exclude'?'[кроме]':'[только]'}` : '—';
     const net = r.network || 'any';
-    const targetBadge = r.target==='reject'?'danger':r.target==='direct'?'success':'info';
+    const target = routingTargetPresentation(r.target);
+    const targetBadge = r.target==='reject' || target.stale?'danger':r.target==='direct'?'success':'info';
 
     // Target cell: <select> if editing, otherwise clickable span
     let targetCell;
     if (ed && ed.row===i && ed.col==='target') {
-      const opts = ['active','direct','reject','best'];
       targetCell = `<select onchange="inlineSaveSelect(${i},'target',this.value)" onblur="inlineCancelEdit()" class="badge badge-${targetBadge}" style="border:1px solid var(--accent);background:var(--surface1);font-weight:600;font-size:12px;border-radius:4px;padding:2px 6px">
-        ${opts.map(o=>`<option value="${o}" ${r.target===o?'selected':''}>${o}</option>`).join('')}
+        ${routingTargetOptions(r.target)}
       </select>`;
     } else {
-      targetCell = `<span class="badge badge-${targetBadge} cell-edit" onclick="inlineStartEdit(${i},'target')" style="cursor:pointer">${r.target}</span>`;
+      const diagnostic = String(r.target || '').startsWith('server:') ? String(r.target) : '';
+      targetCell = `<span class="badge badge-${targetBadge} cell-edit" onclick="inlineStartEdit(${i},'target')" style="cursor:pointer" title="${attrEscape(diagnostic)}">${htmlEscape(target.label)}</span>${target.detail ? `<div class="server-target-detail">${htmlEscape(target.detail)}</div>` : ''}`;
     }
 
     // Protocol cell: <select> if editing, otherwise clickable span
@@ -3587,8 +3650,8 @@ function renderRoutingRules(data) {
 
     return `<tr>
     <td><label class="toggle"><input type="checkbox" ${r.enabled?'checked':''} onchange="toggleRoutingRule(${i},this.checked)"><span class="slider"></span></label></td>
-    <td><span class="cell-edit" onclick="inlineEditName(${i},this)" title="${t('Нажми для редактирования')}">${r.name||'—'}</span></td>
-    <td class="mono" style="font-size:12px"><span class="cell-edit" onclick="inlineEditEntries(${i},this)" title="${entriesStr}">${entriesShort}</span></td>
+    <td><span class="cell-edit" onclick="inlineEditName(${i},this)" title="${attrEscape(t('Нажми для редактирования'))}">${htmlEscape(r.name||'—')}</span></td>
+    <td class="mono" style="font-size:12px"><span class="cell-edit" onclick="inlineEditEntries(${i},this)" title="${attrEscape(entriesStr)}">${htmlEscape(entriesShort)}</span></td>
     <td>${targetCell}</td>
     <td class="mono" style="font-size:12px"><span class="cell-edit" onclick="inlineEditPorts(${i},this)">${portLabel}</span></td>
     <td style="font-size:12px">${protoCell}</td>
@@ -5339,9 +5402,11 @@ function normalizeConnections(data) {
 function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>null), api('GET','/api/profiles').catch(()=>null)]).then(([stats,profiles]) => { MOCK.profiles = normalizeProfiles(stats, profiles); renderProfiles(MOCK.profiles); }); }
 function loadRouting() { return api('GET','/api/routing').then(d => {
   MOCK.routing_rules = d.rules || d.routing_rules || [];
+  MOCK.routing_servers = Array.isArray(d.servers) ? d.servers : [];
   MOCK.managed_routing_rules = d.managed_rules || [];
   MOCK.geobase_requires_apply = d.geobase_requires_apply === true;
   MOCK.split_routing = d.settings || d.split_routing || MOCK.split_routing;
+  refreshRoutingTargetSelect(editingRuleIndex !== null ? MOCK.routing_rules[editingRuleIndex]?.target : 'active');
   renderRoutingRules(MOCK.routing_rules);
   renderRuleChips(d.catalog || []);
   if (d.settings || d.split_routing) updateRoutingForm(d.settings || d.split_routing);

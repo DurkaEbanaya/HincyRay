@@ -762,7 +762,17 @@ pub const TPROXY_LISTENER: &str = "tproxy-in";
 /// this URL **through the proxy** to determine availability. When the
 /// probe fails, mihomo automatically falls back to DIRECT — preventing
 /// connection storms when the upstream proxy is unreachable.
-const FALLBACK_HEALTH_URL: &str = "https://www.gstatic.com/generate_204";
+pub const FALLBACK_HEALTH_URL: &str = "https://www.gstatic.com/generate_204";
+
+/// A server-specific outbound and its routing target group.
+///
+/// Names are supplied by the daemon so persisted routes can use stable,
+/// opaque references without coupling the config builder to profile IDs.
+pub struct PinnedServerRoute<'a> {
+    pub outbound_name: String,
+    pub group_name: String,
+    pub profile: &'a Profile,
+}
 
 /// v0.17: Default URL for the RKN bypass rule provider.
 /// `itworksig/rublacklist` is auto-updated via GitHub Actions and
@@ -1492,6 +1502,7 @@ fn build_sniffer_json(features: &MihomoFeatures) -> Value {
 pub fn build_mihomo_router_config(
     active_profile: &Profile,
     extra_profiles: &[(&Profile, String)],
+    pinned_server_routes: &[PinnedServerRoute<'_>],
     route_rules: &[XrayRouteRule],
     listen_host: &str,
     socks_port: u16,
@@ -1514,9 +1525,40 @@ pub fn build_mihomo_router_config(
     // and the direct-fallback is merged into them.
     let active_proxy_name = PROXY_ACTIVE_NAME.to_owned();
 
+    let proxy_provider_names: HashSet<&str> = features
+        .proxy_providers
+        .iter()
+        .map(|provider| provider.name.as_str())
+        .collect();
+    let mut internal_names: HashSet<&str> =
+        [PROXY_ACTIVE_NAME, PROXY_NAME, DIRECT_NAME, REJECT_NAME]
+            .into_iter()
+            .collect();
+    for (_, name) in extra_profiles {
+        if name.trim().is_empty() || !internal_names.insert(name) {
+            return Err(format!("duplicate or empty proxy/group name {name:?}"));
+        }
+        if proxy_provider_names.contains(name.as_str()) {
+            return Err(format!("proxy name collides with provider {name:?}"));
+        }
+    }
+    for route in pinned_server_routes {
+        for name in [route.outbound_name.as_str(), route.group_name.as_str()] {
+            if name.trim().is_empty() || !internal_names.insert(name) {
+                return Err(format!("duplicate or empty proxy/group name {name:?}"));
+            }
+            if proxy_provider_names.contains(name) {
+                return Err(format!("proxy/group name collides with provider {name:?}"));
+            }
+        }
+    }
+
     let mut proxies = vec![build_proxy(active_profile, &active_proxy_name)?];
     for (profile, name) in extra_profiles {
         proxies.push(build_proxy(profile, name)?);
+    }
+    for route in pinned_server_routes {
+        proxies.push(build_proxy(route.profile, &route.outbound_name)?);
     }
     for proxy in proxies.iter_mut() {
         apply_per_proxy_fields(proxy, features);
@@ -1693,6 +1735,21 @@ pub fn build_mihomo_router_config(
             "timeout": 3000,
         }]);
     }
+
+    let groups = config
+        .get_mut("proxy-groups")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "internal error: router proxy groups are missing".to_owned())?;
+    groups.extend(pinned_server_routes.iter().map(|route| {
+        json!({
+            "name": &route.group_name,
+            "type": "fallback",
+            "proxies": [&route.outbound_name, PROXY_ACTIVE_NAME],
+            "url": FALLBACK_HEALTH_URL,
+            "interval": 10,
+            "timeout": 3000,
+        })
+    }));
 
     // Proxy providers — Mihomo fetches subscriptions itself.
     if !features.proxy_providers.is_empty() {
@@ -3495,11 +3552,12 @@ fn apply_grpc_advanced(grpc_opts: &mut Value, url: &Url) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalControllerConfig, FallbackFilter, LoadBalanceStrategy, MihomoFeatures, NtpConfig,
-        PROXY_NAME, PerProxyDefaults, ProxyGroupConfig, ProxyGroupType, ProxyProviderConfig,
-        REDIR_LISTENER, RuleProviderConfig, SmuxConfig, SubRuleConfig, TPROXY_LISTENER,
-        TunnelConfig, build_anytls_proxy, build_http_proxy, build_hysteria_proxy,
-        build_hysteria2_proxy, build_masque_proxy, build_mihomo_bench_config, build_mihomo_config,
+        ExternalControllerConfig, FALLBACK_HEALTH_URL, FallbackFilter, LoadBalanceStrategy,
+        MihomoFeatures, NtpConfig, PROXY_ACTIVE_NAME, PROXY_NAME, PerProxyDefaults,
+        PinnedServerRoute, ProxyGroupConfig, ProxyGroupType, ProxyProviderConfig, REDIR_LISTENER,
+        RuleProviderConfig, SmuxConfig, SubRuleConfig, TPROXY_LISTENER, TunnelConfig,
+        build_anytls_proxy, build_http_proxy, build_hysteria_proxy, build_hysteria2_proxy,
+        build_masque_proxy, build_mihomo_bench_config, build_mihomo_config,
         build_mihomo_router_config, build_openvpn_proxy, build_shadowsocks_proxy,
         build_shadowsocksr_proxy, build_snell_proxy, build_socks_proxy, build_ssh_proxy,
         build_tailscale_proxy, build_trojan_proxy, build_tuic_proxy, build_vless_proxy,
@@ -3780,6 +3838,7 @@ mod tests {
             profile,
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -3804,6 +3863,166 @@ mod tests {
         assert!(names.contains(&TPROXY_LISTENER));
     }
 
+    fn pinned_route_rule(target: &str) -> XrayRouteRule {
+        XrayRouteRule {
+            domains: vec!["pinned.example".to_owned()],
+            ips: Vec::new(),
+            outbound_tag: target.to_owned(),
+            block_quic: false,
+            ports: Vec::new(),
+            network: None,
+            port_mode: "include".to_owned(),
+        }
+    }
+
+    #[test]
+    fn pinned_server_route_builds_exact_fallback_group_and_rule_target() {
+        let active = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@active.example:443?type=tcp#Active",
+        );
+        let pinned = parse_profiles(
+            "vless://22222222-2222-2222-2222-222222222222@pinned.example:443?type=tcp#Pinned",
+        );
+        let descriptor = PinnedServerRoute {
+            outbound_name: "pinned-out-opaque-7".to_owned(),
+            group_name: "pinned-route-opaque-7".to_owned(),
+            profile: &pinned[0],
+        };
+        let yaml = build_mihomo_router_config(
+            &active[0],
+            &[],
+            &[descriptor],
+            &[pinned_route_rule("pinned-route-opaque-7")],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Proxy,
+            false,
+            &RouterExtra::default(),
+            &MihomoFeatures::default(),
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let groups = config["proxy-groups"].as_array().expect("groups");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[1],
+            json!({
+                "name": "pinned-route-opaque-7",
+                "type": "fallback",
+                "proxies": ["pinned-out-opaque-7", PROXY_ACTIVE_NAME],
+                "url": FALLBACK_HEALTH_URL,
+                "interval": 10,
+                "timeout": 3000,
+            })
+        );
+        let members = groups[1]["proxies"].as_array().expect("members");
+        assert!(
+            !members
+                .iter()
+                .any(|name| name == "DIRECT" || name == PROXY_NAME)
+        );
+        assert!(
+            router_rules(&yaml)
+                .contains(&"DOMAIN-SUFFIX,pinned.example,pinned-route-opaque-7".to_owned())
+        );
+    }
+
+    #[test]
+    fn pinned_server_routes_stay_out_of_global_proxy_group() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@active.example:443?type=tcp#Active\n\
+             vless://22222222-2222-2222-2222-222222222222@candidate.example:443?type=tcp#Candidate\n\
+             vless://33333333-3333-3333-3333-333333333333@pinned.example:443?type=tcp#Pinned",
+        );
+        let descriptor = PinnedServerRoute {
+            outbound_name: "pinned-out".to_owned(),
+            group_name: "pinned-group".to_owned(),
+            profile: &profiles[2],
+        };
+        let mut features = MihomoFeatures::default();
+        features.proxy_group.enabled = true;
+        let yaml = build_mihomo_router_config(
+            &profiles[0],
+            &[(&profiles[1], "candidate".to_owned())],
+            &[descriptor],
+            &[],
+            "0.0.0.0",
+            10808,
+            Some(10810),
+            true,
+            QuicMode::Proxy,
+            false,
+            &RouterExtra::default(),
+            &features,
+        )
+        .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let groups = config["proxy-groups"].as_array().expect("groups");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0]["name"], PROXY_NAME);
+        assert_eq!(
+            groups[0]["proxies"],
+            json!([PROXY_ACTIVE_NAME, "candidate"])
+        );
+        assert_eq!(
+            groups[1]["proxies"],
+            json!(["pinned-out", PROXY_ACTIVE_NAME])
+        );
+    }
+
+    #[test]
+    fn pinned_server_routes_reject_duplicate_and_reserved_names() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@active.example:443?type=tcp#Active\n\
+             vless://22222222-2222-2222-2222-222222222222@pinned.example:443?type=tcp#Pinned",
+        );
+        let build = |routes: &[PinnedServerRoute<'_>]| {
+            build_mihomo_router_config(
+                &profiles[0],
+                &[],
+                routes,
+                &[],
+                "0.0.0.0",
+                10808,
+                Some(10810),
+                true,
+                QuicMode::Proxy,
+                false,
+                &RouterExtra::default(),
+                &MihomoFeatures::default(),
+            )
+        };
+        let duplicates = [
+            PinnedServerRoute {
+                outbound_name: "same".to_owned(),
+                group_name: "group-a".to_owned(),
+                profile: &profiles[1],
+            },
+            PinnedServerRoute {
+                outbound_name: "out-b".to_owned(),
+                group_name: "same".to_owned(),
+                profile: &profiles[1],
+            },
+        ];
+        assert!(
+            build(&duplicates)
+                .expect_err("duplicate must fail")
+                .contains("duplicate")
+        );
+        let reserved = [PinnedServerRoute {
+            outbound_name: PROXY_NAME.to_owned(),
+            group_name: "pinned-group".to_owned(),
+            profile: &profiles[1],
+        }];
+        assert!(
+            build(&reserved)
+                .expect_err("reserved must fail")
+                .contains("duplicate")
+        );
+    }
+
     #[test]
     fn build_mihomo_router_config_omits_tproxy_when_unavailable() {
         let profiles = parse_profiles(
@@ -3812,6 +4031,7 @@ mod tests {
         let profile = &profiles[0];
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[],
             "0.0.0.0",
@@ -3847,6 +4067,7 @@ mod tests {
             profile,
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -3875,6 +4096,7 @@ mod tests {
         let profile = &profiles[0];
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[],
             "0.0.0.0",
@@ -3907,6 +4129,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[],
             "0.0.0.0",
@@ -3943,6 +4166,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[],
             "0.0.0.0",
@@ -4001,6 +4225,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[quic_rule],
             "0.0.0.0",
             10808,
@@ -4044,6 +4269,7 @@ mod tests {
                 profile,
                 &[],
                 &[],
+                &[],
                 "0.0.0.0",
                 10808,
                 Some(10810),
@@ -4075,6 +4301,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[rule],
             "0.0.0.0",
@@ -4119,6 +4346,7 @@ mod tests {
             profile,
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -4154,6 +4382,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[],
             "0.0.0.0",
@@ -4566,6 +4795,7 @@ mod tests {
             profile,
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -4817,6 +5047,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[rule],
             "0.0.0.0",
             10808,
@@ -4857,6 +5088,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[rule],
             "0.0.0.0",
@@ -5500,6 +5732,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[rule],
             "0.0.0.0",
             10808,
@@ -5536,6 +5769,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[rule],
             "0.0.0.0",
@@ -5578,6 +5812,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[rule],
             "0.0.0.0",
             10808,
@@ -5619,6 +5854,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[rule],
             "0.0.0.0",
             10808,
@@ -5659,6 +5895,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[rule],
             "0.0.0.0",
@@ -5721,6 +5958,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[rule],
             "0.0.0.0",
             10808,
@@ -5764,6 +6002,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[rule],
             "0.0.0.0",
             10808,
@@ -5805,6 +6044,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[rule],
             "0.0.0.0",
             10808,
@@ -5845,6 +6085,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[rule],
             "0.0.0.0",
@@ -5889,6 +6130,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[rule],
             "0.0.0.0",
             10808,
@@ -5929,6 +6171,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[rule],
             "0.0.0.0",
@@ -6335,6 +6578,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[rule],
             "0.0.0.0",
             10808,
@@ -6478,6 +6722,7 @@ mod tests {
         );
         build_mihomo_router_config(
             &profiles[0],
+            &[],
             &[],
             route_rules,
             "0.0.0.0",
@@ -6783,6 +7028,7 @@ mod tests {
             &profiles[0],
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -6813,6 +7059,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             &profiles[0],
+            &[],
             &[],
             &[],
             "0.0.0.0",
@@ -6849,6 +7096,7 @@ mod tests {
             &profiles[0],
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -6883,6 +7131,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             &profiles[0],
+            &[],
             &[],
             &[],
             "0.0.0.0",
@@ -6941,6 +7190,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             &profiles[0],
             &[],
+            &[],
             &user_rules,
             "0.0.0.0",
             10808,
@@ -6987,6 +7237,7 @@ mod tests {
             &profiles[0],
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -7026,6 +7277,7 @@ mod tests {
             &profiles[0],
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -7059,6 +7311,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             &profiles[0],
+            &[],
             &[],
             &[],
             "0.0.0.0",
@@ -7102,6 +7355,7 @@ mod tests {
             &profiles[0],
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -7137,6 +7391,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             &profiles[0],
+            &[],
             &[],
             &[],
             "0.0.0.0",
@@ -7195,6 +7450,7 @@ mod tests {
             &profiles[0],
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -7248,6 +7504,7 @@ mod tests {
             &profiles[0],
             &[],
             &[],
+            &[],
             "0.0.0.0",
             10808,
             Some(10810),
@@ -7292,6 +7549,7 @@ mod tests {
         let yaml = build_mihomo_router_config(
             profile,
             &[],
+            &[],
             &[rule],
             "0.0.0.0",
             10808,
@@ -7335,6 +7593,7 @@ mod tests {
         };
         let yaml = build_mihomo_router_config(
             profile,
+            &[],
             &[],
             &[rule],
             "0.0.0.0",
