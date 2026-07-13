@@ -465,9 +465,6 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .modal p{color:var(--muted);margin:0 0 20px;font-size:var(--fs-body)}
 .modal-actions{display:flex;gap:var(--gap-sm);justify-content:flex-end}
 .modal-wide{max-width:680px;max-height:80vh;overflow-y:auto}
-.modal-wide.routing-visual-modal{width:min(1180px,calc(100vw - 32px));max-width:min(1180px,calc(100vw - 32px));padding:0;overflow:hidden;background:linear-gradient(135deg,color-mix(in srgb,var(--surface) 92%,transparent),color-mix(in srgb,var(--surface-2) 72%,transparent));backdrop-filter:var(--acrylic-blur)}
-.modal-wide.routing-visual-modal h3{padding:18px 22px 10px;margin:0;border-bottom:1px solid var(--border)}
-.modal-wide.routing-visual-modal #resultBody{padding:0}
 .result-table{width:100%;border-collapse:collapse;font-size:13px}
 .result-table td{padding:6px 10px;border-bottom:1px solid var(--border)}
 .result-table td:first-child{color:var(--muted);white-space:nowrap;width:40%}
@@ -826,7 +823,7 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
         </div>
         <div class="nav-sub-list">
           <div class="nav-sub-item" data-section="routing" onclick="navTo('routing')"><span class="nav-label">Split Routing</span></div>
-          <div class="nav-sub-item" data-action="routing-visual" role="button" tabindex="0" onclick="openVisualRoutingWindow()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openVisualRoutingWindow();}"><span class="nav-label">Визуальная таблица маршрутизации</span></div>
+          <div class="nav-sub-item" data-section="connections-table" onclick="navTo('connections-table')"><span class="nav-label">Таблица соединений</span></div>
           <div class="nav-sub-item" data-section="devices" onclick="navTo('devices')"><span class="nav-label">По устройствам</span></div>
           <div class="nav-sub-item" data-section="dns" onclick="navTo('dns')"><span class="nav-label">DNS</span></div>
         </div>
@@ -1220,7 +1217,7 @@ https://sub.example.com/…"></textarea>
             <h3>Маршрутизация по серверам</h3>
             <div>Назначьте доменам, IP и портам конкретный сервер в обычном правиле маршрутизации.</div>
             <div class="server-target-detail">если выбранный сервер недоступен — текущий активный VPN; DIRECT не используется</div>
-            <div style="margin-top:10px"><button class="btn btn-sm" onclick="openVisualRoutingWindow()">Открыть визуальную таблицу маршрутизации</button></div>
+            <div style="margin-top:10px"><button class="btn btn-sm" onclick="navTo('connections-table')">Открыть таблицу соединений</button></div>
           </div>
           <div class="feature-card" style="margin-bottom:16px">
             <h4 id="ruleFormTitle">Добавить правило</h4>
@@ -1263,6 +1260,36 @@ https://sub.example.com/…"></textarea>
           <div style="display:flex;gap:8px">
             <button class="btn btn-accent" onclick="apiAction('POST','/api/routing/firewall-start',null,t('Файрвол запущен'),refreshDashboard)">Запустить файрвол</button>
             <button class="btn btn-danger" onclick="confirmCmd(t('Остановить файрвол?'),'/api/routing/firewall-stop')">Остановить</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══ CONNECTIONS TABLE ═══ -->
+      <section class="section-panel" data-section="connections-table" data-od-id="sec-connections-table">
+        <div class="section-header" onclick="toggleSection(this)">
+          <h2>Таблица соединений</h2>
+          <svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg>
+        </div>
+        <div class="section-body">
+          <div class="routing-visual-commandbar">
+            <div>
+              <div class="routing-visual-title">Текущие маршруты соединений</div>
+              <div class="routing-visual-subtitle">Агрегация по сайту/IP. Источник маршрута берётся из observed Mihomo chain, без угадывания profile id.</div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <input id="connectionsTableSearch" class="form-control" type="search" placeholder="Сайт/IP, source IP, сервер, порт, правило" oninput="filterConnectionsTable(this.value)">
+              <select id="routingVisualInterval" class="form-control" onchange="setVisualRoutingInterval(this.value)" aria-label="Интервал обновления">
+                <option value="2">2 с</option><option value="5" selected>5 с</option><option value="10">10 с</option><option value="15">15 с</option><option value="30">30 с</option><option value="60">60 с</option>
+              </select>
+            </div>
+          </div>
+          <div id="connectionsTableSummary" class="routing-visual-summary"></div>
+          <div id="connectionsTableUpdated" class="routing-visual-subtitle" style="margin:8px 0"></div>
+          <div class="routing-visual-table-wrap">
+            <table id="connectionsRoutingTable" class="routing-visual-table">
+              <thead><tr><th>Сайт / IP</th><th>Соед.</th><th>Профиль / сервер</th><th>Source IP</th><th>Сеть / порт</th><th>Правило</th><th>↑</th><th>↓</th></tr></thead>
+              <tbody id="connectionsRoutingBody"><tr><td colspan="8" style="color:var(--muted)">Откройте вкладку для загрузки соединений</td></tr></tbody>
+            </table>
           </div>
         </div>
       </section>
@@ -2267,6 +2294,7 @@ const NAV_MAP = {
   'import':      {group:'profiles',label:'Импорт'},
   'sub-store':   {group:'profiles',label:'Sub-Store Lite'},
   'routing':     {group:'routing',label:'Split Routing'},
+  'connections-table': {group:'routing',label:'Таблица соединений'},
   'devices':     {group:'routing',label:'По устройствам'},
   'dns':         {group:'routing',label:'DNS'},
   'features':    {group:'mihomo',label:'Параметры'},
@@ -2291,7 +2319,7 @@ const NAV_MAP = {
 const GROUP_SUBS = {
   overview:    ['ov-system','ov-proxy','ov-traffic'],
   profiles:    ['profiles','import','sub-store'],
-  routing:     ['routing','devices','dns'],
+  routing:     ['routing','connections-table','devices','dns'],
   mihomo:      ['features','config','logs','update'],
   automation:  ['auto-select','maintenance'],
   diagnostics: ['chain','trace','unlock','diag-network','deep-bench','trash'],
@@ -2305,6 +2333,7 @@ const GROUP_LABELS = {
 function navTo(section) {
   const info = NAV_MAP[section];
   if (!info) return;
+  stopConnectionsTableAutoRefresh();
   // Open the group accordion
   document.querySelectorAll('.nav-group').forEach(g => g.classList.toggle('open', g.dataset.group === info.group));
   // Highlight sub-item
@@ -2328,6 +2357,7 @@ function navTo(section) {
   document.getElementById('sidebarBackdrop').classList.remove('show');
   // Persist
   localStorage.setItem('hr_current_section', section);
+  if (section === 'connections-table') startConnectionsTableAutoRefresh();
 }
 
 function globalSearch(query) {
@@ -2494,7 +2524,6 @@ function toggleTheme() {
     el.classList.add('dark');
   }
   localStorage.setItem('hr_theme', wasDark ? 'light' : 'dark');
-  syncVisualRoutingTheme();
 }
 
 // ─── LANGUAGE TOGGLE ─────────────────────────────────────────────────
@@ -2513,7 +2542,7 @@ const I18N = {
   // Nav sub-items + section titles
   'Система':'System','Статус прокси':'Proxy Status','Трафик':'Traffic',
   'Профили':'Profiles','Импорт':'Import','Sub-Store Lite':'Sub-Store Lite',
-  'Split Routing':'Split Routing','Визуальная таблица маршрутизации':'Visual Routing Table','По устройствам':'Per-Device','DNS':'DNS',
+  'Split Routing':'Split Routing','Таблица соединений':'Connections Table','По устройствам':'Per-Device','DNS':'DNS',
   'Параметры':'Parameters','Конфигурация':'Configuration','Логи':'Logs','Обновление':'Update',
   'Auto-Select':'Auto-Select','Обслуживание':'Maintenance',
   'Трассировка':'Traceroute','Разблокировка':'Unlock Check',
@@ -4363,85 +4392,29 @@ function countryFlag(code) {
   return cc.replace(/./g, ch => String.fromCodePoint(127397 + ch.charCodeAt(0)));
 }
 
-let visualRoutingWindowRef = null;
 let visualRoutingRefreshTimer = null;
 let visualRoutingIntervalSeconds = 5;
 let visualRoutingRefreshInFlight = false;
+let connectionsTableRows = [];
+let connectionsTableSearch = '';
 
-function openVisualRoutingWindow() {
-  const title = t('Визуальная таблица маршрутизации');
-  const shell = routingVisualWindowShell(title);
-  stopVisualRoutingAutoRefresh();
-  try {
-    visualRoutingWindowRef = window.open('', 'hincyray-routing-visual', 'popup,width=1220,height=760,resizable=yes,scrollbars=yes');
-    if (visualRoutingWindowRef && !visualRoutingWindowRef.closed) {
-      visualRoutingWindowRef.document.open();
-      visualRoutingWindowRef.document.write(shell);
-      visualRoutingWindowRef.document.close();
-    } else {
-      visualRoutingWindowRef = null;
-      showResultModal(title, '<div id="routingVisualContent" class="routing-visual-content">Загрузка…</div>', 'routing-visual-modal');
-    }
-  } catch (_) {
-    visualRoutingWindowRef = null;
-    showResultModal(title, '<div id="routingVisualContent" class="routing-visual-content">Загрузка…</div>', 'routing-visual-modal');
-  }
-  syncVisualRoutingTheme();
-  refreshVisualRoutingTable();
-  startVisualRoutingAutoRefresh();
+function isConnectionsTableActive() {
+  return document.querySelector('.section-panel[data-section="connections-table"]')?.classList.contains('open') === true;
 }
 
-function syncVisualRoutingTheme() {
-  if (!visualRoutingWindowRef || visualRoutingWindowRef.closed) return;
-  const root = visualRoutingWindowRef.document.documentElement;
-  if (!root) return;
-  const dark = document.documentElement.classList.contains('dark');
-  root.classList.toggle('theme-dark', dark);
-  root.classList.toggle('theme-light', !dark);
-}
-
-function routingVisualWindowShell(title) {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${htmlEscape(title)}</title>
-    <style>
-      :root{color-scheme:light;--bg:#f3f2f1;--surface:rgba(255,255,255,.78);--surface-solid:#ffffff;--surface2:#f8f8f8;--border:rgba(0,0,0,.12);--text:#1b1b1b;--muted:#605e5c;--accent:#0078d4;--accent-soft:rgba(0,120,212,.12);--ok:#107c10;--warn:#ffaa44;--bad:#d13438;font-family:"Segoe UI",-apple-system,BlinkMacSystemFont,sans-serif}
-      body{margin:0;min-height:100vh;background:radial-gradient(900px 420px at -120px -80px,rgba(0,120,212,.22),transparent 64%),linear-gradient(135deg,#f7f7f7,#ecebea);color:var(--text);font-size:13px}.wrap{padding:22px}.acrylic{background:var(--surface);backdrop-filter:blur(22px) saturate(140%);border:1px solid rgba(255,255,255,.72);box-shadow:0 16px 48px rgba(0,0,0,.14)}
-      html.theme-dark{color-scheme:dark;--bg:#202020;--surface:rgba(45,45,48,.82);--surface-solid:#2d2d30;--surface2:#333337;--border:#4a4a50;--text:#ffffff;--muted:#b4b4b8;--accent:#60cdff;--accent-soft:rgba(96,205,255,.16);--ok:#6ccb5f;--warn:#ffb900;--bad:#ff6b6b}html.theme-dark body{background:radial-gradient(900px 420px at -120px -80px,rgba(0,120,212,.28),transparent 64%),linear-gradient(135deg,#202020,#171717)}html.theme-dark .acrylic{border-color:rgba(255,255,255,.12);box-shadow:0 16px 48px rgba(0,0,0,.42)}html.theme-dark button,html.theme-dark select,html.theme-dark .breakdown-card,html.theme-dark .routing-visual-table-wrap{background:var(--surface-solid);color:var(--text)}html.theme-dark .routing-visual-table th{background:#323236}html.theme-dark .result-badge.warn{color:#ffd166}
-      .hero{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:14px;padding:18px 20px;border-radius:2px}.title{font-size:24px;font-weight:600;letter-spacing:-.01em}.muted{color:var(--muted)}
-      button{border:1px solid var(--border);background:var(--surface-solid);color:var(--text);border-radius:2px;padding:7px 12px;cursor:pointer;font:inherit}button:hover{border-color:var(--accent);background:#fff}.primary{background:var(--accent);border-color:var(--accent);color:#fff}.primary:hover{background:#106ebe;color:#fff}.commandbar{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin:0 0 14px;padding:10px 12px;border-radius:2px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}label{display:flex;gap:6px;align-items:center;color:var(--muted);font-size:12px}select{height:32px;border:1px solid var(--border);border-radius:2px;background:#fff;color:var(--text);padding:4px 26px 4px 8px}
-      .routing-visual-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin:10px 0 14px}.breakdown-card{padding:12px 14px;border:1px solid var(--border);border-radius:2px;background:var(--surface-solid)}.breakdown-label{font-size:12px;color:var(--muted);margin-bottom:4px}.breakdown-value{font-family:"Cascadia Mono",Consolas,monospace;font-size:19px;font-weight:600}.routing-visual-table-wrap{max-height:calc(100vh - 245px);overflow:auto;border:1px solid var(--border);border-radius:2px;background:#fff}.routing-visual-table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}.routing-visual-table th,.routing-visual-table td{padding:9px 11px;border-bottom:1px solid var(--border);vertical-align:top}.routing-visual-table th{position:sticky;top:0;background:#faf9f8;z-index:1;text-align:left;color:var(--muted);font-weight:600}.routing-visual-table tr:hover td{background:var(--accent-soft)}.mono{font-family:"Cascadia Mono",Consolas,monospace}.result-badge{display:inline-block;padding:2px 9px;border-radius:2px;font-size:12px;font-weight:600}.result-badge.ok{background:rgba(16,124,16,.12);color:var(--ok)}.result-badge.warn{background:rgba(255,170,68,.18);color:#8a5700}.result-badge.bad{background:rgba(209,52,56,.12);color:var(--bad)}.routing-route-detail{font-size:10px;color:var(--muted);margin-top:3px;word-break:break-all}
-    </style></head><body><div class="wrap"><div class="hero acrylic"><div><div class="title">${htmlEscape(title)}</div><div class="muted">${htmlEscape(t('Текущие соединения по сайтам и используемые профили/серверы'))}</div></div></div><div id="routingVisualContent">${htmlEscape(t('Загрузка…'))}</div></div></body></html>`;
-}
-
-function visualRoutingRefreshHandlerExpression() {
-  return 'window.opener&&window.opener.refreshVisualRoutingTable?window.opener.refreshVisualRoutingTable():refreshVisualRoutingTable()';
-}
-
-function visualRoutingIntervalHandlerExpression() {
-  return 'window.opener&&window.opener.setVisualRoutingInterval?window.opener.setVisualRoutingInterval(this.value):setVisualRoutingInterval(this.value)';
-}
-
-function isVisualRoutingModalOpen() {
-  const modal = document.getElementById('resultModal');
-  return !!(modal && modal.style.display !== 'none' && document.getElementById('routingVisualContent'));
-}
-
-function isVisualRoutingWindowOpen() {
-  if (visualRoutingWindowRef && visualRoutingWindowRef.closed) visualRoutingWindowRef = null;
-  return !!((visualRoutingWindowRef && !visualRoutingWindowRef.closed) || isVisualRoutingModalOpen());
-}
-
-function startVisualRoutingAutoRefresh() {
-  stopVisualRoutingAutoRefresh();
-  if (!isVisualRoutingWindowOpen()) return;
+function startConnectionsTableAutoRefresh() {
+  stopConnectionsTableAutoRefresh();
+  if (!isConnectionsTableActive()) return;
+  refreshConnectionsTable();
   const seconds = Number(visualRoutingIntervalSeconds || 0);
   if (seconds <= 0) return;
   visualRoutingRefreshTimer = setInterval(() => {
-    if (!isVisualRoutingWindowOpen()) { stopVisualRoutingAutoRefresh(); return; }
-    refreshVisualRoutingTable({auto: true});
+    if (!isConnectionsTableActive()) { stopConnectionsTableAutoRefresh(); return; }
+    refreshConnectionsTable({auto: true});
   }, seconds * 1000);
 }
 
-function stopVisualRoutingAutoRefresh() {
+function stopConnectionsTableAutoRefresh() {
   if (visualRoutingRefreshTimer) clearInterval(visualRoutingRefreshTimer);
   visualRoutingRefreshTimer = null;
 }
@@ -4449,59 +4422,29 @@ function stopVisualRoutingAutoRefresh() {
 function setVisualRoutingInterval(value) {
   const seconds = Math.max(0, Math.min(60, parseInt(value, 10) || 0));
   visualRoutingIntervalSeconds = seconds;
-  syncVisualRoutingIntervalControls();
-  if (isVisualRoutingWindowOpen()) startVisualRoutingAutoRefresh();
+  if (isConnectionsTableActive()) startConnectionsTableAutoRefresh();
 }
 
-function syncVisualRoutingIntervalControls() {
-  const setValue = doc => {
-    const select = doc && doc.getElementById && doc.getElementById('routingVisualInterval');
-    if (select) select.value = String(visualRoutingIntervalSeconds);
-  };
-  setValue(document);
-  if (visualRoutingWindowRef && !visualRoutingWindowRef.closed) setValue(visualRoutingWindowRef.document);
-}
-
-function setVisualRoutingContent(html) {
-  if (visualRoutingWindowRef && !visualRoutingWindowRef.closed) {
-    const target = visualRoutingWindowRef.document.getElementById('routingVisualContent');
-    if (target) { target.innerHTML = html; syncVisualRoutingIntervalControls(); return; }
-  }
-  const modalTarget = document.getElementById('routingVisualContent');
-  if (modalTarget) { modalTarget.innerHTML = html; syncVisualRoutingIntervalControls(); }
-  else if (isVisualRoutingWindowOpen()) showResultModal(t('Визуальная таблица маршрутизации'), `<div id="routingVisualContent" class="routing-visual-content">${html}</div>`, 'routing-visual-modal');
-}
-
-function refreshVisualRoutingTable(options = {}) {
-  if (!isVisualRoutingWindowOpen()) { stopVisualRoutingAutoRefresh(); return; }
+function refreshConnectionsTable(options = {}) {
+  if (!isConnectionsTableActive()) { stopConnectionsTableAutoRefresh(); return; }
   if (visualRoutingRefreshInFlight) return;
   visualRoutingRefreshInFlight = true;
-  if (!options.auto) setVisualRoutingContent(routingVisualLoadingHtml());
+  if (!options.auto) safeSet('connectionsTableUpdated', t('Загрузка…'));
   Promise.all([
     api('GET','/api/mihomo-api/connections',undefined,true),
     api('GET','/api/routing',undefined,true),
     api('GET','/api/status',undefined,true),
   ]).then(([connectionsData, routingData, status]) => {
-    if (!isVisualRoutingWindowOpen()) { stopVisualRoutingAutoRefresh(); return; }
+    if (!isConnectionsTableActive()) { stopConnectionsTableAutoRefresh(); return; }
     const connections = normalizeConnections(connectionsData, null);
-    setVisualRoutingContent(buildVisualRoutingTableHtml(connections, routingData || {}, status || {}));
+    connectionsTableRows = buildVisualRoutingRows(connections, routingData || {}, status || {});
+    renderConnectionsTable(status || {}, connections);
   }).catch(error => {
-    if (!isVisualRoutingWindowOpen()) { stopVisualRoutingAutoRefresh(); return; }
-    setVisualRoutingContent(`<div class="result-badge bad">${htmlEscape(error.message || String(error))}</div>`);
+    if (!isConnectionsTableActive()) { stopConnectionsTableAutoRefresh(); return; }
+    safeSet('connectionsTableUpdated', error.message || String(error));
   }).finally(() => {
     visualRoutingRefreshInFlight = false;
   });
-}
-
-function routingVisualLoadingHtml() {
-  return `<div class="routing-visual-shell"><div class="routing-visual-commandbar"><div><div class="routing-visual-title">${htmlEscape(t('Загрузка…'))}</div><div class="routing-visual-subtitle">${htmlEscape(t('Автообновление работает только пока это окно открыто'))}</div></div>${visualRoutingControlsHtml()}</div></div>`;
-}
-
-function visualRoutingControlsHtml() {
-  const refresh = visualRoutingRefreshHandlerExpression();
-  const interval = visualRoutingIntervalHandlerExpression();
-  const options = [2,5,10,15,30,60].map(seconds => `<option value="${seconds}" ${visualRoutingIntervalSeconds===seconds?'selected':''}>${seconds} ${htmlEscape(t('сек'))}</option>`).join('');
-  return `<div class="routing-visual-actions"><label>${htmlEscape(t('Автообновление'))}<select id="routingVisualInterval" onchange="${attrEscape(interval)}">${options}</select></label><button class="btn btn-sm primary" onclick="${attrEscape(refresh)}">↻ ${htmlEscape(t('Обновить'))}</button></div>`;
 }
 
 function serverByRouteSuffix(servers) {
@@ -4569,19 +4512,36 @@ function buildVisualRoutingRows(connections, routingData, status) {
   return Array.from(groups.values()).sort((a,b) => (b.download + b.upload) - (a.download + a.upload));
 }
 
-function buildVisualRoutingTableHtml(connections, routingData, status) {
-  const rows = buildVisualRoutingRows(connections, routingData, status);
+function connectionsTableSearchText(row) {
+  return [row.site, ...row.sources, ...row.ports, ...row.networks, ...row.countries, ...row.rules, ...row.routes.keys(), ...row.details].join(' ').toLowerCase();
+}
+
+function filterConnectionsTable(value) {
+  connectionsTableSearch = String(value || '').trim().toLowerCase();
+  renderConnectionsTableRows();
+}
+
+function renderConnectionsTable(status, connections) {
   const totalUp = connections.reduce((sum,c) => sum + Number(c.upload || 0), 0);
   const totalDown = connections.reduce((sum,c) => sum + Number(c.download || 0), 0);
   const active = status.active_profile_name || '—';
-  const updated = new Date().toLocaleTimeString();
-  const summary = `<div class="routing-visual-summary">
-    <div class="breakdown-card"><div class="breakdown-label">${htmlEscape(t('Сайтов'))}</div><div class="breakdown-value">${rows.length}</div></div>
+  const summary = document.getElementById('connectionsTableSummary');
+  if (summary) summary.innerHTML = `
+    <div class="breakdown-card"><div class="breakdown-label">${htmlEscape(t('Сайтов'))}</div><div class="breakdown-value" id="connectionsTableVisibleCount">${connectionsTableRows.length}</div></div>
     <div class="breakdown-card"><div class="breakdown-label">${htmlEscape(t('Соединений'))}</div><div class="breakdown-value">${connections.length}</div></div>
     <div class="breakdown-card"><div class="breakdown-label">${htmlEscape(t('Активный профиль'))}</div><div class="breakdown-value" style="font-size:14px">${htmlEscape(active)}</div></div>
-    <div class="breakdown-card"><div class="breakdown-label">↑ / ↓</div><div class="breakdown-value" style="font-size:14px">${htmlEscape(fmtBytes(totalUp))} / ${htmlEscape(fmtBytes(totalDown))}</div></div>
-  </div>`;
-  const tableRows = rows.map(row => {
+    <div class="breakdown-card"><div class="breakdown-label">↑ / ↓</div><div class="breakdown-value" style="font-size:14px">${htmlEscape(fmtBytes(totalUp))} / ${htmlEscape(fmtBytes(totalDown))}</div></div>`;
+  safeSet('connectionsTableUpdated', `${t('Обновлено')}: ${new Date().toLocaleTimeString()} · ${t('Автообновление работает только пока эта вкладка открыта')}`);
+  renderConnectionsTableRows();
+}
+
+function renderConnectionsTableRows() {
+  const rows = connectionsTableSearch ? connectionsTableRows.filter(row => connectionsTableSearchText(row).includes(connectionsTableSearch)) : connectionsTableRows;
+  const visible = document.getElementById('connectionsTableVisibleCount');
+  if (visible) visible.textContent = String(rows.length);
+  const body = document.getElementById('connectionsRoutingBody');
+  if (!body) return;
+  body.innerHTML = rows.map(row => {
     const routeHtml = Array.from(row.routes.entries()).map(([label,badge]) => `<span class="result-badge ${badge}">${htmlEscape(label)}</span>`).join('<br>') || '—';
     const details = Array.from(row.details).slice(0, 3).join('\n');
     return `<tr>
@@ -4594,8 +4554,7 @@ function buildVisualRoutingTableHtml(connections, routingData, status) {
       <td class="mono">${htmlEscape(fmtBytes(row.upload))}</td>
       <td class="mono">${htmlEscape(fmtBytes(row.download))}</td>
     </tr>`;
-  }).join('') || `<tr><td colspan="8" style="color:var(--muted)">${htmlEscape(t('Активных соединений нет'))}</td></tr>`;
-  return `<div class="routing-visual-shell"><div class="routing-visual-commandbar"><div><div class="routing-visual-title">${htmlEscape(t('Текущие маршруты соединений'))}</div><div class="routing-visual-subtitle">${htmlEscape(t('Агрегация по сайту/IP. Источник маршрута берётся из observed Mihomo chain, без угадывания profile id.'))} · ${htmlEscape(t('Обновлено'))}: ${htmlEscape(updated)}</div></div>${visualRoutingControlsHtml()}</div>${summary}<div class="routing-visual-table-wrap"><table class="routing-visual-table"><thead><tr><th>${htmlEscape(t('Сайт / IP'))}</th><th>${htmlEscape(t('Соед.'))}</th><th>${htmlEscape(t('Профиль / сервер'))}</th><th>Source IP</th><th>${htmlEscape(t('Сеть / порт'))}</th><th>${htmlEscape(t('Правило'))}</th><th>↑</th><th>↓</th></tr></thead><tbody>${tableRows}</tbody></table></div></div>`;
+  }).join('') || `<tr><td colspan="8" style="color:var(--muted)">${htmlEscape(connectionsTableSearch ? t('Поиск не дал результатов') : t('Активных соединений нет'))}</td></tr>`;
 }
 function showEcRaw(endpoint) {
   const out = document.getElementById('ecApiResult');
@@ -4880,9 +4839,7 @@ function showResultModal(title, html, extraClass) {
   document.getElementById('resultModal').style.display = 'flex';
 }
 function closeResultModal() {
-  const closingVisualRoutingModal = isVisualRoutingModalOpen() && !(visualRoutingWindowRef && !visualRoutingWindowRef.closed);
   document.getElementById('resultModal').style.display = 'none';
-  if (closingVisualRoutingModal) stopVisualRoutingAutoRefresh();
   const modal = document.querySelector('#resultModal .modal');
   if (modal) modal.className = 'modal modal-wide';
 }
