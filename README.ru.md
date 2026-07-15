@@ -49,7 +49,7 @@ v0.21 реализует контракты безопасности и упра
 
 Версионированная поверхность API описывается `GET /api/contracts`. Readiness/onboarding, routing summary/context/preview/explain, фактический memory report, safe mode и bounded страницы соединений доступны через `/api/onboarding/status`, `/api/routing/summary`, `/api/routing/connection-context`, `/api/routing/preview`, `/api/routing/explain`, `/api/memory-estimate`, `GET/POST /api/safe-mode` и `POST /api/mihomo-api/connections/page`. Memory report содержит измеренные source bytes на диске, текущий RSS Mihomo, доступную память, число правил/providers и observed risk по настроенным порогам; будущий peak allocation не выдумывается.
 
-Web UI получил responsive table-to-card layout, mobile/tablet navigation, диалог переименования профиля вместо `window.prompt` и точный поиск по видимой строке флаг+host, например `🇷🇺 chatgpt.com`. Модульные границы включают typed API DTO в `hincyray_api`, auth policy в `hincyray_security` и ownership встроенного UI в `hincyray_webui`. Полные gates, результат Playwright, cross-build и router deploy остаются pending до финального отчёта. См. [`docs/architecture-v0.21.md`](docs/architecture-v0.21.md).
+Web UI получил responsive table-to-card layout, mobile/tablet navigation, диалог переименования профиля вместо `window.prompt` и точный поиск по видимой строке флаг+host, например `🇷🇺 chatgpt.com`. Модульные границы включают typed API DTO в `hincyray_api`, auth policy в `hincyray_security` и ownership встроенного UI в `hincyray_webui`. Релиз v0.21 прошёл полные Rust/frontend/browser gates, был cross-built для Keenetic/Entware aarch64 и live-validated на Keenetic Giga. См. [`docs/architecture-v0.21.md`](docs/architecture-v0.21.md) и [`docs/releases/v0.21.0.md`](docs/releases/v0.21.0.md).
 
 ### v0.20.0
 
@@ -278,7 +278,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Результаты полного gate и подтверждение router deploy остаются pending до финального отчёта.
+Команда Playwright запускает fixture-backed browser smoke suite. Результаты gates v0.21.0 и подтверждение router deploy зафиксированы в [`docs/releases/v0.21.0.md`](docs/releases/v0.21.0.md).
 
 ## Установка
 

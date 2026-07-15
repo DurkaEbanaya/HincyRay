@@ -28,7 +28,7 @@
 - Responsive tables автоматически получают `data-label` и превращаются в карточки; переименование профиля использует modal dialog вместо `window.prompt`.
 - Поиск соединений индексирует точно отображаемую строку флаг+host, поэтому запрос `🇷🇺 chatgpt.com` сохраняет каноническую строку.
 
-Полный контракт описан в [`architecture-v0.21.md`](architecture-v0.21.md). Финальные полные gates, результат Playwright и deploy v0.21 пока не объявляются пройденными: они pending до финального отчёта.
+Полный контракт описан в [`architecture-v0.21.md`](architecture-v0.21.md). Финальные gates, Playwright smoke, cross-build и live deploy v0.21 завершены; результаты зафиксированы в [`releases/v0.21.0.md`](releases/v0.21.0.md).
 
 ## 1. Важная модель: не WiFi сам по себе, а политика Keenetic
 
@@ -477,7 +477,7 @@ Backend: `POST /api/routing-presets/apply` с `apply:true`, чтобы preset с
 - `git diff --check`.
 - Router E2E после deploy: readiness, transactional apply/rollback, firewall/DNS/TCP/UDP path, factual memory report, safe mode и bounded API payloads.
 
-Playwright smoke suite существует и запускается через команды выше, но его финальный результат, полные Rust gates и router deploy пока pending до финального отчёта.
+Playwright smoke suite существует и запускается через команды выше. Для v0.21.0 финальный результат уже зафиксирован: полные Rust gates прошли, Playwright smoke прошёл, router deploy и router E2E прошли; см. [`releases/v0.21.0.md`](releases/v0.21.0.md).
 
 ## 28. Что нужно для настоящего live E2E всех функций
 

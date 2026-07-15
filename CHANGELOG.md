@@ -2,13 +2,92 @@
 
 ## v0.21.0 - 2026-07-15
 
-- Security boundary: Argon2id password hashes with legacy plaintext migration, CSPRNG 256-bit sessions, idle/absolute expiry, session cap, per-IP login throttling, same-origin state-change checks, security headers, restore invalidation, and sessionStorage bearer handling.
-- Secret safety: generated Mihomo config is redacted by the backend and escaped by the WebUI before rendering.
-- Typed bounded APIs: contracts, onboarding readiness, routing summary/preview/explain/connection context, factual memory footprint, reversible safe mode, and paginated/filterable Mihomo connections.
-- WebUI reliability: fixed boot-time loader contract, exact country-flag resource search, canonical Connections actions, route explanation, apply preview, readiness/safe-mode cards, reusable rename dialog, and responsive table-to-card layouts.
-- Architecture: dedicated `hincyray_api`, `hincyray_security`, and `hincyray_webui` module boundaries.
-- Testing: deterministic Playwright browser smoke tests and CI browser job, while retaining Rust and static frontend contract gates.
-- Router lifecycle: installer-generated init scripts now detach with `nohup`, resolve only the authoritative PID file, verify `/proc/<pid>/exe` before signaling, and reject stale PID reuse; operational guidance forbids argv-based process scans that can terminate their own SSH shell.
+v0.21.0 is the hardening and operability release. It turns the router daemon from a feature-heavy single-file control plane into a contract-driven system with explicit security, bounded APIs, transactional runtime changes, browser smoke coverage, and safer installer lifecycle semantics.
+
+### Security and authentication
+
+- Web UI passwords are now stored as Argon2id PHC hashes with random salts. Legacy plaintext state is migrated on load and is not serialized again.
+- Session tokens are generated from cryptographically secure 256-bit randomness instead of timestamp/PID material.
+- Sessions have idle and absolute expiry, a hard cap, and are invalidated when username, password, auth-enabled state, or state restore changes the security boundary.
+- Login attempts are throttled per source IP after repeated failures.
+- State-changing HTTP requests enforce same-origin checks when `Origin` is present.
+- Request bodies are bounded and malformed UTF-8/length handling is rejected before handler logic.
+- The browser keeps the Bearer token in `sessionStorage`; stale `localStorage.hincyray_token` is removed during Web UI boot.
+- Security headers are emitted for the embedded UI/API responses.
+- Password hashing/verification work is capacity-limited per daemon instance, preventing CPU exhaustion without making parallel tests share a process-global limiter.
+
+### Secret redaction and diagnostics safety
+
+- `GET /api/mihomo-config` and `GET /api/mihomo-config/preview` now pass generated YAML through structural redaction before returning it to the browser.
+- Known credential families are redacted, including proxy passwords, UUID-like user secrets where appropriate, private keys, preshared keys, bearer/API secrets, TLS client key material, and provider URLs carrying opaque tokens.
+- The Web UI escapes rendered config output instead of injecting it as HTML.
+- Redaction is fail-closed: malformed generated YAML is not returned raw.
+
+### Typed, bounded API surface
+
+- Added `src/hincyray_api.rs` for typed DTOs and bounded response contracts.
+- Added `GET /api/contracts` so the Web UI and diagnostics can discover contract version, bounded endpoints, auth scheme, and same-origin mutation policy.
+- Added `GET /api/onboarding/status` with readiness checks and remediation for Mihomo, active profile, GeoIP asset, core, transparent firewall/TPROXY state, and the ndm firewall hook.
+- Added `GET /api/routing/summary` for a compact routing/safe-mode/runtime summary.
+- Added `GET /api/routing/connection-context` to provide a bounded server projection for connection routing controls without raw share links or credentials.
+- Added `GET /api/routing/preview` to compare desired vs applied config hashes, GeoBase generations, firewall/core effects, and conflicts without mutating runtime.
+- Added `POST /api/routing/explain` for local route explanation by host/resource/source/port/network while marking Mihomo-owned GEOSITE/GEOIP/RULE-SET decisions as runtime-owned instead of guessing.
+- Added `GET /api/memory-estimate` as a factual current-state report: rule-source bytes on disk, current Mihomo RSS, MemAvailable, rule/provider counts, safe-mode state, and observed risk. It no longer pretends to forecast future peak allocation.
+- Added `GET/POST /api/safe-mode` for reversible suppression of heavy optional features such as RKN bypass, managed GeoBases, proxy/rule providers, sub-rules, raw/typed rules, tunnels, and smux.
+- Added `POST /api/mihomo-api/connections/page` for server-side search, filtering, offset, and clamped limits over Mihomo connections.
+- Added `POST /api/mihomo-api/connections/device-traffic` for bounded per-device accounting over observed source IPs.
+
+### Runtime activation and rollback
+
+- Routing apply now runs through a serialized activation path: clone authoritative state, generate desired config, validate, atomically write, restart/start Mihomo, observe readiness, apply firewall, and commit desired GeoBase generation only after success.
+- Activation failure restores previous config bytes, core state, firewall state, and policy state instead of leaving mixed desired/applied runtime.
+- Safe mode rollback is field-scoped: it suppresses generated heavy features without purging profiles, subscriptions, source artifacts, backups, or history.
+- Desired vs applied GeoBase state is explicitly reported, so the UI can show when a config requires apply.
+
+### Web UI reliability and responsiveness
+
+- The Web UI boot contract was tightened so required loaders and DOM targets are statically verified.
+- Connections views now use server-side pagination/search instead of dumping unbounded `/connections` payloads into the browser.
+- Connection search indexes the exact rendered flag-plus-host label, fixing searches such as `🇷🇺 chatgpt.com`.
+- Connections actions now use canonical server refs/context rather than requiring the browser to infer internal routing identity.
+- Added route explanation, apply preview, onboarding/readiness, safe-mode, and factual memory cards.
+- Profile rename now uses an in-page dialog with keyboard behavior instead of `window.prompt`.
+- Responsive table-to-card rendering adds `data-label` from table headers for mobile/tablet layouts.
+- Mobile/tablet navigation and sheets were added while keeping the UI a single embedded document with no CDN/build step.
+
+### Module boundaries
+
+- Added `src/hincyray_security.rs` for password hashing, password verification, session generation/expiry/caps, login throttling, and password-work limiting.
+- Added `src/hincyray_api.rs` for versioned DTOs and bounded API contracts.
+- Added `src/hincyray_webui.rs` as the embedded Web UI asset boundary.
+- `src/hincyray.rs` remains the composition root for HTTP dispatch, persisted state, activation, core/firewall/watchdog orchestration, and route handlers.
+
+### Installer and router lifecycle safety
+
+- The installer now uses an Entware-aware transaction model with lifecycle locking and rollback guards.
+- Generated init scripts detach the daemon with `nohup`, redirect stdin, own the authoritative PID file, and verify `/proc/<pid>/exe` before signaling.
+- Stale PID files pointing at another process are rejected instead of killed.
+- The installer starts core through the daemon API where appropriate and no longer relies on unsafe argv/process-name scans.
+- Repository operational guidance now forbids `pgrep -f`, `pkill -f`, `killall`, and similar process-name lifecycle controls for HincyRay because they can match and terminate the invoking SSH shell.
+
+### Tests and CI
+
+- Added deterministic Playwright browser smoke tests with a fixture server.
+- Browser smoke covers Web UI boot without JavaScript errors, exact flag+host search, native connection-route action payloads, and the profile rename dialog.
+- Added `package.json`, `package-lock.json`, and `playwright.config.mjs` for reproducible browser tests.
+- Added `scripts/installer-lifecycle-contract-test.py` for static installer/init lifecycle invariants.
+- CI now runs Rust gates, frontend contract checks, installer lifecycle checks, and browser smoke tests.
+- Final local gates passed: `cargo fmt --all --check`, `cargo check --all-targets --all-features`, both clippy profiles with `-D warnings`, `cargo test --all-targets --all-features` (464 passed), frontend contract, installer lifecycle contract, Playwright browser tests (6 passed), and `git diff --check`.
+
+### Router validation
+
+- Cross-built no-default-features aarch64 router binary for Keenetic/Entware.
+- Final binary SHA256: `61721753bd49f171f3c7ae5b2299691c5d0ffc4275468caa5a68b3345b8c023d`.
+- Deployed on Keenetic Giga through the authoritative init script with backup and rollback guard.
+- Live `/opt/sbin/hincyray` was copied back from the router and its SHA matched the local release artifact.
+- Live checks passed: `/api/health` reports `0.21.0`, `/api/status` reports core running, `/api/safe-mode` reports core/firewall running, `/api/onboarding/status` reports ready, and router E2E passed.
+
+Full release notes are in `docs/releases/v0.21.0.md` and on the GitHub Release page.
 
 ## v0.19.4 - 2026-07-05
 

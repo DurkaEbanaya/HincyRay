@@ -49,7 +49,7 @@ v0.21 implements the hardening and operability contracts end to end. Authenticat
 
 The versioned API surface is advertised by `GET /api/contracts`. Readiness/onboarding, routing summary/context/preview/explain, observed memory reporting, safe mode, and bounded connection pages are available at `/api/onboarding/status`, `/api/routing/summary`, `/api/routing/connection-context`, `/api/routing/preview`, `/api/routing/explain`, `/api/memory-estimate`, `GET/POST /api/safe-mode`, and `POST /api/mihomo-api/connections/page`. The memory report is factual: rule-source bytes on disk, current Mihomo RSS, available memory, rule/provider counts, and threshold-derived observed risk. It does not speculate about future peak allocation.
 
-The Web UI adds responsive table-to-card layouts, mobile/tablet navigation, a profile rename dialog instead of `window.prompt`, and exact search support for rendered flag-plus-host labels such as `🇷🇺 chatgpt.com`. Module boundaries now include typed API DTOs in `hincyray_api`, auth policy in `hincyray_security`, and embedded UI ownership in `hincyray_webui`. Full gates, Playwright results, cross-build, and router deployment remain pending until the final report. See [`docs/architecture-v0.21.md`](docs/architecture-v0.21.md).
+The Web UI adds responsive table-to-card layouts, mobile/tablet navigation, a profile rename dialog instead of `window.prompt`, and exact search support for rendered flag-plus-host labels such as `🇷🇺 chatgpt.com`. Module boundaries now include typed API DTOs in `hincyray_api`, auth policy in `hincyray_security`, and embedded UI ownership in `hincyray_webui`. The v0.21 release passed full Rust/frontend/browser gates, was cross-built for Keenetic/Entware aarch64, and was live-validated on Keenetic Giga. See [`docs/architecture-v0.21.md`](docs/architecture-v0.21.md) and [`docs/releases/v0.21.0.md`](docs/releases/v0.21.0.md).
 
 ### v0.20.0
 
@@ -310,7 +310,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Full gate results and router deployment evidence remain pending until the final report.
+The Playwright command runs the fixture-backed browser smoke suite. v0.21.0 gate results and router deployment evidence are recorded in [`docs/releases/v0.21.0.md`](docs/releases/v0.21.0.md).
 
 ## Installation
 
