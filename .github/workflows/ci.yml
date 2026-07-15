@@ -27,3 +27,18 @@ jobs:
         run: cargo test --all-targets --all-features
       - name: Frontend contract
         run: python3 scripts/frontend-contract-test.py
+      - name: Installer lifecycle contract
+        run: python3 scripts/installer-lifecycle-contract-test.py
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Browser smoke
+        run: npm run test:browser

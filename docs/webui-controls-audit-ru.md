@@ -1,8 +1,34 @@
-# HincyRay Web UI: понятное описание кнопок, переключателей и найденных аномалий
+# HincyRay Web UI v0.21: контракты контролов и актуализация аудита
 
-Дата аудита: 2026-07-04  
-Версия проекта: v0.19.4
+Дата первичного аудита: 2026-07-04
+
+Актуализация: 2026-07-15
+
+Версия документации: v0.21.0
+
 Фокус: Web UI роутерного демона `hincyray`, файл `src/webui/index.html`, backend `src/hincyray.rs`.
+
+## 0. Статус v0.21
+
+Аудит ниже сохраняет историю найденных проблем, но его статусы v0.19 нельзя автоматически считать текущим результатом проверки v0.21.
+
+Реализовано в v0.21:
+
+- Auth hardening: Argon2id вместо persisted plaintext, миграция старого state, криптографические session tokens, idle/absolute expiry, лимит сессий, per-IP login throttling и invalidation сессий при изменении auth settings.
+- Browser token хранится в `sessionStorage`, а старое значение `hincyray_token` из `localStorage` удаляется при загрузке.
+- HTTP hardening: same-origin проверка изменяющих запросов, bounded request bodies, redacted applied/preview config и публичный allowlist только для UI, health, login и чтения auth settings.
+- Активация runtime: config validation, readiness observation, сериализация apply-операций, rollback предыдущих config/core/firewall и разделение desired/applied GeoBase generation.
+- Typed API DTO и bounded projections вынесены в `hincyray_api`, auth policy — в `hincyray_security`, embedded HTML boundary — в `hincyray_webui`.
+- `GET /api/contracts` публикует версию contract surface, bounded endpoints, same-origin policy и auth scheme.
+- `GET /api/onboarding/status` возвращает readiness checks и remediation.
+- Routing API: `GET /api/routing/summary`, `GET /api/routing/connection-context`, `GET /api/routing/preview`, `POST /api/routing/explain`.
+- Safety API: `GET /api/memory-estimate`, `GET/POST /api/safe-mode`.
+- `/api/memory-estimate` — compatibility name для factual report: source bytes на диске, текущий RSS Mihomo, MemAvailable, counts и observed threshold risk; speculative peak estimate не возвращается.
+- `POST /api/mihomo-api/connections/page` фильтрует и выдаёт bounded страницу соединений по `query`, `offset`, `limit`.
+- Responsive tables автоматически получают `data-label` и превращаются в карточки; переименование профиля использует modal dialog вместо `window.prompt`.
+- Поиск соединений индексирует точно отображаемую строку флаг+host, поэтому запрос `🇷🇺 chatgpt.com` сохраняет каноническую строку.
+
+Полный контракт описан в [`architecture-v0.21.md`](architecture-v0.21.md). Финальные полные gates, результат Playwright и deploy v0.21 пока не объявляются пройденными: они pending до финального отчёта.
 
 ## 1. Важная модель: не WiFi сам по себе, а политика Keenetic
 
@@ -18,7 +44,7 @@ SSID / сегмент / устройство
 
 Отдельная SSID полезна как удобный способ назначить одну политику сразу всему сегменту. Если SSID `HincyRay-VPN` создана, но сегменту не назначена политика Xkeen/HincyRay, это обычная WiFi-сеть.
 
-## 2. Как проверялось
+## 2. Как проверялся первичный аудит
 
 Проверено безопасно:
 
@@ -28,14 +54,14 @@ SSID / сегмент / устройство
 - Backend handlers в `src/hincyray.rs`.
 - Существующие тесты проекта.
 
-На момент первичного аудита было запущено:
+На момент первичного аудита были записаны следующие исторические результаты:
 
 ```text
 cargo check --all-targets --all-features — OK
 cargo test --all-targets --all-features — OK, 339 tests passed
 ```
 
-После аудита начат fix-pass в коде. Исправления, уже внесённые в рабочее дерево, отмечены ниже как **Статус: исправлено в коде**; для них ещё требуется полный финальный gate и, при необходимости, live E2E на роутере.
+После аудита был выполнен fix-pass. Пометки **Статус: исправлено в коде** ниже относятся к тому проходу; для v0.21 они не заменяют повторный полный gate, browser E2E и, при необходимости, live E2E на роутере.
 
 Не выполнялись без отдельного подтверждения разрушительные live-действия на роутере: остановка ядра, остановка firewall, restore backup, WebDAV restore, обновление Mihomo, reset маршрутизации, закрытие всех соединений. В документе они отмечены отдельно.
 
@@ -72,7 +98,7 @@ cargo test --all-targets --all-features — OK, 339 tests passed
 
 - **★** — добавить/убрать профиль из избранного: `POST /api/favorites/toggle`.
 - **Выбрать** — сделать профиль активным: `POST /api/active-profile`.
-- **✎** — переименовать профиль через prompt: `POST /api/profiles/update`.
+- **✎** — открыть in-page диалог переименования и отправить `POST /api/profiles/update`; `window.prompt` не используется.
 - **✕** — удалить профиль: `POST /api/profiles/delete`, есть подтверждение. Если удалить активный профиль, backend останавливает core.
 - **⤴ Поделиться / QR** в заголовке группы — `POST /api/profile-groups/share`; backend по `group` возвращает всю подписку/группу серверов. Для URL-подписки QR кодирует URL, для именованной группы возвращается bundle raw links; QR может отсутствовать, если bundle физически не помещается в QR.
 - **✕** в заголовке группы — `POST /api/profile-groups/delete`; удаляет всю видимую подписку/группу серверов, а не один server profile.
@@ -147,7 +173,7 @@ Backend проверяет метод и отказывает, если проф
 
 ### RKN Bypass
 
-- **Включить обход блокировок РКН** — включает rule provider `ru-bypass`.
+- **Включить обход блокировок РКН** — включает rule provider `ru-bypass`; текущий безопасный default выключен из-за стоимости очень больших списков в памяти.
 - **URL списка** — источник списка, по умолчанию `itworksig/rublacklist`.
 - **Интервал обновления** — как часто Mihomo обновляет rule provider.
 
@@ -235,11 +261,11 @@ Backend: `POST /api/routing-presets/apply` с `apply:true`, чтобы preset с
 
 После сохранения UI вызывает `POST /api/routing/apply`.
 
-### Частично или не подключены
+### Исторически частично подключённые поля
 
-Визуально есть карточки NTP, Per-proxy defaults, DNS расширенные, Sniffer, Sub-rules, Typed rules, Raw rules, Proxy providers, Rule providers, Tunnels, Authentication, Experimental, Hosts. Но большинство полей в этих карточках не имеют `id` и не читаются в `saveFeatures()`/`loadFeatures()`.
+Первичный аудит v0.19 обнаружил карточки NTP, Per-proxy defaults, DNS расширенные, Sniffer, Sub-rules, Typed rules, Raw rules, Proxy providers, Rule providers, Tunnels, Authentication, Experimental и Hosts, для которых часть полей не имела полного save/load binding.
 
-**Аномалия:** эти элементы выглядят как рабочие настройки, но в текущем UI они в основном декоративные/неподключенные. Backend поддерживает многие из этих структур, но экран сохраняет только ограниченный набор.
+**Статус v0.21:** это историческое наблюдение должно быть повторно проверено browser E2E по каждому видимому контролу. Нельзя ни объявлять все поля рабочими, ни повторять старое утверждение, что большинство из них декоративны, без нового control-to-API прохода.
 
 ## 10. Статус прокси
 
@@ -251,7 +277,9 @@ Backend: `POST /api/routing-presets/apply` с `apply:true`, чтобы preset с
 - **Перезагрузить ресурс** в таблице соединений — `POST /api/mihomo-api/connections/close` с `{resource}`; backend сам определяет host/IP и закрывает совпавшие соединения.
 - **Назначить маршрут ресурсу** в таблице соединений — `POST /api/routing/resource-route` с `{resource,target,close_connections:true}`; backend создаёт/обновляет правило, применяет конфиг и закрывает старые соединения ресурса.
 - Таблица групп прокси — `GET /api/mihomo-api/proxies`.
-- Активные соединения — `GET /api/mihomo-api/connections`.
+- Активные соединения для UI — `POST /api/mihomo-api/connections/page` с `query`, `offset`, `limit`; backend ограничивает `limit` диапазоном 1–500 и возвращает `total`, `filtered`, `offset`, `limit`, `connections`.
+- `GET /api/mihomo-api/connections` сохранён как legacy raw snapshot.
+- Контекст назначения server routes — `GET /api/routing/connection-context`; объяснение выбранного ресурса — `POST /api/routing/explain`.
 - EC API raw buttons — должны показывать raw JSON из Mihomo EC.
 - **Disable rules** — `POST /api/mihomo-api/rules/disable`, есть подтверждение.
 
@@ -268,9 +296,14 @@ Backend: `POST /api/routing-presets/apply` с `apply:true`, чтобы preset с
 - **Timeout** — timeout speed-test.
 - **Download URL** — URL тестового файла.
 - **Тест скорости** — ping через EC delay и/или `POST /api/mihomo-api/speed-test`.
-- Лог подключений — `GET /api/connection-log`.
+- Лог подключений — `GET /api/connection-log`; это bounded in-memory журнал до 500 записей, который очищается при restart daemon, а не persisted history.
 
 **Риск:** speed-test создаёт реальный трафик через proxy.
+
+### Поиск и responsive layout
+
+- Search text включает host/IP/source/country/rule/chains и точно отрисованный label `флаг + host`; это исправляет поиск строк вроде `🇷🇺 chatgpt.com`.
+- Таблицы получают класс `responsive-cards`; на mobile заголовки колонок переносятся в `data-label` каждой ячейки и строки показываются как карточки.
 
 ## 12. Тесты
 
@@ -376,9 +409,9 @@ Backend: `POST /api/routing-presets/apply` с `apply:true`, чтобы preset с
 - **Имя пользователя** — login.
 - **Новый пароль** — новый пароль; placeholder “Не менять”.
 - **Сохранить** — `POST /api/auth-settings`.
-- **Выйти** — `POST /api/auth/logout`, удаляет token из localStorage.
+- **Выйти** — `POST /api/auth/logout`, удаляет token из `sessionStorage`.
 
-**Риск:** если поле пароля пустое, нужно live-проверить, сохраняет ли backend старый пароль или устанавливает пустой. По коду UI всегда отправляет `password` как текущее значение поля.
+**Статус v0.21:** пустое поле пароля означает «не менять»; новый непустой пароль хешируется Argon2id, plaintext не возвращается и не сериализуется. Включить auth без установленного пароля нельзя. Изменение username/password/enabled инвалидирует активные сессии.
 
 ## 22. Acrylic, тема, язык, меню, подсказки
 
@@ -417,17 +450,36 @@ Backend: `POST /api/routing-presets/apply` с `apply:true`, чтобы preset с
 1. **Исправлено:** одиночное добавление профиля теперь отправляет `raw`.
 2. **Исправлено:** Sub-Store sort теперь отправляет `sort_by`.
 3. **Исправлено:** нерабочий UI создания device override убран из пользовательского экрана; экран стал списком подключённых устройств.
-4. **Остаётся:** Mihomo Features частично декоративны — много полей не имеют `id` и не участвуют в `saveFeatures()`.
+4. **Исторический риск:** часть Mihomo Features ранее не имела полного save/load binding; финальный полный control audit остаётся частью release report.
 5. **Исправлено:** EC raw показывает реальный ответ API.
 6. **Исправлено:** Auto-update UI подключён к `/api/update/status` и `/api/update/settings`.
 7. **Исправлено:** `failover_fail_count` стал read-only runtime-счётчиком и не отправляется в SET.
 8. **Исправлено:** QUIC toggle профиля убран из таблицы; пользовательский QUIC control остаётся в routing rules.
-9. **Остаётся:** “Закрыть все соединения” без подтверждения.
+9. **Требует повторной проверки:** destructive UX для “Закрыть все соединения” и других bulk actions должен иметь явное подтверждение.
 10. **Исправлено:** терминология WiFi заменена на policy/connmark wording.
 11. **Исправлено:** статичные demo-значения Hardware заменены на placeholders и реальные `/api/system` bindings.
 12. **Добавлено:** `POST /api/profiles/share` для share-link + QR SVG по `profile_id` без раскрытия raw-ссылок в обычном списке профилей.
+13. **Исправлено:** profile rename использует dialog, не `window.prompt`.
+14. **Исправлено:** точный поиск `🇷🇺 chatgpt.com` учитывает rendered flag+host label.
+15. **Добавлено:** responsive table-to-card layout с `data-label` на mobile.
 
-## 27. Что нужно для настоящего live E2E всех функций
+## 27. Обязательная проверка v0.21
+
+Перед релизом нужны как минимум:
+
+- `cargo fmt --all --check`.
+- `cargo check --all-targets --all-features`.
+- Оба clippy-профиля с `-D warnings`.
+- `cargo test --all-targets --all-features`.
+- `python3 scripts/frontend-contract-test.py`.
+- `npm ci`.
+- `npm run test:browser`.
+- `git diff --check`.
+- Router E2E после deploy: readiness, transactional apply/rollback, firewall/DNS/TCP/UDP path, factual memory report, safe mode и bounded API payloads.
+
+Playwright smoke suite существует и запускается через команды выше, но его финальный результат, полные Rust gates и router deploy пока pending до финального отчёта.
+
+## 28. Что нужно для настоящего live E2E всех функций
 
 Чтобы проверить именно поведение на роутере, а не только кодовый контракт, нужен отдельный проход с разрешением на опасные действия:
 

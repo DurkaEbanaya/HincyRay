@@ -42,6 +42,19 @@ use crate::geobase::{
     GeoBaseListMetadata, GeoBaseSource, GeoBaseSourceKind, GeoBaseStatus, GeoBaseStore,
     GeoBaseUpsertRequest, StaticRouteEntry,
 };
+use crate::hincyray_api::{
+    ApiContractDescriptor, ConnectionPageResponse, ConnectionQueryRequest, DeviceTrafficRequest,
+    DeviceTrafficResponse, DeviceTrafficSummary, MemoryEstimateResponse, OnboardingStatusResponse,
+    ReadinessCheck, RoutingConnectionContextResponse, RoutingPreviewResponse, RoutingServerSummary,
+    RoutingSummaryResponse, SafeModeRequest, SafeModeResponse,
+};
+#[cfg(test)]
+use crate::hincyray_security::verify_password;
+use crate::hincyray_security::{
+    LoginLimiter, MAX_CONCURRENT_PASSWORD_OPS, MAX_WEB_SESSIONS, PasswordWorkLimiter, WebSession,
+    generate_session_token, hash_password, hash_password_with_permit, verify_password_with_permit,
+};
+use crate::hincyray_webui::index_html;
 use crate::mihomo_config::{
     DIRECT_NAME, MihomoFeatures, PROXY_ACTIVE_NAME, PROXY_NAME, PinnedServerRoute, REJECT_NAME,
     RKN_BYPASS_DEFAULT_INTERVAL, RKN_BYPASS_DEFAULT_URL, build_mihomo_config,
@@ -341,6 +354,7 @@ fn cli_doctor() -> Result<(), String> {
 pub struct Daemon {
     inner: Arc<Mutex<DaemonInner>>,
     apply: Arc<Mutex<()>>,
+    password_work: Arc<PasswordWorkLimiter>,
     state_path: PathBuf,
     mihomo_config_path: PathBuf,
     geobase_store_root: PathBuf,
@@ -368,9 +382,10 @@ struct DaemonInner {
     prev_cpu: Option<CpuTimes>,
     /// v0.6.1: per-core previous samples for per-core usage.
     prev_cpu_per_core: Vec<CpuTimes>,
-    /// v0.13: active session tokens for Web UI authentication.
-    /// In-memory only — cleared on restart.
-    sessions: std::collections::HashSet<String>,
+    /// Auth runtime is deliberately not persisted. Sessions expire on idle and
+    /// absolute deadlines; login throttling is keyed by observed peer IP.
+    sessions: HashMap<String, WebSession>,
+    login_limiter: LoginLimiter,
     /// v0.20: Deep Bench runtime — background thread + cancel flag.
     /// Separate from `bench` so a running deep bench does not block
     /// manual quick benches from the UI (the daemon decides which to
@@ -590,18 +605,75 @@ impl BenchRuntime {
     }
 }
 
-/// v0.13: Web UI authentication settings. When enabled, API endpoints
-/// require a valid session token obtained via `POST /api/auth/login`.
-/// The password is stored in plain text — acceptable for a router daemon
-/// on a trusted LAN, not for internet-facing deployments.
+/// Web UI authentication settings. Only an Argon2id PHC string is persisted.
+/// `password` exists solely as a deserialization bridge for pre-v0.21 state and
+/// is never serialized back to disk.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WebUiAuth {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_auth_username")]
     pub username: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub password: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub password_hash: String,
+}
+
+impl WebUiAuth {
+    fn has_password(&self) -> bool {
+        !self.password_hash.is_empty() || !self.password.is_empty()
+    }
+
+    fn migrate_legacy_password_with(
+        &mut self,
+        hash: impl FnOnce(&str) -> Result<String, String>,
+    ) -> AuthMigration {
+        if !self.password_hash.is_empty() {
+            let removed_legacy_password = !self.password.is_empty();
+            self.password.clear();
+            return if removed_legacy_password {
+                AuthMigration::Migrated
+            } else {
+                AuthMigration::Unchanged
+            };
+        }
+        if self.password.is_empty() {
+            return AuthMigration::Unchanged;
+        }
+        match hash(&self.password) {
+            Ok(password_hash) => {
+                self.password_hash = password_hash;
+                self.password.clear();
+                AuthMigration::Migrated
+            }
+            Err(error) => {
+                self.enabled = false;
+                self.password.clear();
+                AuthMigration::Disabled(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_password(&mut self, password: &str) -> Result<(), String> {
+        self.password_hash = hash_password(password)?;
+        self.password.clear();
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AuthMigration {
+    Unchanged,
+    Migrated,
+    Disabled(String),
+}
+
+impl AuthMigration {
+    fn changed(&self) -> bool {
+        !matches!(self, Self::Unchanged)
+    }
 }
 
 fn default_auth_username() -> String {
@@ -735,6 +807,10 @@ pub struct HincyrayState {
     /// v0.19: memory guard thresholds and last warning state.
     #[serde(default)]
     pub memory_guard: MemoryGuardSettings,
+    /// v0.21: runtime projection that suppresses memory-heavy optional rule
+    /// sources without destroying their persisted configuration.
+    #[serde(default)]
+    pub safe_mode_enabled: bool,
     /// v0.20: Deep Bench settings (scheduled quality testing).
     #[serde(default)]
     pub deep_bench: DeepBenchSettings,
@@ -798,6 +874,7 @@ impl Default for HincyrayState {
             last_subscription_refresh_report: None,
             undo_stack: Vec::new(),
             memory_guard: MemoryGuardSettings::default(),
+            safe_mode_enabled: false,
             deep_bench: DeepBenchSettings::default(),
             trash_raws: std::collections::HashSet::new(),
             trash_promoted_at: std::collections::HashMap::new(),
@@ -1878,7 +1955,8 @@ impl Daemon {
                 failover_fail_count: 0,
                 prev_cpu: None,
                 prev_cpu_per_core: Vec::new(),
-                sessions: std::collections::HashSet::new(),
+                sessions: HashMap::new(),
+                login_limiter: LoginLimiter::default(),
                 deep_bench_cancel: None,
                 deep_bench_handle: None,
                 deep_bench_active: false,
@@ -1887,6 +1965,7 @@ impl Daemon {
                 pinned_route_now: HashMap::new(),
             })),
             apply: Arc::new(Mutex::new(())),
+            password_work: Arc::new(PasswordWorkLimiter::new(MAX_CONCURRENT_PASSWORD_OPS)),
             state_path,
             mihomo_config_path,
             geobase_store_root,
@@ -2114,10 +2193,6 @@ impl FirewallManager {
     }
 
     fn stop(&mut self, _vpn_subnet: &str) -> Result<(), String> {
-        if !self.active {
-            return Ok(());
-        }
-
         // Remove ready marker first so ndm hook becomes a no-op.
         let _ = fs::remove_file("/tmp/hincyray_ready");
 
@@ -2983,11 +3058,18 @@ fn resolve_mihomo_config_path(state_path: &Path) -> PathBuf {
 }
 
 fn load_state(state_path: &Path) -> HincyrayState {
+    load_state_with_hasher(state_path, hash_password)
+}
+
+fn load_state_with_hasher(
+    state_path: &Path,
+    hash: impl FnOnce(&str) -> Result<String, String>,
+) -> HincyrayState {
     let Ok(text) = fs::read_to_string(state_path) else {
         return HincyrayState::default();
     };
-    let mut state = match deserialize_persisted_state(&text) {
-        Ok(state) => state,
+    let (mut state, auth_migration) = match deserialize_persisted_state_with_hasher(&text, hash) {
+        Ok(result) => result,
         Err(error) => {
             eprintln!(
                 "hincyray: state file {} is corrupted ({}), backing up and starting fresh",
@@ -2997,7 +3079,7 @@ fn load_state(state_path: &Path) -> HincyrayState {
             let backup = state_path.with_extension("json.corrupt");
             let _ = fs::write(&backup, &text);
             eprintln!("hincyray: corrupted state saved to {}", backup.display());
-            HincyrayState::default()
+            (HincyrayState::default(), AuthMigration::Unchanged)
         }
     };
     // The transparent proxy requires DNS — force enabled when split
@@ -3093,7 +3175,10 @@ fn load_state(state_path: &Path) -> HincyrayState {
     // The old generic-SOCKS probe obeyed routing rules and could cache a
     // false negative for 24h. Invalidate non-promoted timestamps exactly
     // once after switching to forced `proxy-active` EC probes.
-    let mut migration_changed = routing_identity_changed;
+    let mut migration_changed = routing_identity_changed || auth_migration.changed();
+    if let AuthMigration::Disabled(error) = auth_migration {
+        eprintln!("hincyray: failed to migrate Web UI password: {error}");
+    }
     if state.split_routing.auto_vpn_probe_contract_version < AUTO_VPN_PROBE_CONTRACT_VERSION {
         let promoted: HashSet<String> = state
             .split_routing
@@ -3136,6 +3221,13 @@ fn migrate_legacy_target(
 }
 
 fn deserialize_persisted_state(text: &str) -> Result<HincyrayState, String> {
+    deserialize_persisted_state_with_hasher(text, hash_password).map(|(state, _)| state)
+}
+
+fn deserialize_persisted_state_with_hasher(
+    text: &str,
+    hash: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<(HincyrayState, AuthMigration), String> {
     let mut value: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
     if let Some(split) = value
         .get_mut("split_routing")
@@ -3151,7 +3243,10 @@ fn deserialize_persisted_state(text: &str) -> Result<HincyrayState, String> {
             .entry("ru_direct_mode")
             .or_insert_with(|| Value::String("geosite".to_owned()));
     }
-    serde_json::from_value(value).map_err(|error| error.to_string())
+    let mut state: HincyrayState =
+        serde_json::from_value(value).map_err(|error| error.to_string())?;
+    let auth_migration = state.web_ui_auth.migrate_legacy_password_with(hash);
+    Ok((state, auth_migration))
 }
 
 fn compact_state_for_persist(state: &mut HincyrayState) {
@@ -3192,6 +3287,7 @@ fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String>
     compacted.undo_stack.clear();
     compacted.connection_log.clear();
     compacted.metrics_history.clear();
+    compacted.web_ui_auth.password.clear();
     let text = serde_json::to_string_pretty(&compacted).map_err(|error| error.to_string())?;
     let tmp = state_path.with_extension("tmp");
     fs::write(&tmp, &text).map_err(|error| error.to_string())?;
@@ -3274,19 +3370,28 @@ fn build_daemon_config(
         return Err("active profile missing".to_owned());
     };
 
+    let effective_features = effective_mihomo_features(state);
     if !state.split_routing.enabled {
         return build_mihomo_config(
             active_profile,
             &state.listen_host,
             state.socks_port,
-            &state.mihomo_features,
+            &effective_features,
         );
     }
 
     // Split routing: build the full router config.
     validate_routing_targets(state, &state.routing_rules, &state.device_routes)?;
     let (extra_profiles, mut pinned_routes, mut routes, active_block_quic, extra) =
-        build_routing_context(state, active_profile, geobase_rule_providers)?;
+        build_routing_context(
+            state,
+            active_profile,
+            if state.safe_mode_enabled {
+                &[]
+            } else {
+                geobase_rule_providers
+            },
+        )?;
 
     // Prepend per-device routing rules (SRC-IP-CIDR) BEFORE general
     // routing rules so device-specific rules match first.
@@ -3321,8 +3426,22 @@ fn build_daemon_config(
         state.split_routing.quic_mode.clone(),
         active_block_quic,
         &extra,
-        &state.mihomo_features,
+        &effective_features,
     )
+}
+
+fn effective_mihomo_features(state: &HincyrayState) -> MihomoFeatures {
+    let mut features = state.mihomo_features.clone();
+    if state.safe_mode_enabled {
+        features.proxy_providers.clear();
+        features.rule_providers.clear();
+        features.sub_rules.clear();
+        features.raw_rules.clear();
+        features.typed_rules.clear();
+        features.tunnels.clear();
+        features.per_proxy.smux = None;
+    }
+    features
 }
 
 /// Build the routing context shared by the daemon's config generator.
@@ -3401,7 +3520,7 @@ fn build_routing_context<'a>(
         ru_direct_exceptions: normalize_route_items(&state.split_routing.ru_direct_exceptions),
         auto_vpn_exceptions: normalize_route_items(&state.split_routing.auto_vpn_exceptions),
         match_target: state.split_routing.match_target.clone(),
-        rkn_bypass_enabled: state.split_routing.rkn_bypass_enabled,
+        rkn_bypass_enabled: state.split_routing.rkn_bypass_enabled && !state.safe_mode_enabled,
         rkn_bypass_url: state.split_routing.rkn_bypass_url.clone(),
         rkn_bypass_interval: state.split_routing.rkn_bypass_interval,
         mihomo_home: geo_dir_from_state(state),
@@ -3876,7 +3995,7 @@ fn load_subscription_for_daemon(
 /// - The path is in the public allowlist, or
 /// - The request carries a valid session token.
 fn check_auth(daemon: &Daemon, auth_header: &Option<String>, path: &str, method: &str) -> bool {
-    let inner = lock(&daemon.inner);
+    let mut inner = lock(&daemon.inner);
     if !inner.state.web_ui_auth.enabled {
         return true;
     }
@@ -3896,12 +4015,24 @@ fn check_auth(daemon: &Daemon, auth_header: &Option<String>, path: &str, method:
             .strip_prefix("bearer ")
             .or_else(|| header.strip_prefix("Bearer "))
     {
-        return inner.sessions.contains(token);
+        let now = unix_now();
+        let valid = inner
+            .sessions
+            .get_mut(token)
+            .is_some_and(|session| session.validate_and_touch(now));
+        if !valid {
+            inner.sessions.remove(token);
+        }
+        return valid;
     }
     false
 }
 
 fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), String> {
+    let peer_ip = stream
+        .peer_addr()
+        .map(|address| address.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
 
     let mut request_line = String::new();
@@ -3914,6 +4045,8 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
 
     let mut content_length = None;
     let mut auth_header: Option<String> = None;
+    let mut host_header: Option<String> = None;
+    let mut origin_header: Option<String> = None;
     loop {
         let mut line = String::new();
         let read = reader
@@ -3926,9 +4059,13 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
         if trimmed.is_empty() {
             break;
         }
-        let lower = trimmed.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            match rest.trim().parse::<usize>() {
+        let Some((header_name, header_value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let header_name = header_name.trim();
+        let header_value = header_value.trim();
+        if header_name.eq_ignore_ascii_case("content-length") {
+            match header_value.parse::<usize>() {
                 Ok(value) if content_length.is_none() => content_length = Some(value),
                 _ => {
                     write_response(
@@ -3940,8 +4077,12 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
                     return Ok(());
                 }
             }
-        } else if let Some(rest) = lower.strip_prefix("authorization:") {
-            auth_header = Some(rest.trim().to_owned());
+        } else if header_name.eq_ignore_ascii_case("authorization") {
+            auth_header = Some(header_value.to_owned());
+        } else if header_name.eq_ignore_ascii_case("host") {
+            host_header = Some(header_value.to_owned());
+        } else if header_name.eq_ignore_ascii_case("origin") {
+            origin_header = Some(header_value.to_owned());
         }
     }
 
@@ -3988,6 +4129,19 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
         }
     };
 
+    if is_state_changing_method(method)
+        && let Some(origin) = origin_header.as_deref()
+        && !origin_matches_host(origin, host_header.as_deref())
+    {
+        write_response(
+            &mut stream,
+            403,
+            "application/json",
+            &json!({"error": "cross-origin state change rejected"}).to_string(),
+        )?;
+        return Ok(());
+    }
+
     // v0.13: Web UI authentication middleware.
     if !check_auth(daemon, &auth_header, path, method) {
         let response_body = json!({"error": "unauthorized"}).to_string();
@@ -3995,8 +4149,34 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
         return Ok(());
     }
 
-    let (status, content_type, response_body) = dispatch(method, path, &body_text, daemon);
+    let (status, content_type, response_body) =
+        dispatch_from(method, path, &body_text, daemon, peer_ip);
     write_response(&mut stream, status, content_type, &response_body)
+}
+
+fn is_state_changing_method(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+}
+
+fn origin_matches_host(origin: &str, host: Option<&str>) -> bool {
+    let Some(host) = host.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Ok(origin) = url::Url::parse(origin) else {
+        return false;
+    };
+    matches!(origin.scheme(), "http" | "https")
+        && origin.host_str().is_some()
+        && origin
+            .port_or_known_default()
+            .map(|port| format!("{}:{port}", origin.host_str().unwrap_or_default()))
+            .is_some_and(|origin_host| {
+                origin_host.eq_ignore_ascii_case(host)
+                    || (origin.port().is_none()
+                        && origin
+                            .host_str()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(host)))
+            })
 }
 
 fn request_body_limit(method: &str, path: &str) -> usize {
@@ -4015,7 +4195,18 @@ fn split_query(raw_path: &str) -> (&str, Option<&str>) {
     }
 }
 
+#[cfg(test)]
 fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    dispatch_from(method, path, body, daemon, IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+fn dispatch_from(
+    method: &str,
+    path: &str,
+    body: &str,
+    daemon: &Daemon,
+    peer_ip: IpAddr,
+) -> (u16, &'static str, String) {
     match (method, path) {
         ("GET", "/") => (200, "text/html; charset=utf-8", index_html().to_owned()),
         ("GET", "/api/health") => (
@@ -4063,6 +4254,8 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
             });
             (200, "application/json", response.to_string())
         }
+        ("GET", "/api/contracts") => handle_api_contracts(),
+        ("GET", "/api/onboarding/status") => handle_onboarding_status(daemon),
         ("GET", "/api/profiles") => {
             let inner = lock(&daemon.inner);
             let active_id = inner.state.active_profile_id;
@@ -4132,6 +4325,10 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/undo") => handle_undo_list(daemon),
         ("POST", "/api/undo/restore") => handle_undo_restore(body, daemon),
         ("GET", "/api/routing") => handle_routing_get(daemon),
+        ("GET", "/api/routing/summary") => handle_routing_summary(daemon),
+        ("GET", "/api/routing/connection-context") => handle_routing_connection_context(daemon),
+        ("GET", "/api/routing/preview") => handle_routing_preview(daemon),
+        ("POST", "/api/routing/explain") => handle_routing_explain(body, daemon),
         ("POST", "/api/routing/settings") => handle_routing_settings(body, daemon),
         ("POST", "/api/routing/rules") => handle_routing_rules(body, daemon),
         ("POST", "/api/routing/resource-route") => handle_routing_resource_route(body, daemon),
@@ -4164,6 +4361,9 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/diagnostics/dns") => handle_dns_diagnostics_v2(daemon),
         ("GET", "/api/diagnostics/udp-quic") => handle_udp_quic_diagnostics(daemon),
         ("GET", "/api/memory-guard") => handle_memory_guard(daemon),
+        ("GET", "/api/memory-estimate") => handle_memory_estimate(daemon),
+        ("GET", "/api/safe-mode") => handle_safe_mode_get(daemon),
+        ("POST", "/api/safe-mode") => handle_safe_mode_set(body, daemon),
         ("GET", "/metrics") => handle_prometheus_metrics(daemon),
         ("GET", "/api/logs") => handle_logs(daemon),
         ("GET", "/api/system") => handle_system(daemon),
@@ -4179,6 +4379,12 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/mihomo-features") => handle_mihomo_features_set(body, daemon),
         ("GET", "/api/mihomo-api/proxies") => handle_mihomo_api_proxies(daemon),
         ("GET", "/api/mihomo-api/connections") => handle_mihomo_api_connections(daemon),
+        ("POST", "/api/mihomo-api/connections/page") => {
+            handle_mihomo_api_connections_page(body, daemon)
+        }
+        ("POST", "/api/mihomo-api/connections/device-traffic") => {
+            handle_mihomo_api_connections_device_traffic(body, daemon)
+        }
         ("GET", "/api/mihomo-api/version") => handle_mihomo_api_forward_get("/version", daemon),
         ("GET", "/api/mihomo-api/configs") => handle_mihomo_api_forward_get("/configs", daemon),
         ("GET", "/api/mihomo-api/configs/geo") => {
@@ -4224,7 +4430,7 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("POST", "/api/backups/delete") => handle_backup_delete(body, daemon),
         ("POST", "/api/backups/webdav-upload") => handle_backup_webdav_upload(body, daemon),
         ("POST", "/api/backups/webdav-download") => handle_backup_webdav_download(body, daemon),
-        ("POST", "/api/auth/login") => handle_auth_login(body, daemon),
+        ("POST", "/api/auth/login") => handle_auth_login(body, daemon, peer_ip),
         ("POST", "/api/auth/logout") => handle_auth_logout(body, daemon),
         ("GET", "/api/auth-settings") => handle_auth_settings_get(daemon),
         ("POST", "/api/auth-settings") => handle_auth_settings_set(body, daemon),
@@ -4449,14 +4655,7 @@ fn handle_get_mihomo_config(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
     let projection = GeoBaseProjection::Applied;
     match build_authoritative_daemon_config(&inner.state, daemon) {
-        Ok(config_yaml) => (
-            200,
-            "text/yaml; charset=utf-8",
-            format!(
-                "# geobase-projection: {}\n{config_yaml}",
-                projection.label()
-            ),
-        ),
+        Ok(config_yaml) => redacted_config_response(projection, &config_yaml),
         Err(error) => (
             400,
             "application/json",
@@ -4473,15 +4672,475 @@ fn handle_get_mihomo_config_preview(daemon: &Daemon) -> (u16, &'static str, Stri
         Err(error) => return json_error(400, &error),
     };
     match build_daemon_config(&inner.state, &providers) {
-        Ok(config_yaml) => (
+        Ok(config_yaml) => redacted_config_response(projection, &config_yaml),
+        Err(error) => json_error(400, &error),
+    }
+}
+
+fn redacted_config_response(
+    projection: GeoBaseProjection,
+    config_yaml: &str,
+) -> (u16, &'static str, String) {
+    match redact_config_yaml(config_yaml) {
+        Ok(redacted) => (
             200,
             "text/yaml; charset=utf-8",
             format!(
-                "# geobase-projection: {}\n{config_yaml}",
+                "# geobase-projection: {}\n# secrets: redacted\n{redacted}",
                 projection.label()
             ),
         ),
-        Err(error) => json_error(400, &error),
+        Err(error) => json_error(500, &format!("redact generated config: {error}")),
+    }
+}
+
+fn redact_config_yaml(config_yaml: &str) -> Result<String, String> {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(config_yaml).map_err(|error| error.to_string())?;
+    redact_mihomo_config(&mut value)?;
+    serde_yaml::to_string(&value).map_err(|error| error.to_string())
+}
+
+fn redacted_yaml_value() -> serde_yaml::Value {
+    serde_yaml::Value::String("<redacted>".to_owned())
+}
+
+fn redact_mihomo_config(value: &mut serde_yaml::Value) -> Result<(), String> {
+    let mapping = value
+        .as_mapping_mut()
+        .ok_or_else(|| "generated Mihomo config root is not a mapping".to_owned())?;
+    for (key, child) in mapping {
+        let Some(key) = key.as_str() else {
+            *child = redacted_yaml_value();
+            continue;
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "proxies" => redact_yaml_sequence(child, redact_mihomo_proxy),
+            "proxy-groups" => redact_yaml_sequence(child, redact_proxy_group),
+            "proxy-providers" | "rule-providers" => redact_provider_map(child),
+            "dns" => redact_dns_config(child),
+            "tunnels" => redact_yaml_sequence(child, redact_tunnel),
+            "ntp" => redact_mapping_fields(
+                child,
+                &[
+                    "enable",
+                    "write-to-system",
+                    "port",
+                    "interval",
+                    "dialer-proxy",
+                ],
+            ),
+            // These sections are generated from typed, non-credential settings.
+            key if ROOT_DIAGNOSTIC_FIELDS.contains(&key) => {}
+            // Unknown root fields are hidden until they are classified. This makes
+            // newly generated credential fields fail closed rather than leak.
+            _ => *child = redacted_yaml_value(),
+        }
+    }
+    Ok(())
+}
+
+const ROOT_DIAGNOSTIC_FIELDS: &[&str] = &[
+    "mode",
+    "log-level",
+    "allow-lan",
+    "bind-address",
+    "find-process-mode",
+    "ipv6",
+    "geo-auto-update",
+    "socks-port",
+    "listeners",
+    "rules",
+    "sub-rules",
+    "sniffer",
+    "geodata-loader",
+    "unified-delay",
+    "profile",
+    "keep-alive-interval",
+    "keep-alive-idle",
+    "disable-keep-alive",
+    "tcp-concurrent",
+    "experimental",
+    "skip-auth-prefixes",
+    "hosts",
+    "external-controller",
+    "external-controller-cors",
+];
+
+fn redact_yaml_sequence(value: &mut serde_yaml::Value, redact_item: fn(&mut serde_yaml::Value)) {
+    let Some(sequence) = value.as_sequence_mut() else {
+        *value = redacted_yaml_value();
+        return;
+    };
+    for item in sequence {
+        redact_item(item);
+    }
+}
+
+fn redact_mihomo_proxy(value: &mut serde_yaml::Value) {
+    let Some(mapping) = value.as_mapping_mut() else {
+        *value = redacted_yaml_value();
+        return;
+    };
+    let proxy_type = mapping
+        .get(serde_yaml::Value::String("type".to_owned()))
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for (key, child) in mapping {
+        let Some(key) = key.as_str() else {
+            *child = redacted_yaml_value();
+            continue;
+        };
+        let key = key.to_ascii_lowercase();
+        match key.as_str() {
+            "reality-opts" => {
+                redact_mapping_fields(child, &["public-key", "support-x25519mlkem768"])
+            }
+            "xhttp-opts" => redact_xhttp_opts(child),
+            "ws-opts" => redact_ws_opts(child),
+            "grpc-opts" => redact_mapping_fields(
+                child,
+                &[
+                    "grpc-service-name",
+                    "grpc-user-agent",
+                    "ping-interval",
+                    "max-connections",
+                    "min-streams",
+                    "max-streams",
+                ],
+            ),
+            "ech-opts" => redact_mapping_fields(child, &["enable", "config", "query-server-name"]),
+            "smux" => redact_smux(child),
+            "obfs-opts" => redact_mapping_fields(child, &["mode", "host"]),
+            key if proxy_field_is_diagnostic(&proxy_type, key) => {}
+            _ => *child = redacted_yaml_value(),
+        }
+    }
+}
+
+fn proxy_field_is_diagnostic(proxy_type: &str, key: &str) -> bool {
+    const COMMON: &[&str] = &[
+        "name",
+        "type",
+        "server",
+        "port",
+        "udp",
+        "tfo",
+        "mptcp",
+        "ip-version",
+        "dialer-proxy",
+        "tls",
+        "sni",
+        "servername",
+        "fingerprint",
+        "client-fingerprint",
+        "skip-cert-verify",
+        "alpn",
+        "network",
+        "fast-open",
+    ];
+    if COMMON.contains(&key) {
+        return true;
+    }
+    let protocol_fields: &[&str] = match proxy_type {
+        "vless" => &["flow", "packet-encoding"],
+        "vmess" => &["alterid", "cipher", "packet-encoding"],
+        "trojan" => &[],
+        "ss" => &["cipher"],
+        "ssr" => &["cipher", "obfs", "protocol"],
+        "snell" => &["version", "reuse"],
+        "http" | "socks4" | "socks5" => &[],
+        "anytls" => &[
+            "idle-session-check-interval",
+            "idle-session-timeout",
+            "min-idle-session",
+        ],
+        // Hysteria v1 `obfs` is a shared secret, not merely a mode.
+        "hysteria" => &[
+            "ports",
+            "protocol",
+            "up",
+            "down",
+            "recv-window-conn",
+            "recv-window",
+            "disable_mtu_discovery",
+        ],
+        "hysteria2" => &["up", "down", "obfs", "ports", "hop-interval"],
+        "wireguard" => &[
+            "public-key",
+            "ip",
+            "ipv6",
+            "allowed-ips",
+            "reserved",
+            "mtu",
+            "persistent-keepalive",
+        ],
+        "tuic" => &[
+            "ip",
+            "disable-sni",
+            "reduce-rtt",
+            "request-timeout",
+            "udp-relay-mode",
+            "congestion-controller",
+            "max-udp-relay-packet-size",
+            "heartbeat-interval",
+            "max-open-streams",
+        ],
+        "ssh" => &["host-key", "host-key-algorithms"],
+        "masque" => &[
+            "public-key",
+            "ip",
+            "ipv6",
+            "mtu",
+            "remote-dns-resolve",
+            "dns",
+            "congestion-controller",
+            "bbr-profile",
+        ],
+        "openvpn" => &[
+            "ca",
+            "proto",
+            "ping",
+            "ping-restart",
+            "dev",
+            "cipher",
+            "auth",
+            "comp-lzo",
+            "mtu",
+            "remote-dns-resolve",
+            "dns",
+        ],
+        "tailscale" => &[
+            "hostname",
+            "state-dir",
+            "ephemeral",
+            "accept-routes",
+            "exit-node",
+            "exit-node-allow-lan-access",
+        ],
+        _ => &[],
+    };
+    protocol_fields.contains(&key)
+}
+
+fn redact_xhttp_opts(value: &mut serde_yaml::Value) {
+    let Some(mapping) = value.as_mapping_mut() else {
+        *value = redacted_yaml_value();
+        return;
+    };
+    for (key, child) in mapping {
+        let key = key
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match key.as_str() {
+            "reuse-settings" => redact_mapping_fields(
+                child,
+                &[
+                    "max-concurrency",
+                    "max-connections",
+                    "c-max-reuse-times",
+                    "h-max-request-times",
+                    "h-max-reusable-secs",
+                    "h-keep-alive-period",
+                ],
+            ),
+            "host"
+            | "mode"
+            | "no-grpc-header"
+            | "x-padding-bytes"
+            | "x-padding-obfs-mode"
+            | "x-padding-header"
+            | "x-padding-placement"
+            | "x-padding-method"
+            | "uplink-http-method"
+            | "session-placement"
+            | "seq-placement"
+            | "uplink-data-placement"
+            | "uplink-chunk-size"
+            | "sc-max-each-post-bytes"
+            | "sc-min-posts-interval-ms" => {}
+            _ => *child = redacted_yaml_value(),
+        }
+    }
+}
+
+fn redact_ws_opts(value: &mut serde_yaml::Value) {
+    let Some(mapping) = value.as_mapping_mut() else {
+        *value = redacted_yaml_value();
+        return;
+    };
+    for (key, child) in mapping {
+        let key = key
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match key.as_str() {
+            "headers" => redact_mapping_fields(child, &["host"]),
+            "max-early-data"
+            | "early-data-header-name"
+            | "v2ray-http-upgrade"
+            | "v2ray-http-upgrade-fast-open" => {}
+            _ => *child = redacted_yaml_value(),
+        }
+    }
+}
+
+fn redact_smux(value: &mut serde_yaml::Value) {
+    let Some(mapping) = value.as_mapping_mut() else {
+        *value = redacted_yaml_value();
+        return;
+    };
+    for (key, child) in mapping {
+        let key = key
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match key.as_str() {
+            "brutal-opts" => redact_mapping_fields(child, &["enabled", "up", "down"]),
+            "enabled" | "protocol" | "statistic" | "only-tcp" | "padding" | "max-connections"
+            | "min-streams" | "max-streams" => {}
+            _ => *child = redacted_yaml_value(),
+        }
+    }
+}
+
+fn redact_proxy_group(value: &mut serde_yaml::Value) {
+    redact_mapping_fields(
+        value,
+        &[
+            "name",
+            "type",
+            "proxies",
+            "use",
+            "interval",
+            "timeout",
+            "lazy",
+            "max-failed-times",
+            "tolerance",
+            "strategy",
+            "expected-status",
+            "filter",
+            "exclude-filter",
+            "exclude-type",
+            "include-all-providers",
+            "include-all",
+            "include-all-proxies",
+        ],
+    );
+}
+
+fn redact_provider_map(value: &mut serde_yaml::Value) {
+    let Some(providers) = value.as_mapping_mut() else {
+        *value = redacted_yaml_value();
+        return;
+    };
+    for (_, provider) in providers {
+        let Some(mapping) = provider.as_mapping_mut() else {
+            *provider = redacted_yaml_value();
+            continue;
+        };
+        for (key, child) in mapping {
+            let key = key
+                .as_str()
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            match key.as_str() {
+                "health-check" => redact_mapping_fields(
+                    child,
+                    &["enable", "interval", "timeout", "lazy", "expected-status"],
+                ),
+                "type" | "path" | "interval" | "proxy" | "filter" | "exclude-filter"
+                | "exclude-type" | "behavior" | "format" | "path-in-bundle" | "size-limit" => {}
+                // URL, age-secret-key, header, payload, and future provider fields
+                // are credential-bearing by contract and therefore fail closed.
+                _ => *child = redacted_yaml_value(),
+            }
+        }
+    }
+}
+
+fn redact_tunnel(value: &mut serde_yaml::Value) {
+    redact_mapping_fields(value, &["network", "address", "proxy"]);
+}
+
+fn redact_dns_config(value: &mut serde_yaml::Value) {
+    let Some(mapping) = value.as_mapping_mut() else {
+        *value = redacted_yaml_value();
+        return;
+    };
+    for (key, child) in mapping {
+        let key = key
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        match key.as_str() {
+            "nameserver"
+            | "fallback"
+            | "default-nameserver"
+            | "proxy-server-nameserver"
+            | "direct-nameserver" => redact_yaml_values(child),
+            "nameserver-policy" | "proxy-server-nameserver-policy" => {
+                let Some(policy) = child.as_mapping_mut() else {
+                    *child = redacted_yaml_value();
+                    continue;
+                };
+                for (_, servers) in policy {
+                    redact_yaml_values(servers);
+                }
+            }
+            "enable"
+            | "listen"
+            | "enhanced-mode"
+            | "fake-ip-range"
+            | "fake-ip-filter"
+            | "cache-algorithm"
+            | "ipv6"
+            | "prefer-h3"
+            | "fake-ip-filter-mode"
+            | "fake-ip-ttl"
+            | "use-hosts"
+            | "use-system-hosts"
+            | "respect-rules"
+            | "direct-nameserver-follow-policy"
+            | "ecs"
+            | "ecs-override"
+            | "disable-ipv4"
+            | "disable-ipv6" => {}
+            "fallback-filter" => redact_mapping_fields(
+                child,
+                &["geoip", "geoip-code", "geosite", "ipcidr", "domain"],
+            ),
+            key if key.starts_with("disable-qtype-") => {}
+            _ => *child = redacted_yaml_value(),
+        }
+    }
+}
+
+fn redact_yaml_values(value: &mut serde_yaml::Value) {
+    if let Some(sequence) = value.as_sequence_mut() {
+        for item in sequence {
+            *item = redacted_yaml_value();
+        }
+    } else {
+        *value = redacted_yaml_value();
+    }
+}
+
+fn redact_mapping_fields(value: &mut serde_yaml::Value, diagnostic_fields: &[&str]) {
+    let Some(mapping) = value.as_mapping_mut() else {
+        *value = redacted_yaml_value();
+        return;
+    };
+    for (key, child) in mapping {
+        let key = key
+            .as_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !diagnostic_fields.contains(&key.as_str()) {
+            *child = redacted_yaml_value();
+        }
     }
 }
 
@@ -5038,6 +5697,15 @@ fn activate_current_config(
         .apply
         .lock()
         .map_err(|_| "config apply lock is poisoned".to_owned())?;
+    activate_current_config_locked(daemon, start_if_stopped, configure_firewall, projection)
+}
+
+fn activate_current_config_locked(
+    daemon: &Daemon,
+    start_if_stopped: bool,
+    configure_firewall: bool,
+    projection: GeoBaseProjection,
+) -> Result<ActivationResult, String> {
     let (state, previous_running, firewall_was_running) = {
         let mut inner = lock(&daemon.inner);
         (
@@ -7128,6 +7796,7 @@ fn handle_undo_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, Strin
     // still recover from a mistaken restore if another snapshot existed.
     restored.undo_stack = inner.state.undo_stack.clone();
     inner.state = restored;
+    inner.sessions.clear();
     let _ = inner.core.stop();
     let _ = fs::remove_file(&daemon.mihomo_config_path);
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
@@ -7260,6 +7929,331 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
         "geobase_requires_apply": manifest.requires_apply(),
     });
     (200, "application/json", response.to_string())
+}
+
+fn handle_api_contracts() -> (u16, &'static str, String) {
+    let response = ApiContractDescriptor {
+        version: 1,
+        bounded_endpoints: vec![
+            "/api/onboarding/status",
+            "/api/routing/summary",
+            "/api/routing/preview",
+            "/api/routing/explain",
+            "/api/memory-estimate",
+            "/api/mihomo-api/connections/page",
+            "/api/safe-mode",
+        ],
+        state_changing_requires_same_origin: true,
+        authentication: "argon2id-password+cSPRNG-bearer-expiry",
+    };
+    json_response(&response)
+}
+
+fn handle_onboarding_status(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (state, core_running, firewall_active, tproxy_available) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            inner.state.clone(),
+            inner.core.is_running(),
+            inner.firewall.active,
+            inner.firewall.tproxy_available,
+        )
+    };
+    let geo_dir = geo_dir_from_state(&state).map(PathBuf::from);
+    let geoip_exists = geo_dir
+        .as_ref()
+        .is_some_and(|path| path.join("geoip.metadb").is_file());
+    let mihomo_version = get_mihomo_version(&state.mihomo_path).ok();
+    let active_profile_ok = state
+        .active_profile_id
+        .is_some_and(|id| state.profiles.iter().any(|profile| profile.id == id));
+    let hook_required = Path::new("/opt/etc/ndm/netfilter.d").is_dir();
+    let hook_exists = Path::new("/opt/etc/ndm/netfilter.d/hincyray.sh").is_file();
+    let checks = vec![
+        readiness_check(
+            "mihomo",
+            "Mihomo binary",
+            mihomo_version.is_some(),
+            mihomo_version.unwrap_or_else(|| format!("{} unavailable", state.mihomo_path)),
+            "Install Mihomo or correct mihomo_path",
+        ),
+        readiness_check(
+            "profile",
+            "Active profile",
+            active_profile_ok,
+            format!(
+                "{} profiles; active={:?}",
+                state.profiles.len(),
+                state.active_profile_id
+            ),
+            "Import and select a profile",
+        ),
+        readiness_check(
+            "geoip",
+            "GeoIP database",
+            geoip_exists,
+            geo_dir
+                .map(|path| path.join("geoip.metadb").display().to_string())
+                .unwrap_or_else(|| "geo directory is not configured".to_owned()),
+            "Download geoip.metadb into the configured geo directory",
+        ),
+        readiness_check(
+            "core",
+            "Mihomo core",
+            core_running,
+            if core_running { "running" } else { "stopped" }.to_owned(),
+            "Start the core after profile/config checks pass",
+        ),
+        readiness_check(
+            "firewall",
+            "Transparent firewall",
+            !state.split_routing.enabled || firewall_active,
+            format!(
+                "split={} firewall={} tproxy={}",
+                state.split_routing.enabled, firewall_active, tproxy_available
+            ),
+            "Apply routing to install REDIRECT/TPROXY rules",
+        ),
+        readiness_check(
+            "ndm-hook",
+            "Keenetic firewall hook",
+            !hook_required || hook_exists,
+            if hook_required {
+                format!("installed={hook_exists}")
+            } else {
+                "not a Keenetic/Entware host".to_owned()
+            },
+            "Apply routing once to install the ndm hook",
+        ),
+    ];
+    let ready = checks.iter().all(|check| check.status == "ok");
+    json_response(&OnboardingStatusResponse {
+        ready,
+        version: env!("CARGO_PKG_VERSION"),
+        checks,
+    })
+}
+
+fn readiness_check(
+    id: &'static str,
+    label: &'static str,
+    ok: bool,
+    detail: String,
+    remediation: &'static str,
+) -> ReadinessCheck {
+    ReadinessCheck {
+        id,
+        label,
+        status: if ok { "ok" } else { "error" },
+        detail,
+        remediation: (!ok).then_some(remediation),
+    }
+}
+
+fn handle_routing_summary(daemon: &Daemon) -> (u16, &'static str, String) {
+    let manifest = match daemon.geobase_store().load_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) => return json_error(500, &format!("GeoBase manifest: {error}")),
+    };
+    let inner = lock(&daemon.inner);
+    let conflicts = detect_routing_conflicts(&inner.state);
+    json_response(&RoutingSummaryResponse {
+        enabled: inner.state.split_routing.enabled,
+        safe_mode_enabled: inner.state.safe_mode_enabled,
+        match_target: inner.state.split_routing.match_target.clone(),
+        user_rule_count: inner.state.routing_rules.len(),
+        enabled_user_rule_count: inner
+            .state
+            .routing_rules
+            .iter()
+            .filter(|rule| rule.enabled)
+            .count(),
+        device_route_count: inner.state.device_routes.len(),
+        managed_rule_count: managed_geobase_routing_rules(&manifest).len(),
+        server_count: inner.state.profiles.len(),
+        conflict_count: conflicts.len(),
+        geobase_requires_apply: manifest.requires_apply(),
+    })
+}
+
+fn handle_routing_connection_context(daemon: &Daemon) -> (u16, &'static str, String) {
+    let inner = lock(&daemon.inner);
+    let active_canonical = inner
+        .state
+        .active_profile_id
+        .and_then(|id| inner.state.profiles.iter().find(|profile| profile.id == id))
+        .map(canonical_profile_raw);
+    let servers = inner
+        .state
+        .profiles
+        .iter()
+        .filter_map(|profile| {
+            let canonical = canonical_profile_raw(profile);
+            let entry = inner
+                .state
+                .server_route_registry
+                .iter()
+                .find(|entry| entry.canonical_raw == canonical)?;
+            Some(RoutingServerSummary {
+                reference: entry.server_ref.clone(),
+                id: profile.id,
+                name: profile.name.clone(),
+                protocol: profile.protocol.to_string(),
+                address: profile.address.clone(),
+                group: profile.group.clone(),
+                active: active_canonical.as_deref() == Some(canonical.as_str()),
+            })
+        })
+        .collect();
+    json_response(&RoutingConnectionContextResponse { servers })
+}
+
+fn handle_routing_preview(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (state, core_running, firewall_running, tproxy_available) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            inner.state.clone(),
+            inner.core.is_running(),
+            inner.firewall.is_running(),
+            inner.firewall.tproxy_available,
+        )
+    };
+    let firewall_rules_running = if firewall_running || !state.split_routing.enabled {
+        firewall_rules_exist(tproxy_available)
+    } else {
+        false
+    };
+    let manifest = match daemon.geobase_store().load_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) => return json_error(500, &format!("GeoBase manifest: {error}")),
+    };
+    let providers = match project_geobase_manifest(daemon, &manifest, GeoBaseProjection::Desired) {
+        Ok(providers) => providers,
+        Err(error) => return json_error(400, &error),
+    };
+    let desired = match build_daemon_config(&state, &providers) {
+        Ok(config) => config,
+        Err(error) => return json_error(400, &error),
+    };
+    let desired_hash = sha256_hex(desired.as_bytes());
+    let applied = fs::read(&daemon.mihomo_config_path).ok();
+    let applied_hash = applied.as_deref().map(sha256_hex);
+    let config_requires_apply = applied_hash.as_deref() != Some(desired_hash.as_str());
+    let geobase_requires_apply = manifest.requires_apply();
+    let core_requires_apply = state.active_profile_id.is_some() && !core_running;
+    let firewall_requires_apply = firewall_runtime_requires_apply(
+        state.split_routing.enabled,
+        firewall_running,
+        firewall_rules_running,
+    );
+    let requires_apply = config_requires_apply
+        || geobase_requires_apply
+        || core_requires_apply
+        || firewall_requires_apply;
+    let mut changes = Vec::new();
+    if config_requires_apply {
+        changes.push("generated Mihomo config differs from the applied file".to_owned());
+    }
+    if geobase_requires_apply {
+        changes.push("desired GeoBase generation is not applied".to_owned());
+    }
+    if core_requires_apply {
+        changes.push("Mihomo core is stopped but should be running".to_owned());
+    }
+    if state.split_routing.enabled && !firewall_running {
+        changes.push("transparent firewall is stopped but split routing is enabled".to_owned());
+    } else if state.split_routing.enabled && !firewall_rules_running {
+        changes.push("transparent firewall runtime rules are missing".to_owned());
+    } else if !state.split_routing.enabled && (firewall_running || firewall_rules_running) {
+        changes
+            .push("transparent firewall remains active while split routing is disabled".to_owned());
+    }
+    if state.safe_mode_enabled {
+        changes.push("safe mode suppresses heavy optional rule sources".to_owned());
+    }
+    json_response(&RoutingPreviewResponse {
+        requires_apply,
+        core_restart: requires_apply && core_running,
+        firewall_reload: firewall_requires_apply
+            || ((config_requires_apply || geobase_requires_apply) && state.split_routing.enabled),
+        desired_config_sha256: desired_hash,
+        applied_config_sha256: applied_hash,
+        changes,
+        warnings: detect_routing_conflicts(&state),
+    })
+}
+
+fn firewall_runtime_requires_apply(
+    split_enabled: bool,
+    firewall_running: bool,
+    firewall_rules_running: bool,
+) -> bool {
+    if split_enabled {
+        !firewall_running || !firewall_rules_running
+    } else {
+        firewall_running || firewall_rules_running
+    }
+}
+
+fn handle_routing_explain(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return json_error(400, "invalid JSON body");
+    };
+    let raw = value
+        .get("resource")
+        .or_else(|| value.get("host"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let Some(resource) = normalize_routing_resource(raw) else {
+        return json_error(400, "resource is not a routable host or IP");
+    };
+    let (host, ip) = match resource.kind {
+        RoutingResourceKind::Domain => (resource.value.clone(), String::new()),
+        RoutingResourceKind::Ip => (String::new(), resource.value.clone()),
+    };
+    let request = TraceRequest {
+        host,
+        ip,
+        source_ip: value
+            .get("source_ip")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned(),
+        port: value
+            .get("port")
+            .and_then(Value::as_u64)
+            .map(|port| port as u16),
+        network: value
+            .get("network")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase(),
+    };
+    let inner = lock(&daemon.inner);
+    let mut trace = trace_routing_decision(&inner.state, &request);
+    trace["resource"] = json!(resource.value);
+    trace["resource_kind"] = json!(resource.kind.as_str());
+    trace["safe_mode_enabled"] = json!(inner.state.safe_mode_enabled);
+    (200, "application/json", trace.to_string())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = sha256(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn json_response<T: Serialize>(value: &T) -> (u16, &'static str, String) {
+    match serde_json::to_string(value) {
+        Ok(body) => (200, "application/json", body),
+        Err(error) => json_error(500, &format!("serialize response: {error}")),
+    }
 }
 
 /// Detect conflicts between per-rule ports and global PortMode.
@@ -7846,7 +8840,7 @@ fn handle_routing_catalog_refresh(body: &str, daemon: &Daemon) -> (u16, &'static
 }
 
 fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
-    match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
+    match activate_current_config(daemon, true, true, GeoBaseProjection::Desired) {
         Ok(result) => (
             200,
             "application/json",
@@ -9636,6 +10630,205 @@ fn handle_mihomo_api_connections(daemon: &Daemon) -> (u16, &'static str, String)
     }
 }
 
+fn handle_mihomo_api_connections_page(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request = match serde_json::from_str::<ConnectionQueryRequest>(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid request: {error}")),
+    };
+    let limit = request.limit.clamp(1, 500);
+    let query_terms: Vec<String> = request
+        .query
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let (addr, secret, geo_dir) = {
+        let inner = lock(&daemon.inner);
+        let Some((addr, secret)) = mihomo_controller(&inner.state.mihomo_features) else {
+            return json_error(400, "external controller not enabled");
+        };
+        (addr, secret, geo_dir_from_state(&inner.state))
+    };
+    let body = match mihomo_api_get(&addr, secret.as_deref(), "/connections") {
+        Ok(body) => {
+            enrich_connections_with_geoip(&body, geo_dir.as_deref().map(Path::new)).unwrap_or(body)
+        }
+        Err(error) => return json_error(502, &format!("Mihomo API: {error}")),
+    };
+    let value: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(error) => return json_error(502, &format!("Mihomo connections JSON: {error}")),
+    };
+    let all = value
+        .get("connections")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let total = all.len();
+    let filtered_rows: Vec<Value> = all
+        .into_iter()
+        .filter(|connection| {
+            let search_text = connection_search_text(connection);
+            query_terms.iter().all(|term| search_text.contains(term))
+        })
+        .collect();
+    let filtered = filtered_rows.len();
+    let connections = filtered_rows
+        .into_iter()
+        .skip(request.offset)
+        .take(limit)
+        .collect();
+    json_response(&ConnectionPageResponse {
+        total,
+        filtered,
+        offset: request.offset,
+        limit,
+        connections,
+    })
+}
+
+fn handle_mihomo_api_connections_device_traffic(
+    body: &str,
+    daemon: &Daemon,
+) -> (u16, &'static str, String) {
+    const MAX_DEVICE_SOURCES: usize = 256;
+
+    let request = match serde_json::from_str::<DeviceTrafficRequest>(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid request: {error}")),
+    };
+    if request.source_ips.len() > MAX_DEVICE_SOURCES {
+        return json_error(
+            400,
+            &format!("source_ips exceeds maximum of {MAX_DEVICE_SOURCES}"),
+        );
+    }
+    let source_ips: HashSet<String> = request
+        .source_ips
+        .into_iter()
+        .map(|ip| ip.trim().to_owned())
+        .filter(|ip| !ip.is_empty() && ip.len() <= 64)
+        .collect();
+    if source_ips.is_empty() {
+        return json_response(&DeviceTrafficResponse {
+            devices: HashMap::new(),
+        });
+    }
+    let (addr, secret) = {
+        let inner = lock(&daemon.inner);
+        let Some((addr, secret)) = mihomo_controller(&inner.state.mihomo_features) else {
+            return json_error(400, "external controller not enabled");
+        };
+        (addr, secret)
+    };
+    let body = match mihomo_api_get(&addr, secret.as_deref(), "/connections") {
+        Ok(body) => body,
+        Err(error) => return json_error(502, &format!("Mihomo API: {error}")),
+    };
+    let value: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(error) => return json_error(502, &format!("Mihomo connections JSON: {error}")),
+    };
+    let devices = aggregate_device_traffic(
+        value
+            .get("connections")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        &source_ips,
+    );
+    json_response(&DeviceTrafficResponse { devices })
+}
+
+fn aggregate_device_traffic(
+    connections: &[Value],
+    source_ips: &HashSet<String>,
+) -> HashMap<String, DeviceTrafficSummary> {
+    let mut devices = HashMap::new();
+    for connection in connections {
+        let Some(source_ip) = connection
+            .get("metadata")
+            .and_then(|metadata| metadata.get("sourceIP"))
+            .and_then(Value::as_str)
+            .filter(|source_ip| source_ips.contains(*source_ip))
+        else {
+            continue;
+        };
+        let summary = devices
+            .entry(source_ip.to_owned())
+            .or_insert_with(DeviceTrafficSummary::default);
+        summary.upload = summary.upload.saturating_add(
+            connection
+                .get("upload")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        summary.download = summary.download.saturating_add(
+            connection
+                .get("download")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        summary.connections = summary.connections.saturating_add(1);
+    }
+    devices
+}
+
+fn connection_search_text(connection: &Value) -> String {
+    let metadata = connection.get("metadata").unwrap_or(&Value::Null);
+    let mut fields = [
+        metadata.get("host").and_then(Value::as_str).unwrap_or(""),
+        metadata
+            .get("sniffHost")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        metadata
+            .get("destinationIP")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        metadata
+            .get("remoteDestination")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        metadata
+            .get("sourceIP")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        metadata
+            .get("destinationPort")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        metadata
+            .get("network")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        metadata
+            .get("inboundName")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        metadata
+            .get("destinationGeoIP")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        metadata
+            .get("destinationCountry")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        connection.get("rule").and_then(Value::as_str).unwrap_or(""),
+        connection
+            .get("rulePayload")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    ]
+    .join(" ");
+    if let Some(chains) = connection.get("chains").and_then(Value::as_array) {
+        for chain in chains.iter().filter_map(Value::as_str) {
+            fields.push(' ');
+            fields.push_str(chain);
+        }
+    }
+    fields.to_ascii_lowercase()
+}
+
 fn enrich_connections_with_geoip(body: &str, geo_dir: Option<&Path>) -> Option<String> {
     let mut value = serde_json::from_str::<Value>(body).ok()?;
     let db_path = geo_dir?.join("geoip.metadb");
@@ -10271,6 +11464,202 @@ fn handle_memory_guard(daemon: &Daemon) -> (u16, &'static str, String) {
         })
         .to_string(),
     )
+}
+
+const SAFE_MODE_SUPPRESSED: [&str; 8] = [
+    "rkn-bypass",
+    "managed-geobases",
+    "proxy-providers",
+    "rule-providers",
+    "sub-rules",
+    "raw-rules",
+    "typed-rules",
+    "tunnels-and-smux",
+];
+
+fn handle_safe_mode_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let mut inner = lock(&daemon.inner);
+    json_response(&json!({
+        "enabled": inner.state.safe_mode_enabled,
+        "suppressed": SAFE_MODE_SUPPRESSED,
+        "core_status": inner.core.status(),
+        "firewall_status": inner.firewall.status(),
+    }))
+}
+
+fn handle_safe_mode_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request = match serde_json::from_str::<SafeModeRequest>(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid request: {error}")),
+    };
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    let (previous_enabled, undo_id) = {
+        let mut inner = lock(&daemon.inner);
+        let previous_enabled = inner.state.safe_mode_enabled;
+        push_undo_snapshot(
+            &mut inner.state,
+            format!(
+                "Safe mode {}",
+                if request.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
+        );
+        let undo_id = inner.state.undo_stack.last().map(|entry| entry.id.clone());
+        inner.state.safe_mode_enabled = request.enabled;
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            inner.state.safe_mode_enabled = previous_enabled;
+            if let Some(undo_id) = undo_id.as_deref() {
+                inner.state.undo_stack.retain(|entry| entry.id != undo_id);
+            }
+            return json_error(500, &format!("persist safe mode: {error}"));
+        }
+        (previous_enabled, undo_id)
+    };
+    if !request.apply {
+        let mut inner = lock(&daemon.inner);
+        return json_response(&SafeModeResponse {
+            enabled: request.enabled,
+            applied: false,
+            core_status: inner.core.status().to_owned(),
+            firewall_status: inner.firewall.status().to_owned(),
+            suppressed: SAFE_MODE_SUPPRESSED.to_vec(),
+        });
+    }
+    match activate_current_config_locked(daemon, true, true, GeoBaseProjection::Desired) {
+        Ok(result) => json_response(&SafeModeResponse {
+            enabled: request.enabled,
+            applied: true,
+            core_status: result.core_status,
+            firewall_status: result.firewall_status,
+            suppressed: SAFE_MODE_SUPPRESSED.to_vec(),
+        }),
+        Err(error) => {
+            let rollback = restore_safe_mode_after_failed_activation(
+                daemon,
+                request.enabled,
+                previous_enabled,
+                undo_id.as_deref(),
+            );
+            json_error(500, &format!("{error}; state rollback: {rollback}"))
+        }
+    }
+}
+
+fn restore_safe_mode_after_failed_activation(
+    daemon: &Daemon,
+    attempted: bool,
+    previous: bool,
+    undo_id: Option<&str>,
+) -> String {
+    let mut inner = lock(&daemon.inner);
+    if inner.state.safe_mode_enabled != attempted {
+        return "skipped (safe mode changed concurrently)".to_owned();
+    }
+    inner.state.safe_mode_enabled = previous;
+    if let Some(undo_id) = undo_id {
+        inner.state.undo_stack.retain(|entry| entry.id != undo_id);
+    }
+    match persist_state(&daemon.state_path, &inner.state) {
+        Ok(()) => "restored".to_owned(),
+        Err(error) => format!("failed ({error})"),
+    }
+}
+
+fn handle_memory_estimate(daemon: &Daemon) -> (u16, &'static str, String) {
+    let manifest = match daemon.geobase_store().load_manifest() {
+        Ok(manifest) => manifest,
+        Err(error) => return json_error(500, &format!("GeoBase manifest: {error}")),
+    };
+    let (state, mihomo_pid) = {
+        let mut inner = lock(&daemon.inner);
+        (inner.state.clone(), inner.core.pid())
+    };
+    let (_, available_kb, usage_pct) = memory_summary_from_proc();
+    let current_mihomo_rss_kb = mihomo_pid.and_then(read_process_rss_kb).unwrap_or(0);
+    let mut source_paths = Vec::new();
+    if state.split_routing.rkn_bypass_enabled
+        && let Some(home) = geo_dir_from_state(&state)
+    {
+        source_paths.push(PathBuf::from(home).join("rule-providers/ru-bypass.list"));
+    }
+    for provider in &state.mihomo_features.rule_providers {
+        if provider.provider_type == "file"
+            && let Some(path) = provider.path.as_deref()
+        {
+            source_paths.push(PathBuf::from(path));
+        }
+    }
+    let geobase_entries = manifest
+        .applied_bases
+        .iter()
+        .filter(|base| base.enabled)
+        .map(|base| {
+            base.counts.direct
+                + base.counts.active
+                + base.counts.static_direct
+                + base.counts.static_active
+        })
+        .sum();
+    let geobase_bytes = manifest
+        .applied_bases
+        .iter()
+        .filter(|base| base.enabled)
+        .flat_map(|base| {
+            [
+                Some(&base.lists.direct),
+                Some(&base.lists.active),
+                base.lists.static_direct.as_ref(),
+                base.lists.static_active.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .filter_map(|metadata| fs::metadata(daemon.geobase_store_root.join(&metadata.file)).ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>();
+    let rule_source_bytes = source_paths
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>()
+        .saturating_add(geobase_bytes);
+    let mut reasons = Vec::new();
+    if state.memory_guard.enabled && usage_pct >= state.memory_guard.system_usage_warn_pct {
+        reasons.push(format!(
+            "observed system usage {usage_pct}% exceeds configured {}% threshold",
+            state.memory_guard.system_usage_warn_pct
+        ));
+    }
+    if state.memory_guard.enabled && current_mihomo_rss_kb >= state.memory_guard.mihomo_rss_warn_kb
+    {
+        reasons.push(format!(
+            "observed Mihomo RSS {current_mihomo_rss_kb} KiB exceeds configured {} KiB threshold",
+            state.memory_guard.mihomo_rss_warn_kb
+        ));
+    }
+    let risk = if reasons.is_empty() {
+        "observed-ok"
+    } else {
+        "observed-warning"
+    };
+    json_response(&MemoryEstimateResponse {
+        risk,
+        rule_source_bytes,
+        current_mihomo_rss_kb,
+        available_memory_kb: available_kb,
+        user_rules: state.routing_rules.len(),
+        rule_provider_count: state.mihomo_features.rule_providers.len(),
+        geobase_entries,
+        rkn_bypass_enabled: state.split_routing.rkn_bypass_enabled,
+        safe_mode_enabled: state.safe_mode_enabled,
+        reasons,
+    })
 }
 
 /// Return cumulative traffic statistics (persisted totals) plus
@@ -12500,6 +13889,7 @@ fn handle_backup_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
     let was_running = inner.core.is_running();
     let _ = create_state_backup(&daemon.state_path, &inner.state, "pre-restore");
     inner.state = restored;
+    inner.sessions.clear();
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
         return (
             500,
@@ -12635,6 +14025,7 @@ fn handle_backup_webdav_download(body: &str, daemon: &Daemon) -> (u16, &'static 
             let was_running = inner.core.is_running();
             let _ = create_state_backup(&daemon.state_path, &inner.state, "pre-webdav-restore");
             inner.state = restored;
+            inner.sessions.clear();
             let _ = persist_state(&daemon.state_path, &inner.state);
             if was_running {
                 let _ = restart_core_locked(&mut inner, daemon);
@@ -12783,19 +14174,8 @@ fn restart_core_locked(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon) -> 
         .restart(&binary_path, &config_path, geo_dir.as_deref())
 }
 
-/// Generate a pseudo-random session token. Uses nanosecond timestamp
-/// + process ID as entropy — sufficient for a LAN router daemon.
-fn generate_session_token() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    format!("{nanos:016x}{pid:08x}")
-}
-
-/// v0.13: Authenticate a user and return a session token.
-fn handle_auth_login(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+/// Authenticate a user and return a bounded-lifetime cryptographic session.
+fn handle_auth_login(body: &str, daemon: &Daemon, peer_ip: IpAddr) -> (u16, &'static str, String) {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return (
             400,
@@ -12806,30 +14186,89 @@ fn handle_auth_login(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
     let username = value.get("username").and_then(Value::as_str).unwrap_or("");
     let password = value.get("password").and_then(Value::as_str).unwrap_or("");
 
-    let mut inner = lock(&daemon.inner);
-    let auth = &inner.state.web_ui_auth;
-    if !auth.enabled {
-        return (
-            200,
-            "application/json",
-            json!({"token": null, "auth_enabled": false}).to_string(),
-        );
-    }
-    if username == auth.username && password == auth.password {
-        let token = generate_session_token();
-        inner.sessions.insert(token.clone());
+    let now = unix_now();
+    let password_permit = match daemon.password_work.try_acquire() {
+        Some(permit) => permit,
+        None => {
+            return (
+                503,
+                "application/json",
+                json!({"error": "password verification capacity exhausted", "retry_after_seconds": 1})
+                    .to_string(),
+            );
+        }
+    };
+    let (expected_username, password_hash, reservation) = {
+        let mut inner = lock(&daemon.inner);
+        if !inner.state.web_ui_auth.enabled {
+            return (
+                200,
+                "application/json",
+                json!({"token": null, "auth_enabled": false}).to_string(),
+            );
+        }
+        let reservation = match inner.login_limiter.reserve_attempt(peer_ip, now) {
+            Ok(reservation) => reservation,
+            Err(retry_after) => {
+                return (
+                    429,
+                    "application/json",
+                    json!({"error": "too many login attempts", "retry_after_seconds": retry_after})
+                        .to_string(),
+                );
+            }
+        };
         (
-            200,
-            "application/json",
-            json!({"token": token, "auth_enabled": true}).to_string(),
+            inner.state.web_ui_auth.username.clone(),
+            inner.state.web_ui_auth.password_hash.clone(),
+            reservation,
         )
-    } else {
-        (
+    };
+
+    let password_valid =
+        verify_password_with_permit(password, &password_hash, password_permit).unwrap_or(false);
+    let credentials_valid = username == expected_username && password_valid;
+    if !credentials_valid {
+        return (
             401,
             "application/json",
-            json!({"error": "invalid credentials"}).to_string(),
-        )
+            json!({
+                "error": "invalid credentials",
+                "retry_after_seconds": reservation.retry_after_on_failure()
+            })
+            .to_string(),
+        );
     }
+
+    let token = match generate_session_token() {
+        Ok(token) => token,
+        Err(error) => return json_error(500, &error),
+    };
+    let mut inner = lock(&daemon.inner);
+    inner.login_limiter.record_success(peer_ip);
+    inner.sessions.retain(|_, session| !session.is_expired(now));
+    if inner.sessions.len() >= MAX_WEB_SESSIONS
+        && let Some(oldest) = inner
+            .sessions
+            .iter()
+            .min_by_key(|(_, session)| session.created_at_unix)
+            .map(|(token, _)| token.clone())
+    {
+        inner.sessions.remove(&oldest);
+    }
+    let session = WebSession::new(now);
+    let expires_at = session.expires_at_unix;
+    inner.sessions.insert(token.clone(), session);
+    (
+        200,
+        "application/json",
+        json!({
+            "token": token,
+            "auth_enabled": true,
+            "expires_at_unix": expires_at,
+        })
+        .to_string(),
+    )
 }
 
 /// v0.13: Invalidate a session token.
@@ -12854,7 +14293,7 @@ fn handle_auth_settings_get(daemon: &Daemon) -> (u16, &'static str, String) {
         json!({
             "enabled": auth.enabled,
             "username": auth.username,
-            "password_set": !auth.password.is_empty(),
+            "password_set": auth.has_password(),
         })
         .to_string(),
     )
@@ -12869,28 +14308,52 @@ fn handle_auth_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
             json!({"error": "invalid JSON body"}).to_string(),
         );
     };
-    let mut inner = lock(&daemon.inner);
-    if let Some(enabled) = value.get("enabled").and_then(Value::as_bool) {
-        inner.state.web_ui_auth.enabled = enabled;
-        if !enabled {
-            // Clear all sessions when disabling auth.
-            inner.sessions.clear();
+    let requested_password = value
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|password| !password.is_empty());
+    let password_hash = if let Some(password) = requested_password {
+        let permit = match daemon.password_work.try_acquire() {
+            Some(permit) => permit,
+            None => {
+                return (
+                    503,
+                    "application/json",
+                    json!({"error": "password hashing capacity exhausted", "retry_after_seconds": 1})
+                        .to_string(),
+                );
+            }
+        };
+        match hash_password_with_permit(password, permit) {
+            Ok(hash) => Some(hash),
+            Err(error) => return json_error(400, &error),
         }
-    }
+    } else {
+        None
+    };
+    let mut inner = lock(&daemon.inner);
+    let mut invalidate_sessions = false;
+    let requested_enabled = value.get("enabled").and_then(Value::as_bool);
     if let Some(username) = value.get("username").and_then(Value::as_str) {
         let username = username.trim();
         if !username.is_empty() {
+            invalidate_sessions |= inner.state.web_ui_auth.username != username;
             inner.state.web_ui_auth.username = username.to_owned();
         }
     }
-    // Password is only updated if the field is present and non-empty.
-    // This prevents accidental password wipe when the UI only sends
-    // enabled/username changes.
-    if let Some(password) = value.get("password").and_then(Value::as_str)
-        && !password.is_empty()
-    {
-        inner.state.web_ui_auth.password = password.to_owned();
-        // Clear sessions on password change — forces re-login.
+    if let Some(password_hash) = password_hash {
+        inner.state.web_ui_auth.password_hash = password_hash;
+        inner.state.web_ui_auth.password.clear();
+        invalidate_sessions = true;
+    }
+    if requested_enabled == Some(true) && !inner.state.web_ui_auth.has_password() {
+        return json_error(400, "cannot enable authentication without a password");
+    }
+    if let Some(enabled) = requested_enabled {
+        invalidate_sessions |= inner.state.web_ui_auth.enabled != enabled;
+        inner.state.web_ui_auth.enabled = enabled;
+    }
+    if invalidate_sessions {
         inner.sessions.clear();
     }
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
@@ -12906,7 +14369,7 @@ fn handle_auth_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
         json!({
             "enabled": inner.state.web_ui_auth.enabled,
             "username": inner.state.web_ui_auth.username,
-            "password_set": !inner.state.web_ui_auth.password.is_empty(),
+            "password_set": inner.state.web_ui_auth.has_password(),
         })
         .to_string(),
     )
@@ -16073,7 +17536,7 @@ fn write_response(
 ) -> Result<(), String> {
     let status_text = status_text(status);
     let head = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n",
         len = body.len()
     );
     stream
@@ -16090,16 +17553,14 @@ fn status_text(code: u16) -> &'static str {
         200 => "OK",
         202 => "Accepted",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
+        429 => "Too Many Requests",
         409 => "Conflict",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
         _ => "OK",
     }
-}
-
-fn index_html() -> &'static str {
-    include_str!("webui/index.html")
 }
 
 #[cfg(test)]
@@ -16757,10 +18218,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn stopped_core_successful_apply_marks_authoritative_generation() {
         let dir = TempDir::new().expect("temp dir");
+        let script = dir.path().join("fake-mihomo.sh");
+        fs::write(
+            &script,
+            b"#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then exit 0; fi\nsleep 30\n",
+        )
+        .expect("fake mihomo");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
         let mut state = geobase_config_state();
-        state.mihomo_path = "/usr/bin/true".to_owned();
+        state.mihomo_path = script.to_string_lossy().into_owned();
         state.split_routing.enabled = false;
         let daemon = Daemon::new(
             state,
@@ -16778,6 +18247,116 @@ mod tests {
             .expect("applied manifest");
         assert_eq!(applied.applied_generation, desired);
         assert!(!applied.requires_apply());
+        assert!(lock(&daemon.inner).core.is_running());
+        let _ = lock(&daemon.inner).core.stop();
+    }
+
+    #[test]
+    fn routing_preview_requires_apply_for_pending_geobase_with_identical_yaml() {
+        let (_dir, daemon) = test_daemon();
+        create_geobase_config_generation(&daemon, "pending", true);
+        let mut state = geobase_config_state_for(&daemon);
+        state.safe_mode_enabled = true;
+        let desired = config_plan(&state, &daemon, GeoBaseProjection::Desired)
+            .expect("desired config")
+            .0;
+        atomic_write_config(&daemon.mihomo_config_path, desired.as_bytes()).expect("config");
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state = state;
+            inner.core.child = Some(Command::new("sleep").arg("30").spawn().expect("sleep"));
+            inner.firewall.active = true;
+        }
+
+        let (status, _, body) = handle_routing_preview(&daemon);
+        assert_eq!(status, 200);
+        let preview: Value = serde_json::from_str(&body).expect("preview JSON");
+        assert_eq!(
+            preview["desired_config_sha256"],
+            preview["applied_config_sha256"]
+        );
+        assert_eq!(preview["requires_apply"], true);
+        assert!(
+            preview["changes"]
+                .as_array()
+                .expect("changes")
+                .iter()
+                .any(|change| change
+                    .as_str()
+                    .is_some_and(|change| change.contains("GeoBase")))
+        );
+        let mut inner = lock(&daemon.inner);
+        let _ = inner.core.stop();
+        inner.firewall.active = false;
+    }
+
+    #[test]
+    fn routing_preview_requires_apply_for_stopped_core_with_identical_config() {
+        let (_dir, daemon) = test_daemon();
+        let mut state = geobase_config_state_for(&daemon);
+        state.split_routing.enabled = false;
+        let desired = config_plan(&state, &daemon, GeoBaseProjection::Desired)
+            .expect("desired config")
+            .0;
+        atomic_write_config(&daemon.mihomo_config_path, desired.as_bytes()).expect("config");
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state = state;
+            inner.core.child = Some(Command::new("sleep").arg("30").spawn().expect("sleep"));
+        }
+        let (_, _, body) = handle_routing_preview(&daemon);
+        let applied: Value = serde_json::from_str(&body).expect("applied preview");
+        assert_eq!(applied["requires_apply"], false);
+
+        let _ = lock(&daemon.inner).core.stop();
+        let (_, _, body) = handle_routing_preview(&daemon);
+        let stopped_core: Value = serde_json::from_str(&body).expect("core preview");
+        assert_eq!(stopped_core["requires_apply"], true);
+        assert!(
+            stopped_core["changes"]
+                .as_array()
+                .expect("changes")
+                .iter()
+                .any(|change| change
+                    .as_str()
+                    .is_some_and(|change| change.contains("core is stopped")))
+        );
+    }
+
+    #[test]
+    fn routing_preview_firewall_runtime_matrix_requires_repairs() {
+        assert!(!firewall_runtime_requires_apply(true, true, true));
+        assert!(firewall_runtime_requires_apply(true, false, false));
+        assert!(firewall_runtime_requires_apply(true, true, false));
+        assert!(!firewall_runtime_requires_apply(false, false, false));
+        assert!(firewall_runtime_requires_apply(false, true, false));
+        assert!(firewall_runtime_requires_apply(false, false, true));
+    }
+
+    #[test]
+    fn routing_preview_requires_apply_to_remove_unwanted_firewall_runtime() {
+        let (_dir, daemon) = test_daemon();
+        let mut state = geobase_config_state_for(&daemon);
+        state.split_routing.enabled = false;
+        let desired = config_plan(&state, &daemon, GeoBaseProjection::Desired)
+            .expect("desired config")
+            .0;
+        atomic_write_config(&daemon.mihomo_config_path, desired.as_bytes()).expect("config");
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state = state;
+            inner.core.child = Some(Command::new("sleep").arg("30").spawn().expect("sleep"));
+            inner.firewall.active = true;
+        }
+
+        let (status, _, body) = handle_routing_preview(&daemon);
+        assert_eq!(status, 200);
+        let preview: Value = serde_json::from_str(&body).expect("preview JSON");
+        assert_eq!(preview["requires_apply"], true);
+        assert_eq!(preview["firewall_reload"], true);
+        let mut inner = lock(&daemon.inner);
+        let _ = inner.core.stop();
+        inner.firewall.active = false;
     }
 
     #[test]
@@ -19591,7 +21170,11 @@ mod tests {
             let mut inner = lock(&daemon.inner);
             inner.state.web_ui_auth.enabled = true;
             inner.state.web_ui_auth.username = "admin".to_owned();
-            inner.state.web_ui_auth.password = "secret".to_owned();
+            inner
+                .state
+                .web_ui_auth
+                .set_password("secret")
+                .expect("hash");
         }
         assert!(!check_auth(&daemon, &None, "/api/status", "GET"));
         assert!(!check_auth(&daemon, &None, "/api/profiles", "GET"));
@@ -19616,8 +21199,10 @@ mod tests {
         let token = {
             let mut inner = lock(&daemon.inner);
             inner.state.web_ui_auth.enabled = true;
-            let t = generate_session_token();
-            inner.sessions.insert(t.clone());
+            let t = generate_session_token().expect("token");
+            inner
+                .sessions
+                .insert(t.clone(), WebSession::new(unix_now()));
             t
         };
         let auth_header = Some(format!("Bearer {token}"));
@@ -19643,10 +21228,17 @@ mod tests {
             let mut inner = lock(&daemon.inner);
             inner.state.web_ui_auth.enabled = true;
             inner.state.web_ui_auth.username = "admin".to_owned();
-            inner.state.web_ui_auth.password = "pass123".to_owned();
+            inner
+                .state
+                .web_ui_auth
+                .set_password("pass123")
+                .expect("hash");
         }
-        let (status, _, body) =
-            handle_auth_login(r#"{"username":"admin","password":"pass123"}"#, &daemon);
+        let (status, _, body) = handle_auth_login(
+            r#"{"username":"admin","password":"pass123"}"#,
+            &daemon,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
         assert_eq!(status, 200);
         let result: Value = serde_json::from_str(&body).expect("parse json");
         assert_eq!(result["auth_enabled"], json!(true));
@@ -19660,10 +21252,17 @@ mod tests {
             let mut inner = lock(&daemon.inner);
             inner.state.web_ui_auth.enabled = true;
             inner.state.web_ui_auth.username = "admin".to_owned();
-            inner.state.web_ui_auth.password = "correct".to_owned();
+            inner
+                .state
+                .web_ui_auth
+                .set_password("correct")
+                .expect("hash");
         }
-        let (status, _, body) =
-            handle_auth_login(r#"{"username":"admin","password":"wrong"}"#, &daemon);
+        let (status, _, body) = handle_auth_login(
+            r#"{"username":"admin","password":"wrong"}"#,
+            &daemon,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
         assert_eq!(status, 401);
         let result: Value = serde_json::from_str(&body).expect("parse json");
         assert_eq!(result["error"], json!("invalid credentials"));
@@ -19675,7 +21274,11 @@ mod tests {
         {
             let mut inner = lock(&daemon.inner);
             inner.state.web_ui_auth.enabled = true;
-            inner.state.web_ui_auth.password = "sensitive".to_owned();
+            inner
+                .state
+                .web_ui_auth
+                .set_password("sensitive")
+                .expect("hash");
         }
         let (status, _, body) = handle_auth_settings_get(&daemon);
         assert_eq!(status, 200);
@@ -19708,7 +21311,13 @@ mod tests {
         let inner = lock(&daemon.inner);
         assert!(inner.state.web_ui_auth.enabled);
         assert_eq!(inner.state.web_ui_auth.username, "root");
-        assert_eq!(inner.state.web_ui_auth.password, "hunter2");
+        assert!(inner.state.web_ui_auth.password.is_empty());
+        assert!(
+            verify_password("hunter2", &inner.state.web_ui_auth.password_hash).expect("verify")
+        );
+        let persisted = fs::read_to_string(&daemon.state_path).expect("persisted state");
+        assert!(!persisted.contains("hunter2"));
+        assert!(!persisted.contains("\"password\""));
     }
 
     #[test]
@@ -19716,16 +21325,20 @@ mod tests {
         let (_dir, daemon) = test_daemon();
         {
             let mut inner = lock(&daemon.inner);
-            inner.state.web_ui_auth.password = "existingpass".to_owned();
+            inner
+                .state
+                .web_ui_auth
+                .set_password("existingpass")
+                .expect("hash");
         }
         // Send only enabled=true, no password field.
         let body = r#"{"enabled":true}"#;
         let (status, _, _) = handle_auth_settings_set(body, &daemon);
         assert_eq!(status, 200);
         let inner = lock(&daemon.inner);
-        assert_eq!(
-            inner.state.web_ui_auth.password, "existingpass",
-            "empty password should not wipe existing"
+        assert!(
+            verify_password("existingpass", &inner.state.web_ui_auth.password_hash)
+                .expect("verify")
         );
     }
 
@@ -19735,15 +21348,618 @@ mod tests {
         let token = {
             let mut inner = lock(&daemon.inner);
             inner.state.web_ui_auth.enabled = true;
-            let t = generate_session_token();
-            inner.sessions.insert(t.clone());
+            let t = generate_session_token().expect("token");
+            inner
+                .sessions
+                .insert(t.clone(), WebSession::new(unix_now()));
             t
         };
         let body = format!(r#"{{"token":"{token}"}}"#);
         let (status, _, _) = handle_auth_logout(&body, &daemon);
         assert_eq!(status, 200);
         let inner = lock(&daemon.inner);
-        assert!(!inner.sessions.contains(&token));
+        assert!(!inner.sessions.contains_key(&token));
+    }
+
+    #[test]
+    fn legacy_plaintext_auth_migrates_to_hash_without_reserializing_secret() {
+        let mut value = serde_json::to_value(HincyrayState::default()).expect("state");
+        value["web_ui_auth"] = json!({
+            "enabled": true,
+            "username": "admin",
+            "password": "legacy-secret"
+        });
+        let state = deserialize_persisted_state(&value.to_string()).expect("migrate");
+        assert!(state.web_ui_auth.password.is_empty());
+        assert!(
+            verify_password("legacy-secret", &state.web_ui_auth.password_hash).expect("verify")
+        );
+        let serialized = serde_json::to_string(&state).expect("serialize");
+        assert!(!serialized.contains("legacy-secret"));
+        assert!(!serialized.contains("\"password\""));
+    }
+
+    #[test]
+    fn failed_auth_migration_preserves_state_disables_auth_and_is_not_corruption() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let mut original = HincyrayState::default();
+        original
+            .profiles
+            .push(sample_profile(7, "Preserved", "preserved.example"));
+        original.routing_rules.push(RoutingRule {
+            enabled: true,
+            name: "Preserved rule".to_owned(),
+            target: "direct".to_owned(),
+            domains: vec!["preserved.example".to_owned()],
+            ..RoutingRule::default()
+        });
+        let mut value = serde_json::to_value(original).expect("state");
+        value["web_ui_auth"] = json!({
+            "enabled": true,
+            "username": "admin",
+            "password": "legacy-secret"
+        });
+        fs::write(&state_path, value.to_string()).expect("write state");
+
+        let loaded =
+            load_state_with_hasher(&state_path, |_| Err("simulated Argon2 failure".to_owned()));
+
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].name, "Preserved");
+        assert!(
+            loaded
+                .routing_rules
+                .iter()
+                .any(|rule| rule.name == "Preserved rule")
+        );
+        assert!(!loaded.web_ui_auth.enabled);
+        assert!(loaded.web_ui_auth.password.is_empty());
+        assert!(loaded.web_ui_auth.password_hash.is_empty());
+        assert!(!state_path.with_extension("json.corrupt").exists());
+
+        let persisted = fs::read_to_string(&state_path).expect("persisted state");
+        assert!(!persisted.contains("legacy-secret"));
+        assert!(!persisted.contains("\"password\""));
+        let persisted: HincyrayState = serde_json::from_str(&persisted).expect("valid state");
+        assert!(!persisted.web_ui_auth.enabled);
+        assert_eq!(persisted.profiles.len(), 1);
+        assert!(
+            persisted
+                .routing_rules
+                .iter()
+                .any(|rule| rule.name == "Preserved rule")
+        );
+    }
+
+    #[test]
+    fn expired_session_is_rejected_and_removed() {
+        let (_dir, daemon) = test_daemon();
+        let token = generate_session_token().expect("token");
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.enabled = true;
+            inner.sessions.insert(
+                token.clone(),
+                WebSession {
+                    created_at_unix: 0,
+                    last_seen_unix: 0,
+                    expires_at_unix: 1,
+                },
+            );
+        }
+        assert!(!check_auth(
+            &daemon,
+            &Some(format!("Bearer {token}")),
+            "/api/status",
+            "GET"
+        ));
+        assert!(!lock(&daemon.inner).sessions.contains_key(&token));
+    }
+
+    #[test]
+    fn origin_contract_accepts_same_host_and_rejects_cross_origin() {
+        assert!(origin_matches_host(
+            "http://192.168.1.1:8088",
+            Some("192.168.1.1:8088")
+        ));
+        assert!(origin_matches_host(
+            "https://router.example",
+            Some("router.example")
+        ));
+        assert!(!origin_matches_host(
+            "https://evil.example",
+            Some("192.168.1.1:8088")
+        ));
+    }
+
+    #[test]
+    fn config_redaction_covers_every_generated_credential_family() {
+        let yaml = r#"
+authentication:
+  - SECRET_LOCAL_AUTH
+secret: SECRET_CONTROLLER
+proxies:
+  - name: VLESS diagnostic
+    type: vless
+    server: vless.example
+    port: 443
+    uuid: SECRET_VLESS_UUID
+    certificate: SECRET_VLESS_CERT
+    private-key: SECRET_VLESS_KEY
+    reality-opts:
+      public-key: SAFE_REALITY_PUBLIC_KEY
+      short-id: SECRET_REALITY_SHORT_ID
+    xhttp-opts:
+      path: /diagnostic
+      x-padding-key: SECRET_X_PADDING_KEY
+      session-key: SECRET_SESSION_KEY
+      seq-key: SECRET_SEQ_KEY
+      uplink-data-key: SECRET_UPLINK_DATA_KEY
+  - name: VMess diagnostic
+    type: vmess
+    server: vmess.example
+    port: 443
+    uuid: SECRET_VMESS_UUID
+    certificate: SECRET_VMESS_CERT
+    private-key: SECRET_VMESS_KEY
+  - name: Trojan diagnostic
+    type: trojan
+    server: trojan.example
+    port: 443
+    password: SECRET_TROJAN_PASSWORD
+  - name: Shadowsocks diagnostic
+    type: ss
+    server: ss.example
+    port: 8388
+    cipher: aes-256-gcm
+    password: SECRET_SS_PASSWORD
+  - name: SSR diagnostic
+    type: ssr
+    server: ssr.example
+    port: 443
+    cipher: aes-256-cfb
+    password: SECRET_SSR_PASSWORD
+    obfs-param: SECRET_SSR_OBFS_PARAM
+    protocol-param: SECRET_SSR_PROTOCOL_PARAM
+  - name: Snell diagnostic
+    type: snell
+    server: snell.example
+    port: 44046
+    psk: SECRET_SNELL_PSK
+  - name: HTTP diagnostic
+    type: http
+    server: http.example
+    port: 8080
+    username: SECRET_HTTP_USERNAME
+    password: SECRET_HTTP_PASSWORD
+  - name: SOCKS diagnostic
+    type: socks5
+    server: socks.example
+    port: 1080
+    username: SECRET_SOCKS_USERNAME
+    password: SECRET_SOCKS_PASSWORD
+  - name: AnyTLS diagnostic
+    type: anytls
+    server: anytls.example
+    port: 443
+    password: SECRET_ANYTLS_PASSWORD
+  - name: Hysteria diagnostic
+    type: hysteria
+    server: hysteria.example
+    port: 443
+    auth-str: SECRET_HYSTERIA_AUTH
+    obfs: SECRET_HYSTERIA_OBFS
+  - name: Hysteria2 diagnostic
+    type: hysteria2
+    server: hysteria2.example
+    port: 443
+    password: SECRET_HYSTERIA2_PASSWORD
+    obfs: salamander
+    obfs-password: SECRET_HYSTERIA2_OBFS_PASSWORD
+  - name: WireGuard diagnostic
+    type: wireguard
+    server: wireguard.example
+    port: 51820
+    private-key: SECRET_WIREGUARD_PRIVATE_KEY
+    public-key: SAFE_WIREGUARD_PUBLIC_KEY
+    pre-shared-key: SECRET_WIREGUARD_PSK
+    allowed-ips: [0.0.0.0/0]
+  - name: TUIC diagnostic
+    type: tuic
+    server: tuic.example
+    port: 443
+    uuid: SECRET_TUIC_UUID
+    password: SECRET_TUIC_PASSWORD
+  - name: SSH diagnostic
+    type: ssh
+    server: ssh.example
+    port: 22
+    username: SECRET_SSH_USERNAME
+    password: SECRET_SSH_PASSWORD
+    private-key: SECRET_SSH_PRIVATE_KEY
+    private-key-passphrase: SECRET_SSH_PASSPHRASE
+  - name: MASQUE diagnostic
+    type: masque
+    server: masque.example
+    port: 443
+    private-key: SECRET_MASQUE_PRIVATE_KEY
+    public-key: SAFE_MASQUE_PUBLIC_KEY
+  - name: OpenVPN diagnostic
+    type: openvpn
+    server: openvpn.example
+    port: 1194
+    ca: SAFE_OPENVPN_CA
+    cert: SECRET_OPENVPN_CLIENT_CERT
+    key: SECRET_OPENVPN_KEY
+    tls-crypt: SECRET_OPENVPN_TLS_CRYPT
+    username: SECRET_OPENVPN_USERNAME
+    password: SECRET_OPENVPN_PASSWORD
+  - name: Tailscale diagnostic
+    type: tailscale
+    hostname: tailscale-diagnostic
+    auth-key: SECRET_TAILSCALE_AUTH_KEY
+rules:
+  - MATCH,proxy
+"#;
+        let redacted = redact_config_yaml(yaml).expect("redact");
+        for secret in yaml
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '[' | ']' | ','))
+            .filter(|value| value.starts_with("SECRET_"))
+        {
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        for diagnostic in [
+            "VLESS diagnostic",
+            "vless.example",
+            "SAFE_REALITY_PUBLIC_KEY",
+            "aes-256-gcm",
+            "salamander",
+            "SAFE_WIREGUARD_PUBLIC_KEY",
+            "0.0.0.0/0",
+            "SAFE_MASQUE_PUBLIC_KEY",
+            "SAFE_OPENVPN_CA",
+            "tailscale-diagnostic",
+            "MATCH,proxy",
+        ] {
+            assert!(
+                redacted.contains(diagnostic),
+                "missing diagnostic {diagnostic}: {redacted}"
+            );
+        }
+        assert!(redacted.matches("<redacted>").count() >= 35);
+    }
+
+    #[test]
+    fn config_redaction_collapses_provider_credentials_and_arbitrary_payloads() {
+        let yaml = r#"
+proxy-providers:
+  subscription-diagnostic:
+    type: inline
+    interval: 3600
+    proxy: proxy
+    url: https://provider.example/sub/SECRET_PROVIDER_URL
+    age-secret-key: SECRET_AGE_KEY
+    header:
+      X-Arbitrary-Credential: [SECRET_PROXY_HEADER]
+      Harmless-Looking-Name: [SECRET_PROXY_HEADER_UNKNOWN]
+    payload:
+      - "type: vless, uuid: SECRET_INLINE_PROXY"
+    future-provider-credential:
+      nested: SECRET_FUTURE_PROVIDER_FIELD
+rule-providers:
+  rules-diagnostic:
+    type: inline
+    behavior: domain
+    format: yaml
+    interval: 7200
+    header:
+      Authorization: [SECRET_RULE_HEADER]
+    payload:
+      - DOMAIN,SECRET_INLINE_RULE,DIRECT
+    future-inline-data: SECRET_FUTURE_RULE_FIELD
+"#;
+        let redacted = redact_config_yaml(yaml).expect("redact");
+        for secret in yaml
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '[' | ']' | ',' | '/'))
+            .filter(|value| value.starts_with("SECRET_"))
+        {
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        for diagnostic in [
+            "subscription-diagnostic",
+            "rules-diagnostic",
+            "type: inline",
+            "interval: 3600",
+            "behavior: domain",
+            "format: yaml",
+        ] {
+            assert!(
+                redacted.contains(diagnostic),
+                "missing {diagnostic}: {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_redaction_fails_closed_for_unknown_schema_and_dns_credentials() {
+        let yaml = r#"
+mode: rule
+future-root-credential: SECRET_FUTURE_ROOT
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  nameserver:
+    - https://SECRET_DNS_USER:SECRET_DNS_PASSWORD@dns.example/dns-query
+  nameserver-policy:
+    "+.example.com":
+      - tls://SECRET_POLICY_TOKEN@dns.example
+proxies:
+  - name: Future protocol diagnostic
+    type: future-protocol
+    server: future.example
+    port: 443
+    harmless-looking-new-field: SECRET_FUTURE_PROXY_FIELD
+proxy-groups:
+  - name: proxy
+    type: fallback
+    proxies: [Future protocol diagnostic, DIRECT]
+    url: https://www.gstatic.com/generate_204
+    future-group-secret: SECRET_FUTURE_GROUP
+"#;
+        let redacted = redact_config_yaml(yaml).expect("redact");
+        for secret in yaml
+            .split(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '[' | ']' | ',' | '/' | '@'))
+            .filter(|value| value.starts_with("SECRET_"))
+        {
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        for diagnostic in [
+            "mode: rule",
+            "listen: 0.0.0.0:1053",
+            "+.example.com",
+            "Future protocol diagnostic",
+            "future.example",
+            "type: fallback",
+        ] {
+            assert!(
+                redacted.contains(diagnostic),
+                "missing {diagnostic}: {redacted}"
+            );
+        }
+        assert!(!redacted.contains("https://www.gstatic.com/generate_204"));
+    }
+
+    #[test]
+    fn config_redaction_hides_opaque_diagnostic_urls_and_targets() {
+        let yaml = r#"
+proxies:
+  - name: opaque paths
+    type: vless
+    server: proxy.example
+    port: 443
+    xhttp-opts:
+      path: /SECRET_XHTTP_PATH
+    ws-opts:
+      path: /SECRET_WS_PATH
+proxy-groups:
+  - name: proxy
+    type: fallback
+    proxies: [opaque paths, DIRECT]
+    url: https://health.example/SECRET_GROUP_URL
+proxy-providers:
+  remote:
+    type: http
+    health-check:
+      enable: true
+      url: https://health.example/SECRET_PROVIDER_HEALTH
+tunnels:
+  - network: [tcp]
+    address: 127.0.0.1:9000
+    target: SECRET_TUNNEL_TARGET
+ntp:
+  enable: true
+  server: SECRET_NTP_SERVER
+  port: 123
+"#;
+        let redacted = redact_config_yaml(yaml).expect("redact");
+        for secret in [
+            "SECRET_XHTTP_PATH",
+            "SECRET_WS_PATH",
+            "SECRET_GROUP_URL",
+            "SECRET_PROVIDER_HEALTH",
+            "SECRET_TUNNEL_TARGET",
+            "SECRET_NTP_SERVER",
+        ] {
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        for diagnostic in [
+            "opaque paths",
+            "proxy.example",
+            "type: fallback",
+            "address: 127.0.0.1:9000",
+            "port: 123",
+        ] {
+            assert!(
+                redacted.contains(diagnostic),
+                "missing {diagnostic}: {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_mode_projection_suppresses_heavy_features_without_mutating_state() {
+        let mut state = HincyrayState {
+            safe_mode_enabled: true,
+            ..HincyrayState::default()
+        };
+        state.mihomo_features.raw_rules = vec!["DOMAIN,example.com,DIRECT".to_owned()];
+        state.mihomo_features.typed_rules = vec![crate::mihomo_config::MihomoRuleConfig {
+            rule_type: "DOMAIN".to_owned(),
+            value: "example.net".to_owned(),
+            target: "DIRECT".to_owned(),
+            options: Vec::new(),
+        }];
+        state
+            .mihomo_features
+            .tunnels
+            .push(crate::mihomo_config::TunnelConfig {
+                network: vec!["tcp".to_owned()],
+                address: "127.0.0.1:1".to_owned(),
+                target: "example.com:443".to_owned(),
+                proxy: None,
+            });
+        let effective = effective_mihomo_features(&state);
+        assert!(effective.raw_rules.is_empty());
+        assert!(effective.typed_rules.is_empty());
+        assert!(effective.tunnels.is_empty());
+        assert_eq!(state.mihomo_features.raw_rules.len(), 1);
+        assert_eq!(state.mihomo_features.typed_rules.len(), 1);
+        assert_eq!(state.mihomo_features.tunnels.len(), 1);
+    }
+
+    #[test]
+    fn safe_mode_rollback_preserves_unrelated_concurrent_state() {
+        let (_dir, daemon) = test_daemon();
+        let undo_id = {
+            let mut inner = lock(&daemon.inner);
+            push_undo_snapshot(&mut inner.state, "Safe mode enabled");
+            inner.state.safe_mode_enabled = true;
+            inner.state.auto_select = true;
+            persist_state(&daemon.state_path, &inner.state).expect("persist concurrent state");
+            inner
+                .state
+                .undo_stack
+                .last()
+                .expect("safe mode undo")
+                .id
+                .clone()
+        };
+
+        assert_eq!(
+            restore_safe_mode_after_failed_activation(&daemon, true, false, Some(&undo_id),),
+            "restored"
+        );
+        let inner = lock(&daemon.inner);
+        assert!(!inner.state.safe_mode_enabled);
+        assert!(inner.state.auto_select);
+        assert!(
+            !inner
+                .state
+                .undo_stack
+                .iter()
+                .any(|entry| entry.id == undo_id)
+        );
+        let persisted = load_state(&daemon.state_path);
+        assert!(!persisted.safe_mode_enabled);
+        assert!(persisted.auto_select);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn safe_mode_handler_failure_does_not_erase_concurrent_state_update() {
+        let dir = TempDir::new().expect("temp dir");
+        let marker = dir.path().join("validation-started");
+        let script = dir.path().join("fake-mihomo.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then touch '{}'; sleep 1; exit 1; fi\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .expect("fake mihomo");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut state = geobase_config_state();
+        state.split_routing.enabled = false;
+        state.mihomo_path = script.to_string_lossy().into_owned();
+        let daemon = Daemon::new(
+            state,
+            dir.path().join("state.json"),
+            dir.path().join("mihomo-config.yaml"),
+        );
+        let worker_daemon = daemon.clone();
+        let worker = thread::spawn(move || {
+            handle_safe_mode_set(r#"{"enabled":true,"apply":true}"#, &worker_daemon)
+        });
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists(), "validation did not start");
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.auto_select = true;
+        }
+
+        let (status, _, body) = worker.join().expect("safe mode worker");
+        assert_eq!(status, 500, "{body}");
+        let inner = lock(&daemon.inner);
+        assert!(!inner.state.safe_mode_enabled);
+        assert!(inner.state.auto_select);
+        drop(inner);
+        let persisted = load_state(&daemon.state_path);
+        assert!(!persisted.safe_mode_enabled);
+        assert!(persisted.auto_select);
+    }
+
+    #[test]
+    fn connection_search_contract_covers_canonical_metadata_and_chain() {
+        let connection = json!({
+            "metadata": {
+                "host": "chatgpt.com",
+                "destinationIP": "203.0.113.5",
+                "sourceIP": "192.168.2.35",
+                "destinationCountry": "RU"
+            },
+            "chains": ["proxy-active", "proxy"],
+            "rule": "DomainSuffix",
+            "rulePayload": "chatgpt.com"
+        });
+        let text = connection_search_text(&connection);
+        for expected in [
+            "chatgpt.com",
+            "203.0.113.5",
+            "192.168.2.35",
+            "ru",
+            "proxy-active",
+            "domainsuffix",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let terms = ["ru", "chatgpt.com"];
+        assert!(terms.iter().all(|term| text.contains(term)));
+    }
+
+    #[test]
+    fn device_traffic_projection_aggregates_only_requested_sources() {
+        let connections = vec![
+            json!({"metadata":{"sourceIP":"192.168.2.2"},"upload":10,"download":20}),
+            json!({"metadata":{"sourceIP":"192.168.2.2"},"upload":5,"download":7}),
+            json!({"metadata":{"sourceIP":"192.168.2.3"},"upload":100,"download":200}),
+        ];
+        let source_ips = HashSet::from(["192.168.2.2".to_owned()]);
+        let projected = aggregate_device_traffic(&connections, &source_ips);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected["192.168.2.2"].upload, 15);
+        assert_eq!(projected["192.168.2.2"].download, 27);
+        assert_eq!(projected["192.168.2.2"].connections, 2);
+    }
+
+    #[test]
+    fn typed_contract_and_routing_summary_endpoints_are_bounded() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, contracts) = handle_api_contracts();
+        assert_eq!(status, 200);
+        assert!(contracts.contains("/api/routing/summary"));
+        let (status, _, summary) = handle_routing_summary(&daemon);
+        assert_eq!(status, 200);
+        let value: Value = serde_json::from_str(&summary).expect("summary");
+        assert_eq!(value["user_rule_count"], 0);
+        assert!(value.get("catalog").is_none());
+        assert!(value.get("servers").is_none());
     }
 
     fn sample_profile(id: usize, name: &str, address: &str) -> Profile {

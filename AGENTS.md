@@ -101,7 +101,7 @@ EXPECT
 | Redir port (TCP) | `10810` |
 | Tproxy port (UDP) | `10811` |
 
-Daemon control on router: start `/opt/etc/init.d/S99hincyray start`; stop `kill $(pgrep -f /opt/sbin/hincyray)`.
+Daemon control on router: use `/opt/etc/init.d/S99hincyray start|stop|restart|status`. The init script owns `/opt/var/run/hincyray.pid` and verifies the process identity. Never stop HincyRay with `pgrep -f`, `pkill -f`, `killall`, or another process-name/argv scan: the pattern also matches the invoking remote shell and can terminate the SSH command itself.
 
 ### Router toolchain constraints
 
@@ -118,6 +118,7 @@ shasum -a 256 target/aarch64-unknown-linux-gnu/release/hincyray
 
 # Deploy: SCP binary to /tmp/hincyray-new, then on router via SSH:
 #   cp /opt/sbin/hincyray /opt/sbin/hincyray.bak
+#   /opt/etc/init.d/S99hincyray stop
 #   cp /tmp/hincyray-new /opt/sbin/hincyray && chmod +x /opt/sbin/hincyray
 #   sha256sum /opt/sbin/hincyray   # must match the local shasum
 #   /opt/etc/init.d/S99hincyray start
@@ -135,6 +136,7 @@ cargo clippy --all-targets --no-default-features --bin hincyray -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 python3 scripts/frontend-contract-test.py
+python3 scripts/installer-lifecycle-contract-test.py
 git diff --check
 ```
 

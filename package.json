@@ -1,0 +1,11 @@
+{
+  "name": "hincyray-browser-smoke",
+  "private": true,
+  "scripts": {
+    "test:browser": "playwright test",
+    "test:browser:install": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1"
+  }
+}

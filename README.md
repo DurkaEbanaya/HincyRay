@@ -1,4 +1,4 @@
-# HincyRay v0.19.4
+# HincyRay v0.21.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -43,6 +43,18 @@ Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN eve
 
 ## Features
 
+### v0.21.0
+
+v0.21 implements the hardening and operability contracts end to end. Authentication uses Argon2id password storage with legacy plaintext migration, cryptographically random bounded sessions, login throttling, same-origin mutation checks, and `sessionStorage` for the browser Bearer token. Generated applied and preview configs are redacted before they leave the daemon.
+
+The versioned API surface is advertised by `GET /api/contracts`. Readiness/onboarding, routing summary/context/preview/explain, observed memory reporting, safe mode, and bounded connection pages are available at `/api/onboarding/status`, `/api/routing/summary`, `/api/routing/connection-context`, `/api/routing/preview`, `/api/routing/explain`, `/api/memory-estimate`, `GET/POST /api/safe-mode`, and `POST /api/mihomo-api/connections/page`. The memory report is factual: rule-source bytes on disk, current Mihomo RSS, available memory, rule/provider counts, and threshold-derived observed risk. It does not speculate about future peak allocation.
+
+The Web UI adds responsive table-to-card layouts, mobile/tablet navigation, a profile rename dialog instead of `window.prompt`, and exact search support for rendered flag-plus-host labels such as `🇷🇺 chatgpt.com`. Module boundaries now include typed API DTOs in `hincyray_api`, auth policy in `hincyray_security`, and embedded UI ownership in `hincyray_webui`. Full gates, Playwright results, cross-build, and router deployment remain pending until the final report. See [`docs/architecture-v0.21.md`](docs/architecture-v0.21.md).
+
+### v0.20.0
+
+Deep Bench adds a two-phase server quality workflow: quick benchmarking followed by stability samples, unlock checks, and sustained-download observation. Compact daily snapshots live in `quality-history.json`, and the 30-day history supports conservative Trash Bin promotion after repeated poor readings plus automatic or manual restore.
+
 ### v0.19.4
 
 Fluent Reveal spotlight effect fixed (var() in radial-gradient was not resolving) and extended to buttons, chips, section headers, select triggers, and tabs. `/api/profiles/add` now accepts subscription URLs, not just share links — pasting a subscription URL fetches and imports all profiles instead of returning a parse error.
@@ -83,8 +95,8 @@ Web UI sharing and audit hardening:
 
 ### v0.17.0
 
-- **RKN Bypass**: automatic routing of domains blocked in Russia through proxy. Uses `itworksig/rublacklist` (auto-updated via GitHub Actions, 744K+ rules) as a Mihomo rule provider. The list is downloaded through the proxy itself and refreshed every 24 hours. Russian IPs (`GEOIP,RU`) and Chinese IPs (`GEOIP,CN`) are routed direct to avoid unnecessary proxy load. Toggle on/off in the WebUI with configurable URL and update interval.
-- **Reset to factory defaults**: one-click reset button restores the default routing policy — RKN Bypass on, RU Direct (geosite), MATCH,proxy, AllowList ports 80/443, QUIC Block rule, all user rules and raw rules cleared. The WebUI calls `POST /api/routing/reset` with `{"apply":true}`, so state persistence, config regeneration, core restart, and rollback on activation failure are one backend transaction.
+- **RKN Bypass**: v0.17 introduced routing of domains blocked in Russia through proxy. The implementation now uses a preprocessed domain list derived from `itworksig/rublacklist`; although originally enabled by default, the current safe default is off because very large lists can exceed the memory budget of a 512 MB router. The Web UI exposes the source URL and update interval.
+- **Reset to factory defaults**: v0.17 added one-click routing reset. The current reset restores safe defaults, including RKN Bypass off, and clears user/raw rules. The Web UI calls `POST /api/routing/reset` with `{"apply":true}`, so state persistence, config regeneration, core restart, and rollback on activation failure are one backend transaction.
 - **Configurable sniffer override-destination**: toggle in the DNS section to control Mihomo's `override-destination` sniffer setting. Default `true` — ensures domain rules match even when clients use DoH/DoT (SNI is extracted into the destination field). `saveDns()` now calls `/api/routing/apply` after saving so DNS changes take effect immediately.
 - 339 tests, 0 clippy warnings.
 - Router E2E verified on Keenetic Giga: bypass list downloaded (24 MB, 744,070 rules, ~5s), Mihomo RSS 157 MB, toggle on/off verified in config, reset restores factory defaults.
@@ -190,7 +202,7 @@ Web UI sharing and audit hardening:
 ### v0.12.0
 
 - **Hysteria2 port hopping**: `mport`/`ports` and `hopInterval`/`hop_interval` query params parsed from share links, emitted as Mihomo `ports` + `hop-interval` fields.
-- **Profile CRUD API**: `POST /api/profiles/add` (parse share link), `POST /api/profiles/delete` (remove by ID, re-index), `POST /api/profiles/update` (rename, toggle block_quic). Backend-only, UI pending redesign.
+- **Profile CRUD API**: `POST /api/profiles/add` (parse share link), `POST /api/profiles/delete` (remove by ID, re-index), `POST /api/profiles/update` (rename, toggle block_quic). The current Web UI exposes add/delete and dialog-based rename flows.
 - **Auto-refresh subscriptions**: watchdog Phase 7 refreshes all subscriptions on a configurable interval. Disabled by default. If the active profile is removed during refresh, auto-selects the best available.
 - **Traffic statistics**: cumulative upload/download byte counters persisted in state. Real-time speed via Mihomo `/traffic` API. `GET /api/traffic`, `GET /api/mihomo-api/traffic`, `GET /api/mihomo-api/memory`.
 - **Connection log**: persisted log of connections seen through the proxy (host, source IP, chain, rule, upload/download). Cap 500 entries. `GET /api/connection-log`.
@@ -287,11 +299,18 @@ cargo build --release --bin xray-vpn-test
 ### Quality gates
 
 ```bash
-cargo fmt --all
+cargo fmt --all --check
 cargo check --all-targets --all-features
-cargo test --all-targets --all-features   # 301 tests
-cargo clippy --all-targets --all-features   # 0 warnings
+cargo clippy --all-targets --no-default-features --bin hincyray -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+python3 scripts/frontend-contract-test.py
+npm ci
+npm run test:browser
+git diff --check
 ```
+
+The Playwright command runs the fixture-backed browser smoke suite. Full gate results and router deployment evidence remain pending until the final report.
 
 ## Installation
 
@@ -311,7 +330,7 @@ See [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md) for m
 http://<router-ip>:8088/
 ```
 
-Fluent/Acrylic design with 7 navigation groups, 24 sidebar items, RU/EN i18n, light/dark theme. Status, profiles, benchmark, import, subscriptions, routing rules, per-device routing, firewall controls, DNS, diagnostics, backups, HWID, system monitor, Mihomo update, Mihomo features, proxy status, traffic & connections, logs — all in one page. Auto-refreshes every 5 seconds. No external CDN or build step.
+Embedded Fluent/Acrylic panel with RU/EN i18n, light/dark themes, desktop/sidebar, tablet, and mobile navigation. Tables become labelled cards on narrow screens. Profile rename uses an in-page dialog, connection search matches exact rendered flag-plus-host labels, and the Bearer token is held in `sessionStorage`. Status, profiles, benchmark, import, subscriptions, routing, firewall, DNS, diagnostics, backups, HWID, system monitoring, Mihomo management, traffic, connections, and logs remain available without an external CDN or frontend build step. Lightweight status and system heartbeats are used instead of periodically refreshing the full dashboard.
 
 ### Environment overrides
 
@@ -327,6 +346,8 @@ Fluent/Acrylic design with 7 navigation groups, 24 sidebar items, RU/EN i18n, li
 |---|---|---|
 | `GET` | `/` | Embedded web panel |
 | `GET` | `/api/health` | Service health + version |
+| `GET` | `/api/contracts` | Versioned bounded-endpoint and auth contract descriptor |
+| `GET` | `/api/onboarding/status` | Readiness checks and remediation for Mihomo, profile, GeoIP, core, firewall, and ndm hook |
 | `GET` | `/api/status` | Active profile, core status, split routing, DNS, HWID, mihomo_version, update_available_version, proxy_group_enabled, ec_enabled |
 | `GET` | `/api/profiles` | Imported profiles |
 | `POST` | `/api/profiles/import` | Import share links / subscription URL / Xray JSON |
@@ -335,7 +356,8 @@ Fluent/Acrylic design with 7 navigation groups, 24 sidebar items, RU/EN i18n, li
 | `POST` | `/api/profiles/update` | Update profile name and/or block_quic |
 | `POST` | `/api/profiles/block-quic` | Toggle block_quic flag on a profile |
 | `POST` | `/api/active-profile` | Set active profile, regenerate config, restart core |
-| `GET` | `/api/mihomo-config` | Generated Mihomo config |
+| `GET` | `/api/mihomo-config` | Applied generated Mihomo config, with secrets redacted |
+| `GET` | `/api/mihomo-config/preview` | Non-mutating preview of the desired generated config, with secrets redacted |
 | `POST` | `/api/core/start` | Start Mihomo core |
 | `POST` | `/api/core/stop` | Stop Mihomo core |
 | `POST` | `/api/core/restart` | Restart Mihomo core |
@@ -350,6 +372,10 @@ Fluent/Acrylic design with 7 navigation groups, 24 sidebar items, RU/EN i18n, li
 | `POST` | `/api/subscriptions/refresh-one` | Refresh a single subscription by URL |
 | `POST` | `/api/subscriptions/delete` | Delete a subscription and its profiles |
 | `GET` | `/api/routing` | Routing settings + rules + catalog |
+| `GET` | `/api/routing/summary` | Compact routing, safe-mode, rule, server, conflict, and GeoBase apply summary |
+| `GET` | `/api/routing/connection-context` | Stable server references and active server context for connection routing UI |
+| `GET` | `/api/routing/preview` | Non-mutating desired/applied config hash comparison and apply effects |
+| `POST` | `/api/routing/explain` | Explain routing for a normalized host/IP resource with optional source/port/network context |
 | `POST` | `/api/routing/settings` | Save routing settings; `{"apply":true}` saves + applies atomically |
 | `POST` | `/api/routing/rules` | Save routing rules; `{"rules":[...],"apply":true}` saves + applies atomically |
 | `POST` | `/api/routing/apply` | Regenerate config + restart core + restart firewall |
@@ -371,6 +397,9 @@ Fluent/Acrylic design with 7 navigation groups, 24 sidebar items, RU/EN i18n, li
 | `GET` | `/api/dns/diagnostics` | Resolver + Mihomo DNS diagnostics |
 | `GET` | `/api/logs` | Mihomo log tail (last 200 lines) |
 | `GET` | `/api/system` | CPU/RAM/temp/load/uptime |
+| `GET` | `/api/memory-estimate` | Observed rule-source bytes, current Mihomo RSS, available memory, counts, and threshold risk |
+| `GET` | `/api/safe-mode` | Safe-mode status and suppressed heavy features |
+| `POST` | `/api/safe-mode` | Enable/disable safe mode, optionally applying through transactional activation |
 | `GET` | `/api/auto-settings` | Auto-select, auto-switch, auto-benchmark, auto-refresh settings |
 | `POST` | `/api/auto-settings` | Save auto-settings |
 | `GET` | `/api/hwid` | HWID fingerprint config |
@@ -382,7 +411,8 @@ Fluent/Acrylic design with 7 navigation groups, 24 sidebar items, RU/EN i18n, li
 | `GET` | `/api/mihomo-features` | MihomoFeatures config (proxy groups, EC, NTP, providers, etc.) |
 | `POST` | `/api/mihomo-features` | Save MihomoFeatures config |
 | `GET` | `/api/mihomo-api/proxies` | Forward `GET /proxies` to Mihomo REST API |
-| `GET` | `/api/mihomo-api/connections` | Forward `GET /connections` to Mihomo REST API |
+| `GET` | `/api/mihomo-api/connections` | Legacy full Mihomo connection snapshot |
+| `POST` | `/api/mihomo-api/connections/page` | Filtered connection page with `query`, `offset`, and bounded `limit` (1–500) |
 | `POST` | `/api/mihomo-api/connections/close` | Close all/filter-matched Mihomo connections (`scope`, `id`, `resource`, `host`, `destination_ip`, `source_ip`) |
 | `POST` | `/api/mihomo-api/delay` | Test proxy delay via Mihomo API |
 | `GET` | `/api/mihomo-api/traffic` | Forward `GET /traffic` to Mihomo REST API |
@@ -412,7 +442,7 @@ Fluent/Acrylic design with 7 navigation groups, 24 sidebar items, RU/EN i18n, li
 | `GET` | `/api/auth-settings` | Web UI authentication settings |
 | `POST` | `/api/auth-settings` | Save Web UI authentication settings |
 | `GET` | `/api/traffic` | Cumulative + real-time traffic statistics |
-| `GET` | `/api/connection-log` | Persisted connection log (cap 500 entries) |
+| `GET` | `/api/connection-log` | In-memory recent connection log (cap 500 entries; reset on daemon restart) |
 
 ## WiFi VPN segment (optional)
 
@@ -441,6 +471,7 @@ Use the web panel's "Per-Device Routing" section:
 - [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md) — Entware install runbook.
 - [`docs/hincyray-v0.1-status.md`](docs/hincyray-v0.1-status.md) — version status.
 - [`docs/keenetic-client-roadmap.md`](docs/keenetic-client-roadmap.md) — product roadmap.
+- [`docs/architecture-v0.21.md`](docs/architecture-v0.21.md) — v0.21 module/API contracts and router operational model.
 
 ## State migration
 
@@ -453,6 +484,8 @@ Existing `state.json` from any prior version is automatically migrated:
 - v0.12→v0.13: `web_ui_auth` added with disabled default; routing targets accept `reject`.
 - v0.13→v0.14: `sub_store_lite`, `smart_select`, `maintenance`, and EWMA/cooldown profile stats added with defaults.
 - v0.14→v0.15: New `Protocol` variants (ShadowsocksR, Snell, Http, Socks, AnyTls, Hysteria, Ssh, Masque, OpenVpn, Tailscale), `ProxyGroupType::Relay`, DNS parity fields (`dns_fake_ip_filter_mode`, `dns_fake_ip_ttl`, `dns_use_hosts`, `dns_use_system_hosts`, `dns_default_nameserver`, `dns_proxy_server_nameserver_policy`, `dns_direct_nameserver_follow_policy`, `dns_ecs`, `dns_ecs_override`, `dns_disable_ipv4`, `dns_disable_ipv6`, `dns_disable_qtypes`), `typed_rules` (Vec<MihomoRuleConfig>) added to MihomoFeatures with defaults.
+- v0.19→v0.20: Deep Bench and Trash Bin settings use serde defaults; quality history is stored separately from `state.json`.
+- v0.20→v0.21: legacy plaintext Web UI passwords are converted to an Argon2id PHC hash on state load and are not serialized again; runtime sessions remain in memory only.
 
 No manual intervention required.
 

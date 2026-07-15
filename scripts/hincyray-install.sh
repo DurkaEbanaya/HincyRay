@@ -10,8 +10,9 @@
 #   5. COMMIT   — remove backup on success, OR
 #      ROLLBACK — restore from backup on any failure (trap-based).
 #
-# No step can leave the system in a half-installed state: either
-# everything succeeds or the previous state is fully restored.
+# HincyRay-owned files and runtime state commit together or are restored
+# together. Entware package operations remain owned by opkg and complete
+# before the HincyRay transaction begins.
 #
 # Usage:
 #   sh /tmp/hincyray-install.sh
@@ -26,13 +27,14 @@
 
 set -eu
 
-VERSION="0.6.1"
+VERSION="0.21.0"
 GITHUB="https://github.com/DurkaEbanaya/HincyRay"
-ENTWARE="/opt"
+ENTWARE="${HINCYRAY_ENTWARE:-/opt}"
 HINCYRAY_DIR="${ENTWARE}/etc/hincyray"
 LOG_DIR="${ENTWARE}/var/log/hincyray"
 INIT_SCRIPT="${ENTWARE}/etc/init.d/S99hincyray"
 PID_FILE="${ENTWARE}/var/run/hincyray.pid"
+LIFECYCLE_LOCK="${ENTWARE}/var/run/hincyray.lifecycle.lock"
 DAEMON_BIN="${ENTWARE}/sbin/hincyray"
 XRAY_BIN="${HINCYRAY_DIR}/xray"
 XRAY_LINK="${ENTWARE}/sbin/xray"
@@ -48,7 +50,12 @@ BACKUP="${ENTWARE}/tmp/hincyray-backup-$$"
 # Rollback tracking. Each file we touch gets an entry here.
 # Format: "dest_path|backup_path" (backup_path may be "NONE" if dest didn't exist).
 TOUCHED=""
-DEPS_INSTALLED=""
+TRANSACTION_ACTIVE=0
+TRANSACTION_COMMITTED=0
+DAEMON_WAS_RUNNING=0
+RUNTIME_TREE_REGISTERED=0
+LIFECYCLE_LOCK_HELD=0
+TRANSACTION_MANAGES_DAEMON=0
 
 # ANSI colors (disabled if not a tty)
 if [ -t 1 ]; then
@@ -95,19 +102,32 @@ check_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 # Register a file for rollback: if we modify `dest`, save its current
 # state to backup first, and record the pair for the rollback trap.
-register_file() {
+register_path() {
     dest="$1"
     backup_name="$2"
+    kind="$3"
     backup_path="${BACKUP}/${backup_name}"
 
     if [ -e "$dest" ] || [ -L "$dest" ]; then
-        cp -a "$dest" "$backup_path" 2>/dev/null || true
-        TOUCHED="${TOUCHED}${dest}|${backup_path}
-"
+        mkdir -p "$(dirname "$backup_path")"
+        cp -a "$dest" "$backup_path" 2>/dev/null \
+            || die "Cannot back up $dest to $backup_path"
+        TOUCHED="${dest}|${backup_path}|${kind}
+${TOUCHED}"
     else
-        TOUCHED="${TOUCHED}${dest}|NONE
-"
+        TOUCHED="${dest}|NONE|${kind}
+${TOUCHED}"
     fi
+}
+
+register_file() {
+    register_path "$1" "$2" file
+}
+
+register_runtime_tree() {
+    [ "$RUNTIME_TREE_REGISTERED" -eq 0 ] || return 0
+    register_path "$HINCYRAY_DIR" "etc/hincyray" tree
+    RUNTIME_TREE_REGISTERED=1
 }
 
 # Atomic install: mv from staging to dest. The file must already be
@@ -123,73 +143,146 @@ atomic_install() {
     mv -f "$src" "$dest"
 }
 
-# Rollback: restore all touched files from backup. Called by the EXIT
-# trap when ROLLBACK_FLAG is set.
-do_rollback() {
-    err "Rolling back all changes..."
-    # Process in reverse order of registration.
-    echo "$TOUCHED" | tac 2>/dev/null | while IFS='|' read -r dest backup_path; do
-        [ -z "$dest" ] && continue
-        if [ "$backup_path" = "NONE" ]; then
-            rm -f "$dest" 2>/dev/null || true
-            info "  removed: $dest (was not present before)"
-        elif [ -e "$backup_path" ]; then
-            cp -a "$backup_path" "$dest" 2>/dev/null || true
-            info "  restored: $dest"
-        fi
+process_is_daemon() {
+    pid="$1"
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = "$DAEMON_BIN" ]
+}
+
+stop_daemon_pid() {
+    target_pid="$1"
+    process_is_daemon "$target_pid" || return 0
+    kill "$target_pid" 2>/dev/null || return 1
+    for i in 1 2 3 4 5; do
+        process_is_daemon "$target_pid" || return 0
+        sleep 1
     done
-
-    # Rollback installed opkg packages.
-    if [ -n "$DEPS_INSTALLED" ]; then
-        info "Removing packages installed during this run: ${DEPS_INSTALLED}"
-        # shellcheck disable=SC2086
-        opkg remove $DEPS_INSTALLED 2>/dev/null || true
-    fi
-
-    # Restart old daemon if it was running before.
-    if [ -f "$PID_FILE" ] && [ -x "$INIT_SCRIPT" ]; then
-        info "Restarting previous daemon..."
-        "$INIT_SCRIPT" start 2>/dev/null || true
-    fi
-
-    # Cleanup temp dirs.
-    rm -rf "$STAGING" "$BACKUP" 2>/dev/null || true
-    err "Rollback complete. System restored to previous state."
-}
-
-# Commit: installation succeeded. Remove backup, keep everything.
-do_commit() {
-    if [ -n "${ROLLBACK_FLAG:-0}" ] && [ "$ROLLBACK_FLAG" -eq 1 ]; then
-        do_rollback
-        exit 1
-    fi
-    # Success — clean up temp dirs.
-    rm -rf "$STAGING" "$BACKUP" 2>/dev/null || true
-}
-
-# EXIT trap: check the flag.
-ROLLBACK_FLAG=0
-trap 'do_commit' EXIT
-
-# Signal handler: mark for rollback, then let EXIT trap do the work.
-on_error() {
-    ROLLBACK_FLAG=1
-}
-trap 'on_error' HUP INT TERM
-
-# Set -e already handles command failures, but we need to catch them
-# and set the flag rather than exiting immediately (so the trap runs).
-# Wrap the entire main logic in a function and check its exit code.
-set +e
-run_with_trap() {
-    "$@"
-    rc=$?
-    if [ $rc -ne 0 ]; then
-        ROLLBACK_FLAG=1
-        return $rc
-    fi
+    process_is_daemon "$target_pid" && kill -9 "$target_pid" 2>/dev/null || true
+    process_is_daemon "$target_pid" && return 1
     return 0
 }
+
+begin_transaction() {
+    [ "$TRANSACTION_ACTIVE" -eq 0 ] || return 0
+    TOUCHED=""
+    RUNTIME_TREE_REGISTERED=0
+    DAEMON_WAS_RUNNING=0
+    TRANSACTION_MANAGES_DAEMON=0
+    TRANSACTION_ACTIVE=1
+    TRANSACTION_COMMITTED=0
+}
+
+acquire_transaction_lock() {
+    [ "$LIFECYCLE_LOCK_HELD" -eq 0 ] || return 0
+    if ! mkdir "$LIFECYCLE_LOCK" 2>/dev/null; then
+        owner="$(cat "$LIFECYCLE_LOCK/owner" 2>/dev/null || true)"
+        case "$owner" in
+            ''|*[!0-9]*) owner='' ;;
+        esac
+        if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+            die "HincyRay lifecycle operation already in progress (pid $owner)"
+        fi
+        rm -rf "$LIFECYCLE_LOCK"
+        mkdir "$LIFECYCLE_LOCK" || die "Cannot acquire HincyRay lifecycle lock"
+    fi
+    printf '%s\n' "$$" > "$LIFECYCLE_LOCK/owner"
+    LIFECYCLE_LOCK_HELD=1
+}
+
+release_transaction_lock() {
+    if [ "$LIFECYCLE_LOCK_HELD" -eq 1 ]; then
+        owner="$(cat "$LIFECYCLE_LOCK/owner" 2>/dev/null || true)"
+        [ "$owner" = "$$" ] && rm -rf "$LIFECYCLE_LOCK"
+        LIFECYCLE_LOCK_HELD=0
+    fi
+}
+
+# Rollback: stop the candidate, restore files in reverse registration order,
+# then restore the daemon's pre-transaction running/stopped state.
+do_rollback() {
+    err "Rolling back all changes..."
+    rollback_failed=0
+    candidate_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ "$TRANSACTION_MANAGES_DAEMON" -eq 1 ] && [ -x "$INIT_SCRIPT" ]; then
+        HINCYRAY_LIFECYCLE_OWNER=$$ "$INIT_SCRIPT" stop >/dev/null 2>&1 || true
+    fi
+    if [ "$TRANSACTION_MANAGES_DAEMON" -eq 1 ] \
+        && process_is_daemon "$candidate_pid" \
+        && ! stop_daemon_pid "$candidate_pid"; then
+        err "Cannot stop candidate daemon pid $candidate_pid; preserving backups"
+        return 1
+    fi
+    while IFS='|' read -r dest backup_path kind; do
+        [ -z "$dest" ] && continue
+        if [ "$backup_path" = "NONE" ]; then
+            if rm -rf "$dest" 2>/dev/null; then
+                info "  removed: $dest (was not present before)"
+            else
+                err "  failed to remove: $dest"
+                rollback_failed=1
+            fi
+        elif [ -e "$backup_path" ]; then
+            restore_ready=1
+            rm -rf "$dest" 2>/dev/null || restore_ready=0
+            if [ "$restore_ready" -eq 1 ] && cp -a "$backup_path" "$dest" 2>/dev/null; then
+                info "  restored: $dest"
+            else
+                err "  failed to restore: $dest"
+                rollback_failed=1
+            fi
+        else
+            err "  backup missing for: $dest"
+            rollback_failed=1
+        fi
+    done <<EOF
+$TOUCHED
+EOF
+
+    if [ "$rollback_failed" -eq 0 ] \
+        && [ "$TRANSACTION_MANAGES_DAEMON" -eq 1 ] \
+        && [ "$DAEMON_WAS_RUNNING" -eq 1 ] \
+        && [ -x "$INIT_SCRIPT" ]; then
+        info "Restarting previous daemon..."
+        HINCYRAY_LIFECYCLE_OWNER=$$ "$INIT_SCRIPT" start 2>/dev/null || rollback_failed=1
+    fi
+
+    if [ "$rollback_failed" -eq 0 ]; then
+        release_transaction_lock
+        rm -rf "$STAGING" "$BACKUP" 2>/dev/null || true
+        err "Rollback complete. System restored to previous state."
+        return 0
+    fi
+    err "Rollback incomplete; backups preserved at $BACKUP"
+    return 1
+}
+
+commit_transaction() {
+    TRANSACTION_COMMITTED=1
+    rm -rf "$STAGING" "$BACKUP" 2>/dev/null || true
+    TRANSACTION_ACTIVE=0
+    TOUCHED=""
+    release_transaction_lock
+}
+
+on_exit() {
+    rc="$1"
+    trap - EXIT HUP INT TERM
+    if [ "$TRANSACTION_ACTIVE" -eq 1 ] && [ "$TRANSACTION_COMMITTED" -eq 0 ]; then
+        do_rollback || rc=1
+        [ "$rc" -eq 0 ] && rc=1
+    else
+        release_transaction_lock
+        rm -rf "$STAGING" "$BACKUP" 2>/dev/null || true
+    fi
+    exit "$rc"
+}
+trap 'on_exit $?' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ── Environment detection ────────────────────────────────────────────
 
@@ -211,10 +304,8 @@ detect_env() {
 
     check_cmd opkg || die "opkg not found. Entware may be broken."
 
-    # Check if daemon is already running (for rollback restart).
-    DAEMON_WAS_RUNNING=0
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-        DAEMON_WAS_RUNNING=1
+    # Report the current daemon state. Each transaction snapshots it again.
+    if [ -r "$PID_FILE" ] && process_is_daemon "$(cat "$PID_FILE" 2>/dev/null)"; then
         info "HincyRay daemon is currently running"
     fi
 
@@ -256,29 +347,13 @@ detect_env() {
 # ── Pre-flight: prepare staging and backup dirs ──────────────────────
 
 prepare_dirs() {
+    begin_transaction
     mkdir -p "$STAGING" "$BACKUP" || die "Cannot create temp dirs under ${ENTWARE}"
     mkdir -p "${STAGING}/sbin" "${STAGING}/etc/init.d" "${STAGING}/etc/hincyray"
-    mkdir -p "${BACKUP}/sbin" "${BACKUP}/etc/init.d" "${BACKUP}/etc/hincyray"
+    mkdir -p "${BACKUP}/sbin" "${BACKUP}/etc/init.d" "${BACKUP}/etc"
 }
 
-# ── Phase: remove legacy ─────────────────────────────────────────────
-
-remove_legacy() {
-    [ -z "$LEGACY_PKGS" ] && return 0
-    step "Removing legacy proxy packages"
-    for s in /opt/etc/init.d/S*xkeen* /opt/etc/init.d/S*xray_s* /opt/etc/init.d/S*mihomo_s*; do
-        if [ -x "$s" ]; then
-            info "Stopping $s..."
-            "$s" stop 2>/dev/null || true
-        fi
-    done
-    for pkg in xkeen xray-s xray_s mihomo-s mihomo_s; do
-        opkg remove "$pkg" 2>/dev/null && info "  removed $pkg" || true
-    done
-    ok "Legacy packages removed"
-}
-
-# ── Phase: install dependencies (tracked for rollback) ───────────────
+# ── Phase: install dependencies (owned and verified by opkg) ─────────
 
 install_deps() {
     step "Installing dependencies"
@@ -289,11 +364,6 @@ install_deps() {
     [ "$HAVE_CURL" -eq 0 ] && NEED="$NEED curl"
     [ "$HAVE_JQ" -eq 0 ] && NEED="$NEED jq"
     [ "$HAVE_UNZIP" -eq 0 ] && NEED="$NEED unzip"
-
-    # v0.7: create ndm hook directory if missing.
-    if [ "$HAVE_NDM_HOOKS" -eq 0 ]; then
-        mkdir -p /opt/etc/ndm/netfilter.d 2>/dev/null && info "Created /opt/etc/ndm/netfilter.d" || warn "Cannot create ndm hook directory"
-    fi
 
     # v0.7: check kernel modules.
     [ "$HAVE_TPROXY" -eq 0 ] && warn "xt_TPROXY.ko not found — UDP TPROXY unavailable (TCP-only REDIRECT will be used)"
@@ -307,22 +377,13 @@ install_deps() {
 
     info "Installing:${NEED}"
     # shellcheck disable=SC2086
-    if opkg install $NEED 2>/dev/null; then
-        ok "Dependencies installed"
-        # Track for rollback.
-        DEPS_INSTALLED="$NEED"
-    else
-        # Check which ones actually failed.
-        FAILED=""
-        for pkg in $NEED; do
-            check_cmd "$pkg" || FAILED="$FAILED $pkg"
-        done
-        if [ -n "$FAILED" ]; then
-            warn "Failed to install:${FAILED} — some features may not work"
-        else
-            ok "All packages present (some may have been pre-installed)"
-        fi
-    fi
+    opkg install $NEED 2>/dev/null || true
+    FAILED=""
+    for pkg in $NEED; do
+        check_cmd "$pkg" || FAILED="$FAILED $pkg"
+    done
+    [ -z "$FAILED" ] || die "Required dependencies unavailable after opkg install:${FAILED}"
+    ok "Dependencies installed and verified"
 }
 
 # ── Phase: stage binary ──────────────────────────────────────────────
@@ -342,7 +403,7 @@ stage_binary() {
     fi
 
     if [ ! -f "$BIN_PATH" ]; then
-        DOWNLOAD_URL="${GITHUB}/releases/download/v${VERSION}/hincyray-aarch64"
+        DOWNLOAD_URL="${GITHUB}/releases/download/v${VERSION}/hincyray"
         if [ "$HAVE_CURL" -eq 1 ] && ask_yn "Binary not found. Download from GitHub releases?"; then
             info "Downloading from ${DOWNLOAD_URL}..."
             if curl -sSL -o "${STAGING}/sbin/hincyray" "$DOWNLOAD_URL" 2>/dev/null && [ -s "${STAGING}/sbin/hincyray" ]; then
@@ -375,7 +436,6 @@ stage_binary() {
     fi
 
     # Register existing binary for rollback.
-    register_file "$DAEMON_BIN" "sbin/hincyray"
 }
 
 # ── Phase: stage Xray ────────────────────────────────────────────────
@@ -459,10 +519,6 @@ for n in ['xray','geoip.dat','geosite.dat']:
     fi
 
     # Register for rollback.
-    register_file "$XRAY_BIN" "etc/hincyray/xray"
-    register_file "$XRAY_LINK" "sbin/xray"
-    [ -f "${HINCYRAY_DIR}/geoip.dat" ] && register_file "${HINCYRAY_DIR}/geoip.dat" "etc/hincyray/geoip.dat" || true
-    [ -f "${HINCYRAY_DIR}/geosite.dat" ] && register_file "${HINCYRAY_DIR}/geosite.dat" "etc/hincyray/geosite.dat" || true
 }
 
 # ── Phase: stage init script ─────────────────────────────────────────
@@ -473,57 +529,122 @@ stage_init() {
     cat > "${STAGING}/etc/init.d/S99hincyray" << 'INITEOF'
 #!/bin/sh
 
-PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PATH=/opt/sbin:/opt/bin:/opt/usr/bin:/usr/sbin:/usr/bin:/sbin:/bin
 DAEMON=/opt/sbin/hincyray
 PIDFILE=/opt/var/run/hincyray.pid
+LOCKDIR=/opt/var/run/hincyray.lifecycle.lock
 LOGDIR=/opt/var/log/hincyray
 LOGFILE=$LOGDIR/hincyray.log
 
 mkdir -p "$LOGDIR" /opt/var/run
 
-start() {
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "hincyray already running (pid $(cat "$PIDFILE"))"
+daemon_identity() {
+    pid="$1"
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = "$DAEMON" ] || return 1
+}
+
+daemon_pid() {
+    [ -r "$PIDFILE" ] || return 1
+    pid="$(cat "$PIDFILE" 2>/dev/null)"
+    daemon_identity "$pid" || return 1
+    printf '%s\n' "$pid"
+}
+
+acquire_lock() {
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCKDIR/owner"
         return 0
     fi
+    owner="$(cat "$LOCKDIR/owner" 2>/dev/null)"
+    case "$owner" in
+        ''|*[!0-9]*) owner='' ;;
+    esac
+    if [ -n "${HINCYRAY_LIFECYCLE_OWNER:-}" ] && [ "$owner" = "$HINCYRAY_LIFECYCLE_OWNER" ]; then
+        return 0
+    fi
+    if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
+        rm -rf "$LOCKDIR"
+        mkdir "$LOCKDIR" || return 1
+        printf '%s\n' "$$" > "$LOCKDIR/owner"
+        return 0
+    fi
+    echo "hincyray lifecycle operation already in progress (pid $owner)" >&2
+    return 1
+}
+
+release_lock() {
+    owner="$(cat "$LOCKDIR/owner" 2>/dev/null)"
+    if [ -z "${HINCYRAY_LIFECYCLE_OWNER:-}" ] || [ "$owner" = "$$" ]; then
+        rm -rf "$LOCKDIR"
+    fi
+}
+
+start() {
+    if PID="$(daemon_pid)"; then
+        echo "hincyray already running (pid $PID)"
+        return 0
+    fi
+    rm -f "$PIDFILE"
     echo "starting hincyray"
-    "$DAEMON" >>"$LOGFILE" 2>&1 &
+    nohup "$DAEMON" </dev/null >>"$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     sleep 1
-    if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "hincyray started (pid $(cat "$PIDFILE"))"
+    if PID="$(daemon_pid)"; then
+        echo "hincyray started (pid $PID)"
     else
         echo "hincyray failed to start — check $LOGFILE"
         rm -f "$PIDFILE"
         return 1
     fi
+
+    i=0
+    while [ "$i" -lt 15 ]; do
+        if curl -sS --max-time 2 http://127.0.0.1:8088/api/health >/dev/null 2>&1; then
+            curl -sS --max-time 10 -X POST http://127.0.0.1:8088/api/core/start \
+                >>"$LOGFILE" 2>&1 || true
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
 }
 
 stop() {
-    if [ -f "$PIDFILE" ]; then
-        PID=$(cat "$PIDFILE")
-        if kill -0 "$PID" 2>/dev/null; then
-            echo "stopping hincyray (pid $PID)"
-            kill "$PID"
-            for i in 1 2 3 4 5; do
-                kill -0 "$PID" 2>/dev/null || break
-                sleep 1
-            done
-            kill -9 "$PID" 2>/dev/null || true
+    if PID="$(daemon_pid)"; then
+        echo "stopping hincyray (pid $PID)"
+        daemon_identity "$PID" && kill "$PID"
+        for i in 1 2 3 4 5; do
+            daemon_identity "$PID" || break
+            sleep 1
+        done
+        daemon_identity "$PID" && kill -9 "$PID" 2>/dev/null || true
+        if daemon_identity "$PID"; then
+            echo "hincyray failed to stop (pid $PID)" >&2
+            return 1
         fi
-        rm -f "$PIDFILE"
     fi
+    rm -f "$PIDFILE"
     echo "hincyray stopped"
 }
 
 status() {
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "hincyray running (pid $(cat "$PIDFILE"))"
+    if PID="$(daemon_pid)"; then
+        echo "hincyray running (pid $PID)"
         return 0
     fi
     echo "hincyray not running"
     return 3
 }
+
+acquire_lock || exit 1
+trap 'release_lock' EXIT
+trap 'release_lock; exit 129' HUP
+trap 'release_lock; exit 130' INT
+trap 'release_lock; exit 143' TERM
 
 case "$1" in
     start)   start ;;
@@ -539,7 +660,6 @@ exit $?
 INITEOF
 
     chmod +x "${STAGING}/etc/init.d/S99hincyray"
-    register_file "$INIT_SCRIPT" "etc/init.d/S99hincyray"
     ok "Init script staged"
 }
 
@@ -551,7 +671,6 @@ stage_wifi_script() {
         for try in "$(dirname "$0")/wifi-segment-setup.sh" /tmp/wifi-segment-setup.sh; do
             if [ -f "$try" ]; then
                 cp "$try" "${STAGING}/etc/hincyray/wifi-segment-setup.sh"
-                register_file "${HINCYRAY_DIR}/scripts/wifi-segment-setup.sh" "etc/hincyray/wifi-segment-setup.sh"
                 ok "WiFi setup script staged"
                 return 0
             fi
@@ -560,7 +679,6 @@ stage_wifi_script() {
         if [ "$HAVE_CURL" -eq 1 ]; then
             URL="${GITHUB}/raw/v${VERSION}/scripts/wifi-segment-setup.sh"
             if curl -sSL -o "${STAGING}/etc/hincyray/wifi-segment-setup.sh" "$URL" 2>/dev/null && [ -s "${STAGING}/etc/hincyray/wifi-segment-setup.sh" ]; then
-                register_file "${HINCYRAY_DIR}/scripts/wifi-segment-setup.sh" "etc/hincyray/wifi-segment-setup.sh"
                 ok "WiFi setup script downloaded to staging"
                 return 0
             fi
@@ -574,25 +692,60 @@ stage_wifi_script() {
 commit_install() {
     step "Committing installation (atomic)"
 
-    # Stop existing daemon first (graceful).
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
-        info "Stopping existing daemon..."
-        kill "$(cat "$PID_FILE")" 2>/dev/null || true
-        for i in 1 2 3 4 5; do
-            kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null || break
-            sleep 1
-        done
-        kill -9 "$(cat "$PID_FILE")" 2>/dev/null || true
+    LIFECYCLE_CHANGE=0
+    if [ -f "${STAGING}/sbin/hincyray" ] || [ -f "${STAGING}/etc/init.d/S99hincyray" ]; then
+        LIFECYCLE_CHANGE=1
+        TRANSACTION_MANAGES_DAEMON=1
+    fi
+    acquire_transaction_lock
+    if [ "$LIFECYCLE_CHANGE" -eq 1 ]; then
+        register_file "${ENTWARE}/etc/ndm/netfilter.d/hincyray.sh" "etc/ndm/netfilter.d/hincyray.sh"
+    fi
+
+    # Stop only the daemon identified by the authoritative PID file. A stale
+    # PID must never target an unrelated process after PID reuse.
+    if [ "$LIFECYCLE_CHANGE" -eq 1 ] && [ -r "$PID_FILE" ]; then
+        OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"
+        case "$OLD_PID" in
+            ''|*[!0-9]*) OLD_PID='' ;;
+        esac
+        if [ -n "$OLD_PID" ] \
+            && kill -0 "$OLD_PID" 2>/dev/null \
+            && [ "$(readlink "/proc/$OLD_PID/exe" 2>/dev/null)" = "$DAEMON_BIN" ]; then
+            info "Stopping existing daemon..."
+            DAEMON_WAS_RUNNING=1
+            if [ -x "$INIT_SCRIPT" ]; then
+                HINCYRAY_LIFECYCLE_OWNER=$$ "$INIT_SCRIPT" stop \
+                    || die "Existing daemon stop failed"
+            else
+                stop_daemon_pid "$OLD_PID" || die "Existing daemon stop failed"
+            fi
+            process_is_daemon "$OLD_PID" && die "Existing daemon did not stop"
+        fi
         rm -f "$PID_FILE"
     fi
+
+    if [ "$LIFECYCLE_CHANGE" -eq 1 ]; then
+        register_runtime_tree
+    else
+        [ -f "${STAGING}/etc/hincyray/xray" ] && register_file "$XRAY_BIN" "etc/hincyray/xray"
+        [ -f "${STAGING}/etc/hincyray/geoip.dat" ] && register_file "${HINCYRAY_DIR}/geoip.dat" "etc/hincyray/geoip.dat"
+        [ -f "${STAGING}/etc/hincyray/geosite.dat" ] && register_file "${HINCYRAY_DIR}/geosite.dat" "etc/hincyray/geosite.dat"
+        [ -f "${STAGING}/etc/hincyray/wifi-segment-setup.sh" ] && register_file "${SCRIPTS_DIR}/wifi-segment-setup.sh" "etc/hincyray/scripts/wifi-segment-setup.sh"
+    fi
+    [ -f "${STAGING}/sbin/hincyray" ] && register_file "$DAEMON_BIN" "sbin/hincyray"
+    [ -f "${STAGING}/etc/init.d/S99hincyray" ] && register_file "$INIT_SCRIPT" "etc/init.d/S99hincyray"
+    [ -f "${STAGING}/etc/hincyray/xray" ] && register_file "$XRAY_LINK" "sbin/xray"
 
     # Create target directories if they don't exist.
     mkdir -p "$HINCYRAY_DIR" "$LOG_DIR" "${ENTWARE}/sbin" "${ENTWARE}/etc/init.d"
 
     # Atomic moves — each mv is atomic on the same filesystem.
-    info "Installing binary..."
-    atomic_install "${STAGING}/sbin/hincyray" "$DAEMON_BIN"
-    ok "  → $DAEMON_BIN"
+    if [ -f "${STAGING}/sbin/hincyray" ]; then
+        info "Installing binary..."
+        atomic_install "${STAGING}/sbin/hincyray" "$DAEMON_BIN"
+        ok "  → $DAEMON_BIN"
+    fi
 
     if [ -f "${STAGING}/etc/hincyray/xray" ]; then
         info "Installing Xray..."
@@ -611,9 +764,11 @@ commit_install() {
         done
     fi
 
-    info "Installing init script..."
-    atomic_install "${STAGING}/etc/init.d/S99hincyray" "$INIT_SCRIPT"
-    ok "  → $INIT_SCRIPT"
+    if [ -f "${STAGING}/etc/init.d/S99hincyray" ]; then
+        info "Installing init script..."
+        atomic_install "${STAGING}/etc/init.d/S99hincyray" "$INIT_SCRIPT"
+        ok "  → $INIT_SCRIPT"
+    fi
 
     if [ -f "${STAGING}/etc/hincyray/wifi-segment-setup.sh" ]; then
         mkdir -p "$SCRIPTS_DIR"
@@ -631,18 +786,22 @@ start_and_verify() {
     step "Starting daemon and verifying"
 
     info "Starting hincyray..."
-    "$INIT_SCRIPT" start || {
+    HINCYRAY_LIFECYCLE_OWNER=$$ "$INIT_SCRIPT" start || {
         err "Daemon failed to start"
         warn "Last log lines:"
         tail -20 "${LOG_DIR}/hincyray.log" 2>/dev/null || true
         die "Health check cannot proceed"
     }
 
-    # Wait for the daemon to be ready (up to 10 seconds).
+    NEW_PID="$(cat "$PID_FILE" 2>/dev/null)"
+    process_is_daemon "$NEW_PID" || die "Init script did not register the installed daemon"
+
+    # Wait for this exact daemon to remain alive and become ready.
     info "Waiting for daemon to be ready..."
     READY=0
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        if curl -s --max-time 2 "http://127.0.0.1:${LISTEN_PORT}/api/health" 2>/dev/null | grep -q '"ok":true'; then
+        HEALTH="$(curl -s --max-time 2 "http://127.0.0.1:${LISTEN_PORT}/api/health" 2>/dev/null || true)"
+        if process_is_daemon "$NEW_PID" && printf '%s' "$HEALTH" | grep -q '"ok":true'; then
             READY=1
             break
         fi
@@ -657,6 +816,26 @@ start_and_verify() {
         warn "Last log lines:"
         tail -20 "${LOG_DIR}/hincyray.log" 2>/dev/null || true
         die "Health check failed — triggering rollback"
+    fi
+
+    STATUS="$(curl -s --max-time 3 "http://127.0.0.1:${LISTEN_PORT}/api/status")"
+    ACTIVE_PROFILE="$(printf '%s' "$STATUS" | jq -r '.active_profile_id // empty')"
+    ROUTING_ENABLED="$(curl -s --max-time 3 "http://127.0.0.1:${LISTEN_PORT}/api/routing/summary" | jq -r '.enabled // false')"
+    if [ -n "$ACTIVE_PROFILE" ] || [ "$ROUTING_ENABLED" = "true" ]; then
+        RUNTIME_READY=0
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            RUNTIME="$(curl -s --max-time 3 "http://127.0.0.1:${LISTEN_PORT}/api/safe-mode" 2>/dev/null || true)"
+            CORE_STATUS="$(printf '%s' "$RUNTIME" | jq -r '.core_status // ""')"
+            FIREWALL_STATUS="$(printf '%s' "$RUNTIME" | jq -r '.firewall_status // ""')"
+            if { [ -z "$ACTIVE_PROFILE" ] || [ "$CORE_STATUS" = "running" ]; } \
+                && { [ "$ROUTING_ENABLED" != "true" ] || [ "$FIREWALL_STATUS" = "running" ]; }; then
+                RUNTIME_READY=1
+                break
+            fi
+            sleep 1
+        done
+        [ "$RUNTIME_READY" -eq 1 ] \
+            || die "Daemon API is healthy but proxy/firewall runtime did not recover"
     fi
 
     # Determine LAN IP for display.
@@ -851,10 +1030,11 @@ full_setup() {
         fi
     fi
 
-    # ── ATOMIC CORE (rollback if any step fails) ──
-    prepare_dirs
-    [ -n "$LEGACY_PKGS" ] && remove_legacy
+    [ -z "$LEGACY_PKGS" ] \
+        || die "Legacy proxy packages must be removed explicitly before HincyRay installation: $(echo "$LEGACY_PKGS" | tr '\n' ' ')"
     install_deps
+    # ── HINCYRAY-OWNED TRANSACTION (rollback if any step fails) ──
+    prepare_dirs
     stage_binary
     stage_xray
     stage_init
@@ -865,6 +1045,7 @@ full_setup() {
 
     # Verify: if this fails, the trap triggers rollback of all files.
     start_and_verify
+    commit_transaction
 
     # ── POST-COMMIT (non-fatal — core is already committed) ──
     # These phases configure the running daemon. Failure here does NOT
@@ -898,6 +1079,7 @@ do_install_binary() {
     stage_init
     commit_install
     start_and_verify
+    commit_transaction
     ok "Binary upgraded atomically"
 }
 
@@ -905,6 +1087,7 @@ do_install_xray() {
     prepare_dirs
     stage_xray
     commit_install
+    commit_transaction
     ok "Xray installed atomically"
 }
 
@@ -918,6 +1101,7 @@ do_init_start() {
     stage_init
     commit_install
     start_and_verify
+    commit_transaction
 }
 
 # ── Menu ─────────────────────────────────────────────────────────────

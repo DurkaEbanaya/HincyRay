@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.21.0 - 2026-07-15
+
+- Security boundary: Argon2id password hashes with legacy plaintext migration, CSPRNG 256-bit sessions, idle/absolute expiry, session cap, per-IP login throttling, same-origin state-change checks, security headers, restore invalidation, and sessionStorage bearer handling.
+- Secret safety: generated Mihomo config is redacted by the backend and escaped by the WebUI before rendering.
+- Typed bounded APIs: contracts, onboarding readiness, routing summary/preview/explain/connection context, factual memory footprint, reversible safe mode, and paginated/filterable Mihomo connections.
+- WebUI reliability: fixed boot-time loader contract, exact country-flag resource search, canonical Connections actions, route explanation, apply preview, readiness/safe-mode cards, reusable rename dialog, and responsive table-to-card layouts.
+- Architecture: dedicated `hincyray_api`, `hincyray_security`, and `hincyray_webui` module boundaries.
+- Testing: deterministic Playwright browser smoke tests and CI browser job, while retaining Rust and static frontend contract gates.
+- Router lifecycle: installer-generated init scripts now detach with `nohup`, resolve only the authoritative PID file, verify `/proc/<pid>/exe` before signaling, and reject stale PID reuse; operational guidance forbids argv-based process scans that can terminate their own SSH shell.
+
 ## v0.19.4 - 2026-07-05
 
 - Fluent Reveal spotlight effect fixed and extended to all interactive elements:

@@ -142,67 +142,7 @@ Expected paths after this step:
 
 ## Step 4 &mdash; Install the init script
 
-Create `/opt/etc/init.d/S99hincyray` on the router so HincyRay starts on boot and can be controlled with `start` / `stop` / `restart` / `status`. The script should:
-
-- set `PATH` so `/opt/sbin` is found;
-- run `/opt/sbin/hincyray` as a daemon, redirecting output to `/opt/var/log/hincyray/hincyray.log`;
-- write a PID file under `/opt/var/run/hincyray.pid` (or use `start-stop-daemon` if your Entware ships it);
-- implement `stop` by killing the PID;
-- implement `status` by checking the PID.
-
-A minimal template:
-
-```sh
-#!/bin/sh
-
-PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
-DAEMON=/opt/sbin/hincyray
-PIDFILE=/opt/var/run/hincyray.pid
-LOGDIR=/opt/var/log/hincyray
-LOGFILE=$LOGDIR/hincyray.log
-
-mkdir -p "$LOGDIR"
-
-start() {
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "hincyray already running (pid $(cat "$PIDFILE"))"
-        return 0
-    fi
-    echo "starting hincyray"
-    "$DAEMON" >>"$LOGFILE" 2>&1 &
-    echo $! > "$PIDFILE"
-}
-
-stop() {
-    if [ -f "$PIDFILE" ]; then
-        PID=$(cat "$PIDFILE")
-        if kill -0 "$PID" 2>/dev/null; then
-            echo "stopping hincyray (pid $PID)"
-            kill "$PID"
-        fi
-        rm -f "$PIDFILE"
-    fi
-}
-
-status() {
-    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        echo "hincyray running (pid $(cat "$PIDFILE"))"
-        return 0
-    fi
-    echo "hincyray not running"
-    return 3
-}
-
-case "$1" in
-    start)   start ;;
-    stop)    stop ;;
-    restart) stop; start ;;
-    status)  status ;;
-    *)       echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
-esac
-
-exit $?
-```
+Install `/opt/etc/init.d/S99hincyray` through `scripts/hincyray-install.sh` (menu item **Install init script + start daemon**). The installer is the canonical owner of this lifecycle contract. Its generated script serializes lifecycle operations, detaches the daemon with `nohup`, stores the authoritative PID in `/opt/var/run/hincyray.pid`, and verifies `/proc/<pid>/exe` before every signal. Do not replace it with a process-name scan or a hand-written PID-only template: both can terminate the invoking SSH shell or signal an unrelated process after PID reuse.
 
 Install and enable it:
 

@@ -1,9 +1,9 @@
 [package]
 name = "xray-vpn-test"
-version = "0.20.5"
+version = "0.21.0"
 edition = "2024"
 authors = ["lain"]
-description = "VPN profile benchmark tool for VLESS, Hysteria2, and XHTTP nodes"
+description = "Keenetic-native Mihomo router daemon with policy routing, diagnostics, and VPN quality automation"
 license = "MIT"
 
 [[bin]]
@@ -24,10 +24,12 @@ desktop = ["dep:arboard", "dep:eframe", "dep:egui_extras"]
 
 [dependencies]
 arboard = { version = "3.6", optional = true }
+argon2 = { version = "0.5.3", default-features = false, features = ["std"] }
 base64 = "0.22"
 eframe = { version = "0.33", default-features = true, optional = true }
 egui_extras = { version = "0.33", optional = true }
 percent-encoding = "2.3"
+getrandom = "0.4.3"
 maxminddb = "0.26"
 qrcode = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "socks"] }

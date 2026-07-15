@@ -1,4 +1,4 @@
-# HincyRay v0.19.4
+# HincyRay v0.21.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -43,6 +43,18 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 
 ## Возможности
 
+### v0.21.0
+
+v0.21 реализует контракты безопасности и управляемости end to end. Авторизация использует Argon2id с миграцией legacy plaintext, криптографически случайные ограниченные сессии, throttling входа, same-origin проверку изменяющих запросов и `sessionStorage` для Bearer token в браузере. Применённый и preview-конфиги редактируются перед выдачей из daemon.
+
+Версионированная поверхность API описывается `GET /api/contracts`. Readiness/onboarding, routing summary/context/preview/explain, фактический memory report, safe mode и bounded страницы соединений доступны через `/api/onboarding/status`, `/api/routing/summary`, `/api/routing/connection-context`, `/api/routing/preview`, `/api/routing/explain`, `/api/memory-estimate`, `GET/POST /api/safe-mode` и `POST /api/mihomo-api/connections/page`. Memory report содержит измеренные source bytes на диске, текущий RSS Mihomo, доступную память, число правил/providers и observed risk по настроенным порогам; будущий peak allocation не выдумывается.
+
+Web UI получил responsive table-to-card layout, mobile/tablet navigation, диалог переименования профиля вместо `window.prompt` и точный поиск по видимой строке флаг+host, например `🇷🇺 chatgpt.com`. Модульные границы включают typed API DTO в `hincyray_api`, auth policy в `hincyray_security` и ownership встроенного UI в `hincyray_webui`. Полные gates, результат Playwright, cross-build и router deploy остаются pending до финального отчёта. См. [`docs/architecture-v0.21.md`](docs/architecture-v0.21.md).
+
+### v0.20.0
+
+Deep Bench добавляет двухфазную проверку качества серверов: быстрый benchmark, затем выборки стабильности, unlock checks и sustained download. Компактные дневные snapshots хранятся отдельно в `quality-history.json`; 30-дневная история используется для консервативного переноса в Trash Bin после повторяющихся плохих результатов и для автоматического или ручного восстановления.
+
 ### v0.19.4
 
 Fluent Reveal эффект подсветки исправлен (var() в radial-gradient не резолвился) и расширен на кнопки, чипы, заголовки разделов, триггеры селектов и вкладки. `/api/profiles/add` теперь принимает subscription URL, а не только share links — вставка URL подписки загружает и импортирует все профили вместо ошибки парсинга.
@@ -83,8 +95,8 @@ Hotfix: страница «Система» теперь явно показыв
 
 ### v0.17.0
 
-- **Обход блокировок РКН (RKN Bypass)**: автоматическая маршрутизация доменов, заблокированных в РФ, через прокси. Использует список `itworksig/rublacklist` (автообновление через GitHub Actions, 744K+ правил) как Mihomo rule provider. Список скачивается через сам прокси и обновляется каждые 24 часа. Российские IP (`GEOIP,RU`) и китайские IP (`GEOIP,CN`) идут напрямую. Тоггл в WebUI с настраиваемым URL и интервалом обновления.
-- **Сброс к заводским настройкам**: кнопка «↺ Штатные настройки» восстанавливает маршрутизацию по умолчанию — RKN Bypass вкл, RU Direct (geosite), MATCH,proxy, AllowList порты 80/443, правило QUIC Block, все пользовательские правила и raw rules очищены. WebUI вызывает `POST /api/routing/reset` с `{"apply":true}`, поэтому сохранение state, регенерация конфига, перезапуск ядра и rollback при ошибке активации выполняются одной backend-транзакцией.
+- **Обход блокировок РКН (RKN Bypass)**: v0.17 добавила маршрутизацию заблокированных доменов через proxy. Сейчас используется предобработанный domain-список на основе `itworksig/rublacklist`; изначально функция была включена по умолчанию, но текущий безопасный default выключен, потому что очень большие списки могут превысить memory budget роутера с 512 МБ RAM. В Web UI настраиваются URL и интервал обновления.
+- **Сброс к штатным настройкам**: v0.17 добавила однокнопочный reset маршрутизации. Сейчас он восстанавливает безопасные defaults, включая выключенный RKN Bypass, и очищает пользовательские/raw rules. Web UI вызывает `POST /api/routing/reset` с `{"apply":true}`, поэтому сохранение state, регенерация конфига, перезапуск ядра и rollback при ошибке активации выполняются одной backend-транзакцией.
 - **Настраиваемый sniffer override-destination**: тоггл в секции DNS для управления `override-destination` сниффера Mihomo. По умолчанию `true` — доменные правила работают даже когда клиенты используют DoH/DoT (SNI подставляется в поле назначения). `saveDns()` теперь вызывает `/api/routing/apply` после сохранения, чтобы изменения DNS вступали в силу немедленно.
 - 339 тестов, 0 clippy warnings.
 - Проверено на Keenetic Giga: список скачан (24 МБ, 744 070 правил, ~5 сек), RSS Mihomo 157 МБ, тоггл вкл/выкл проверен в конфиге, сброс восстанавливает заводские настройки.
@@ -158,7 +170,7 @@ Hotfix: страница «Система» теперь явно показыв
 ### v0.12.0
 
 - **Hysteria2 port hopping**: query-параметры `mport`/`ports` и `hopInterval`/`hop_interval` парсятся из share-ссылок, попадают в Mihomo как поля `ports` + `hop-interval`.
-- **Profile CRUD API**: `POST /api/profiles/add` (парсинг share-ссылки), `POST /api/profiles/delete` (удаление по ID, реиндексация), `POST /api/profiles/update` (переименование, тоггл block_quic). Только бэкенд, UI ожидает редизайн.
+- **Profile CRUD API**: `POST /api/profiles/add` (парсинг share-ссылки), `POST /api/profiles/delete` (удаление по ID, реиндексация), `POST /api/profiles/update` (переименование, тоггл block_quic). Текущий Web UI предоставляет add/delete и переименование через dialog.
 - **Автообновление подписок**: watchdog Phase 7 обновляет все подписки с настраиваемым интервалом. По умолчанию отключено. Если активный профиль удалён при обновлении, авто-выбирается лучший доступный.
 - **Статистика трафика**: накопительные счётчики байт upload/download, сохраняемые в state. Скорость в реальном времени через Mihomo `/traffic` API. `GET /api/traffic`, `GET /api/mihomo-api/traffic`, `GET /api/mihomo-api/memory`.
 - **Лог соединений**: сохраняемый лог соединений, прошедших через прокси (хост, исходный IP, chain, правило, upload/download). Лимит 500 записей. `GET /api/connection-log`.
@@ -255,11 +267,18 @@ cargo build --release --bin xray-vpn-test
 ### Проверка качества
 
 ```bash
-cargo fmt --all
+cargo fmt --all --check
 cargo check --all-targets --all-features
-cargo test --all-targets --all-features   # 301 тест
-cargo clippy --all-targets --all-features   # 0 предупреждений
+cargo clippy --all-targets --no-default-features --bin hincyray -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+python3 scripts/frontend-contract-test.py
+npm ci
+npm run test:browser
+git diff --check
 ```
+
+Команда Playwright запускает fixture-backed browser smoke suite. Результаты полного gate и подтверждение router deploy остаются pending до финального отчёта.
 
 ## Установка
 
@@ -279,7 +298,7 @@ sh scripts/hincyray-install.sh
 http://<ip-роутера>:8088/
 ```
 
-Fluent/Acrylic-дизайн с 7 группами навигации, 24 пунктами сайдбара, RU/EN i18n, светлой/тёмной темой. Статус, профили, бенчмарк, импорт, подписки, правила роутинга, per-device routing, управление firewall, DNS, диагностика, бэкапы, HWID, системный монитор, обновление Mihomo, возможности Mihomo, статус прокси, трафик и соединения, логи — всё на одной странице. Автообновление каждые 5 секунд. Без внешних CDN и сборки.
+Встроенная Fluent/Acrylic-панель с RU/EN i18n, светлой/тёмной темой и навигацией для desktop, tablet и mobile. На узких экранах таблицы превращаются в подписанные карточки. Переименование профиля выполняется в диалоге, поиск соединений учитывает точную видимую строку флаг+host, Bearer token хранится в `sessionStorage`. Статус, профили, benchmark, импорт, подписки, routing, firewall, DNS, диагностика, backup, HWID, системный мониторинг, управление Mihomo, трафик, соединения и логи доступны без внешнего CDN и frontend build step. Вместо периодического полного refresh используются лёгкие heartbeat статуса и системы.
 
 ### Переменные окружения
 
@@ -295,6 +314,8 @@ Fluent/Acrylic-дизайн с 7 группами навигации, 24 пун�
 |---|---|---|
 | `GET` | `/` | Встроенная веб-панель |
 | `GET` | `/api/health` | Здоровье сервиса + версия |
+| `GET` | `/api/contracts` | Версионированный descriptor bounded endpoints и auth contract |
+| `GET` | `/api/onboarding/status` | Readiness checks и remediation для Mihomo, профиля, GeoIP, core, firewall и ndm hook |
 | `GET` | `/api/status` | Активный профиль, статус ядра, сплит-роутинг, DNS, HWID, mihomo_version, update_available_version, proxy_group_enabled, ec_enabled |
 | `GET` | `/api/profiles` | Импортированные профили |
 | `POST` | `/api/profiles/import` | Импорт share-ссылок / URL подписки / Xray JSON |
@@ -303,7 +324,8 @@ Fluent/Acrylic-дизайн с 7 группами навигации, 24 пун�
 | `POST` | `/api/profiles/update` | Обновить имя профиля и/или block_quic |
 | `POST` | `/api/profiles/block-quic` | Тоггл флага block_quic на профиле |
 | `POST` | `/api/active-profile` | Установка активного профиля, регенерация конфига, перезапуск ядра |
-| `GET` | `/api/mihomo-config` | Сгенерированный Mihomo-конфиг |
+| `GET` | `/api/mihomo-config` | Применённый сгенерированный Mihomo-конфиг с редактированными секретами |
+| `GET` | `/api/mihomo-config/preview` | Неизменяющий preview желаемого конфига с редактированными секретами |
 | `POST` | `/api/core/start` | Запуск ядра Mihomo |
 | `POST` | `/api/core/stop` | Остановка ядра Mihomo |
 | `POST` | `/api/core/restart` | Перезапуск ядра Mihomo |
@@ -318,6 +340,10 @@ Fluent/Acrylic-дизайн с 7 группами навигации, 24 пун�
 | `POST` | `/api/subscriptions/refresh-one` | Обновить отдельную подписку по URL |
 | `POST` | `/api/subscriptions/delete` | Удалить подписку и её профили |
 | `GET` | `/api/routing` | Настройки роутинга + правила + каталог |
+| `GET` | `/api/routing/summary` | Компактная сводка routing, safe mode, правил, серверов, конфликтов и GeoBase apply |
+| `GET` | `/api/routing/connection-context` | Стабильные server refs и активный server context для UI соединений |
+| `GET` | `/api/routing/preview` | Non-mutating сравнение hash desired/applied config и эффекты apply |
+| `POST` | `/api/routing/explain` | Объяснить routing нормализованного host/IP с optional source/port/network context |
 | `POST` | `/api/routing/settings` | Сохранить настройки роутинга; `{"apply":true}` сохраняет и применяет атомарно |
 | `POST` | `/api/routing/rules` | Сохранить правила роутинга; `{"rules":[...],"apply":true}` сохраняет и применяет атомарно |
 | `POST` | `/api/routing/apply` | Перегенерировать конфиг + перезапуск ядра + перезапуск firewall |
@@ -339,6 +365,9 @@ Fluent/Acrylic-дизайн с 7 группами навигации, 24 пун�
 | `GET` | `/api/dns/diagnostics` | Диагностика resolver + Mihomo DNS |
 | `GET` | `/api/logs` | Хвост логов Mihomo (последние 200 строк) |
 | `GET` | `/api/system` | CPU/RAM/temp/load/uptime |
+| `GET` | `/api/memory-estimate` | Observed source bytes правил, текущий RSS Mihomo, доступная память, counts и threshold risk |
+| `GET` | `/api/safe-mode` | Статус safe mode и список подавленных тяжёлых features |
+| `POST` | `/api/safe-mode` | Включить/выключить safe mode с optional transactional apply |
 | `GET` | `/api/auto-settings` | Auto-select, auto-switch, auto-benchmark, auto-refresh настройки |
 | `POST` | `/api/auto-settings` | Сохранить авто-настройки |
 | `GET` | `/api/hwid` | Конфиг HWID-фингерпринта |
@@ -350,7 +379,8 @@ Fluent/Acrylic-дизайн с 7 группами навигации, 24 пун�
 | `GET` | `/api/mihomo-features` | Конфиг MihomoFeatures (proxy groups, EC, NTP, providers и т.д.) |
 | `POST` | `/api/mihomo-features` | Сохранить конфиг MihomoFeatures |
 | `GET` | `/api/mihomo-api/proxies` | Проксирование `GET /proxies` на Mihomo REST API |
-| `GET` | `/api/mihomo-api/connections` | Проксирование `GET /connections` на Mihomo REST API |
+| `GET` | `/api/mihomo-api/connections` | Legacy полный snapshot соединений Mihomo |
+| `POST` | `/api/mihomo-api/connections/page` | Фильтрованная страница с `query`, `offset` и bounded `limit` (1–500) |
 | `POST` | `/api/mihomo-api/connections/close` | Закрыть все/отфильтрованные соединения Mihomo (`scope`, `id`, `resource`, `host`, `destination_ip`, `source_ip`) |
 | `POST` | `/api/mihomo-api/delay` | Тест delay прокси через Mihomo API |
 | `GET` | `/api/mihomo-api/traffic` | Проксирование `GET /traffic` на Mihomo REST API |
@@ -380,7 +410,7 @@ Fluent/Acrylic-дизайн с 7 группами навигации, 24 пун�
 | `GET` | `/api/auth-settings` | Настройки Web UI authentication |
 | `POST` | `/api/auth-settings` | Сохранить настройки Web UI authentication |
 | `GET` | `/api/traffic` | Накопительная + realtime статистика трафика |
-| `GET` | `/api/connection-log` | Сохраняемый лог соединений (лимит 500 записей) |
+| `GET` | `/api/connection-log` | In-memory лог последних соединений (лимит 500; очищается при restart daemon) |
 
 ## WiFi VPN-сегмент (опционально)
 
@@ -409,6 +439,7 @@ Fluent/Acrylic-дизайн с 7 группами навигации, 24 пун�
 - [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md) — runbook установки на Entware.
 - [`docs/hincyray-v0.1-status.md`](docs/hincyray-v0.1-status.md) — статус версий.
 - [`docs/keenetic-client-roadmap.md`](docs/keenetic-client-roadmap.md) — roadmap продукта.
+- [`docs/architecture-v0.21.md`](docs/architecture-v0.21.md) — модульные/API-контракты v0.21 и operational model роутера.
 
 ## Миграция состояния
 
@@ -421,6 +452,8 @@ Fluent/Acrylic-дизайн с 7 группами навигации, 24 пун�
 - v0.12→v0.13: добавлен `web_ui_auth` с disabled default; routing targets принимают `reject`.
 - v0.13→v0.14: добавлены `sub_store_lite`, `smart_select`, `maintenance` и EWMA/cooldown profile stats со значениями по умолчанию.
 - v0.14→v0.15: новые варианты `Protocol` (ShadowsocksR, Snell, Http, Socks, AnyTls, Hysteria, Ssh, Masque, OpenVpn, Tailscale), `ProxyGroupType::Relay`, DNS parity-поля (`dns_fake_ip_filter_mode`, `dns_fake_ip_ttl`, `dns_use_hosts`, `dns_use_system_hosts`, `dns_default_nameserver`, `dns_proxy_server_nameserver_policy`, `dns_direct_nameserver_follow_policy`, `dns_ecs`, `dns_ecs_override`, `dns_disable_ipv4`, `dns_disable_ipv6`, `dns_disable_qtypes`), `typed_rules` (Vec<MihomoRuleConfig>) добавлены в MihomoFeatures со значениями по умолчанию.
+- v0.19→v0.20: настройки Deep Bench и Trash Bin получают serde defaults; quality history хранится отдельно от `state.json`.
+- v0.20→v0.21: legacy plaintext-пароли Web UI при загрузке state преобразуются в Argon2id PHC hash и больше не сериализуются; runtime sessions остаются только в памяти.
 
 Ручное вмешательство не требуется.
 
