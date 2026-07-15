@@ -45,9 +45,18 @@ use crate::geobase::{
 use crate::hincyray_api::{
     ApiContractDescriptor, ConnectionPageResponse, ConnectionQueryRequest, DeviceTrafficRequest,
     DeviceTrafficResponse, DeviceTrafficSummary, MemoryEstimateResponse, OnboardingStatusResponse,
-    ReadinessCheck, RoutingConnectionContextResponse, RoutingPreviewResponse, RoutingServerSummary,
-    RoutingSummaryResponse, SafeModeRequest, SafeModeResponse,
+    ReadinessCheck, RoutingConnectionContextResponse, RoutingPreviewDiff, RoutingPreviewResponse,
+    RoutingServerSummary, RoutingSummaryResponse, SafeModeRequest, SafeModeResponse,
+    api_endpoint_contracts, openapi_document,
 };
+#[cfg(test)]
+use crate::hincyray_mihomo_api::{controller_dial_address, first_stream_json};
+use crate::hincyray_mihomo_api::{
+    mihomo_api_delay, mihomo_api_delete, mihomo_api_get, mihomo_api_get_json,
+    mihomo_api_get_response, mihomo_api_post, mihomo_api_post_response, mihomo_api_stream_get,
+    mihomo_api_stream_get_json, mihomo_controller,
+};
+use crate::hincyray_routing::{RoutingResource, RoutingResourceKind, normalize_routing_resource};
 #[cfg(test)]
 use crate::hincyray_security::verify_password;
 use crate::hincyray_security::{
@@ -4255,6 +4264,7 @@ fn dispatch_from(
             (200, "application/json", response.to_string())
         }
         ("GET", "/api/contracts") => handle_api_contracts(),
+        ("GET", "/api/openapi.json") => json_response(&openapi_document()),
         ("GET", "/api/onboarding/status") => handle_onboarding_status(daemon),
         ("GET", "/api/profiles") => {
             let inner = lock(&daemon.inner);
@@ -7937,12 +7947,16 @@ fn handle_api_contracts() -> (u16, &'static str, String) {
         bounded_endpoints: vec![
             "/api/onboarding/status",
             "/api/routing/summary",
+            "/api/routing/connection-context",
             "/api/routing/preview",
             "/api/routing/explain",
             "/api/memory-estimate",
             "/api/mihomo-api/connections/page",
+            "/api/mihomo-api/connections/device-traffic",
             "/api/safe-mode",
         ],
+        schema_endpoint: "/api/openapi.json",
+        endpoints: api_endpoint_contracts(),
         state_changing_requires_same_origin: true,
         authentication: "argon2id-password+cSPRNG-bearer-expiry",
     };
@@ -7950,13 +7964,14 @@ fn handle_api_contracts() -> (u16, &'static str, String) {
 }
 
 fn handle_onboarding_status(daemon: &Daemon) -> (u16, &'static str, String) {
-    let (state, core_running, firewall_active, tproxy_available) = {
+    let (state, core_running, firewall_active, tproxy_available, policy_mark_runtime) = {
         let mut inner = lock(&daemon.inner);
         (
             inner.state.clone(),
             inner.core.is_running(),
             inner.firewall.active,
             inner.firewall.tproxy_available,
+            inner.firewall.policy_mark.clone(),
         )
     };
     let geo_dir = geo_dir_from_state(&state).map(PathBuf::from);
@@ -7969,6 +7984,28 @@ fn handle_onboarding_status(daemon: &Daemon) -> (u16, &'static str, String) {
         .is_some_and(|id| state.profiles.iter().any(|profile| profile.id == id));
     let hook_required = Path::new("/opt/etc/ndm/netfilter.d").is_dir();
     let hook_exists = Path::new("/opt/etc/ndm/netfilter.d/hincyray.sh").is_file();
+    let policy_mark = policy_mark_runtime
+        .or_else(|| state.split_routing.policy_mark.clone())
+        .or_else(|| query_policy_mark(&state.split_routing.policy_name));
+    let proc_modules_available = Path::new("/proc/modules").is_file();
+    let modules_ok = !state.split_routing.enabled
+        || !proc_modules_available
+        || (["xt_TPROXY", "xt_socket", "xt_comment"]
+            .iter()
+            .all(|name| kernel_module_loaded(name))
+            || tproxy_available);
+    let ec_check = mihomo_controller(&state.mihomo_features).map(|(addr, secret)| {
+        mihomo_api_get_response(&addr, secret.as_deref(), "/version")
+            .is_ok_and(|(status, _)| status < 500)
+    });
+    let dns_check = if core_running && state.split_routing.enabled {
+        dns_query_tcp("127.0.0.1", 1053, "example.com")
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    } else {
+        true
+    };
     let checks = vec![
         readiness_check(
             "mihomo",
@@ -7996,6 +8033,61 @@ fn handle_onboarding_status(daemon: &Daemon) -> (u16, &'static str, String) {
                 .map(|path| path.join("geoip.metadb").display().to_string())
                 .unwrap_or_else(|| "geo directory is not configured".to_owned()),
             "Download geoip.metadb into the configured geo directory",
+        ),
+        readiness_check(
+            "policy-mark",
+            "Keenetic policy mark",
+            !state.split_routing.enabled || policy_mark.is_some(),
+            policy_mark.unwrap_or_else(|| {
+                format!(
+                    "policy {:?} has no connmark",
+                    state.split_routing.policy_name
+                )
+            }),
+            "Create/select the Keenetic traffic policy and apply routing",
+        ),
+        readiness_check(
+            "kernel-modules",
+            "Kernel modules",
+            modules_ok,
+            if proc_modules_available {
+                format!(
+                    "xt_TPROXY={} xt_socket={} xt_comment={} tproxy={}",
+                    kernel_module_loaded("xt_TPROXY"),
+                    kernel_module_loaded("xt_socket"),
+                    kernel_module_loaded("xt_comment"),
+                    tproxy_available
+                )
+            } else {
+                "not a Linux router host".to_owned()
+            },
+            "Install/load xt_TPROXY, xt_socket, and xt_comment modules",
+        ),
+        readiness_check(
+            "external-controller",
+            "Mihomo External Controller",
+            ec_check.unwrap_or(true),
+            match ec_check {
+                Some(true) => "reachable".to_owned(),
+                Some(false) => "enabled but unreachable".to_owned(),
+                None => "disabled by configuration".to_owned(),
+            },
+            "Enable EC or start Mihomo so the daemon can query runtime state",
+        ),
+        readiness_check(
+            "dns",
+            "DNS listener",
+            dns_check,
+            if state.split_routing.enabled {
+                if core_running {
+                    "127.0.0.1:1053 TCP query".to_owned()
+                } else {
+                    "core stopped; DNS runtime not checked".to_owned()
+                }
+            } else {
+                "split routing disabled".to_owned()
+            },
+            "Start Mihomo and ensure DNS listener 1053 is generated",
         ),
         readiness_check(
             "core",
@@ -8171,16 +8263,119 @@ fn handle_routing_preview(daemon: &Daemon) -> (u16, &'static str, String) {
     if state.safe_mode_enabled {
         changes.push("safe mode suppresses heavy optional rule sources".to_owned());
     }
+    let core_restart = requires_apply && core_running;
+    let firewall_reload = firewall_requires_apply
+        || ((config_requires_apply || geobase_requires_apply) && state.split_routing.enabled);
+    let diff = routing_preview_diff(
+        &desired,
+        applied
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok()),
+        config_requires_apply,
+        geobase_requires_apply,
+        core_restart,
+        firewall_reload,
+    );
     json_response(&RoutingPreviewResponse {
         requires_apply,
-        core_restart: requires_apply && core_running,
-        firewall_reload: firewall_requires_apply
-            || ((config_requires_apply || geobase_requires_apply) && state.split_routing.enabled),
+        core_restart,
+        firewall_reload,
         desired_config_sha256: desired_hash,
         applied_config_sha256: applied_hash,
         changes,
+        diff,
         warnings: detect_routing_conflicts(&state),
     })
+}
+
+#[derive(Default)]
+struct ConfigPreviewSummary {
+    rule_count: usize,
+    match_target: Option<String>,
+}
+
+fn config_preview_summary(config_yaml: &str) -> ConfigPreviewSummary {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(config_yaml) else {
+        return ConfigPreviewSummary::default();
+    };
+    let Some(rules) = value.get("rules").and_then(serde_yaml::Value::as_sequence) else {
+        return ConfigPreviewSummary::default();
+    };
+    let match_target = rules.iter().rev().find_map(|rule| {
+        let raw = rule.as_str()?;
+        let mut parts = raw.split(',').map(str::trim);
+        (parts.next()?.eq_ignore_ascii_case("MATCH")).then(|| parts.next().unwrap_or("").to_owned())
+    });
+    ConfigPreviewSummary {
+        rule_count: rules.len(),
+        match_target,
+    }
+}
+
+fn routing_preview_diff(
+    desired_yaml: &str,
+    applied_yaml: Option<&str>,
+    config_requires_apply: bool,
+    geobase_requires_apply: bool,
+    core_restart: bool,
+    firewall_reload: bool,
+) -> Vec<RoutingPreviewDiff> {
+    let desired = config_preview_summary(desired_yaml);
+    let applied = applied_yaml.map(config_preview_summary).unwrap_or_default();
+    let mut diff = Vec::new();
+    if config_requires_apply {
+        let delta = desired.rule_count as i64 - applied.rule_count as i64;
+        diff.push(RoutingPreviewDiff {
+            kind: "rules",
+            title: if delta == 0 {
+                "Mihomo rules will be regenerated".to_owned()
+            } else if delta > 0 {
+                format!("{} routing rules will be added", delta)
+            } else {
+                format!("{} routing rules will be removed", delta.abs())
+            },
+            before: Some(applied.rule_count.to_string()),
+            after: Some(desired.rule_count.to_string()),
+            delta: Some(delta),
+        });
+    }
+    if desired.match_target != applied.match_target {
+        diff.push(RoutingPreviewDiff {
+            kind: "match-target",
+            title: "MATCH target will change".to_owned(),
+            before: applied.match_target,
+            after: desired.match_target,
+            delta: None,
+        });
+    }
+    if geobase_requires_apply {
+        diff.push(RoutingPreviewDiff {
+            kind: "geobase",
+            title: "Desired GeoBase generation will be applied".to_owned(),
+            before: None,
+            after: None,
+            delta: None,
+        });
+    }
+    if core_restart {
+        diff.push(RoutingPreviewDiff {
+            kind: "core",
+            title: "Mihomo core will be restarted".to_owned(),
+            before: Some("running".to_owned()),
+            after: Some("restarted".to_owned()),
+            delta: None,
+        });
+    }
+    if firewall_reload {
+        diff.push(RoutingPreviewDiff {
+            kind: "firewall",
+            title: "Transparent firewall rules will be reloaded".to_owned(),
+            before: None,
+            after: None,
+            delta: None,
+        });
+    }
+    diff
 }
 
 fn firewall_runtime_requires_apply(
@@ -8692,76 +8887,10 @@ fn handle_routing_resource_route(body: &str, daemon: &Daemon) -> (u16, &'static 
     (status, "application/json", response.to_string())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RoutingResourceKind {
-    Domain,
-    Ip,
-}
-
-impl RoutingResourceKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Domain => "domain",
-            Self::Ip => "ip",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RoutingResource {
-    kind: RoutingResourceKind,
-    value: String,
-}
-
 #[derive(Default)]
 struct ResourceCloseResult {
     closed: usize,
     errors: Vec<String>,
-}
-
-fn normalize_routing_resource(raw: &str) -> Option<RoutingResource> {
-    let mut value = raw.trim().trim_end_matches('.').to_ascii_lowercase();
-    if value.is_empty() || value == "—" {
-        return None;
-    }
-    if let Some(stripped) = value
-        .strip_prefix("http://")
-        .or_else(|| value.strip_prefix("https://"))
-        && let Some(host) = stripped.split('/').next()
-    {
-        value = host.to_owned();
-    }
-    if value.starts_with('[')
-        && let Some(end) = value.find(']')
-    {
-        value = value[1..end].to_owned();
-    } else if let Some((host, port)) = value.rsplit_once(':')
-        && !host.contains(':')
-        && port.bytes().all(|b| b.is_ascii_digit())
-    {
-        value = host.to_owned();
-    }
-    let value = value.trim().trim_end_matches('.').to_owned();
-    if value.is_empty() {
-        return None;
-    }
-    if value.parse::<IpAddr>().is_ok() {
-        return Some(RoutingResource {
-            kind: RoutingResourceKind::Ip,
-            value,
-        });
-    }
-    if value.contains('.')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
-    {
-        return Some(RoutingResource {
-            kind: RoutingResourceKind::Domain,
-            value,
-        });
-    }
-    None
 }
 
 fn upsert_resource_routing_rule(
@@ -14648,7 +14777,7 @@ fn handle_logs(_daemon: &Daemon) -> (u16, &'static str, String) {
         };
         let lines: Vec<&str> = text.lines().collect();
         let start = lines.len().saturating_sub(200);
-        lines[start..].join("\n")
+        redact_log_text(&lines[start..].join("\n"))
     };
 
     (
@@ -14660,6 +14789,47 @@ fn handle_logs(_daemon: &Daemon) -> (u16, &'static str, String) {
         })
         .to_string(),
     )
+}
+
+fn redact_log_text(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if log_line_may_contain_secret(line) {
+                "[redacted log line: possible secret]".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn log_line_may_contain_secret(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    const SECRET_MARKERS: &[&str] = &[
+        "password",
+        "passwd",
+        "private-key",
+        "private_key",
+        "preshared-key",
+        "pre-shared-key",
+        "token",
+        "secret",
+        "authorization",
+        "bearer ",
+        "set-cookie",
+        "uuid",
+        "alterid",
+        "client-fingerprint",
+    ];
+    if SECRET_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return true;
+    }
+    (lower.contains("://") && lower.contains('@'))
+        || (lower.contains("://")
+            && ["?key=", "&key=", "?auth=", "&auth=", "?token=", "&token="]
+                .iter()
+                .any(|marker| lower.contains(marker)))
 }
 
 /// Collect and return system resource information: CPU (architecture,
@@ -15153,215 +15323,6 @@ fn socks_health_check(socks_port: u16) -> bool {
             o.status.success() && code.starts_with('2')
         })
         .unwrap_or(false)
-}
-
-// ---------------------------------------------------------------------------
-// Mihomo external-controller REST API client
-// ---------------------------------------------------------------------------
-
-/// Extract the external-controller address and secret from `MihomoFeatures`,
-/// returning `None` if the controller is disabled.
-fn mihomo_controller(
-    features: &crate::mihomo_config::MihomoFeatures,
-) -> Option<(String, Option<String>)> {
-    if features.external_controller.enabled {
-        Some((
-            controller_dial_address(&features.external_controller.address),
-            features.external_controller.secret.clone(),
-        ))
-    } else {
-        None
-    }
-}
-
-fn controller_dial_address(bind_address: &str) -> String {
-    if let Some(port) = bind_address.strip_prefix("0.0.0.0:") {
-        return format!("127.0.0.1:{port}");
-    }
-    if let Some(port) = bind_address.strip_prefix("[::]:") {
-        return format!("127.0.0.1:{port}");
-    }
-    if let Some(port) = bind_address.strip_prefix(":::") {
-        return format!("127.0.0.1:{port}");
-    }
-    if bind_address.starts_with(':') {
-        return format!("127.0.0.1{bind_address}");
-    }
-    bind_address.to_owned()
-}
-
-/// Make a GET request to the Mihomo external-controller REST API.
-///
-/// Returns the response body as a string, or an error message.
-/// Timeout is 3 seconds (localhost, should be <100ms).
-fn mihomo_api_get(addr: &str, secret: Option<&str>, path: &str) -> Result<String, String> {
-    let (status, body) = mihomo_api_get_response(addr, secret, path)?;
-    if !(200..300).contains(&status) {
-        return Err(format!("Mihomo API {path}: HTTP {status}"));
-    }
-    Ok(body)
-}
-
-fn mihomo_api_get_response(
-    addr: &str,
-    secret: Option<&str>,
-    path: &str,
-) -> Result<(u16, String), String> {
-    let url = format!("http://{addr}{path}");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .no_proxy()
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = client.get(&url);
-    if let Some(s) = secret
-        && !s.is_empty()
-    {
-        req = req.header("Authorization", format!("Bearer {s}"));
-    }
-    let resp = req.send().map_err(|e| e.to_string())?;
-    let status = resp.status().as_u16();
-    let body = resp.text().map_err(|e| e.to_string())?;
-    Ok((status, body))
-}
-
-fn mihomo_api_delete(addr: &str, secret: Option<&str>, path: &str) -> Result<u16, String> {
-    let url = format!("http://{addr}{path}");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .no_proxy()
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = client.delete(&url);
-    if let Some(s) = secret
-        && !s.is_empty()
-    {
-        req = req.header("Authorization", format!("Bearer {s}"));
-    }
-    let resp = req.send().map_err(|e| e.to_string())?;
-    let status = resp.status().as_u16();
-    if !resp.status().is_success() {
-        return Err(format!("Mihomo API {path}: HTTP {}", resp.status()));
-    }
-    Ok(status)
-}
-
-fn mihomo_api_post(
-    addr: &str,
-    secret: Option<&str>,
-    path: &str,
-    body: &str,
-) -> Result<String, String> {
-    let (status, response) = mihomo_api_post_response(addr, secret, path, body)?;
-    if !(200..300).contains(&status) {
-        return Err(format!("Mihomo API {path}: HTTP {status}"));
-    }
-    Ok(response)
-}
-
-fn mihomo_api_post_response(
-    addr: &str,
-    secret: Option<&str>,
-    path: &str,
-    body: &str,
-) -> Result<(u16, String), String> {
-    let url = format!("http://{addr}{path}");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .no_proxy()
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut req = client.post(&url);
-    if let Some(s) = secret
-        && !s.is_empty()
-    {
-        req = req.header("Authorization", format!("Bearer {s}"));
-    }
-    if !body.trim().is_empty() {
-        req = req
-            .header("Content-Type", "application/json")
-            .body(body.to_owned());
-    }
-    let resp = req.send().map_err(|e| e.to_string())?;
-    let status = resp.status().as_u16();
-    let response = resp.text().map_err(|e| e.to_string())?;
-    Ok((status, response))
-}
-
-/// Like `mihomo_api_get` but for streaming endpoints (`/traffic`,
-/// `/memory`) that keep the connection open. Uses `curl` with
-/// `--max-time` to read the first JSON snapshot from the stream.
-fn mihomo_api_stream_get(addr: &str, secret: Option<&str>, path: &str) -> Result<String, String> {
-    let url = format!("http://{addr}{path}");
-    let mut cmd = Command::new("curl");
-    cmd.args(["-s", "--max-time", "2", &url]);
-    if let Some(s) = secret
-        && !s.is_empty()
-    {
-        cmd.args(["-H", &format!("Authorization: Bearer {s}")]);
-    }
-    let output = cmd.output().map_err(|e| e.to_string())?;
-    let body = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() && body.trim().is_empty() {
-        return Err(format!(
-            "Mihomo API {path}: curl exit {:?}",
-            output.status.code()
-        ));
-    }
-    first_stream_json(&body).ok_or_else(|| format!("empty or invalid Mihomo stream {path}"))
-}
-
-fn first_stream_json(body: &str) -> Option<String> {
-    // The stream may contain multiple JSON objects (one per second).
-    // Take the first non-empty line.
-    let first = body.lines().find(|line| !line.trim().is_empty())?;
-    serde_json::from_str::<Value>(first).ok()?;
-    Some(first.to_owned())
-}
-
-/// Make a GET request and parse the response as JSON.
-fn mihomo_api_get_json(addr: &str, secret: Option<&str>, path: &str) -> Result<Value, String> {
-    let body = mihomo_api_get(addr, secret, path)?;
-    serde_json::from_str(&body).map_err(|e| format!("Mihomo API {path}: parse error: {e}"))
-}
-
-/// Like `mihomo_api_stream_get` but parses the first JSON object.
-fn mihomo_api_stream_get_json(
-    addr: &str,
-    secret: Option<&str>,
-    path: &str,
-) -> Result<Value, String> {
-    let body = mihomo_api_stream_get(addr, secret, path)?;
-    serde_json::from_str(&body).map_err(|e| format!("Mihomo API {path}: parse error: {e}"))
-}
-
-/// Test the delay (latency) of a specific proxy through the Mihomo API.
-///
-/// Calls `GET /proxies/{name}/delay?url={test_url}&timeout={ms}`.
-/// Returns the delay in milliseconds on success.
-fn mihomo_api_delay(
-    addr: &str,
-    secret: Option<&str>,
-    proxy_name: &str,
-    test_url: &str,
-    timeout_ms: u32,
-) -> Result<u32, String> {
-    let path = format!(
-        "/proxies/{}/delay?url={}&timeout={}",
-        utf8_percent_encode(proxy_name, NON_ALPHANUMERIC),
-        utf8_percent_encode(test_url, NON_ALPHANUMERIC),
-        timeout_ms
-    );
-    let json = mihomo_api_get_json(addr, secret, &path)?;
-    json.get("delay")
-        .and_then(Value::as_u64)
-        .map(|d| d as u32)
-        .ok_or_else(|| {
-            json.get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("no delay in response")
-                .to_owned()
-        })
 }
 
 /// Find the profile with the highest `last_score` from `ProfileStats`

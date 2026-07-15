@@ -1,6 +1,6 @@
 # HincyRay v0.21 Architecture and Operational Contracts
 
-Status: implemented and released contracts, 2026-07-15. Full Rust gates, Playwright smoke tests, aarch64 cross-build, and Keenetic router deployment were completed for v0.21.0; see `docs/releases/v0.21.0.md`.
+Status: implemented contracts, 2026-07-15. v0.21.1 completes the remaining schema/onboarding/diff/browser-E2E/module-boundary work; see `docs/releases/v0.21.1.md`. v0.21.0 router deployment evidence remains in `docs/releases/v0.21.0.md`.
 
 ## 1. Operational Model
 
@@ -59,7 +59,7 @@ Returns:
 ```json
 {
   "ready": false,
-  "version": "0.21.0",
+  "version": "0.21.1",
   "checks": [
     {
       "id": "mihomo",
@@ -200,4 +200,4 @@ npm run test:browser
 git diff --check
 ```
 
-This document records the implemented contracts. Final command results, the no-default-features aarch64 artifact SHA, and router E2E/deployment evidence are recorded in `docs/releases/v0.21.0.md` and the GitHub Release notes.
+This document records the implemented contracts. v0.21.1 local gate results are recorded in `docs/releases/v0.21.1.md`; the v0.21.0 no-default-features aarch64 artifact SHA and router E2E/deployment evidence are recorded in `docs/releases/v0.21.0.md` and the GitHub Release notes.

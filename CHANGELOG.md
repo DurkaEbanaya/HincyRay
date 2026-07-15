@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.21.1 - 2026-07-15
+
+- Completed the remaining v0.21 control-plane contracts instead of leaving them as release-note promises.
+- Onboarding readiness now checks Mihomo, active profile, `geoip.metadb`, Keenetic policy mark, kernel modules/TPROXY capability, Mihomo core, EC reachability when enabled, DNS listener health, transparent firewall state, and the ndm firewall hook.
+- Added generated OpenAPI/JSON schema output at `GET /api/openapi.json`; `GET /api/contracts` now points at the schema endpoint and lists typed endpoint contracts.
+- Routing preview now returns typed diff entries for rule-count changes, MATCH target changes, GeoBase apply, core restart, and firewall reload instead of forcing the Web UI to parse human strings.
+- Connections table now has an explicit “create/change rule” flow in addition to quick target select and “why this route” diagnostics.
+- `/api/logs` now redacts suspicious log lines before returning Mihomo log tails to the Web UI.
+- Browser E2E smoke coverage expanded from 6 to 12 tests: login, connection search/pagination/action/rule editor, device accounting, routing rule add/apply, DNS save/apply, profile import, mobile bottom navigation, and prompt-free rename.
+- Decomposition continued: Mihomo External Controller transport moved to `hincyray_mihomo_api`; routing resource normalization moved to `hincyray_routing`.
+- Gates: full Rust/frontend/installer/browser gate passed locally; Rust tests now report 467 passed and Playwright reports 12 passed.
+- Router validation: v0.21.1 aarch64 binary SHA256 `a7f89cfac39b2f676deb7a8ead35925905cccab71a783a00d815faaaba6b1e94` was deployed to Keenetic Giga, copied back byte-for-byte, and router E2E passed.
+
 ## v0.21.0 - 2026-07-15
 
 v0.21.0 is the hardening and operability release. It turns the router daemon from a feature-heavy single-file control plane into a contract-driven system with explicit security, bounded APIs, transactional runtime changes, browser smoke coverage, and safer installer lifecycle semantics.

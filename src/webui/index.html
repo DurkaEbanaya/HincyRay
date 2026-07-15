@@ -4684,7 +4684,7 @@ function renderConnectionsTableRows() {
       <td>${htmlEscape(Array.from(row.rules).join(', ') || '—')}</td>
       <td class="mono">${htmlEscape(fmtBytes(row.upload))}</td>
       <td class="mono">${htmlEscape(fmtBytes(row.download))}</td>
-      <td style="min-width:220px"><div style="display:grid;gap:6px">${actionSelect}<button class="btn btn-sm" data-resource="${resource}" onclick="explainConnectionResource(this)">? ${htmlEscape(t('Почему этот маршрут'))}</button><button class="btn btn-sm" data-resource="${resource}" onclick="reloadConnectionResource(this)">⟳ ${htmlEscape(t('Перезагрузить ресурс'))}</button></div></td>
+      <td style="min-width:220px"><div style="display:grid;gap:6px">${actionSelect}<button class="btn btn-sm" data-resource="${resource}" onclick="openConnectionRuleEditor(this)">✎ ${htmlEscape(t('Создать/изменить правило'))}</button><button class="btn btn-sm" data-resource="${resource}" onclick="explainConnectionResource(this)">? ${htmlEscape(t('Почему этот маршрут'))}</button><button class="btn btn-sm" data-resource="${resource}" onclick="reloadConnectionResource(this)">⟳ ${htmlEscape(t('Перезагрузить ресурс'))}</button></div></td>
     </tr>`;
   }).join('') || `<tr><td colspan="9" style="color:var(--muted)">${htmlEscape(connectionsTableSearch ? t('Поиск не дал результатов') : t('Активных соединений нет'))}</td></tr>`;
 }
@@ -4705,6 +4705,38 @@ function routeConnectionResource(select) {
     select.disabled = false;
     select.value = '';
   });
+}
+
+let _connectionRuleResource = '';
+function openConnectionRuleEditor(button) {
+  _connectionRuleResource = String(button?.dataset?.resource || '').trim();
+  if (!_connectionRuleResource) return showToast('error', t('Ресурс не определён'));
+  showResultModal(t('Создать/изменить правило'), `
+    <div class="form-group">
+      <label>${htmlEscape(t('Ресурс'))}</label>
+      <div class="result-pre">${htmlEscape(_connectionRuleResource)}</div>
+    </div>
+    <div class="form-group">
+      <label>${htmlEscape(t('Цель'))}</label>
+      <select id="connectionRuleTarget" class="form-control">
+        <option value="active">${htmlEscape(t('Текущий активный VPN'))}</option>
+        <option value="direct">DIRECT</option>
+        <option value="reject">REJECT</option>
+        ${routingTargetServerOptions('')}
+      </select>
+    </div>
+    <button class="btn btn-accent" onclick="submitConnectionRuleEditor()">${htmlEscape(t('Создать/изменить правило'))}</button>
+  `);
+}
+function submitConnectionRuleEditor() {
+  const resource = _connectionRuleResource;
+  const target = document.getElementById('connectionRuleTarget')?.value || 'active';
+  if (!resource) return showToast('error', t('Ресурс не определён'));
+  api('POST','/api/routing/resource-route',{resource,target,close_connections:true}).then(r => {
+    closeResultModal();
+    showToast('success', `${t('Маршрут применён')}: ${resource} → ${target}; ${t('закрыто соединений')}: ${r.closed_connections ?? 0}`);
+    return refreshConnectionsTable();
+  }).catch(e => showToast('error', e.message || String(e)));
 }
 
 function reloadConnectionResource(button) {
@@ -5021,8 +5053,10 @@ function showRoutingPreview() {
   return api('GET','/api/routing/preview').then(result => {
     const badge = result.requires_apply ? '<span class="result-badge warn">PENDING</span>' : '<span class="result-badge ok">APPLIED</span>';
     const changes = (result.changes || []).map(change => `<li>${htmlEscape(change)}</li>`).join('') || `<li>${htmlEscape(t('Изменений нет'))}</li>`;
+    const diff = (result.diff || []).map(item => `<tr><td>${htmlEscape(item.kind || 'change')}</td><td>${htmlEscape(item.title || '')}</td><td>${htmlEscape(item.before ?? '—')}</td><td>${htmlEscape(item.after ?? '—')}</td><td>${htmlEscape(item.delta ?? '—')}</td></tr>`).join('');
     const warnings = (result.warnings || []).map(warning => `<div class="msg warning">${htmlEscape(warning)}</div>`).join('');
-    showResultModal(t('Предпросмотр маршрутизации'), `${badge}<ul>${changes}</ul>${warnings}<div class="result-pre">desired: ${htmlEscape(result.desired_config_sha256 || '—')}\napplied: ${htmlEscape(result.applied_config_sha256 || '—')}\ncore restart: ${result.core_restart === true}\nfirewall reload: ${result.firewall_reload === true}</div>`);
+    const diffTable = diff ? `<table class="result-table"><tr><th>${htmlEscape(t('Тип'))}</th><th>${htmlEscape(t('Изменение'))}</th><th>${htmlEscape(t('Было'))}</th><th>${htmlEscape(t('Будет'))}</th><th>Δ</th></tr>${diff}</table>` : '';
+    showResultModal(t('Предпросмотр маршрутизации'), `${badge}${diffTable}<ul>${changes}</ul>${warnings}<div class="result-pre">desired: ${htmlEscape(result.desired_config_sha256 || '—')}\napplied: ${htmlEscape(result.applied_config_sha256 || '—')}\ncore restart: ${result.core_restart === true}\nfirewall reload: ${result.firewall_reload === true}</div>`);
     return result;
   });
 }

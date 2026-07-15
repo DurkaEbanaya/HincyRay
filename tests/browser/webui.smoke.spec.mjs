@@ -31,6 +31,28 @@ test('page boots without JavaScript errors', async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
+test('login overlay authenticates and stores the bearer in sessionStorage', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.__fixturePromptCalled = false;
+    window.prompt = () => {
+      window.__fixturePromptCalled = true;
+      return null;
+    };
+  });
+  await page.route('**/api/auth-settings', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ enabled: true, username: 'admin' }),
+  }));
+  await page.goto('/');
+  await expect(page.locator('#loginOverlay')).toBeVisible();
+  await page.locator('#loginUser').fill('admin');
+  await page.locator('#loginPass').fill('secret');
+  await page.getByRole('button', { name: 'Войти' }).click();
+  await expect(page.locator('#loginOverlay')).toBeHidden();
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem('hincyray_token'))).toBe('fixture-token');
+});
+
 test("connection search keeps the canonical '🇷🇺 chatgpt.com' row", async ({ page }) => {
   await openFixture(page);
   await navigateTo(page, 'connections-table');
@@ -107,6 +129,93 @@ test('native connection action changes target and posts the resource route', asy
     target: 'direct',
     close_connections: true,
   });
+});
+
+test('connection rule editor creates or updates a resource rule', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'connections-table');
+  await page.locator('#connectionsTableSearch').fill('🇷🇺 chatgpt.com');
+  await expect(page.locator('#connectionsRoutingBody tr')).toHaveCount(1);
+
+  await page.locator('#connectionsRoutingBody tr').getByRole('button', { name: /Создать\/изменить правило/ }).click();
+  await expect(page.locator('#resultModal')).toBeVisible();
+  await page.locator('#connectionRuleTarget').selectOption('direct');
+  const posted = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/routing/resource-route'
+  );
+  await page.locator('#resultModal button').filter({ hasText: 'Создать/изменить правило' }).click();
+  expect((await posted).postDataJSON()).toEqual({
+    resource: 'chatgpt.com',
+    target: 'direct',
+    close_connections: true,
+  });
+});
+
+test('routing rule add and apply are posted through the API contract', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'routing');
+  await page.locator('#ruleName').fill('Fixture rule');
+  await page.locator('#ruleEntries').fill('fixture.example');
+  await page.locator('#ruleTarget').selectOption('direct');
+
+  const rulesPost = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/routing/rules'
+  );
+  await page.locator('#ruleSubmitBtn').click();
+  const rulesBody = (await rulesPost).postDataJSON();
+  expect(rulesBody.apply).toBe(true);
+  expect(rulesBody.rules).toContainEqual(expect.objectContaining({
+    name: 'Fixture rule',
+    target: 'direct',
+    domains: ['fixture.example'],
+  }));
+
+  const applyPost = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/routing/apply'
+  );
+  await page.getByRole('button', { name: '⬆ Применить' }).click();
+  expect((await applyPost).postDataJSON()).toBeNull();
+});
+
+test('DNS save persists settings and applies routing', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'dns');
+  await page.locator('#dnsRemote').fill('https://1.1.1.1/dns-query');
+  await page.locator('#dnsLocal').fill('223.5.5.5');
+  const dnsPost = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/dns'
+  );
+  const applyPost = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/routing/apply'
+  );
+  await page.locator('.section-panel[data-section="dns"] button').filter({ hasText: 'Сохранить' }).click();
+  expect((await dnsPost).postDataJSON()).toEqual(expect.objectContaining({
+    remote_servers: ['https://1.1.1.1/dns-query'],
+    local_servers: ['223.5.5.5'],
+  }));
+  expect((await applyPost).postDataJSON()).toEqual({});
+});
+
+test('profile import posts pasted subscription text', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'import');
+  await page.locator('#importText').fill('vless://fixture@example.invalid:443#fixture');
+  const imported = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/profiles/import'
+  );
+  await page.getByRole('button', { name: 'Импортировать' }).click();
+  expect((await imported).postDataJSON()).toEqual({
+    text: 'vless://fixture@example.invalid:443#fixture',
+  });
+});
+
+test('mobile bottom navigation opens routing without horizontal table dependence', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openFixture(page);
+  await expect(page.locator('#bottomNav')).toBeVisible();
+  await page.locator('.bottom-nav-item[data-group="routing"]').click();
+  await expect(page.locator('.section-panel[data-section="routing"]')).toHaveClass(/open/);
+  await expect(page.locator('table.responsive-cards').first()).toHaveCount(1);
 });
 
 test('profile rename uses a modal instead of window.prompt', async ({ page }) => {

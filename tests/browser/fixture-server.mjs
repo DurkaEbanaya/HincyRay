@@ -230,6 +230,26 @@ const server = http.createServer(async (request, response) => {
       sendJson(response, 200, { ok: true, closed_connections: 1 });
       return;
     }
+    if (request.method === 'POST' && url.pathname === '/api/auth/login') {
+      sendJson(response, 200, { token: 'fixture-token' });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/routing/rules') {
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/routing/apply') {
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/dns') {
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/profiles/import') {
+      sendJson(response, 200, { imported: 1 });
+      return;
+    }
     if (request.method === 'POST' && url.pathname === '/api/mihomo-api/connections/page') {
       const queryTerms = String(body?.query || '').toLowerCase().split(/\s+/).filter(Boolean);
       const filteredRows = connections.connections.filter(connection => {

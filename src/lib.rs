@@ -4,6 +4,8 @@ pub mod benchmark;
 pub mod geobase;
 pub mod hincyray;
 pub mod hincyray_api;
+pub mod hincyray_mihomo_api;
+pub mod hincyray_routing;
 pub mod hincyray_security;
 pub mod hincyray_webui;
 pub mod mihomo_config;

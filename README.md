@@ -1,4 +1,4 @@
-# HincyRay v0.21.0
+# HincyRay v0.21.1
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,10 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.21.1
+
+v0.21.1 completes the remaining v0.21 control-plane contract work: full onboarding checks for policy mark, kernel modules, EC and DNS; generated OpenAPI/JSON schemas at `/api/openapi.json`; typed routing preview diffs; redacted log output; an explicit Connections “create/change rule” flow; expanded browser E2E for login, routing add/apply, DNS save/apply, profile import and mobile bottom navigation; and module extraction for Mihomo EC plus resource normalization.
 
 ### v0.21.0
 
@@ -310,7 +314,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. v0.21.0 gate results and router deployment evidence are recorded in [`docs/releases/v0.21.0.md`](docs/releases/v0.21.0.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v0.21.1 gate results are recorded in [`docs/releases/v0.21.1.md`](docs/releases/v0.21.1.md); v0.21.0 router deployment evidence remains in [`docs/releases/v0.21.0.md`](docs/releases/v0.21.0.md).
 
 ## Installation
 
