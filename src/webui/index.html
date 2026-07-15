@@ -1281,14 +1281,15 @@ https://sub.example.com/…"></textarea>
               <select id="routingVisualInterval" class="form-control" onchange="setVisualRoutingInterval(this.value)" aria-label="Интервал обновления">
                 <option value="2">2 с</option><option value="5" selected>5 с</option><option value="10">10 с</option><option value="15">15 с</option><option value="30">30 с</option><option value="60">60 с</option>
               </select>
+              <button class="btn btn-sm" onclick="refreshConnectionsTable()">⟳ Обновить</button>
             </div>
           </div>
           <div id="connectionsTableSummary" class="routing-visual-summary"></div>
           <div id="connectionsTableUpdated" class="routing-visual-subtitle" style="margin:8px 0"></div>
           <div class="routing-visual-table-wrap">
             <table id="connectionsRoutingTable" class="routing-visual-table">
-              <thead><tr><th>Сайт / IP</th><th>Соед.</th><th>Профиль / сервер</th><th>Source IP</th><th>Сеть / порт</th><th>Правило</th><th>↑</th><th>↓</th></tr></thead>
-              <tbody id="connectionsRoutingBody"><tr><td colspan="8" style="color:var(--muted)">Откройте вкладку для загрузки соединений</td></tr></tbody>
+              <thead><tr><th>Сайт / IP</th><th>Соед.</th><th>Профиль / сервер</th><th>Source IP</th><th>Сеть / порт</th><th>Правило</th><th>↑</th><th>↓</th><th>Действия</th></tr></thead>
+              <tbody id="connectionsRoutingBody"><tr><td colspan="9" style="color:var(--muted)">Откройте вкладку для загрузки соединений</td></tr></tbody>
             </table>
           </div>
         </div>
@@ -3476,6 +3477,13 @@ function routingTargetOptions(selectedTarget) {
   const selected = String(selectedTarget || 'active');
   const base = [['active',t('Текущий активный VPN')],['direct','DIRECT'],['reject','REJECT']];
   let html = base.map(([value,label]) => `<option value="${attrEscape(value)}" ${selected===value?'selected':''}>${htmlEscape(label)}</option>`).join('');
+  html += routingTargetServerOptions(selected);
+  return html;
+}
+
+function routingTargetServerOptions(selectedTarget) {
+  const selected = String(selectedTarget || '');
+  let html = '';
   const groups = new Map();
   (Array.isArray(MOCK.routing_servers) ? MOCK.routing_servers : []).forEach(server => {
     if (server == null || server.ref == null) return;
@@ -3604,8 +3612,8 @@ function restoreRoutingRule(idx) {
 }
 
 function saveRoutingRulesToBackend(afterFn) {
-  api('POST','/api/routing/rules',{rules:MOCK.routing_rules}).then(()=>{
-    showToast('success', t('Правила сохранены'));
+  api('POST','/api/routing/rules',{rules:MOCK.routing_rules, apply:true}).then(()=>{
+    showToast('success', t('Правила сохранены и применены'));
     if (afterFn) afterFn();
   });
 }
@@ -3816,8 +3824,8 @@ function inlineEditPorts(idx, el) {
 }
 
 function changeMatchTarget(target) {
-  api('POST','/api/routing/settings', {match_target: target}).then(()=>{
-    showToast('success', t('MATCH цель изменена'));
+  api('POST','/api/routing/settings', {match_target: target, apply:true}).then(()=>{
+    showToast('success', t('MATCH цель изменена и применена'));
     loadRouting();
   }).catch(err => {
     showToast('error', err.message || t('Ошибка'));
@@ -3826,7 +3834,7 @@ function changeMatchTarget(target) {
 }
 
 function applyPreset(id, target) {
-  const body = target ? {preset:id, target:target} : {preset:id};
+  const body = target ? {preset:id, target:target, apply:true} : {preset:id, apply:true};
   api('POST','/api/routing-presets/apply', body).then(()=>{
     showToast('success', t('Пресет')+' '+id+' '+t('применён'));
     loadRouting();
@@ -4495,7 +4503,7 @@ function buildVisualRoutingRows(connections, routingData, status) {
   connections.forEach(conn => {
     const site = visualRoutingSite(conn);
     const route = describeConnectionRoute(conn, suffixMap, status);
-    const item = groups.get(site) || {site, count:0, upload:0, download:0, sources:new Set(), ports:new Set(), networks:new Set(), countries:new Set(), rules:new Set(), routes:new Map(), details:new Set()};
+    const item = groups.get(site) || {site, count:0, upload:0, download:0, sources:new Set(), ports:new Set(), networks:new Set(), countries:new Set(), rules:new Set(), routes:new Map(), details:new Set(), resource:site};
     item.count += 1;
     item.upload += Number(conn.upload || 0);
     item.download += Number(conn.download || 0);
@@ -4544,6 +4552,14 @@ function renderConnectionsTableRows() {
   body.innerHTML = rows.map(row => {
     const routeHtml = Array.from(row.routes.entries()).map(([label,badge]) => `<span class="result-badge ${badge}">${htmlEscape(label)}</span>`).join('<br>') || '—';
     const details = Array.from(row.details).slice(0, 3).join('\n');
+    const resource = attrEscape(row.resource || row.site || '');
+    const actionSelect = `<select class="form-control" style="min-width:150px;font-size:12px;padding:4px 8px" onchange="routeConnectionResource(this,'${resource}')">
+      <option value="">${htmlEscape(t('Следовать правилу…'))}</option>
+      <option value="active">${htmlEscape(t('Текущий активный VPN'))}</option>
+      <option value="direct">DIRECT</option>
+      <option value="reject">REJECT</option>
+      ${routingTargetServerOptions('')}
+    </select>`;
     return `<tr>
       <td><strong>${countryFlag(Array.from(row.countries)[0])} ${htmlEscape(row.site)}</strong><div class="routing-route-detail">${htmlEscape(Array.from(row.countries).filter(Boolean).join(', ') || '—')}</div></td>
       <td class="mono">${row.count}</td>
@@ -4553,8 +4569,32 @@ function renderConnectionsTableRows() {
       <td>${htmlEscape(Array.from(row.rules).join(', ') || '—')}</td>
       <td class="mono">${htmlEscape(fmtBytes(row.upload))}</td>
       <td class="mono">${htmlEscape(fmtBytes(row.download))}</td>
+      <td style="min-width:220px"><div style="display:grid;gap:6px">${actionSelect}<button class="btn btn-sm" onclick="reloadConnectionResource('${resource}')">⟳ ${htmlEscape(t('Перезагрузить ресурс'))}</button></div></td>
     </tr>`;
-  }).join('') || `<tr><td colspan="8" style="color:var(--muted)">${htmlEscape(connectionsTableSearch ? t('Поиск не дал результатов') : t('Активных соединений нет'))}</td></tr>`;
+  }).join('') || `<tr><td colspan="9" style="color:var(--muted)">${htmlEscape(connectionsTableSearch ? t('Поиск не дал результатов') : t('Активных соединений нет'))}</td></tr>`;
+}
+
+function routeConnectionResource(select, resource) {
+  const target = select && select.value;
+  if (!target) return;
+  const body = {resource, target, close_connections:true};
+  select.disabled = true;
+  api('POST','/api/routing/resource-route', body).then(r => {
+    showToast('success', `${t('Маршрут применён')}: ${resource} → ${target}; ${t('закрыто соединений')}: ${r.closed_connections ?? 0}`);
+    return refreshConnectionsTable();
+  }).catch(e => {
+    showToast('error', e.message || String(e));
+  }).finally(() => {
+    select.disabled = false;
+    select.value = '';
+  });
+}
+
+function reloadConnectionResource(resource) {
+  api('POST','/api/mihomo-api/connections/close',{resource}).then(r => {
+    showToast('success', `${t('Ресурс перезагружен')}: ${resource}; ${t('закрыто соединений')}: ${r.closed ?? 0}`);
+    return refreshConnectionsTable();
+  }).catch(e => showToast('error', e.message || String(e)));
 }
 function showEcRaw(endpoint) {
   const out = document.getElementById('ecApiResult');
@@ -5179,7 +5219,11 @@ function saveRoutingSettings() {
     rkn_bypass_url: document.getElementById('rRknBypassUrl')?.value || '',
     rkn_bypass_interval: +(document.getElementById('rRknBypassInterval')?.value || 86400),
   };
-  apiAction('POST','/api/routing/settings',body,t('Настройки маршрутизации сохранены'),refreshDashboard);
+  body.apply = true;
+  api('POST','/api/routing/settings',body).then(() => {
+    showToast('success', t('Настройки маршрутизации сохранены и применены'));
+    refreshDashboard();
+  }).catch(()=>{});
 }
 
 function syncAutoVpnLearningToggles(enabled) {
@@ -5188,10 +5232,7 @@ function syncAutoVpnLearningToggles(enabled) {
 
 function resetRoutingDefaults() {
   if (!confirm(t('Сбросить настройки маршрутизации к заводским? Пользовательские правила будут удалены.'))) return;
-  api('POST','/api/routing/reset').then(() => {
-    showToast('success', t('Настройки сброшены. Применяем…'));
-    return api('POST','/api/routing/apply');
-  }).then(() => {
+  api('POST','/api/routing/reset',{apply:true}).then(() => {
     showToast('success', t('Штатные настройки применены'));
     loadRouting();
   }).catch(e => showToast('error', e.message || t('Ошибка')));

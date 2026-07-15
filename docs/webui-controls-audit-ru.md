@@ -140,8 +140,8 @@ Backend проверяет метод и отказывает, если проф
   - `Allow List` — проксировать только указанные порты.
   - `Deny List` — проксировать всё кроме указанных портов.
 - **Proxy ports / Bypass ports** — списки портов для выбранного режима.
-- **Сохранить настройки** — `POST /api/routing/settings`.
-- **↺ Штатные настройки** — `POST /api/routing/reset`, затем UI вызывает `POST /api/routing/apply`.
+- **Сохранить настройки** — `POST /api/routing/settings` с `apply:true`, backend сохраняет и применяет атомарно.
+- **↺ Штатные настройки** — `POST /api/routing/reset` с `apply:true`, backend сохраняет, применяет и откатывает state при ошибке активации.
 
 **Статус: исправлено в коде.** Формулировка заменена на “Маршрутизация Xkeen политики”; пояснение теперь явно говорит, что техническая основа — Keenetic traffic policy/connmark, а SSID/сегмент только удобный способ назначить policy группе клиентов.
 
@@ -171,7 +171,7 @@ Backend проверяет метод и отказывает, если проф
 - **RU + AdBlock** — RU Direct + ad-block.
 - При некоторых preset'ах UI показывает временный dropdown цели: `active`, `direct`, `reject`.
 
-Backend: `POST /api/routing-presets/apply`.
+Backend: `POST /api/routing-presets/apply` с `apply:true`, чтобы preset сразу попал в running Mihomo config.
 
 ### RU Direct
 
@@ -196,10 +196,10 @@ Backend: `POST /api/routing-presets/apply`.
 - **Режим портов** — только эти / кроме этих.
 - **Домены, зоны и IP** — `geosite:youtube`, `googlevideo.com`, `geoip:us`, `ip-asn:15169`, `ru`, `xn--p1ai`.
 - Chips сервисов добавляют entries в textarea.
-- **+ Добавить правило** — сохраняет весь массив правил через `POST /api/routing/rules`.
+- **+ Добавить правило** — сохраняет весь массив правил через `POST /api/routing/rules` с `apply:true`.
 - Таблица правил поддерживает inline-редактирование ячеек.
 - **MATCH row** — финальное правило `MATCH,proxy` или `MATCH,direct`. `direct` запрещён backend'ом, если пользовательских правил нет.
-- **⬆ Применить** — `POST /api/routing/apply`.
+- **⬆ Применить** — `POST /api/routing/apply` остаётся ручным recovery/advanced-действием; обычные CRUD-действия правил применяются сразу.
 
 **Статус: частично исправлено в коде.** Удаление правила теперь показывает временный undo-блок на 15 секунд вместо confirm-dialog. Inline-редактирование по-прежнему сохраняет на blur — это осознанная UX-модель, но требует аккуратности.
 
@@ -248,6 +248,8 @@ Backend: `POST /api/routing-presets/apply`.
 - **Сброс Fake-IP** — `POST /api/mihomo-api/cache/fakeip/flush`.
 - **Сброс DNS** — `POST /api/mihomo-api/cache/dns/flush`.
 - **Закрыть все соединения** — `POST /api/mihomo-api/connections/close` с `{scope:'all'}`.
+- **Перезагрузить ресурс** в таблице соединений — `POST /api/mihomo-api/connections/close` с `{resource}`; backend сам определяет host/IP и закрывает совпавшие соединения.
+- **Назначить маршрут ресурсу** в таблице соединений — `POST /api/routing/resource-route` с `{resource,target,close_connections:true}`; backend создаёт/обновляет правило, применяет конфиг и закрывает старые соединения ресурса.
 - Таблица групп прокси — `GET /api/mihomo-api/proxies`.
 - Активные соединения — `GET /api/mihomo-api/connections`.
 - EC API raw buttons — должны показывать raw JSON из Mihomo EC.

@@ -4134,9 +4134,10 @@ fn dispatch(method: &str, path: &str, body: &str, daemon: &Daemon) -> (u16, &'st
         ("GET", "/api/routing") => handle_routing_get(daemon),
         ("POST", "/api/routing/settings") => handle_routing_settings(body, daemon),
         ("POST", "/api/routing/rules") => handle_routing_rules(body, daemon),
+        ("POST", "/api/routing/resource-route") => handle_routing_resource_route(body, daemon),
         ("POST", "/api/routing/catalog/refresh") => handle_routing_catalog_refresh(body, daemon),
         ("POST", "/api/routing/apply") => handle_routing_apply(daemon),
-        ("POST", "/api/routing/reset") => handle_routing_reset(daemon),
+        ("POST", "/api/routing/reset") => handle_routing_reset(body, daemon),
         ("GET", "/api/routing-presets") => handle_routing_presets_list(),
         ("POST", "/api/routing-presets/apply") => handle_routing_preset_apply(body, daemon),
         ("GET", "/api/geo/providers") => handle_geo_providers(),
@@ -7334,132 +7335,158 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
             json!({"error": "invalid JSON body"}).to_string(),
         );
     };
-    let mut inner = lock(&daemon.inner);
-    if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
-        inner.state.split_routing.enabled = v;
-        // Transparent proxy requires DNS — force enabled alongside
-        // split routing so the state matches the firewall DNAT rules.
-        if v {
-            inner.state.dns_settings.enabled = true;
+    let apply_requested = value.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    let (previous_state, settings) = {
+        let mut inner = lock(&daemon.inner);
+        let previous_state = inner.state.clone();
+        if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
+            inner.state.split_routing.enabled = v;
+            // Transparent proxy requires DNS — force enabled alongside
+            // split routing so the state matches the firewall DNAT rules.
+            if v {
+                inner.state.dns_settings.enabled = true;
+            }
         }
-    }
-    if let Some(v) = value.get("auto_switch").and_then(Value::as_bool) {
-        inner.state.split_routing.auto_switch = v;
-    }
-    if let Some(v) = value.get("block_quic_global").and_then(Value::as_bool) {
-        inner.state.split_routing.block_quic_global = v;
-    }
-    if let Some(v) = value.get("rule_source").and_then(Value::as_str) {
-        inner.state.split_routing.rule_source = v.trim().to_owned();
-    }
-    if let Some(v) = value
-        .get("vpn_subnet")
-        .and_then(Value::as_str)
-        .filter(|v| !v.trim().is_empty())
-    {
-        inner.state.split_routing.vpn_subnet = v.trim().to_owned();
-    }
-    if let Some(v) = value.get("redirect_port").and_then(Value::as_u64) {
-        inner.state.split_routing.redirect_port = v as u16;
-    }
-    if let Some(v) = value
-        .get("policy_name")
-        .and_then(Value::as_str)
-        .filter(|v| !v.trim().is_empty())
-    {
-        inner.state.split_routing.policy_name = v.trim().to_owned();
-    }
-    if let Some(v) = value.get("quic_mode").and_then(Value::as_str) {
-        inner.state.split_routing.quic_mode = match v {
-            "proxy" => QuicMode::Proxy,
-            _ => QuicMode::Block,
-        };
-    }
-    if let Some(v) = value.get("port_mode").and_then(Value::as_str) {
-        inner.state.split_routing.port_mode = match v {
-            "allow_list" => PortMode::AllowList,
-            "deny_list" => PortMode::DenyList,
-            _ => PortMode::All,
-        };
-    }
-    if let Some(v) = value.get("proxy_ports").and_then(Value::as_array) {
-        inner.state.split_routing.proxy_ports = v
-            .iter()
-            .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
-            .filter(|s| !s.is_empty())
-            .collect();
-    }
-    if let Some(v) = value.get("bypass_ports").and_then(Value::as_array) {
-        inner.state.split_routing.bypass_ports = v
-            .iter()
-            .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
-            .filter(|s| !s.is_empty())
-            .collect();
-    }
-    if let Some(v) = value.get("geo_asset_path").and_then(Value::as_str) {
-        inner.state.split_routing.geo_asset_path = v.trim().to_owned();
-    }
-    if let Some(v) = value.get("ru_direct_mode").and_then(Value::as_str) {
-        inner.state.split_routing.ru_direct_mode = v.trim().to_owned();
-    }
-    if let Some(v) = value.get("ru_direct_exceptions").and_then(Value::as_array) {
-        inner.state.split_routing.ru_direct_exceptions = v
-            .iter()
-            .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
-            .filter(|s| !s.is_empty())
-            .collect();
-    }
-    if let Some(v) = value
-        .get("auto_vpn_learning_enabled")
-        .and_then(Value::as_bool)
-    {
-        inner.state.split_routing.auto_vpn_learning_enabled = v;
-    }
-    if let Some(v) = value.get("auto_vpn_exceptions").and_then(Value::as_array) {
-        let items: Vec<String> = v
-            .iter()
-            .filter_map(|item| normalize_auto_vpn_domain(item.as_str()?))
-            .collect();
-        inner.state.split_routing.auto_vpn_exceptions = dedup_limited_domains(items);
-        prune_auto_vpn_metadata(&mut inner.state.split_routing);
-    }
-    if let Some(v) = value.get("match_target").and_then(Value::as_str) {
-        let target = v.trim().to_ascii_lowercase();
-        // Validate: when no routing rules exist, can't set to "direct"
-        // (would leave router with no VPN routing at all).
-        if target == "direct" && inner.state.routing_rules.is_empty() {
-            return (
+        if let Some(v) = value.get("auto_switch").and_then(Value::as_bool) {
+            inner.state.split_routing.auto_switch = v;
+        }
+        if let Some(v) = value.get("block_quic_global").and_then(Value::as_bool) {
+            inner.state.split_routing.block_quic_global = v;
+        }
+        if let Some(v) = value.get("rule_source").and_then(Value::as_str) {
+            inner.state.split_routing.rule_source = v.trim().to_owned();
+        }
+        if let Some(v) = value
+            .get("vpn_subnet")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+        {
+            inner.state.split_routing.vpn_subnet = v.trim().to_owned();
+        }
+        if let Some(v) = value.get("redirect_port").and_then(Value::as_u64) {
+            inner.state.split_routing.redirect_port = v as u16;
+        }
+        if let Some(v) = value
+            .get("policy_name")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+        {
+            inner.state.split_routing.policy_name = v.trim().to_owned();
+        }
+        if let Some(v) = value.get("quic_mode").and_then(Value::as_str) {
+            inner.state.split_routing.quic_mode = match v {
+                "proxy" => QuicMode::Proxy,
+                _ => QuicMode::Block,
+            };
+        }
+        if let Some(v) = value.get("port_mode").and_then(Value::as_str) {
+            inner.state.split_routing.port_mode = match v {
+                "allow_list" => PortMode::AllowList,
+                "deny_list" => PortMode::DenyList,
+                _ => PortMode::All,
+            };
+        }
+        if let Some(v) = value.get("proxy_ports").and_then(Value::as_array) {
+            inner.state.split_routing.proxy_ports = v
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Some(v) = value.get("bypass_ports").and_then(Value::as_array) {
+            inner.state.split_routing.bypass_ports = v
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Some(v) = value.get("geo_asset_path").and_then(Value::as_str) {
+            inner.state.split_routing.geo_asset_path = v.trim().to_owned();
+        }
+        if let Some(v) = value.get("ru_direct_mode").and_then(Value::as_str) {
+            inner.state.split_routing.ru_direct_mode = v.trim().to_owned();
+        }
+        if let Some(v) = value.get("ru_direct_exceptions").and_then(Value::as_array) {
+            inner.state.split_routing.ru_direct_exceptions = v
+                .iter()
+                .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Some(v) = value
+            .get("auto_vpn_learning_enabled")
+            .and_then(Value::as_bool)
+        {
+            inner.state.split_routing.auto_vpn_learning_enabled = v;
+        }
+        if let Some(v) = value.get("auto_vpn_exceptions").and_then(Value::as_array) {
+            let items: Vec<String> = v
+                .iter()
+                .filter_map(|item| normalize_auto_vpn_domain(item.as_str()?))
+                .collect();
+            inner.state.split_routing.auto_vpn_exceptions = dedup_limited_domains(items);
+            prune_auto_vpn_metadata(&mut inner.state.split_routing);
+        }
+        if let Some(v) = value.get("match_target").and_then(Value::as_str) {
+            let target = v.trim().to_ascii_lowercase();
+            // Validate: when no routing rules exist, can't set to "direct"
+            // (would leave router with no VPN routing at all).
+            if target == "direct" && inner.state.routing_rules.is_empty() {
+                return (
                 400,
                 "application/json",
                 json!({"error": "нельзя установить MATCH,direct когда нет правил маршрутизации — весь трафик пойдёт напрямую"}).to_string(),
             );
+            }
+            inner.state.split_routing.match_target = if target == "direct" {
+                "direct".to_owned()
+            } else {
+                "proxy".to_owned()
+            };
         }
-        inner.state.split_routing.match_target = if target == "direct" {
-            "direct".to_owned()
-        } else {
-            "proxy".to_owned()
+        if let Some(v) = value.get("rkn_bypass_enabled").and_then(Value::as_bool) {
+            inner.state.split_routing.rkn_bypass_enabled = v;
+        }
+        if let Some(v) = value.get("rkn_bypass_url").and_then(Value::as_str) {
+            inner.state.split_routing.rkn_bypass_url = v.trim().to_owned();
+        }
+        if let Some(v) = value.get("rkn_bypass_interval").and_then(Value::as_u64) {
+            inner.state.split_routing.rkn_bypass_interval = v as u32;
+        }
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("persist state: {error}")}).to_string(),
+            );
+        }
+        (previous_state, inner.state.split_routing.clone())
+    };
+    if apply_requested {
+        return match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
+            Ok(result) => (
+                200,
+                "application/json",
+                json!({
+                    "settings": settings,
+                    "applied": true,
+                    "core_status": result.core_status,
+                    "firewall_status": result.firewall_status,
+                    "generation": result.generation,
+                    "gc_warning": result.gc_warning,
+                })
+                .to_string(),
+            ),
+            Err(error) => {
+                let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
+                json_error(500, &format!("{error}; state rollback: {rollback}"))
+            }
         };
-    }
-    if let Some(v) = value.get("rkn_bypass_enabled").and_then(Value::as_bool) {
-        inner.state.split_routing.rkn_bypass_enabled = v;
-    }
-    if let Some(v) = value.get("rkn_bypass_url").and_then(Value::as_str) {
-        inner.state.split_routing.rkn_bypass_url = v.trim().to_owned();
-    }
-    if let Some(v) = value.get("rkn_bypass_interval").and_then(Value::as_u64) {
-        inner.state.split_routing.rkn_bypass_interval = v as u32;
-    }
-    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
-        return (
-            500,
-            "application/json",
-            json!({"error": format!("persist state: {error}")}).to_string(),
-        );
     }
     (
         200,
         "application/json",
-        json!({"settings": inner.state.split_routing}).to_string(),
+        json!({"settings": settings, "applied": false, "requires_apply": true}).to_string(),
     )
 }
 
@@ -7471,6 +7498,7 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
             json!({"error": "invalid JSON body"}).to_string(),
         );
     };
+    let apply_requested = value.get("apply").and_then(Value::as_bool).unwrap_or(false);
     let rules_value = value.get("rules").cloned().unwrap_or(value);
     let Ok(mut rules) = serde_json::from_value::<Vec<RoutingRule>>(rules_value) else {
         return (
@@ -7496,25 +7524,294 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
     if let Err(error) = validate_router_routing_rules(&rules) {
         return (400, "application/json", json!({"error": error}).to_string());
     }
-    let mut inner = lock(&daemon.inner);
-    sync_server_route_registry(&mut inner.state);
-    if let Err(error) = validate_routing_targets(&inner.state, &rules, &inner.state.device_routes) {
-        return (400, "application/json", json!({"error": error}).to_string());
+    let (previous_state, saved_rules) = {
+        let mut inner = lock(&daemon.inner);
+        let mut candidate = inner.state.clone();
+        sync_server_route_registry(&mut candidate);
+        if let Err(error) = validate_routing_targets(&candidate, &rules, &candidate.device_routes) {
+            return (400, "application/json", json!({"error": error}).to_string());
+        }
+        let previous_state = inner.state.clone();
+        push_undo_snapshot(&mut inner.state, "Replace routing rules");
+        inner.state.server_route_registry = candidate.server_route_registry;
+        inner.state.routing_rules = rules;
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("persist state: {error}")}).to_string(),
+            );
+        }
+        (previous_state, inner.state.routing_rules.clone())
+    };
+
+    if apply_requested {
+        return match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
+            Ok(result) => (
+                200,
+                "application/json",
+                json!({
+                    "rules": saved_rules,
+                    "applied": true,
+                    "core_status": result.core_status,
+                    "firewall_status": result.firewall_status,
+                    "generation": result.generation,
+                    "gc_warning": result.gc_warning,
+                })
+                .to_string(),
+            ),
+            Err(error) => {
+                let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
+                json_error(500, &format!("{error}; state rollback: {rollback}"))
+            }
+        };
     }
-    push_undo_snapshot(&mut inner.state, "Replace routing rules");
-    inner.state.routing_rules = rules;
-    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
-        return (
-            500,
-            "application/json",
-            json!({"error": format!("persist state: {error}")}).to_string(),
-        );
-    }
+
     (
         200,
         "application/json",
-        json!({"rules": inner.state.routing_rules}).to_string(),
+        json!({"rules": saved_rules, "applied": false, "requires_apply": true}).to_string(),
     )
+}
+
+fn restore_state_after_failed_policy_change(
+    daemon: &Daemon,
+    previous_state: HincyrayState,
+) -> String {
+    let mut inner = lock(&daemon.inner);
+    inner.state = previous_state;
+    match persist_state(&daemon.state_path, &inner.state) {
+        Ok(()) => "restored".to_owned(),
+        Err(error) => format!("failed ({error})"),
+    }
+}
+
+fn handle_routing_resource_route(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "invalid JSON body"}).to_string(),
+        );
+    };
+    let Some(raw_resource) = value
+        .get("resource")
+        .or_else(|| value.get("site"))
+        .or_else(|| value.get("host"))
+        .and_then(Value::as_str)
+    else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "missing resource"}).to_string(),
+        );
+    };
+    let Some(resource) = normalize_routing_resource(raw_resource) else {
+        return (
+            400,
+            "application/json",
+            json!({"error": "resource is not a routable host or IP"}).to_string(),
+        );
+    };
+    let target = value
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or("active")
+        .trim()
+        .to_owned();
+    if let Err(error) = RoutingTarget::parse(&target) {
+        return (400, "application/json", json!({"error": error}).to_string());
+    }
+
+    let source_ip = value.get("source_ip").and_then(Value::as_str);
+    let close_connections = value
+        .get("close_connections")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let rule_name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Resource route: {}", resource.value));
+
+    let previous_state = {
+        let mut inner = lock(&daemon.inner);
+        let mut candidate = inner.state.clone();
+        sync_server_route_registry(&mut candidate);
+        push_undo_snapshot(&mut candidate, format!("Route resource {}", resource.value));
+        upsert_resource_routing_rule(&mut candidate.routing_rules, &resource, &target, &rule_name);
+        if let Err(error) = validate_router_routing_rules(&candidate.routing_rules) {
+            return (400, "application/json", json!({"error": error}).to_string());
+        }
+        if let Err(error) = validate_routing_targets(
+            &candidate,
+            &candidate.routing_rules,
+            &candidate.device_routes,
+        ) {
+            return (400, "application/json", json!({"error": error}).to_string());
+        }
+        let previous_state = inner.state.clone();
+        inner.state = candidate;
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("persist state: {error}")}).to_string(),
+            );
+        }
+        previous_state
+    };
+
+    let activation = match activate_current_config(daemon, false, true, GeoBaseProjection::Desired)
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
+            return json_error(500, &format!("{error}; state rollback: {rollback}"));
+        }
+    };
+
+    let close_result = if close_connections {
+        close_resource_connections(daemon, &resource, source_ip)
+    } else {
+        ResourceCloseResult::default()
+    };
+
+    let close_ok = close_result.errors.is_empty();
+    let status = if close_ok { 200 } else { 207 };
+    let response = json!({
+        "ok": close_ok,
+        "resource": resource.value,
+        "resource_kind": resource.kind.as_str(),
+        "target": target,
+        "rule_name": rule_name,
+        "applied": true,
+        "core_status": activation.core_status,
+        "firewall_status": activation.firewall_status,
+        "generation": activation.generation,
+        "closed_connections": close_result.closed,
+        "close_errors": close_result.errors,
+        "gc_warning": activation.gc_warning,
+    });
+    (status, "application/json", response.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutingResourceKind {
+    Domain,
+    Ip,
+}
+
+impl RoutingResourceKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Domain => "domain",
+            Self::Ip => "ip",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RoutingResource {
+    kind: RoutingResourceKind,
+    value: String,
+}
+
+#[derive(Default)]
+struct ResourceCloseResult {
+    closed: usize,
+    errors: Vec<String>,
+}
+
+fn normalize_routing_resource(raw: &str) -> Option<RoutingResource> {
+    let mut value = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    if value.is_empty() || value == "—" {
+        return None;
+    }
+    if let Some(stripped) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+        && let Some(host) = stripped.split('/').next()
+    {
+        value = host.to_owned();
+    }
+    if value.starts_with('[')
+        && let Some(end) = value.find(']')
+    {
+        value = value[1..end].to_owned();
+    } else if let Some((host, port)) = value.rsplit_once(':')
+        && !host.contains(':')
+        && port.bytes().all(|b| b.is_ascii_digit())
+    {
+        value = host.to_owned();
+    }
+    let value = value.trim().trim_end_matches('.').to_owned();
+    if value.is_empty() {
+        return None;
+    }
+    if value.parse::<IpAddr>().is_ok() {
+        return Some(RoutingResource {
+            kind: RoutingResourceKind::Ip,
+            value,
+        });
+    }
+    if value.contains('.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+    {
+        return Some(RoutingResource {
+            kind: RoutingResourceKind::Domain,
+            value,
+        });
+    }
+    None
+}
+
+fn upsert_resource_routing_rule(
+    rules: &mut Vec<RoutingRule>,
+    resource: &RoutingResource,
+    target: &str,
+    rule_name: &str,
+) {
+    let existing = rules.iter_mut().find(|rule| match resource.kind {
+        RoutingResourceKind::Domain => rule.domains.iter().any(|domain| {
+            normalize_routing_resource(domain).is_some_and(|normalized| {
+                normalized.kind == resource.kind && normalized.value == resource.value
+            })
+        }),
+        RoutingResourceKind::Ip => rule.ips.iter().any(|ip| {
+            normalize_routing_resource(ip).is_some_and(|normalized| {
+                normalized.kind == resource.kind && normalized.value == resource.value
+            })
+        }),
+    });
+    if let Some(rule) = existing {
+        rule.enabled = true;
+        rule.target = target.to_owned();
+        rule.name = if rule.name.trim().is_empty() {
+            rule_name.to_owned()
+        } else {
+            rule.name.trim().to_owned()
+        };
+        return;
+    }
+
+    let mut rule = RoutingRule {
+        enabled: true,
+        name: rule_name.to_owned(),
+        target: target.to_owned(),
+        network: "any".to_owned(),
+        port_mode: "include".to_owned(),
+        ..RoutingRule::default()
+    };
+    match resource.kind {
+        RoutingResourceKind::Domain => rule.domains.push(resource.value.clone()),
+        RoutingResourceKind::Ip => rule.ips.push(resource.value.clone()),
+    }
+    rules.push(rule);
 }
 
 fn handle_routing_catalog_refresh(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
@@ -7571,60 +7868,100 @@ fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
 /// Resets: rkn_bypass, ru_direct, match_target, port_mode, proxy_ports,
 /// quic_mode, routing_rules, raw_rules. Infrastructure settings (enabled,
 /// auto_switch, vpn_subnet, redirect_port, policy_name, geo_asset_path)
-/// are preserved. After resetting state, the caller should POST
-/// /api/routing/apply to regenerate the config and restart the core.
-fn handle_routing_reset(daemon: &Daemon) -> (u16, &'static str, String) {
-    let mut inner = lock(&daemon.inner);
-    push_undo_snapshot(&mut inner.state, "Reset routing defaults");
+/// are preserved. Pass `{"apply":true}` to persist, regenerate the config,
+/// restart the core, and roll state back if activation fails.
+fn handle_routing_reset(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let value = if body.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str::<Value>(body) {
+            Ok(value) => value,
+            Err(error) => return json_error(400, &format!("invalid JSON body: {error}")),
+        }
+    };
+    let apply_requested = value.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    let previous_state = {
+        let mut inner = lock(&daemon.inner);
+        let previous_state = inner.state.clone();
+        push_undo_snapshot(&mut inner.state, "Reset routing defaults");
 
-    // Reset routing policy fields to factory defaults.
-    let s = &mut inner.state.split_routing;
-    s.rkn_bypass_enabled = false;
-    s.rkn_bypass_url = default_rkn_bypass_url();
-    s.rkn_bypass_interval = default_rkn_bypass_interval();
-    s.ru_direct_mode = "off".to_owned();
-    s.ru_direct_exceptions = Vec::new();
-    s.auto_vpn_exceptions = Vec::new();
-    s.auto_vpn_last_checked_unix.clear();
-    s.auto_vpn_learning_enabled = false;
-    s.match_target = "proxy".to_owned();
-    s.port_mode = PortMode::AllowList;
-    s.proxy_ports = vec!["80".to_owned(), "443".to_owned()];
-    s.bypass_ports = Vec::new();
-    s.quic_mode = QuicMode::Block;
-    s.block_quic_global = false;
+        // Reset routing policy fields to factory defaults.
+        let s = &mut inner.state.split_routing;
+        s.rkn_bypass_enabled = false;
+        s.rkn_bypass_url = default_rkn_bypass_url();
+        s.rkn_bypass_interval = default_rkn_bypass_interval();
+        s.ru_direct_mode = "off".to_owned();
+        s.ru_direct_exceptions = Vec::new();
+        s.auto_vpn_exceptions = Vec::new();
+        s.auto_vpn_last_checked_unix.clear();
+        s.auto_vpn_learning_enabled = false;
+        s.match_target = "proxy".to_owned();
+        s.port_mode = PortMode::AllowList;
+        s.proxy_ports = vec!["80".to_owned(), "443".to_owned()];
+        s.bypass_ports = Vec::new();
+        s.quic_mode = QuicMode::Block;
+        s.block_quic_global = false;
 
-    // Reset routing rules to just QUIC Block (system-level).
-    inner.state.routing_rules = vec![RoutingRule {
-        enabled: true,
-        name: "QUIC Block".to_owned(),
-        kind: String::new(),
-        pattern: String::new(),
-        target: "reject".to_owned(),
-        domains: Vec::new(),
-        ips: Vec::new(),
-        services: Vec::new(),
-        ports: vec!["443".to_owned()],
-        network: "udp".to_owned(),
-        port_mode: "include".to_owned(),
-    }];
+        // Reset routing rules to just QUIC Block (system-level).
+        inner.state.routing_rules = vec![RoutingRule {
+            enabled: true,
+            name: "QUIC Block".to_owned(),
+            kind: String::new(),
+            pattern: String::new(),
+            target: "reject".to_owned(),
+            domains: Vec::new(),
+            ips: Vec::new(),
+            services: Vec::new(),
+            ports: vec!["443".to_owned()],
+            network: "udp".to_owned(),
+            port_mode: "include".to_owned(),
+        }];
 
-    // Clear user-defined raw Mihomo rules (RKN bypass injects its own).
-    inner.state.mihomo_features.raw_rules = Vec::new();
+        // Clear user-defined raw Mihomo rules (RKN bypass injects its own).
+        inner.state.mihomo_features.raw_rules = Vec::new();
 
-    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
-        return (
-            500,
-            "application/json",
-            json!({"error": format!("persist state: {error}")}).to_string(),
-        );
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("persist state: {error}")}).to_string(),
+            );
+        }
+        previous_state
+    };
+
+    if apply_requested {
+        return match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
+            Ok(result) => (
+                200,
+                "application/json",
+                json!({
+                    "reset": true,
+                    "applied": true,
+                    "core_status": result.core_status,
+                    "firewall_status": result.firewall_status,
+                    "generation": result.generation,
+                    "gc_warning": result.gc_warning,
+                })
+                .to_string(),
+            ),
+            Err(error) => {
+                let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
+                json_error(500, &format!("{error}; state rollback: {rollback}"))
+            }
+        };
     }
 
     (
         200,
         "application/json",
-        json!({"reset": true, "message": "Настройки сброшены к заводским. Нажмите «Применить» для активации."})
-            .to_string(),
+        json!({
+            "reset": true,
+            "applied": false,
+            "requires_apply": true,
+            "message": "Настройки сброшены к заводским. Нажмите «Применить» для активации."
+        })
+        .to_string(),
     )
 }
 
@@ -7667,13 +8004,8 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
         );
     }
 
-    let mut inner = lock(&daemon.inner);
-    push_undo_snapshot(&mut inner.state, format!("Apply preset {preset_id}"));
+    let apply_requested = value.get("apply").and_then(Value::as_bool).unwrap_or(false);
 
-    // v0.16: optional target override. If the request includes a "target"
-    // field, all preset rules get this target instead of their hardcoded
-    // default. This lets the user apply e.g. "ru-direct" with target
-    // "active" (route Russian IPs through VPN) instead of "direct".
     let target_override = value.get("target").and_then(Value::as_str).map(|s| {
         let t = s.trim().to_ascii_lowercase();
         match t.as_str() {
@@ -7682,55 +8014,91 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
         }
     });
 
-    // Add preset rules to existing rules, deduplicating by name. Some
-    // presets intentionally reset the rule list first (for example
-    // "All VPN", where an empty rule list is the actual desired state
-    // before the final MATCH,proxy fallback).
-    let mut existing = if preset.clear_existing {
-        Vec::new()
-    } else {
-        inner.state.routing_rules.clone()
+    let previous_state = {
+        let mut inner = lock(&daemon.inner);
+        let previous_state = inner.state.clone();
+        push_undo_snapshot(&mut inner.state, format!("Apply preset {preset_id}"));
+
+        // Add preset rules to existing rules, deduplicating by name. Some
+        // presets intentionally reset the rule list first (for example
+        // "All VPN", where an empty rule list is the actual desired state
+        // before the final MATCH,proxy fallback).
+        let mut existing = if preset.clear_existing {
+            Vec::new()
+        } else {
+            inner.state.routing_rules.clone()
+        };
+        for rule in &preset.rules {
+            if !existing.iter().any(|r| r.name == rule.name) {
+                let mut rule = rule.clone();
+                if let Some(ref target) = target_override {
+                    rule.target = target.clone();
+                }
+                existing.push(rule);
+            }
+        }
+        inner.state.routing_rules = existing;
+
+        // Apply optional port mode change.
+        if let Some(ref mode) = preset.port_mode {
+            match mode.as_str() {
+                "all" => inner.state.split_routing.port_mode = PortMode::All,
+                "allow_list" => {
+                    inner.state.split_routing.port_mode = PortMode::AllowList;
+                    inner.state.split_routing.proxy_ports =
+                        preset.proxy_ports.iter().map(|s| s.to_string()).collect();
+                }
+                "deny_list" => {
+                    inner.state.split_routing.port_mode = PortMode::DenyList;
+                }
+                _ => {}
+            }
+        }
+
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            return (
+                500,
+                "application/json",
+                json!({"error": format!("persist state: {error}")}).to_string(),
+            );
+        }
+        previous_state
     };
-    for rule in &preset.rules {
-        if !existing.iter().any(|r| r.name == rule.name) {
-            let mut rule = rule.clone();
-            if let Some(ref target) = target_override {
-                rule.target = target.clone();
-            }
-            existing.push(rule);
-        }
-    }
-    inner.state.routing_rules = existing;
 
-    // Apply optional port mode change.
-    if let Some(ref mode) = preset.port_mode {
-        match mode.as_str() {
-            "all" => inner.state.split_routing.port_mode = PortMode::All,
-            "allow_list" => {
-                inner.state.split_routing.port_mode = PortMode::AllowList;
-                inner.state.split_routing.proxy_ports =
-                    preset.proxy_ports.iter().map(|s| s.to_string()).collect();
+    if apply_requested {
+        return match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
+            Ok(result) => (
+                200,
+                "application/json",
+                json!({
+                    "saved": true,
+                    "applied": true,
+                    "preset": preset.id,
+                    "rules_added": preset.rules.len(),
+                    "rules_cleared": preset.clear_existing,
+                    "port_mode": preset.port_mode,
+                    "target_override": target_override,
+                    "core_status": result.core_status,
+                    "firewall_status": result.firewall_status,
+                    "generation": result.generation,
+                    "gc_warning": result.gc_warning,
+                })
+                .to_string(),
+            ),
+            Err(error) => {
+                let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
+                json_error(500, &format!("{error}; state rollback: {rollback}"))
             }
-            "deny_list" => {
-                inner.state.split_routing.port_mode = PortMode::DenyList;
-            }
-            _ => {}
-        }
-    }
-
-    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
-        return (
-            500,
-            "application/json",
-            json!({"error": format!("persist state: {error}")}).to_string(),
-        );
+        };
     }
 
     (
         200,
         "application/json",
         json!({
-            "applied": true,
+            "saved": true,
+            "applied": false,
+            "requires_apply": true,
             "preset": preset.id,
             "rules_added": preset.rules.len(),
             "rules_cleared": preset.clear_existing,
@@ -9455,16 +9823,24 @@ fn handle_mihomo_api_optional_forward_post(
 /// Close Mihomo connections. Body:
 /// - `{ "scope": "all" }` closes all connections via verified `DELETE /connections`.
 /// - `{ "id": "..." }` closes one observed connection id.
-/// - `{ "host": "example.com" }` or `{ "source_ip": "192.168.2.35" }`
+/// - `{ "resource": "example.com" }`, `{ "host": "example.com" }`,
+///   `{ "destination_ip": "1.2.3.4" }`, or `{ "source_ip": "192.168.2.35" }`
 ///   first reads `/connections`, filters by observed metadata, then closes
 ///   matching ids. The UI never has to predict connection ids for grouped
 ///   operations.
 fn handle_mihomo_api_connections_close(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let value = if body.trim().is_empty() {
+        json!({"scope":"all"})
+    } else {
+        match serde_json::from_str::<Value>(body) {
+            Ok(value) => value,
+            Err(error) => return json_error(400, &format!("invalid JSON body: {error}")),
+        }
+    };
     let (addr, secret) = match mihomo_controller_for_daemon(daemon) {
         Ok(ec) => ec,
         Err(response) => return response,
     };
-    let value = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({"scope":"all"}));
     let scope = value.get("scope").and_then(Value::as_str).unwrap_or("");
     if scope == "all" || value == json!({}) {
         return match mihomo_api_delete(&addr, secret.as_deref(), "/connections") {
@@ -9491,11 +9867,37 @@ fn handle_mihomo_api_connections_close(body: &str, daemon: &Daemon) -> (u16, &'s
                 json!({"error": "could not read Mihomo connections"}).to_string(),
             );
         };
-        filter_connection_ids(
-            &conns,
-            value.get("host").and_then(Value::as_str),
-            value.get("source_ip").and_then(Value::as_str),
-        )
+        let resource = value
+            .get("resource")
+            .or_else(|| value.get("site"))
+            .and_then(Value::as_str)
+            .and_then(normalize_routing_resource);
+        let source_ip = value.get("source_ip").and_then(Value::as_str);
+        let (host, destination_ip) = if let Some(resource) = resource.as_ref() {
+            match resource.kind {
+                RoutingResourceKind::Domain => (Some(resource.value.as_str()), None),
+                RoutingResourceKind::Ip => (None, Some(resource.value.as_str())),
+            }
+        } else {
+            (
+                value.get("host").and_then(Value::as_str),
+                value
+                    .get("destination_ip")
+                    .or_else(|| value.get("ip"))
+                    .and_then(Value::as_str),
+            )
+        };
+        let has_filter = host.is_some_and(|v| !v.trim().is_empty())
+            || destination_ip.is_some_and(|v| !v.trim().is_empty())
+            || source_ip.is_some_and(|v| !v.trim().is_empty());
+        if !has_filter {
+            return (
+                400,
+                "application/json",
+                json!({"error": "missing connection filter or scope=all"}).to_string(),
+            );
+        }
+        filter_connection_ids(&conns, host, destination_ip, source_ip)
     };
 
     let mut closed = 0usize;
@@ -9533,10 +9935,12 @@ fn mihomo_controller_for_daemon(
 fn filter_connection_ids(
     conns: &Value,
     host: Option<&str>,
+    destination_ip: Option<&str>,
     source_ip: Option<&str>,
 ) -> Vec<String> {
-    let host = host.unwrap_or("").to_ascii_lowercase();
-    let source_ip = source_ip.unwrap_or("");
+    let host = host.unwrap_or("").trim().to_ascii_lowercase();
+    let destination_ip = destination_ip.unwrap_or("").trim();
+    let source_ip = source_ip.unwrap_or("").trim();
     conns
         .get("connections")
         .and_then(Value::as_array)
@@ -9553,14 +9957,65 @@ fn filter_connection_ids(
                 .get("sourceIP")
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            let conn_destination = metadata
+                .get("destinationIP")
+                .or_else(|| metadata.get("remoteDestination"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let host_ok =
                 host.is_empty() || conn_host == host || conn_host.ends_with(&format!(".{host}"));
+            let destination_ok = destination_ip.is_empty() || conn_destination == destination_ip;
             let source_ok = source_ip.is_empty() || conn_source == source_ip;
-            (host_ok && source_ok)
+            (host_ok && destination_ok && source_ok)
                 .then(|| conn.get("id").and_then(Value::as_str).map(str::to_owned))
                 .flatten()
         })
         .collect()
+}
+
+fn close_resource_connections(
+    daemon: &Daemon,
+    resource: &RoutingResource,
+    source_ip: Option<&str>,
+) -> ResourceCloseResult {
+    let (addr, secret) = match mihomo_controller_for_daemon(daemon) {
+        Ok(ec) => ec,
+        Err((_, _, body)) => {
+            return ResourceCloseResult {
+                closed: 0,
+                errors: vec![body],
+            };
+        }
+    };
+    let conns = match mihomo_api_get_json(&addr, secret.as_deref(), "/connections") {
+        Ok(value) => value,
+        Err(error) => {
+            return ResourceCloseResult {
+                closed: 0,
+                errors: vec![format!("could not read Mihomo connections: {error}")],
+            };
+        }
+    };
+    let ids = match resource.kind {
+        RoutingResourceKind::Domain => {
+            filter_connection_ids(&conns, Some(&resource.value), None, source_ip)
+        }
+        RoutingResourceKind::Ip => {
+            filter_connection_ids(&conns, None, Some(&resource.value), source_ip)
+        }
+    };
+    let mut result = ResourceCloseResult::default();
+    for id in ids {
+        let path = format!(
+            "/connections/{}",
+            utf8_percent_encode(&id, NON_ALPHANUMERIC)
+        );
+        match mihomo_api_delete(&addr, secret.as_deref(), &path) {
+            Ok(_) => result.closed += 1,
+            Err(error) => result.errors.push(format!("{id}: {error}")),
+        }
+    }
+    result
 }
 
 /// Forward `GET /proxies/{name}/delay` to the Mihomo external controller.
@@ -19577,13 +20032,55 @@ mod tests {
             ]
         });
         assert_eq!(
-            filter_connection_ids(&conns, Some("example.com"), None),
+            filter_connection_ids(&conns, Some("example.com"), None, None),
             vec!["a"]
         );
         assert_eq!(
-            filter_connection_ids(&conns, None, Some("192.168.2.3")),
+            filter_connection_ids(&conns, None, None, Some("192.168.2.3")),
             vec!["b"]
         );
+    }
+
+    #[test]
+    fn filter_connection_ids_matches_remote_destination_ip_and_source() {
+        let conns = json!({
+            "connections": [
+                {"id":"a", "metadata":{"host":"", "remoteDestination":"1.2.3.4", "sourceIP":"192.168.2.2"}},
+                {"id":"b", "metadata":{"host":"", "destinationIP":"1.2.3.4", "sourceIP":"192.168.2.3"}},
+                {"id":"c", "metadata":{"host":"", "remoteDestination":"5.6.7.8", "sourceIP":"192.168.2.2"}}
+            ]
+        });
+        assert_eq!(
+            filter_connection_ids(&conns, None, Some("1.2.3.4"), Some("192.168.2.2")),
+            vec!["a"]
+        );
+        assert_eq!(
+            filter_connection_ids(&conns, None, Some("1.2.3.4"), None),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn normalize_routing_resource_classifies_urls_hosts_and_ips() {
+        let url = normalize_routing_resource("https://Api.Example.COM:443/path").expect("url");
+        assert_eq!(url.kind, RoutingResourceKind::Domain);
+        assert_eq!(url.value, "api.example.com");
+
+        let ip = normalize_routing_resource("212.193.155.88:443").expect("ip");
+        assert_eq!(ip.kind, RoutingResourceKind::Ip);
+        assert_eq!(ip.value, "212.193.155.88");
+
+        let ipv6 = normalize_routing_resource("[2001:db8::1]:443").expect("ipv6");
+        assert_eq!(ipv6.kind, RoutingResourceKind::Ip);
+        assert_eq!(ipv6.value, "2001:db8::1");
+    }
+
+    #[test]
+    fn close_connections_rejects_invalid_json_before_external_controller_lookup() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = handle_mihomo_api_connections_close("{", &daemon);
+        assert_eq!(status, 400);
+        assert!(body.contains("invalid JSON body"), "body: {body}");
     }
 
     #[test]
@@ -20066,7 +20563,7 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
             });
             inner.state.mihomo_features.raw_rules = vec!["DOMAIN-SUFFIX,test.com,proxy".to_owned()];
         }
-        let (status, _, _body) = handle_routing_reset(&daemon);
+        let (status, _, _body) = handle_routing_reset("{}", &daemon);
         assert_eq!(status, 200);
         {
             let inner = lock(&daemon.inner);

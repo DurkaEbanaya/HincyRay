@@ -84,7 +84,7 @@ Web UI sharing and audit hardening:
 ### v0.17.0
 
 - **RKN Bypass**: automatic routing of domains blocked in Russia through proxy. Uses `itworksig/rublacklist` (auto-updated via GitHub Actions, 744K+ rules) as a Mihomo rule provider. The list is downloaded through the proxy itself and refreshed every 24 hours. Russian IPs (`GEOIP,RU`) and Chinese IPs (`GEOIP,CN`) are routed direct to avoid unnecessary proxy load. Toggle on/off in the WebUI with configurable URL and update interval.
-- **Reset to factory defaults**: one-click reset button restores the default routing policy — RKN Bypass on, RU Direct (geosite), MATCH,proxy, AllowList ports 80/443, QUIC Block rule, all user rules and raw rules cleared. The reset endpoint (`POST /api/routing/reset`) persists state; the WebUI then calls `/api/routing/apply` to regenerate the config and restart the core.
+- **Reset to factory defaults**: one-click reset button restores the default routing policy — RKN Bypass on, RU Direct (geosite), MATCH,proxy, AllowList ports 80/443, QUIC Block rule, all user rules and raw rules cleared. The WebUI calls `POST /api/routing/reset` with `{"apply":true}`, so state persistence, config regeneration, core restart, and rollback on activation failure are one backend transaction.
 - **Configurable sniffer override-destination**: toggle in the DNS section to control Mihomo's `override-destination` sniffer setting. Default `true` — ensures domain rules match even when clients use DoH/DoT (SNI is extracted into the destination field). `saveDns()` now calls `/api/routing/apply` after saving so DNS changes take effect immediately.
 - 339 tests, 0 clippy warnings.
 - Router E2E verified on Keenetic Giga: bypass list downloaded (24 MB, 744,070 rules, ~5s), Mihomo RSS 157 MB, toggle on/off verified in config, reset restores factory defaults.
@@ -177,7 +177,7 @@ Web UI sharing and audit hardening:
 - **Diagnostics & Recovery**: web panel section for rule trace, DNS diagnostics, unlock checks, Sub-Store Lite, backups, WebDAV, and connection closing.
 - **Unlock checker + DNS diagnostics**: `POST /api/unlock-check` probes common services; `GET /api/dns/diagnostics` checks local resolver behavior and Mihomo DNS/API availability.
 - **Scheduled maintenance**: watchdog can periodically create backups, refresh subscriptions, restart Mihomo, and close connections.
-- **Connection control**: `POST /api/mihomo-api/connections/close` closes all connections or filters by connection id, host, or source IP.
+- **Connection control**: `POST /api/mihomo-api/connections/close` closes all connections or filters by connection id, routable resource (`resource` host/IP), host, destination IP, or source IP.
 - **External Controller wildcard fix**: daemon dials loopback for wildcard EC binds (`0.0.0.0`, `[::]`, `:port`). RU Direct presets now use `geoip:RU` only to avoid missing `geosite:ru` datasets.
 
 ### v0.13.0
@@ -350,11 +350,12 @@ Fluent/Acrylic design with 7 navigation groups, 24 sidebar items, RU/EN i18n, li
 | `POST` | `/api/subscriptions/refresh-one` | Refresh a single subscription by URL |
 | `POST` | `/api/subscriptions/delete` | Delete a subscription and its profiles |
 | `GET` | `/api/routing` | Routing settings + rules + catalog |
-| `POST` | `/api/routing/settings` | Save routing settings |
-| `POST` | `/api/routing/rules` | Save routing rules |
+| `POST` | `/api/routing/settings` | Save routing settings; `{"apply":true}` saves + applies atomically |
+| `POST` | `/api/routing/rules` | Save routing rules; `{"rules":[...],"apply":true}` saves + applies atomically |
 | `POST` | `/api/routing/apply` | Regenerate config + restart core + restart firewall |
+| `POST` | `/api/routing/resource-route` | Create/update a rule for observed host/IP resource, apply config, optionally close matching connections |
 | `GET` | `/api/routing-presets` | Built-in routing presets |
-| `POST` | `/api/routing-presets/apply` | Apply a routing preset |
+| `POST` | `/api/routing-presets/apply` | Save a routing preset; `{"apply":true}` saves + applies atomically |
 | `POST` | `/api/routing/trace` | Explain local routing decision for a host/IP/port/source request |
 | `GET` | `/api/routing/firewall-status` | Firewall/iptables/ndm-hook health check |
 | `POST` | `/api/routing/firewall-start` | Start firewall |
@@ -382,7 +383,7 @@ Fluent/Acrylic design with 7 navigation groups, 24 sidebar items, RU/EN i18n, li
 | `POST` | `/api/mihomo-features` | Save MihomoFeatures config |
 | `GET` | `/api/mihomo-api/proxies` | Forward `GET /proxies` to Mihomo REST API |
 | `GET` | `/api/mihomo-api/connections` | Forward `GET /connections` to Mihomo REST API |
-| `POST` | `/api/mihomo-api/connections/close` | Close all/filter-matched Mihomo connections |
+| `POST` | `/api/mihomo-api/connections/close` | Close all/filter-matched Mihomo connections (`scope`, `id`, `resource`, `host`, `destination_ip`, `source_ip`) |
 | `POST` | `/api/mihomo-api/delay` | Test proxy delay via Mihomo API |
 | `GET` | `/api/mihomo-api/traffic` | Forward `GET /traffic` to Mihomo REST API |
 | `GET` | `/api/mihomo-api/memory` | Forward `GET /memory` to Mihomo REST API |

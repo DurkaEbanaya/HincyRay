@@ -84,7 +84,7 @@ Hotfix: страница «Система» теперь явно показыв
 ### v0.17.0
 
 - **Обход блокировок РКН (RKN Bypass)**: автоматическая маршрутизация доменов, заблокированных в РФ, через прокси. Использует список `itworksig/rublacklist` (автообновление через GitHub Actions, 744K+ правил) как Mihomo rule provider. Список скачивается через сам прокси и обновляется каждые 24 часа. Российские IP (`GEOIP,RU`) и китайские IP (`GEOIP,CN`) идут напрямую. Тоггл в WebUI с настраиваемым URL и интервалом обновления.
-- **Сброс к заводским настройкам**: кнопка «↺ Штатные настройки» восстанавливает маршрутизацию по умолчанию — RKN Bypass вкл, RU Direct (geosite), MATCH,proxy, AllowList порты 80/443, правило QUIC Block, все пользовательские правила и raw rules очищены. Endpoint `POST /api/routing/reset` сохраняет state, затем WebUI вызывает `/api/routing/apply` для регенерации конфига и перезапуска ядра.
+- **Сброс к заводским настройкам**: кнопка «↺ Штатные настройки» восстанавливает маршрутизацию по умолчанию — RKN Bypass вкл, RU Direct (geosite), MATCH,proxy, AllowList порты 80/443, правило QUIC Block, все пользовательские правила и raw rules очищены. WebUI вызывает `POST /api/routing/reset` с `{"apply":true}`, поэтому сохранение state, регенерация конфига, перезапуск ядра и rollback при ошибке активации выполняются одной backend-транзакцией.
 - **Настраиваемый sniffer override-destination**: тоггл в секции DNS для управления `override-destination` сниффера Mihomo. По умолчанию `true` — доменные правила работают даже когда клиенты используют DoH/DoT (SNI подставляется в поле назначения). `saveDns()` теперь вызывает `/api/routing/apply` после сохранения, чтобы изменения DNS вступали в силу немедленно.
 - 339 тестов, 0 clippy warnings.
 - Проверено на Keenetic Giga: список скачан (24 МБ, 744 070 правил, ~5 сек), RSS Mihomo 157 МБ, тоггл вкл/выкл проверен в конфиге, сброс восстанавливает заводские настройки.
@@ -145,7 +145,7 @@ Hotfix: страница «Система» теперь явно показыв
 - **Diagnostics & Recovery**: секция веб-панели для rule trace, DNS diagnostics, unlock checks, Sub-Store Lite, бэкапов, WebDAV и закрытия соединений.
 - **Unlock checker + DNS diagnostics**: `POST /api/unlock-check` проверяет популярные сервисы; `GET /api/dns/diagnostics` проверяет локальный resolver и доступность Mihomo DNS/API.
 - **Scheduled maintenance**: watchdog может периодически создавать backup, обновлять подписки, перезапускать Mihomo и закрывать соединения.
-- **Connection control**: `POST /api/mihomo-api/connections/close` закрывает все соединения или фильтрует по id, host, source IP.
+- **Connection control**: `POST /api/mihomo-api/connections/close` закрывает все соединения или фильтрует по id, routable resource (`resource` host/IP), host, destination IP или source IP.
 - **Фикс wildcard External Controller**: демон ходит на loopback при wildcard bind (`0.0.0.0`, `[::]`, `:port`). RU Direct presets теперь используют только `geoip:RU`, чтобы не зависеть от отсутствующего `geosite:ru`.
 
 ### v0.13.0
@@ -318,11 +318,12 @@ Fluent/Acrylic-дизайн с 7 группами навигации, 24 пун�
 | `POST` | `/api/subscriptions/refresh-one` | Обновить отдельную подписку по URL |
 | `POST` | `/api/subscriptions/delete` | Удалить подписку и её профили |
 | `GET` | `/api/routing` | Настройки роутинга + правила + каталог |
-| `POST` | `/api/routing/settings` | Сохранить настройки роутинга |
-| `POST` | `/api/routing/rules` | Сохранить правила роутинга |
+| `POST` | `/api/routing/settings` | Сохранить настройки роутинга; `{"apply":true}` сохраняет и применяет атомарно |
+| `POST` | `/api/routing/rules` | Сохранить правила роутинга; `{"rules":[...],"apply":true}` сохраняет и применяет атомарно |
 | `POST` | `/api/routing/apply` | Перегенерировать конфиг + перезапуск ядра + перезапуск firewall |
+| `POST` | `/api/routing/resource-route` | Создать/обновить правило для наблюдаемого host/IP ресурса, применить конфиг, опционально закрыть совпавшие соединения |
 | `GET` | `/api/routing-presets` | Встроенные routing presets |
-| `POST` | `/api/routing-presets/apply` | Применить routing preset |
+| `POST` | `/api/routing-presets/apply` | Сохранить routing preset; `{"apply":true}` сохраняет и применяет атомарно |
 | `POST` | `/api/routing/trace` | Объяснить локальное решение роутинга для host/IP/port/source запроса |
 | `GET` | `/api/routing/firewall-status` | Проверка здоровья firewall/iptables/ndm-hook |
 | `POST` | `/api/routing/firewall-start` | Запустить firewall |
@@ -350,7 +351,7 @@ Fluent/Acrylic-дизайн с 7 группами навигации, 24 пун�
 | `POST` | `/api/mihomo-features` | Сохранить конфиг MihomoFeatures |
 | `GET` | `/api/mihomo-api/proxies` | Проксирование `GET /proxies` на Mihomo REST API |
 | `GET` | `/api/mihomo-api/connections` | Проксирование `GET /connections` на Mihomo REST API |
-| `POST` | `/api/mihomo-api/connections/close` | Закрыть все/отфильтрованные соединения Mihomo |
+| `POST` | `/api/mihomo-api/connections/close` | Закрыть все/отфильтрованные соединения Mihomo (`scope`, `id`, `resource`, `host`, `destination_ip`, `source_ip`) |
 | `POST` | `/api/mihomo-api/delay` | Тест delay прокси через Mihomo API |
 | `GET` | `/api/mihomo-api/traffic` | Проксирование `GET /traffic` на Mihomo REST API |
 | `GET` | `/api/mihomo-api/memory` | Проксирование `GET /memory` на Mihomo REST API |
