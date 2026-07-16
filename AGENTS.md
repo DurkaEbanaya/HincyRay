@@ -1,135 +1,51 @@
-# Project: HincyRay v0.20.0 (crate `xray-vpn-test`)
+# HincyRay v0.21.6 (`xray-vpn-test`)
 
-Rust crate shipping two binaries: the `hincyray` router daemon for Keenetic/Entware aarch64 and the `xray-vpn-test` desktop diagnostics app (macOS, feature `desktop`). Current router mode uses Mihomo plus iptables NAT REDIRECT/TPROXY; v0.14 adds diagnostics/recovery, Rule Trace, Sub-Store Lite, Smart Auto-Select 2.0, backups/WebDAV, scheduled maintenance, connection close control, and EC wildcard dial safety. Shared parsing/scoring lives in `src/profiles.rs`, `src/scoring.rs`, and `src/xray_config.rs`.
+Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 and the feature-gated `xray-vpn-test` desktop diagnostics app. Router mode uses Mihomo with iptables NAT REDIRECT (TCP 10810) and mangle TPROXY (UDP 10811); there is no TUN/tun2socks path.
 
-Tech stack: Rust 2024, Cargo, `eframe/egui` desktop GUI (feature-gated), `reqwest` blocking client for subscription loading, external `mihomo` binary for router and desktop protocol execution. Router daemon uses iptables NAT REDIRECT (TCP, port 10810) + mangle TPROXY (UDP, port 10811) for transparent proxying via Keenetic traffic policies — no tun2socks, no TUN device. Mihomo config is YAML (via `serde_yaml`).
+## Code map
 
-## Workspace Overview
+- `src/main.rs`, `src/bin/hincyray.rs` — thin entrypoints only.
+- `src/profiles.rs` — profile/share-link parsing and subscription loading. Plain HTTP(S) is a subscription URL; HTTP proxy profiles use `mihomo+http(s)://`.
+- `src/benchmark.rs` — shared Mihomo benchmark, stability, download, and upload execution.
+- `src/scoring.rs` — shared quality scoring.
+- `src/mihomo_config.rs` — router and benchmark Mihomo YAML generation and protocol builders.
+- `src/hincyray.rs` — daemon composition root: persisted state, lifecycle identity, HTTP handlers, transactional activation, watchdog, core/firewall orchestration, Deep Bench, and Dead Servers.
+- `src/geobase.rs` — managed GeoBase storage/generation.
+- `src/hincyray_api.rs` — typed bounded API contracts/OpenAPI.
+- `src/hincyray_mihomo_api.rs` — Mihomo External Controller transport.
+- `src/hincyray_routing.rs` — routing-resource normalization.
+- `src/hincyray_security.rs` — password/session/login security.
+- `src/hincyray_webui.rs`, `src/webui/index.html` — embedded Web UI boundary and asset.
+- `src/tester.rs`, `src/xray_config.rs` — desktop diagnostics; `xray_config.rs` is not used by the router daemon.
+- `scripts/hincyray-install.sh` — transactional installer with lifecycle lock, PID/executable identity checks, and rollback.
+- `scripts/frontend-contract-test.py` — static Web UI/API contract.
+- `scripts/installer-lifecycle-contract-test.py` — installer/init lifecycle contract.
+- `tests/browser/` — fixture-backed Playwright smoke tests.
+- `scripts/router-e2e.sh` — live router smoke suite.
 
-* `src/main.rs` - thin binary entrypoint only.
-* `src/bin/hincyray.rs` - thin binary entrypoint for the Keenetic router daemon.
-* `src/lib.rs` - public module map and `eframe` startup wiring.
-* `src/app.rs` - GUI state, user actions, table sorting, benchmark progress display.
-* `src/profiles.rs` - profile/subscription parsing and subscription HTTP loading. Supports VLESS, VMess, Trojan, Shadowsocks, ShadowsocksR, Snell, HTTP proxy (`mihomo+http(s)://`), SOCKS, AnyTLS, Hysteria v1, Hysteria2, WireGuard, TUIC, SSH, MASQUE, OpenVPN, Tailscale. `HwidConfig` for hardcoded device fingerprint. `decode_vmess_json` for base64-JSON vmess:// links. WireGuard links (`wireguard://`/`wg://`) parsed with private key in username or `privatekey` query param. TUIC links (`tuic://`) parsed with uuid:password userinfo. Plain `http(s)://` remain subscription URLs — HTTP proxy profiles use `mihomo+http(s)://` to avoid collision.
-* `src/scoring.rs` - shared `quality_score` formula reused by `tester.rs` and `hincyray.rs`.
-* `src/xray_config.rs` - shared Xray client config generation for desktop `tester.rs` only. VLESS (Reality + xhttpSettings), VMess, Trojan, Shadowsocks. Hysteria2/WireGuard/TUIC return explicit errors. `RouterExtra` for DNS anti-leak, port routing, geo asset paths. `PortMode` (All/AllowList/DenyList). `QuicMode` (Block/Proxy). `DnsSettings`. Also exposes `query_value`/`percent_decode`/`extract_ss_credentials` to `tester.rs`. NOT used by the router daemon since v0.8.
-* `src/tester.rs` - benchmark result model, sing-box config generation (VLESS/VMess/Trojan/Shadowsocks/Hysteria2), proxy probes, and short download test. Uses `scoring::quality_score` and `xray_config::build_xray_config`. Desktop only. v0.13: Desktop benchmarking now uses Mihomo backend (`run_mihomo_test()`) for all protocols including WireGuard/TUIC. Old `run_xray_test()`/`run_sing_box_test()` kept as dead code reference. `ensure_mihomo_available()` checks `mihomo -v`.
-* `src/mihomo_config.rs` - Mihomo YAML config generation for the router daemon. `build_mihomo_config()` for simple SOCKS proxy, `build_mihomo_router_config()` for transparent proxy (redir + tproxy listeners, sniffer, fake-ip DNS, QUIC block, split routing). Protocol builders for VLESS (Reality + xtls-rprx-vision + ECH + xhttp advanced + mTLS), VMess (ECH + mTLS + ws early-data + grpc), Trojan (ECH + mTLS + ws early-data + grpc), Shadowsocks, ShadowsocksR, Snell, HTTP, SOCKS, AnyTLS, Hysteria v1, Hysteria2, WireGuard, TUIC, SSH, MASQUE, OpenVPN, Tailscale. `RouterExtra` for DNS, port routing, geo asset paths. Redir listener on port 10810 (TCP), tproxy listener on port 10811 (UDP) — separate ports to avoid TCP bind conflict. DNS always included in router config (firewall unconditionally DNATs DNS to 1053). `geo-auto-update: false` to prevent MMDB download hang. v0.9: `MihomoFeatures` master struct for all opt-in features (proxy groups, external controller, NTP, proxy/rule providers, smux, DNS/sniffer enhancements, experimental, per-proxy defaults, tunnels, hosts, authentication). `apply_global_features()`, `apply_per_proxy_fields()` (smux skipped for flow-based proxies), `build_proxy_groups_json()` (DIRECT only in select groups), `build_proxy_providers_json()`, `build_rule_providers_json()`, `build_ntp_json()`, `build_tunnels_json()`, `build_sniffer_json()` (enhanced). `domain_rule()` supports `regex:` and `wildcard:` prefixes. v0.9.1: `ProxyGroupConfig` adds `filter`, `exclude_filter`, `exclude_type`, `include_all_providers`. `MihomoFeatures` adds `tcp_concurrent`. v0.10.0: WireGuard proxy builder (`build_wireguard_proxy` — private key, public key, IPv4/IPv6 addresses, reserved, preshared key, MTU, allowed-ips). TUIC proxy builder (`build_tuic_proxy` — uuid, password, sni, alpn, congestion controller, udp-relay-mode, disable-sni, reduce-rtt, heartbeat, max-open-streams). ECH support (`build_ech_opts` — parses `ech` query param, emits `ech-opts` with enable + optional base64 config). xhttp advanced (no-grpc-header, x-padding-*, uplink-http-method, session-*, seq-*, uplink-data-*, sc-max-each-post-bytes, sc-min-posts-interval-ms, reuse-settings/XMUX). `SubRuleConfig` struct + `build_sub_rules_json()`. `ip_rule()` handles `geoip:`, `geoip-asn:`/`ip-asn:`, `src-geoip:`, `src-ip-asn:` prefixes. `reality-opts.support-x25519mlkem768`. v0.11.0: `domain_rule()` adds `keyword:` prefix (DOMAIN-KEYWORD). `ip_rule()` adds `ip-suffix:`, `src-ip-cidr:`, `src-ip-suffix:` prefixes. `rule_to_strings()` adds `src-port:` and `in-port:` port prefixes. ws-opts early-data (`apply_ws_early_data` — max-early-data, early-data-header-name, v2ray-http-upgrade, v2ray-http-upgrade-fast-open) in VLESS/Trojan/VMess. grpc-opts advanced (`apply_grpc_advanced` — grpc-user-agent, ping-interval, max-connections, min-streams, max-streams) in VLESS/Trojan/VMess. mTLS (`apply_mtls_cert_key` — certificate + private-key, both required) in VLESS/Trojan/VMess. ECH `query-server-name` from `echServerName` param. `MihomoFeatures` adds `dns_nameserver_policy` (HashMap) and `raw_rules` (Vec<String>). `ProxyGroupConfig` adds `include_all` and `include_all_proxies`. `build_dns_config()` emits `nameserver-policy` when non-empty. v0.12.0: Hysteria2 port hopping (`mport`/`ports` → `ports` field, `hopInterval`/`hop_interval` → `hop-interval` field). v0.13: `build_mihomo_bench_config()` for desktop benchmarking (minimal SOCKS + single proxy + MATCH rule, no DNS/geo/features). `outbound_tag_to_name()` maps `"reject"` → `REJECT`. 97 tests (280 total).
-* `src/hincyray.rs` - HincyRay router daemon: sync `TcpListener` HTTP API, state persistence with corruption recovery, `CoreManager` for Mihomo process lifecycle (spawns `mihomo -f config.yaml -d geo_dir`, stdout+stderr to log file), `FirewallManager` for iptables NAT REDIRECT (TCP, port 10810) + mangle TPROXY (UDP, port 10811) transparent proxy lifecycle, Keenetic RCI API integration (policy query/create, connmark-based traffic selection), ndm hook script in `/opt/etc/ndm/netfilter.d/hincyray.sh` for firewall reload survival, watchdog with core restart + exponential backoff + firewall rule reinstall + auto-update scheduling, health-check failover, auto-benchmark scheduling, auto-select best profile, Mihomo log viewer in web UI, auto-refresh status every 5s, system monitoring (CPU/RAM/temp/load/uptime via `/proc` + `/sys`), `CpuTimes` delta computation, QUIC mode toggle (Block/Proxy), graceful shutdown (SIGTERM/SIGINT). Mihomo auto-update: `get_mihomo_version()`, `is_newer_version()`, `check_latest_mihomo_release()` (GitHub API through SOCKS proxy), `download_and_install_mihomo()` (download .gz through proxy, gunzip, verify, unlink+copy to avoid ETXTBSY, backup .bak, rollback on failure). API endpoints: `/api/update/status`, `/api/update/check`, `/api/update/apply`, `/api/update/settings`. v0.9: `GET/POST /api/mihomo-features` for MihomoFeatures config. `HincyrayState.mihomo_features` field (serde default). `build_daemon_config()` passes `&state.mihomo_features`. Web UI "Mihomo Features" section with proxy groups, external controller, NTP, per-proxy, DNS, experimental, sub-rules controls. `load_state()` forces `dns_settings.enabled=true` when `split_routing.enabled`. `geo_dir_from_state()` returns the directory itself (not parent). v0.9.1: External Controller API integration — `mihomo_api_get()`, `mihomo_api_get_json()`, `mihomo_api_delay()` for Mihomo REST API client. `GET /api/mihomo-api/proxies`, `GET /api/mihomo-api/connections`, `POST /api/mihomo-api/delay` proxy endpoints. Watchdog Phase 3 delegates failover to Mihomo native when `proxy_group.enabled` (skips manual profile switch + core restart); uses Mihomo API delay test when `external_controller.enabled` (no proxy groups); falls back to SOCKS curl otherwise. Web UI "Proxy Status" section with live group health, connections, delay test. 163 tests total. v0.11.0: Web UI "DNS Enhancements" adds nameserver-policy textarea, Proxy Groups adds include-all/include-all-proxies checkboxes, new "Raw Rules" textarea for AND/OR/NOT logic rules. `loadFeatures()` and save handler updated for nameserver-policy (object↔textarea), include-all flags, raw_rules (array↔textarea). v0.12.0: Auto-refresh subscriptions (watchdog Phase 7, disabled by default). Profile CRUD API (`POST /api/profiles/add`, `/delete`, `/update`). Traffic statistics (cumulative byte counters in state, real-time via Mihomo `/traffic` API). Connection log (persisted, cap 500 entries, `ConnectionLogEntry` struct). Speed test API (`POST /api/mihomo-api/speed-test`, Cloudflare 10MB default). Per-device routing (`DeviceRoute` struct, `SRC-IP-CIDR` rules before general rules, ARP scan via `/proc/net/arp`). New state fields: `auto_refresh_enabled`, `auto_refresh_interval_hours`, `last_auto_refresh_unix`, `traffic_total_up_bytes`, `traffic_total_down_bytes`, `connection_log`, `device_routes`. New API endpoints: `/api/profiles/add`, `/api/profiles/delete`, `/api/profiles/update`, `/api/device-routes`, `/api/device-routes/delete`, `/api/devices`, `/api/device-routes/apply`, `/api/mihomo-api/traffic`, `/api/mihomo-api/memory`, `/api/traffic`, `/api/connection-log`, `/api/mihomo-api/speed-test`. Web UI: Traffic & Connections section, Per-Device Routing section, auto-refresh checkbox in Auto Settings. v0.13: `RoutingPreset` struct + `routing_presets()` function (5 presets: ru-direct, ad-block, only-web-vpn, block-social, ru-direct-ad-block). `GET /api/routing-presets`, `POST /api/routing-presets/apply`. `WebUiAuth` struct (enabled, username, password) in state. `DaemonInner.sessions` (HashSet<String> for session tokens). `check_auth()` middleware. `POST /api/auth/login`, `POST /api/auth/logout`, `GET/POST /api/auth-settings`. REJECT target in routing rules and device routes. Web UI login overlay + auth settings section. `generate_session_token()` (nanos+PID). 280 tests total.
-* `src/theme.rs` - Fluent/Acrylic-inspired egui styling.
-* `scripts/wifi-segment-setup.sh` - v0.1.1 opt-in WiFi VPN segment: create the `HincyRay-VPN` SSID on `192.168.2.0/24` via Keenetic `ndmc`.
-* `scripts/hincyray-install.sh` - v0.6.1 interactive atomic installer (archinstall-style): staging -> backup -> atomic `mv` -> verify -> commit/rollback. v0.7: checks for kernel modules (xt_TPROXY, xt_socket, xt_comment) and ndm hook directory.
-* `scripts/frontend-contract-test.py` - static Web UI ↔ daemon API contract test; run after changing `src/webui/index.html` or API routes.
-* `scripts/router-e2e.sh` - remote/router smoke test for `/api/health`, status, system, memory guard, DNS/UDP diagnostics, validator, and `/metrics`.
-* `scripts/hincyray-doctor.sh` - one-command terminal diagnostics bundle for support (`HINCYRAY_URL` override supported).
-* `.github/workflows/ci.yml` - CI pipeline: fmt, check, fast daemon clippy, full clippy, tests, frontend contract.
+## Architectural invariants
 
-## Architectural Invariants
+- Keep entrypoints free of application logic. Router behavior belongs behind daemon/library modules; desktop UI must not own router protocol execution.
+- `Profile.group` is subscription/manual provenance only. Dead Servers is a virtual lifecycle projection; never encode dead state by rewriting profile groups.
+- Routing and lifecycle identities are separate contracts:
+  - routing targets use `server:srv-v1-…` and resolve through `server_route_registry`;
+  - Dead Servers, Deep Bench selectors, and quality history use canonical `srv-v2-…` lifecycle refs;
+  - never parse, substitute, or expose one contract as the other.
+- Lifecycle canonicalization removes display identity but preserves connection identity. Startup migration converts raw and resolvable current-profile v1 lifecycle values to v2; legacy orphan v1 Trash entries remain restorable.
+- Manual and automatic Dead Servers transitions share the serialized `mutate_dead_server_membership()` boundary. Validate the whole batch before mutation; active profiles cannot be moved; persistence/dataplane failures must roll lifecycle fields back without erasing unrelated state.
+- Automatic/all/subscription scopes exclude dead profiles. Explicit diagnostic requests may include them. Enabled pinned routes preserve intent and use active fallback while their target is dead.
+- Router DNS is always present because firewall rules unconditionally redirect port 53 to Mihomo on 1053. `dns.enabled` is a desktop-Xray concept.
+- Redir and TPROXY listeners must stay on separate ports. The ndm hook is the primary firewall-reload mechanism; watchdog reinstall is a safety net.
+- `geoip.metadb` must be present locally and `geo-auto-update: false`; router startup must not depend on blocked GitHub downloads.
+- Mihomo fallback group `proxy` is the canonical upstream-health decider. The daemon reads its state; do not add duplicate periodic upstream probes.
+- Keep request/response bodies bounded and structurally redact secrets. Never place real subscription URLs, tokens, private keys, or credentials in source/docs/tests; use `https://provider.example/sub/<token>`.
+- Guard OS-specific APIs behind platform boundaries.
 
-* Keep `main.rs` free of app logic; route new behavior through library modules.
-* UI should not know protocol internals beyond display fields and benchmark results.
-* Real protocol execution belongs behind `tester.rs` (desktop) / `mihomo_config.rs` (router); keep UI changes independent from implementation details.
-* Profile parsing must accept both direct share links and HTTPS subscription URLs; examples may come from RTF/plain text paste buffers.
-* Do not fold router-daemon behavior into the desktop GUI; Keenetic work should become a separate binary/API using shared parsing/scoring modules.
-* WiFi VPN routing uses iptables NAT REDIRECT (TCP, port 10810) + mangle TPROXY (UDP, port 10811) via Keenetic traffic policy connmarks — no tun2socks, no TUN device. Redir and tproxy listeners MUST use separate ports (both bind TCP). An ndm hook script in `/opt/etc/ndm/netfilter.d/hincyray.sh` reinstalls rules after ndm firewall reloads; the watchdog is a safety net.
-* DNS is always enabled in router config — the firewall unconditionally DNATs DNS queries to 127.0.0.1:1053, so the Mihomo config must always include the DNS listener. The `dns.enabled` flag is a desktop-Xray concept that does not apply to router mode.
-* `geoip.metadb` (MMDB format) must be present in the geo directory — Mihomo requires it on startup and will hang indefinitely trying to download from GitHub (blocked from router). `geo-auto-update: false` is set in config.
-* HWID fingerprint must be consistent: HWID, OS version, device model, and User-Agent must all agree so the server's cross-check passes.
-* Mihomo auto-update requires the core to be running (GitHub API requests go through the local SOCKS proxy). Binary replacement uses unlink+copy (not rename) to avoid ETXTBSY on the running process.
+## Required gates
 
-## Development Practices
+Run all before commit/release:
 
-* Build/check: `cargo check`
-* Format: `cargo fmt`
-* Lint full: `cargo clippy --all-targets --all-features`
-* Lint fast daemon profile: `cargo clippy --all-targets --no-default-features --bin hincyray -- -D warnings`
-* Test: `cargo test --all-targets --all-features` (359 tests)
-* Frontend/API contract: `python3 scripts/frontend-contract-test.py`
-* Router E2E after deploy: `HINCYRAY_URL=http://127.0.0.1:8088 scripts/router-e2e.sh` (or set router URL when run remotely)
-* Terminal diagnostics: `hincyray doctor` or `scripts/hincyray-doctor.sh`
-* Run GUI: `cargo run`
-* Release build: `cargo build --release`
-* Cross-compile: `cargo zigbuild --release --no-default-features --bin hincyray --target aarch64-unknown-linux-gnu.2.27` + patchelf `--set-interpreter /opt/lib/ld-linux-aarch64.so.1 --set-rpath /opt/lib`
-
-## Operations: Keenetic Router Access & Deploy
-
-Target device: Keenetic Giga KN-1012 (Entware aarch64). These rules cover SSH access, on-router paths, build/deploy, gates, and GitHub release. Apply on every router-facing task.
-
-### SSH access (expect pattern)
-
-SSH key auth fails in the MCP SSH server (PEM Base64 error), so use `expect` with a password heredoc. Same pattern for SCP (note the `-O` legacy-protocol flag).
-
-SSH command:
-```
-expect <<'EXPECT'
-set timeout 15
-spawn ssh -o StrictHostKeyChecking=no -p 222 root@192.168.1.1 "COMMAND"
-expect {
-    -glob "*password:*" { send -- "keenetic\r"; exp_continue }
-    eof { }
-}
-EXPECT
-```
-
-SCP (file → router):
-```
-expect <<'EXPECT'
-set timeout 60
-spawn scp -O -P 222 local_file root@192.168.1.1:/tmp/remote_file
-expect {
-    -glob "*password:*" { send -- "keenetic\r"; exp_continue }
-    -glob "*100%*" { }
-    eof { }
-}
-EXPECT
-```
-
-### Router paths & services
-
-| Purpose | Path / value |
-|---|---|
-| Binary | `/opt/sbin/hincyray` |
-| Init script | `/opt/etc/init.d/S99hincyray` |
-| State | `/opt/etc/hincyray/state.json` |
-| Mihomo config | `/opt/etc/hincyray/mihomo-config.yaml` |
-| Geo dir (geoip.metadb here) | `/opt/etc/hincyray` |
-| Binary backup | `/opt/sbin/hincyray.bak` |
-| Daemon API | `http://127.0.0.1:8088` |
-| Mihomo EC | `127.0.0.1:9090`, secret `hincyray2026` |
-| SOCKS port | `10808` |
-| HTTP (mixed) port | `10809` |
-| Redir port (TCP) | `10810` |
-| Tproxy port (UDP) | `10811` |
-
-Daemon control on router: use `/opt/etc/init.d/S99hincyray start|stop|restart|status`. The init script owns `/opt/var/run/hincyray.pid` and verifies the process identity. Never stop HincyRay with `pgrep -f`, `pkill -f`, `killall`, or another process-name/argv scan: the pattern also matches the invoking remote shell and can terminate the SSH command itself.
-
-### Router toolchain constraints
-
-Missing: `python3`, `bc`, `timeout`, `iw`, `iwconfig`. Available: `jq`, `awk`, `curl`, `iperf3`, `nc`, `find`, `sha256sum`. Do not assume GNU coreutils semantics (BusyBox). No `timeout` → use `curl --max-time` or background+pkill for deadline control.
-
-### Build & deploy
-
-```
-# Build (macOS host)
-cargo zigbuild --release --no-default-features --bin hincyray --target aarch64-unknown-linux-gnu.2.27
-patchelf --set-interpreter /opt/lib/ld-linux-aarch64.so.1 --set-rpath /opt/lib \
-    target/aarch64-unknown-linux-gnu/release/hincyray
-shasum -a 256 target/aarch64-unknown-linux-gnu/release/hincyray
-
-# Deploy: SCP binary to /tmp/hincyray-new, then on router via SSH:
-#   cp /opt/sbin/hincyray /opt/sbin/hincyray.bak
-#   /opt/etc/init.d/S99hincyray stop
-#   cp /tmp/hincyray-new /opt/sbin/hincyray && chmod +x /opt/sbin/hincyray
-#   sha256sum /opt/sbin/hincyray   # must match the local shasum
-#   /opt/etc/init.d/S99hincyray start
-#   curl -s http://127.0.0.1:8088/api/health   # expect {"version":"0.20.0"}
-```
-
-Always back up the running binary to `.bak` before overwriting, and verify the on-router SHA256 matches the local build before starting the daemon.
-
-### Gates (all green before any commit)
-
-```
+```sh
 cargo fmt --all --check
 cargo check --all-targets --all-features
 cargo clippy --all-targets --no-default-features --bin hincyray -- -D warnings
@@ -137,164 +53,62 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 python3 scripts/frontend-contract-test.py
 python3 scripts/installer-lifecycle-contract-test.py
+npm run test:browser
 git diff --check
 ```
 
-Current gate status: all green, 359 tests, 0 clippy warnings.
+Runtime benchmarking requires `mihomo` in `PATH`. Router E2E after deploy:
 
-### GitHub release
-
-Release token lives at `/Users/lain/Documents/токен телега.rtf`. **NEVER write the token contents into AGENTS.md, source, or commits** — reference it only by loading at call time:
-```
-GH_TOKEN="$(cat '/Users/lain/Documents/токен телега.rtf')" gh release create v0.19.9 \
-    target/aarch64-unknown-linux-gnu/release/hincyray \
-    --title "v0.19.9" --notes "..."
+```sh
+HINCYRAY_URL=http://127.0.0.1:8088 scripts/router-e2e.sh
 ```
 
-### v0.20.0 release status
+Noisy Cargo/tests/router commands must write full output to a temp log and print only a bounded summary.
 
-Ready for release. Deep Bench + Trash Bin quality management.
+## Keenetic operations
 
-v0.20.0 adds long-running server quality testing and conservative automatic trash promotion for persistently bad servers. Deep Bench runs Phase A quick benchmarks, Phase B stability sampling + unlock checks, and writes compact daily snapshots to `quality-history.json` instead of bloating `state.json`. The Web UI shows a 30-day quality heatmap with score breakdown tooltips. Trash Bin promotes a server only after 3 consecutive daily `composite_score < 30` readings and restores automatically when `composite_score > 50`; manual restore/purge endpoints are available.
+Target: Keenetic Giga KN-1012, Entware aarch64. SSH is `root@192.168.1.1:222`; use the established `expect` password pattern because key auth is unreliable. SCP requires `-O`.
 
-Phase B methodology was corrected after router validation: temp Mihomo warm-up is now excluded from `loss_percent`, eliminating the artificial 16.7% one-miss-in-six pattern. Sustained download uses a dedicated 15s fallback download path and records `sustained_download_source`/`sustained_download_error`, so speed either measures successfully or reports why it did not. Real Keenetic validation produced `loss_percent=0.0`, `warmup_ok=true`, 6 measured latency samples, `sustained_download_mbps=46.53`, source `https://proof.ovh.net/files/100Mb.dat`, and `composite_score=81`.
+| Purpose | Value |
+|---|---|
+| Binary | `/opt/sbin/hincyray` |
+| Init script | `/opt/etc/init.d/S99hincyray` |
+| State | `/opt/etc/hincyray/state.json` |
+| Quality history | `/opt/etc/hincyray/quality-history.json` |
+| Mihomo config / geo dir | `/opt/etc/hincyray/mihomo-config.yaml` / `/opt/etc/hincyray` |
+| Logs | `/opt/var/log/hincyray/` |
+| Daemon API | `http://127.0.0.1:8088` |
+| Mihomo EC | `127.0.0.1:9090` |
+| SOCKS / mixed / redir / TPROXY | `10808` / `10809` / `10810` / `10811` |
 
-Gates before release: `cargo fmt --all --check`, `cargo check --all-targets --all-features`, both clippy profiles with `-D warnings`, `cargo test --all-targets --all-features` (359 tests), `python3 scripts/frontend-contract-test.py`, `git diff --check`. Router deploy SHA for the pre-version-bump validation build: `1e3ef1f524c21788b8e641d14056ad67914c73537db2447bb3eb0c25e8361149`.
+Use `/opt/etc/init.d/S99hincyray start|stop|restart|status` exclusively. Never stop HincyRay with `pgrep -f`, `pkill -f`, `killall`, `pidof`, or argv/name scans; the init script owns the PID file and verifies `/proc/<pid>/exe`.
 
-### v0.19.9 release status
+Router BusyBox lacks `python3`, `bc`, `timeout`, `iw`, and `iwconfig`; its `jq` has no regex/ONIGURUMA support. Use `curl --max-time`, bounded projections, and BusyBox-compatible syntax.
 
-Released. Watchdog health check deduplication — eliminates double upstream probing and reduces flapping-induced OOM.
+## Build and deploy
 
-v0.19.9 fixes the **"VPN то работает, то нет"** instability symptom. Diagnosed via on-router log analysis: hincyray.log showed 212 `health check failed (1/3)`, 19 `proxy unreachable → fallback to DIRECT`, 203 `error sending request` (EC unreachable) events in ~30 minutes. Each fallback to DIRECT window = ~30s of "VPN не работает" for the user.
+```sh
+cargo zigbuild --release --no-default-features --bin hincyray \
+  --target aarch64-unknown-linux-gnu.2.27
+patchelf --set-interpreter /opt/lib/ld-linux-aarch64.so.1 \
+  --set-rpath /opt/lib target/aarch64-unknown-linux-gnu/release/hincyray
+shasum -a 256 target/aarch64-unknown-linux-gnu/release/hincyray
+```
 
-**Root cause — duplicated upstream probing.** The Mihomo fallback proxy group `proxy` (auto-generated, wraps `[proxy-active, DIRECT]`) already runs a `https://www.gstatic.com/generate_204` delay test every 10 seconds on its own — that's its job, that's how it decides when to switch to DIRECT. The hincyray watchdog Phase 3 was **also** calling `mihomo_api_delay()` every 10 seconds, triggering a **second** upstream request through the same VLESS Reality outbound. Two requests every 10 seconds to a flaky Italian LTE upstream doubled the load and made flapping worse.
+Before replacing the live binary:
 
-**Fix — read state instead of probing.** Phase 3 EC branch (lines ~11034-11122) now calls `mihomo_api_get_json("/proxies/proxy")` instead of `mihomo_api_delay()`. This is a cheap loopback query (no upstream traffic) that returns `alive: bool` + `now: string` from the fallback group's own state. Health is `true` only when `alive && now == "proxy-active"`. When mihomo switches to DIRECT, we detect it via `now == "DIRECT"` — no extra probe needed. For logging latency in the "recovered" message, we read `proxy-active.history[].last().delay` — populated by the fallback group's own delay test, no new upstream traffic.
+1. Verify staged and local SHA256 match.
+2. Stop through the init script, then snapshot binary, `state.json`, `quality-history.json`, and generated Mihomo config as one rollback set.
+3. Install and verify remote SHA before start.
+4. Start through the init script and wait for both the expected `/api/health` version and `core_status=running`; core startup is asynchronous after init returns.
+5. Verify active profile, fallback group, firewall/TPROXY, and router E2E.
+6. On any failure restore the complete rollback set and verify the previous version health.
 
-**Source of truth shifted.** Mihomo fallback group is now the canonical health decider — it knows better than the daemon whether the upstream is healthy. The daemon becomes a **reactor** to mihomo's state, not a parallel prober.
+Live verified v0.21.6 artifact SHA256: `2cc66ab3ccd65d7351f599493e3d0cb05187116b102afaec347070922eb188f5`. Deployment evidence is in `docs/releases/v0.21.6.md`.
 
-**Side benefit — memory.** Restart (deploy) reset hincyray RSS from 66MB → 6.9MB (undo_stack accumulated over 18h + heap fragmentation). MemAvailable went 186MB → 250MB. This is a one-time deploy effect, not a code fix — the undo_stack-on-disk architectural change is deferred to a future release since the watchdog fix already gives substantial relief.
+## Release
 
-**Risk:** if mihomo EC `/proxies/proxy` returns malformed JSON or the fallback group is in a transition window (testing), the daemon may log 1-2 spurious health failures. The watchdog is robust to this — only state transitions are logged, threshold is 3 consecutive failures.
-
-**E2E verified on Keenetic Giga:** 6 minutes after deploy — `/api/health` → `{"version":"0.19.9"}`, hincomo RSS 7.1MB, mihomo RSS 71MB, MemAvailable 244MB, `/proxies/proxy` → `alive:true, now:proxy-active`, mihomo delay history stable (86, 86, 89, 85, 96, 91, 100, 89, 110 ms — no flapping), zero health check failures in the new log session (was 15-30 per 5 min before). 359 tests, 0 clippy warnings.
-
-### v0.19.8 release status
-
-Released. Write-behind state persistence — eliminates watchdog write amplification.
-
-v0.19.8 replaces the synchronous write-through persistence model with write-behind for the watchdog hot path. Previously, the watchdog could call `persist_state()` up to 6 times per 10-second tick (6 × 660KB = 3.96MB written to USB flash), even when only 200 bytes of timestamps changed. Each call serialized the entire state, wrote it to a temp file, and renamed — competing with mihomo's network I/O on the same USB I/O scheduler.
-
-**What changed:**
-
-1. `DaemonInner` gains a `dirty: bool` flag (in-memory, not serialized).
-2. All 10 `persist_state()` call sites inside the watchdog loop are replaced with `inner.dirty = true` — zero I/O, ~1ns.
-3. `flush_if_dirty()` at the end of each watchdog tick: if dirty, one `persist_state()` call, then clear the flag. If nothing was dirty, zero writes.
-4. `run_scheduled_maintenance()` (called from watchdog Phase 10) also marks dirty instead of persisting.
-5. Graceful shutdown handler calls `flush_if_dirty()` — any pending dirty state is flushed before exit.
-6. Startup persist calls (firewall policy mark, mihomo version cache) remain synchronous — one-time, before the daemon starts serving.
-7. All 42 API handler `persist_state()` calls remain synchronous (write-through) — user-initiated changes require immediate persistence and error reporting.
-
-**New function:** `flush_if_dirty(inner: &mut DaemonInner, state_path: &Path)`.
-
-**Write amplification eliminated:** 6 writes/tick → 1 write/tick (or 0 if nothing changed). Traffic counters still gate on `is_multiple_of(6)` (60s cadence). Connection log phase marks dirty (the log itself is `#[serde(skip)]`, so the flush is a no-op for it but coalesces with other dirty phases).
-
-**Risk:** If the daemon crashes between `mark_dirty()` and the next tick's flush, up to 10 seconds of watchdog state changes (traffic counters, timestamps) are lost. User settings are not affected — they use synchronous persist. The graceful shutdown handler flushes before exit, covering SIGTERM/SIGINT. For a router daemon, losing 10s of traffic counters is acceptable.
-
-E2E verified on Keenetic Giga: `/api/health` → `{"version":"0.19.8"}`, mihomo RSS 60MB, hincyray RSS 5.5MB, MemAvailable 256MB, I/O pressure 0.06%, state.json 660KB. 359 tests, 0 clippy warnings.
-
-### v0.19.7 release status
-
-Released. Critical memory/I/O stability patch — state.json bloat + RKN bypass list memory + fallback tuning.
-
-v0.19.7 fixes a second router OOM death spiral, this time caused by **state persistence I/O** and **rule provider memory** rather than connection storms. The router would run fine for hours, then degrade to load average 35, I/O pressure 99.57%, MemAvailable 4.8MB, mihomo RSS 194-292MB, hincyray RSS 85MB, both processes in D-state — unresponsive.
-
-**Root causes fixed:**
-
-1. **state.json bloated to 4MB by undo_stack** — `UndoEntry.state_json` stored 10 full JSON snapshots of the entire state (each ~300KB). `persist_state()` serialized and wrote 4MB to USB flash every 30-60 seconds (connection log + traffic stats + undo snapshots). This caused chronic I/O pressure on the Keenetic's USB-connected ext4 partition, which in turn stalled mihomo's network I/O (both compete for the same I/O scheduler). Fix: `undo_stack`, `connection_log`, and `metrics_history` are now `#[serde(skip)]` — transient fields that are never serialized. `persist_state()` also explicitly clears them before serialization to avoid holding 3MB+ of JSON strings in memory. state.json shrank from 4MB to 660KB. hincyray RSS dropped from 85MB to 5.5MB.
-
-2. **RKN bypass list: 744K classical rules = ~150-290MB mihomo RSS** — The rule provider used `behavior: "classical"` with `type: "http"`, which made Mihomo parse 744,073 individual rule objects (DOMAIN, DOMAIN-SUFFIX, USER-AGENT, IP-CIDR, etc.) into an in-memory tree. On a 512MB router this consumed 30-57% of total RAM. Fix: Changed rule provider to `type: "file", behavior: "domain"`. Hincyray now downloads and preprocesses the bypass list itself (via `update_bypass_list()` — direct download first, SOCKS proxy fallback) — strips `DOMAIN,`/`DOMAIN-SUFFIX,` prefixes, strips trailing dots, skips unsupported rule types (USER-AGENT, IP-CIDR, DOMAIN-KEYWORD). The preprocessed file contains bare domain names that Mihomo's domain matcher loads efficiently. `preprocess_bypass_list_in_place()` migrates existing classical-format files on startup. Watchdog Phase 11 periodically refreshes the list through the SOCKS proxy. **Note:** 744K domains is still heavy for a 512MB router; bypass is disabled by default on the router and should be enabled with caution.
-
-3. **Fallback group interval 30s, timeout 5000ms** — When the upstream proxy died, the fallback group took up to 30 seconds to detect the failure and switch to DIRECT. During those 30 seconds, clients timed out and retried, creating a mini connection storm. Fix: interval 30→10 seconds, timeout 5000→3000ms. Mihomo now detects a dead proxy within 10 seconds and switches to DIRECT faster.
-
-4. **Health check log spam** — The watchdog logged every single failure (`failed 1/3`, `failed 2/3`, `failed 3/3`, `proxy unreachable`) on every 15-second cycle, producing thousands of log lines per hour. The log file grew to 556KB/10K lines, adding to the I/O pressure. Fix: Only state transitions are logged (healthy→failed, failed→recovered). `failover_fail_count` caps at the threshold instead of resetting to 0 when `auto_switch=false`, preventing repeated threshold-crossing log lines.
-
-**New functions:** `update_bypass_list()`, `preprocess_bypass_list_in_place()`. Watchdog Phase 11 (RKN bypass list update).
-
-**E2E verified on Keenetic Giga:** mihomo RSS 194-292MB → 60MB, hincyray RSS 85MB → 5.5MB, MemAvailable 4.8MB → 256MB, load 35 → 0.38, I/O pressure 99.57% → 0.06%, state.json 4MB → 660KB. 359 tests, 0 clippy warnings.
-
-### v0.19.6 release status
-
-Released. Critical stability patch — direct-fallback proxy group + always-on health check.
-
-v0.19.6 fixes a router OOM death spiral caused by dead proxy servers. When the upstream proxy is unreachable, Mihomo previously timed out every connection — clients retried, creating a connection storm that consumed all RAM (available memory dropped to 7.8MB on 512MB Keenetic Giga) and sent I/O pressure to 99.5%, rendering the router unresponsive.
-
-**Root causes fixed:**
-
-1. **Connection storm on dead proxy** — Mihomo outbound `proxy` had no fallback. When the upstream server died, every connection timed out and clients retried → OOM. Fix: `build_mihomo_router_config()` now **always** wraps the active proxy in a `fallback` group named `proxy` with `[proxy-active, DIRECT]`. Mihomo automatically routes traffic direct when the proxy is unreachable and switches back when it recovers — no restart, no storm. When user-configured proxy groups are enabled, DIRECT is added as last resort in fallback-type groups.
-
-2. **Health check disabled when auto_switch=false** — Watchdog Phase 3 was guarded by `if auto_switch`, so health monitoring was completely skipped when the user disabled auto-switching. The daemon had no idea the proxy was dead. Fix: health check now runs **always** (when `core_running && !bench_running`). The `auto_switch` flag controls only *what happens on failure*: `true` → switch to next-best profile; `false` → log "proxy unreachable, mihomo fallback to DIRECT". EC delay test now probes `PROXY_ACTIVE_NAME` ("proxy-active" — the actual outbound), not `PROXY_NAME` ("proxy" — the fallback group), so a fallback to DIRECT is detected as a proxy failure, not a success.
-
-**New constants:** `PROXY_ACTIVE_NAME` ("proxy-active"), `FALLBACK_HEALTH_URL` (gstatic generate_204).
-
-**E2E verified on Keenetic Giga:** I/O pressure 99.46% → 0.03%, MemAvailable 7.8MB → 119MB, load average 22 → 0.11, CPU iowait 45% → 0%, health check detects proxy flapping (failed 1/3 → recovered 191ms), fallback group `type: Fallback, now: proxy-active, alive: true`. 359 tests, 0 clippy warnings.
-
-### v0.19.5 release status
-
-Released. All changes committed, tagged, pushed, and published to GitHub.
-
-v0.19.5 includes two major feature areas:
-
-**1. Subscription fetch resilience:**
-* `profiles.rs` — `fetch_subscription`: 30s timeout + 10s connect_timeout + `classify_http_error()` turning `reqwest::Error` into human messages ("таймаут (30с)", "TLS handshake failed", "DNS не разрешён", …).
-* `profiles.rs` — `parse_input` base64 fallback: zero profiles/subscriptions/placeholders → `decode_subscription_body()` → rescan. `scan_candidates()` split out.
-* `hincyray.rs` — multi-path fetch (4 paths: direct → socks5h → socks5 → http). `DaemonProxyInfo` with `socks5h_url`/`socks5_url`/`http_url`/`core_running`. `SubscriptionLoadOutcome::Failed { attempts: Vec<(String, String)> }`. `format_error()` prefixes each attempt with `[direct]`/`[socks5h]`/`[socks5]`/`[http]`.
-* `hincyray.rs` — `handle_profile_add` path 3: "could not parse share link or subscription URL" + `hint` field.
-* `webui/index.html` — `showSubscriptionErrorModal()` detects the `[direct]/[socks5h]/[socks5]/[http]` labels, shows a modal with advice; 9 i18n entries; `.catch(err => showSubscriptionErrorModal(err))` on `addProfileByLink` and `doImport`.
-
-**2. Testing UI overhaul + upload speed:**
-* `benchmark.rs` — `run_speed_via_mihomo()` spawns a temporary mihomo instance for download+upload speed testing when the latency method is TCP or HEAD (which don't measure speed). `curl_upload()` pipes 5MB through curl stdin via POST to Cloudflare `__up`, accepts HTTP `100 Continue` as valid, handles timeout-with-data (rc=28). `BenchResult`/`Metrics` gain `upload_mbps` field. `run_bench()` signature extended with `upload_url`, `test_download`, `test_upload` params. `DEFAULT_UPLOAD_URL` constant.
-* `hincyray.rs` — `ProfileStats.last_upload_mbps` field. `handle_bench_start` parses `test_download`, `test_upload`, `upload_url` from request body. `apply_bench_result` and `handle_stats` updated for upload metric.
-* `webui/index.html` — Removed `benchmark` section and `ov-tests` Overview section. Added collapsible "Настройки тестирования" panel in Profiles section (method select, probe/download/upload URLs). ⚡ buttons on each profile row (`benchOne`) and group header (`benchGroup`). `mergeBenchResultsIntoProfiles()` merges bench results into MOCK.profiles in real-time. `metricToggles()` controls which metrics get tested (latency/download/upload/ewma/jitter). Summary bar only for group tests. "Отдача" column added to profiles and favorites tables (NUM_COLS 15→16). `PROFILE_SORT_KEYS` updated for upload metric.
-
-E2E on Keenetic Giga verified: `/api/health` → `{"version":"0.19.5"}`; TCP bench profile #4: latency=32ms, download=2.90 Mbps, upload=7.35 Mbps; `/api/stats` returns `last_upload_mbps: 7.35`; subscription multi-path fetch all 4 paths reported; base64 import 12 profiles, 84 total. 359 tests, 0 clippy warnings.
-
-## Notes
-
-* v0.19.9 watchdog health check deduplication: Phase 3 EC branch (lines ~11034-11122) replaced `mihomo_api_delay()` (which triggered a second upstream `gstatic.com/generate_204` request through the VLESS Reality outbound every 10s) with `mihomo_api_get_json("/proxies/proxy")` (cheap loopback EC query, zero upstream traffic). The Mihomo fallback group `proxy` already runs its own delay test every 10s and switches to DIRECT on failure — that's its job. The daemon was duplicating this work, doubling upstream load on flaky LTE servers and worsening flapping. Now health = `alive && now == "proxy-active"` from `/proxies/proxy`. Latency for "recovered" log comes from `proxy-active.history[].last().delay` — populated by the fallback group's own delay test, no new upstream traffic. Source of truth shifted: mihomo fallback group is the canonical health decider, daemon is a reactor. E2E on Keenetic Giga 6 min after deploy: hincyray RSS 7.1MB, mihomo RSS 71MB, MemAvailable 244MB, mihomo delay history stable (86-110ms, no flapping), zero health fails in new session. 359 tests, 0 clippy warnings.
-* v0.19.8 write-behind state persistence: `DaemonInner.dirty: bool` flag — watchdog's 10 `persist_state()` call sites replaced with `inner.dirty = true` (zero I/O). `flush_if_dirty()` at end of each watchdog tick: one persist if dirty, zero if clean. `run_scheduled_maintenance()` marks dirty. Graceful shutdown calls `flush_if_dirty()`. Startup persists and all 42 API handler persists remain synchronous (write-through). Write amplification: 6 writes/tick → 1 write/tick (or 0). Traffic counters still gate on `is_multiple_of(6)` (60s cadence). Connection log phase marks dirty (log is `#[serde(skip)]`, flush coalesces with other phases). Risk: crash between mark_dirty and flush loses up to 10s of watchdog state (traffic counters, timestamps); user settings unaffected. E2E on Keenetic Giga: `/api/health` 0.19.8, mihomo 60MB, hincyray 5.5MB, MemAvailable 256MB, I/O 0.06%. 359 tests, 0 clippy warnings.
-* v0.19.7 critical memory/I/O stability patch: state.json bloat + RKN bypass list memory + fallback tuning. `undo_stack`, `connection_log`, `metrics_history` are now `#[serde(skip)]` — transient fields never serialized, state.json shrank from 4MB to 660KB, hincyray RSS 85MB → 5.5MB. RKN bypass rule provider changed from `type: http, behavior: classical` (744K rules = ~150-290MB mihomo RSS) to `type: file, behavior: domain` — Hincyray downloads and preprocesses the bypass list itself (`update_bypass_list()` — strips `DOMAIN,`/`DOMAIN-SUFFIX,` prefixes, strips trailing dots, skips unsupported rule types; `preprocess_bypass_list_in_place()` migrates existing classical-format files on startup). Watchdog Phase 11 periodically refreshes the list through SOCKS proxy. Fallback group interval 30→10s, timeout 5000→3000ms. Health check logging: only state transitions logged (healthy→failed, failed→recovered), `failover_fail_count` caps at threshold when `auto_switch=false`. E2E on Keenetic Giga: mihomo RSS 194-292MB → 60MB, MemAvailable 4.8MB → 256MB, load 35 → 0.38, I/O pressure 99.57% → 0.06%. 359 tests, 0 clippy warnings.
-* v0.19.6 critical stability patch: always-on direct-fallback proxy group + always-on health check. `build_mihomo_router_config()` now always wraps the active proxy in a `fallback` group named `proxy` with `[proxy-active, DIRECT]` — Mihomo auto-switches to DIRECT when the upstream proxy is unreachable and back when it recovers, preventing connection storms that OOM the router. `PROXY_ACTIVE_NAME` ("proxy-active") constant. `FALLBACK_HEALTH_URL` (gstatic generate_204). Watchdog Phase 3 health check runs always (not just `auto_switch`); `auto_switch` controls only the action on failure (`true` → switch profile, `false` → log + rely on mihomo fallback). EC delay test probes `PROXY_ACTIVE_NAME` (outbound), not `PROXY_NAME` (group). `build_proxy_groups_json` adds DIRECT as last resort in `fallback`-type groups. E2E on Keenetic Giga: I/O pressure 99.46% → 0.03%, MemAvailable 7.8MB → 119MB, load 22 → 0.11, health check detects proxy flapping (failed 1/3 → recovered 191ms). 359 tests, 0 clippy warnings.
-* Runtime benchmarking requires `mihomo` in `PATH` (desktop only).
-* Router daemon requires `mihomo` binary and `geoip.metadb` file in the geo directory.
-* Subscription bodies are tried as plain text and common base64 variants.
-* Happ/TutNet Xray-style JSON with DNS-over-HTTPS URLs is parsed via the `outbounds` fallback when no direct profiles are found.
-* Do not add OS-specific APIs unless guarded behind a cross-platform boundary.
-* v0.19.5 adds: subscription fetch resilience — `fetch_subscription` gets 30s timeout + 10s connect_timeout + `classify_http_error()` (turns `reqwest::Error` into human messages). `parse_input` base64 fallback: zero candidates → `decode_subscription_body()` → rescan (`scan_candidates()` split out). Router daemon multi-path fetch (4 paths: direct → socks5h → socks5 → http) with `DaemonProxyInfo`, `SubscriptionLoadOutcome::Failed { attempts: Vec<(String, String)> }`, `format_error()` prefixing each attempt with `[direct]/[socks5h]/[socks5]/[http]`. `handle_profile_add` path 3 returns `hint` field. Web UI `showSubscriptionErrorModal()` detects path labels, shows advice modal, 9 i18n entries, wired on `addProfileByLink` and `doImport`. Testing UI overhaul + upload speed: `run_speed_via_mihomo()` spawns temp mihomo for download+upload speed testing when method is TCP/HEAD. `curl_upload()` pipes 5MB via curl stdin POST to Cloudflare `__up`, accepts HTTP `100 Continue` as valid, handles timeout-with-data (rc=28). `BenchResult`/`Metrics` gain `upload_mbps` field. `run_bench()` extended with `upload_url`, `test_download`, `test_upload` params. `ProfileStats.last_upload_mbps` field. `handle_bench_start` parses `test_download`/`test_upload`/`upload_url` from request body. Web UI: removed `benchmark` section and `ov-tests` Overview section, added collapsible "Настройки тестирования" panel in Profiles section (method select, probe/download/upload URLs), ⚡ buttons on each profile row (`benchOne`) and group header (`benchGroup`), `mergeBenchResultsIntoProfiles()` merges bench results in real-time, `metricToggles()` controls which metrics get tested (latency/download/upload/ewma/jitter), summary bar only for group tests, "Отдача" column added to profiles and favorites tables (NUM_COLS 15→16), `PROFILE_SORT_KEYS` updated for upload metric. E2E on Keenetic Giga: `/api/health` 0.19.5, TCP bench profile #4 latency=32ms download=2.90 Mbps upload=7.35 Mbps, `/api/stats` returns `last_upload_mbps: 7.35`, all 4 fetch paths reported, base64 import 12 profiles, 84 total. 359 tests, 0 clippy warnings.
-* v0.19.3 emergency hotfix: Removed the periodic heavyweight `refreshDashboard()` loop after it caused a Web UI request storm and multi-second admin latency on Keenetic. Periodic polling is now limited to lightweight `/api/system` + `/api/memory-guard` every 3s and `/api/status` every 5s. Frontend contract test forbids `setInterval(refreshDashboard...)` / `hrDashboardRefreshInterval` to prevent regression. v0.19.2 GitHub release should be considered bad for router deployment; use v0.19.3+.
-* v0.19.2 hotfix: System hardware/resource metrics refresh through an exception-safe lightweight 3s heartbeat (`/api/system` + `/api/memory-guard`) registered at the start of Web UI init, so later UI init errors cannot freeze the first snapshot. The Memory card is clickable/keyboard-accessible and opens a live breakdown with Linux memory summary, Mihomo/HincyRay RSS, top RSS processes, and Memory Guard warnings. Frontend contract test now requires the refresh loop, memory breakdown entrypoint, and new memory DOM targets. 350 tests, 0 clippy warnings.
-* v0.19.1 hotfix: System page visibly renders the hardware/resource metrics and removes the dead sidebar Hardware item; `POST /api/mihomo-config/validate` is bounded with state-lock release, 8s deadline, captured stdout/stderr, and kill-on-timeout so a hung `mihomo -t` cannot block the daemon API. Frontend contract test now rejects nav entries without panels/NAV_MAP entries and verifies System renderer DOM IDs. 350 tests, 0 clippy warnings.
-* v0.19.0 adds: System section now includes hardware metrics; Mihomo config validator (`POST /api/mihomo-config/validate`); DNS diagnostics 2.0 (`GET /api/diagnostics/dns`); UDP/QUIC diagnostics (`GET /api/diagnostics/udp-quic`); Memory Guard (`GET /api/memory-guard`) with top RSS processes; Prometheus metrics (`GET /metrics`); subscription refresh reports (`GET /api/subscriptions/refresh-report`); backend undo stack (`GET /api/undo`, `POST /api/undo/restore`); state compaction; CLI commands (`status`, `doctor`, `validate-config`, `restart-core`, `apply-routing`, `backup`); global Web UI search; frontend contract test; router E2E script; CI with split clippy profiles. 348 tests.
-* v0.18.0 adds: subscription/group sharing API (`POST /api/profile-groups/share`) for sharing all servers in a visible profile group, group deletion API (`POST /api/profile-groups/delete`), and single-server `POST /api/profiles/share` for raw share-link + backend-generated SVG QR by `profile_id`. Web UI puts Share/QR and delete actions on every subscription/group header, so URL-backed subscriptions and named imported groups are handled uniformly. Web UI contract fixes: single profile add sends `raw`, Sub-Store sends `sort_by`, EC raw buttons show real API responses, auto-update settings are wired, `/api/system` binding uses the actual nested schema, profile-table QUIC toggle removed, routing rule delete has 15s undo, device screen is connected-device focused. `qrcode` dependency added. Web UI controls audit doc added. 344 tests, 0 clippy warnings.
-* v0.17.0 adds: RKN Bypass (`SplitRoutingSettings.rkn_bypass_enabled` default `true`, `rkn_bypass_url`, `rkn_bypass_interval`) — injects `RULE-SET,ru-bypass,proxy` rule provider downloading `itworksig/rublacklist` bypass.list (744K+ domains) through proxy every 24h. Also injects `GEOIP,RU,DIRECT` + `GEOIP,CN,DIRECT`. Rule order: user rules > QUIC block > raw rules > RKN bypass (RULE-SET → GEOIP,RU → GEOIP,CN) > RU Direct > port-mode > MATCH. `RouterExtra` gains `rkn_bypass_enabled`/`rkn_bypass_url`/`rkn_bypass_interval`. `RKN_BYPASS_DEFAULT_URL`/`RKN_BYPASS_DEFAULT_INTERVAL` constants. Reset to factory defaults (`POST /api/routing/reset` — resets rkn_bypass, ru_direct, match_target, port_mode, proxy_ports, routing_rules, raw_rules; preserves infrastructure settings). Configurable sniffer `override-destination` toggle (`MihomoFeatures.sniffer_override_destination` default `true`, bridged via `/api/dns` GET/POST, WebUI checkbox in DNS section, `saveDns()` calls `/api/routing/apply`). 339 tests, 0 clippy warnings. Router E2E verified on Keenetic Giga: bypass list downloaded (24MB, 744K rules, 5s), RSS 157MB, toggle on/off verified, reset restores defaults.
-* v0.16.0 adds: MATCH toggle (`SplitRoutingSettings.match_target` — `"proxy"` or `"direct"`, controls final `MATCH,proxy` vs `MATCH,direct`). Per-rule port mode (`RoutingRule.port_mode` — `"include"` or `"exclude"`, generates `AND` with `NOT,DST-PORT` for exclude). AND rule composition in `rule_to_strings()` — multiple condition types (domains+ports+network) ANDed into single Mihomo rule. `domain_rule_body()`/`ip_rule_body()` split for AND composition. QUIC block migrated from settings to regular routing rule in `load_state()`. Removed "Block QUIC" checkbox + "QUIC mode" dropdown from WebUI. Geo provider API (`GET /api/geo/providers`, `POST /api/geo/download`, `GET /api/geo/status`). Preset target override (`POST /api/routing-presets/apply` with optional `target` field). Routing conflict detection (`GET /api/routing` returns `conflicts` array). WebUI inline cell editing (click any cell in rules table to edit in place — target/protocol use re-rendered `<select>`, name/domains/ports use inline input). Geo provider card in WebUI. Preset target picker dropdown. "Сеть" → "Протокол" renamed. `XrayRouteRule.port_mode`, `RouterExtra.match_target` added. 323 tests, 0 clippy warnings. Router E2E verified on Keenetic Giga: MATCH row visible, QUIC Block as regular rule, inline target/protocol editing works, geo status shows geoip.metadb 8.4MB + geosite.dat 10MB, preset target override works, config `MATCH,DIRECT` with 3 rules.
-* v0.15.6 adds: RU Direct (`SplitRoutingSettings.ru_direct_mode` + `ru_direct_exceptions`) — two modes: `tld` (`DOMAIN-SUFFIX,ru,DIRECT` + `.рф`/`xn--p1ai`) and `geosite` (`GEOSITE,category-ru,DIRECT` from `geosite.dat`). Exceptions list → `DOMAIN-SUFFIX,<domain>,proxy` before main rule. Rule order: user rules > QUIC block > raw rules > RU Direct exceptions > RU Direct main > port-mode > MATCH. `RouterExtra` gains `ru_direct_mode` + `ru_direct_exceptions`. Unified rules UI: merged Domains+IPs into single textarea with `classifyEntry()` auto-classification. Expanded `popular_service_catalog()` to 23 services + 3 domain zones with `group` field (`service`/`zone`/`geosite-zone`). Chips rendered dynamically from `/api/routing` catalog. Rule editing (✎ pencil button, inline edit). Routing CRUD fixed: delete/toggle/add/preset-apply all call API + `loadRouting()` reload. `initCustomSelects()` moved before `refreshDashboard()` to fix custom select sync. Chain-check `info` status for informational nodes (GEOIP runtime, no active connection). `chain_summary()` counts `info` separately. `normalize_route_network()` + `normalize_mihomo_network()` two-layer defense against `NETWORK,any`. Chain-check russified. 313 tests, 0 clippy warnings. Router E2E verified on Keenetic Giga: `ru_direct_mode=geosite` with `2ip.ru` exception, config `DOMAIN-SUFFIX,2ip.ru,proxy` before `GEOSITE,category-ru,DIRECT`, catalog 26 entries, chain-check `bad=0 info=2 status=ok`.
-* v0.15.5 adds: Routing Chain diagnostics (`/api/routing/chain-check`) with Web UI metro visualization; "Без пресетов / Всё VPN" preset; subscription group refresh/delete fixes; provider card cancel fix; unlock-check direct/proxy matrix (`service` and `services` accepted); local GeoIP enrichment for `/api/mihomo-api/connections` from `geoip.metadb` including Meta-geoip0 scalar/array records; router safety rejection for known OOM-heavy `geosite:category-ads-all`; UDP TPROXY detection fix (load `xt_TPROXY`/`xt_socket` before probing and in ndm hook). 306 tests, 0 clippy warnings. Router E2E verified on Keenetic Giga: core running, active profile id 80, EC enabled, Cloudflare direct blocked/proxy OK, unsafe ad-block preset HTTP 400, chain `bad=0`, connection `destinationCountry` enriched, TPROXY modules/listener/mangle rules present, UDP node OK.
-* v0.15.4 adds: Systematic Web UI button audit (~40 buttons fixed). `apiAction(method,path,body,successMsg,reloadFn)` wrapper — toast + reload. `api(silent=true)` for background EC polling — no toast spam. Error toasts auto-hide 5s. Human-readable EC error. Save/load functions: `saveAutoSettings()` (15 fields), `saveSubStore()`, `saveFeatures()` (GET→merge→POST→apply), `saveRoutingSettings()` (12 fields), `saveAuth()`. Result modals: `showConfig()`, `checkUpdate()`, `speedTest()` (Cloudflare/OVH/Google/Custom), `doTrace()`, `loadLogs()`. Benchmark details collapsible with per-server table. Overview "Tests" section (`ov-tests`) with cards + quick buttons + top-20 bench table. Mihomo memory procfs fallback (`read_process_rss_kb()` from `/proc/<pid>/status` when EC disabled or `inuse:0`). Device routing UI split: "Detected LAN devices" table (all scanned) + "Individual override routes" table (explicit rules only) + priority warning. Default target `active` (was `direct`). `loadDevices()` auto-load on init. ID attributes on ~50 form fields. ~40 new i18n entries. 301 tests, 0 clippy warnings.
-* v0.15.3 adds: DNS section WebUI fix — Save button sends all 4 fields (enabled, query_strategy, remote_servers, local_servers) + success toast. Leak test and Diagnostics buttons display results in wide modal (`.modal-wide`, `.result-table`, `.result-badge`, `.result-pre` CSS). `showResultModal()`/`closeResultModal()` helpers. `dnsLeakTest()` shows structured table (status badge, iptables checks, proxy exit IP/location, DNS via proxy vs direct, leak verdict). `dnsDiagnostics()` shows local DNS, direct DNS, Mihomo EC DNS query, proxy trace. DNS diagnostics `local_dns` fixed: replaced `run_nslookup` (BusyBox nslookup doesn't support custom ports) with `dns_query_tcp` — pure-Rust DNS-over-TCP (RFC 7766) query with `build_dns_a_query()` + `parse_dns_a_response()`, no external tools. 6 new tests. 301 tests, 0 clippy warnings.
-* v0.15.2 adds: Profile sorting by column click (13 sortable columns, asc/desc toggle with ▲/▼ arrows, `getSortValue()` handles null/zero). Collapsed group persistence via localStorage (`hr_collapsed_groups`). Favorites table upgraded from text list to full `tbl-compact` table with all 16 columns + inline buttons. `normalizeProfiles()` merges profiles + stats endpoints (fixes undefined IDs and raw URL group names). Compact table CSS (`.tbl-compact` — padding 4px 8px, font 12px). Column order changed (Балл/actions near start, Адрес at end). `max-width:1200px` removed from `.main-content`. Traffic/memory live updates (`loadTrafficMemory()` fetches `/api/traffic` + `/api/mihomo-api/memory`). Delay test empty body → `{}` fallback. WebDAV buttons wired to input fields. `fmtKbps()` helper. `shortGroupName()` shows domain for URL groups. 295 tests, 0 clippy warnings.
-* v0.15.1 adds: New Fluent/Acrylic Web UI (`src/webui/index.html`) embedded via `include_str!`, replacing 2300-line inline raw string. 7 nav groups, 24 sidebar items, 16 Mihomo Features sub-sections, custom Acrylic dropdowns, RU/EN i18n, light/dark theme, tooltips, login overlay, real `fetch()` API helper with Bearer auth, production data loaders for all 87 endpoints, data-URI logo. EC streaming fix (`/traffic`, `/memory`): `first_stream_json()` parses first JSON snapshot from infinite stream, succeeds even when `curl --max-time` exits 28. Optional EC endpoints (`/configs/geo`, `/rules/disable`): 405 normalized to `{"supported":false}` instead of 502. `mihomo_api_get_response()`/`mihomo_api_post_response()` helpers. UI flicker fix: `updateStatusUI` split into `updateStatusCards` + `updateRoutingForm` — `loadRouting()` no longer overwrites status cards with partial data. 2 new stream parser tests. 294 tests, 0 clippy warnings. E2E 64/64 on Keenetic Giga + Pixel 6a ADB; post-flicker-fix 17/17.
-* v0.15.0 adds: 10 new outbound protocols (ShadowsocksR, Snell, HTTP, SOCKS, AnyTLS, Hysteria v1, SSH, MASQUE, OpenVPN, Tailscale) with share-link parsing + Mihomo YAML builders. `ProxyGroupType::Relay` for chain proxy groups. DNS parity fields (`fake-ip-filter-mode`, `fake-ip-ttl`, `use-hosts`, `use-system-hosts`, `default-nameserver`, `proxy-server-nameserver-policy`, `direct-nameserver-follow-policy`, `ecs`, `ecs-override`, `disable-ipv4/6`, `disable-qtype-N`). First-class `typed_rules` (`MihomoRuleConfig` struct for IN-NAME/IN-USER/PROCESS-*/UID/DSCP/RULE-SET). EC API parity endpoints (`/version`, `/configs`, `/configs/geo`, `/rules`, `/providers/proxies`, `/providers/rules`, cache flush, `/rules/disable`). `mihomo_api_post` helper with empty-body normalization. `hysteria://` now maps to Hysteria v1 (was Hysteria2). 292 tests, 0 clippy warnings. E2E 28/28 on Keenetic Giga.
-* v0.14.0 adds: Rule Trace, Sub-Store Lite, Smart Auto-Select 2.0, state backups/restore + WebDAV, unlock/DNS diagnostics, scheduled maintenance, connection close control, External Controller wildcard dial fix, and RU Direct presets using `geoip:RU` only. 288 tests, 0 clippy warnings.
-* v0.13.0 adds: REJECT routing target (block ports/domains/IPs), routing presets (RU Direct, Ad Block, Only Web VPN, Block Social, RU Direct+Ad Block), Web UI authentication (login/password, session tokens, Bearer auth), Mihomo desktop benchmark backend (replaces sing-box/xray, supports all 7 protocols including WireGuard/TUIC). 280 tests, 0 clippy warnings.
-* v0.12.0 adds: Hysteria2 port hopping, Profile CRUD API, Auto-refresh subscriptions, Traffic statistics, Connection log, Speed test API, Per-device routing (SRC-IP-CIDR), README updated to v0.12.0. 280 tests, 0 clippy warnings.
-* v0.11.0 adds Mihomo parity pack: `domain_rule()` adds `keyword:` prefix (DOMAIN-KEYWORD rule). `ip_rule()` adds `ip-suffix:` (IP-SUFFIX), `src-ip-cidr:` (SRC-IP-CIDR), `src-ip-suffix:` (SRC-IP-SUFFIX) prefixes. `rule_to_strings()` adds `src-port:` (SRC-PORT) and `in-port:` (IN-PORT) port prefixes. ws-opts early-data via `apply_ws_early_data()` — parses `maxEarlyData`/`max_early_data`, `earlyDataHeaderName`/`early_data_header_name`, `v2rayHttpUpgrade`/`v2ray_http_upgrade`, `v2rayHttpUpgradeFastOpen`/`v2ray_http_upgrade_fast_open` from VLESS/Trojan query params and VMess JSON fields. grpc-opts advanced via `apply_grpc_advanced()` — parses `grpcUserAgent`/`grpc_user_agent`, `pingInterval`/`ping_interval`, `maxConnections`/`max_connections`, `minStreams`/`min_streams`, `maxStreams`/`max_streams` from VLESS/Trojan query params and VMess JSON; also adds grpc transport support to Trojan and VMess builders (previously ws-only). mTLS via `apply_mtls_cert_key()` — parses `certificate`/`cert` and `privateKey`/`private_key`/`private-key` query params (VLESS/Trojan) and JSON fields (VMess); emits `certificate` + `private-key` when both present. ECH `query-server-name` from `echServerName`/`ech_server_name` param (VLESS/Trojan) and JSON field (VMess). `MihomoFeatures` adds `dns_nameserver_policy` (HashMap<String, Vec<String>>) and `raw_rules` (Vec<String>). `ProxyGroupConfig` adds `include_all` and `include_all_proxies`. `build_dns_config()` emits `nameserver-policy` when non-empty. Raw rules appended before MATCH in both `build_mihomo_config()` and `build_mihomo_router_config()`. Web UI: nameserver-policy textarea (DNS Enhancements), include-all/include-all-proxies checkboxes (Proxy Groups), Raw Rules textarea (Mihomo Features). 280 tests, 0 clippy warnings.
-* v0.10.0 adds WireGuard/TUIC protocol support + ECH + xhttp advanced + sub-rules + GEOIP/IP-ASN rules: `Protocol::WireGuard` and `Protocol::Tuic` added to `profiles.rs` (`wireguard://`/`wg://` and `tuic://` share link parsing). `build_wireguard_proxy()` — Mihomo WireGuard outbound (private-key, public-key, ip/ipv6, allowed-ips, pre-shared-key, reserved, mtu, persistent-keepalive). `build_tuic_proxy()` — Mihomo TUIC outbound (uuid, password, sni, alpn, congestion-controller, udp-relay-mode, disable-sni, reduce-rtt, heartbeat-interval, max-open-streams). ECH support via `build_ech_opts()` — parses `ech` query param from VLESS/Trojan links and `ech` JSON field from VMess, emits `ech-opts` with `enable` + optional base64 `config`. xhttp advanced — parses no-grpc-header, x-padding-*, uplink-http-method, session-*, seq-*, uplink-data-*, sc-max-each-post-bytes, sc-min-posts-interval-ms, reuse-settings (XMUX max-concurrency/max-connections/c-max-reuse-times/h-max-request-times/h-max-reusable-secs/h-keep-alive-period) from VLESS share link query params (both camelCase and snake_case). `SubRuleConfig` struct + `build_sub_rules_json()` for named rule groups. `ip_rule()` handles `geoip:`, `geoip-asn:`/`ip-asn:`, `src-geoip:`, `src-ip-asn:` prefixes in routing rules. `reality-opts.support-x25519mlkem768` parsed from VLESS links. `xray_config.rs` and `tester.rs` return explicit errors for WireGuard/TUIC (Xray/sing-box desktop benchmark not supported). Web UI "Sub-rules" section with textarea (`[name]` format). E2E tested on Keenetic Giga: sub-rules in config, GEOIP,CN,DIRECT rule, Mihomo API delay=133ms, 6 connections via proxy-active, failover=0. 218 tests, 0 clippy warnings.
-* v0.9.1 adds External Controller API integration and proxy group filtering: `ProxyGroupConfig` gains `filter`, `exclude_filter`, `exclude_type`, `include_all_providers` for node selection in large profile sets. `MihomoFeatures` gains `tcp_concurrent` (connect all IPs, first wins). Watchdog Phase 3 now has three modes: (1) `proxy_group.enabled` — delegates failover to Mihomo native (url-test/fallback handles node switching, no core restart, no manual profile switch); (2) `external_controller.enabled` without proxy groups — uses Mihomo API `/proxies/{name}/delay` for health check (more accurate than SOCKS curl, returns latency); (3) fallback — existing SOCKS curl health check. New API endpoints: `GET /api/mihomo-api/proxies`, `GET /api/mihomo-api/connections`, `POST /api/mihomo-api/delay` — proxy to Mihomo REST API. `mihomo_api_get()`, `mihomo_api_get_json()`, `mihomo_api_delay()` client functions (reqwest blocking, 3s timeout, Bearer auth). Web UI "Proxy Status" section with live group health (type/alive/now/delay), connections list, delay test button. `/api/status` adds `proxy_group_enabled` and `ec_enabled` flags. E2E tested on Keenetic Giga with Pixel 6a: delay=99ms, connections visible, traffic through proxy[proxy-active], failover delegated to Mihomo.
-* v0.9 adds advanced Mihomo features: `MihomoFeatures` master struct for all opt-in features. Proxy groups (`url-test`/`fallback`/`load-balance`/`select`) — active profile renamed to `proxy-active`, group named `proxy` wraps all; DIRECT only in `select` groups (would always win `url-test`); smux skipped for flow-based proxies (xtls-rprx-vision incompatible with multiplexing). External controller (REST API on configurable port, `secret` auth). NTP (sync via proxy). Proxy providers (`http`/`file`/`inline`, health-check, filter, override). Rule providers (`http`/`file`/`inline`, `domain`/`ipcidr`/`classical`, `yaml`/`text`/`mrs`). Per-proxy defaults (udp/tfo/mptcp/ip-version/smux/dialer-proxy). DNS enhancements (cache-algorithm=arc, prefer-h3, respect-rules, proxy-server-nameserver, direct-nameserver, fallback-filter). Sniffer enhancements (force-domain, skip-domain, skip-src/dst-address). Experimental (quic-go-disable-gso/ecn). Global features (geodata-loader=memconservative, unified-delay, store-fake-ip/store-selected, keep-alive-interval/idle, authentication, hosts, tunnels). `domain_rule()` supports `regex:` and `wildcard:` prefixes. API: `GET/POST /api/mihomo-features`. Web UI "Mihomo Features" section. E2E tested on Keenetic Giga with Pixel 6a: all features accepted by Mihomo v1.19.27, traffic verified through proxy groups, REST API delay test (107ms), proxy/rule providers initialized.
-* v0.8 replaces dual-engine (Xray+sing-box) with single Mihomo binary: `CoreManager` spawns `mihomo -f config.yaml -d geo_dir`. `src/mihomo_config.rs` generates YAML config (redir listener port 10810, tproxy listener port 10811 — separate ports to avoid TCP bind conflict). DNS always included (fake-ip mode, listen 0.0.0.0:1053, `geo-auto-update: false`, no `nameserver-policy: geosite:cn` to avoid MMDB dependency). `src/singbox_config.rs` deleted. `src/xray_config.rs` kept for desktop `tester.rs` only. State fields: `xray_path`/`xray_config_path`/`singbox_path` -> `mihomo_path`/`mihomo_config_path`. Auto-update: `get_mihomo_version()`, `is_newer_version()`, `check_latest_mihomo_release()` (GitHub API through SOCKS proxy), `download_and_install_mihomo()` (unlink+copy, backup .bak, rollback). API: `/api/update/*`, `/api/mihomo-config`. `load_state()` forces `dns_settings.enabled=true` when split routing on. `geo_dir_from_state()` returns the directory itself. Mihomo stdout+stderr to log file (was stdout to /dev/null). 5 transparent proxy bugs fixed via E2E testing with Pixel 6a on HincyRay-VPN WiFi.
-* v0.7 replaces tun2socks with xkeen-style NAT REDIRECT + TPROXY: `FirewallManager` installs iptables rules (nat table HINCYRAY chain for TCP REDIRECT to port 10810, mangle table HINCYRAY_UDP chain for UDP TPROXY to port 10811) matching Keenetic traffic policy connmarks. An ndm hook script (`/opt/etc/ndm/netfilter.d/hincyray.sh`) is auto-generated and re-runs after every ndm firewall reload. Kernel modules `xt_TPROXY`, `xt_socket`, `xt_comment` are loaded at startup. TPROXY unavailable -> TCP-only REDIRECT + QUIC blocked. `QuicMode` enum (Block/Proxy) controls UDP/443 handling. Keenetic RCI API (`localhost:79/rci/show/ip/policy`) queries policy connmark. State schema migrated: `tun_socks_port` -> `redirect_port`, `tun_device`/`tun_address`/`tun2socks_path`/`tun_mtu` removed, `policy_name`/`policy_mark`/`quic_mode`/`tproxy_available` added. API endpoints renamed: `/api/routing/tun-*` -> `/api/routing/firewall-*`. Benchmark: `docs/benchmark-tun2socks-vs-redirect.md` — NAT REDIRECT is 9-35x faster than tun2socks.
-* v0.6 adds: watchdog always runs (not just split routing); core stderr captured to rotating log file; state corruption recovery (backup to `.corrupt`, log error); graceful shutdown via SIGTERM/SIGINT (stops children, cleans iptables, persists state); health-check failover (SOCKS probe, 3 consecutive failures -> switch to next-best profile by score); auto-benchmark scheduling (`auto_bench_interval_hours`); auto-select best profile after benchmark; benchmark supports VMess/Trojan/SS (not just VLESS); dynamic VPN bridge resolution (not hardcoded `br1`); web UI auto-refresh every 5s; auto-settings and logs sections in web UI; `GET /api/logs`, `GET/POST /api/auto-settings` endpoints.
-* v0.6.1 adds: system monitoring (`GET /api/system` — CPU model/cores/features/temp/usage per-core, RAM total/free/available/usage, load average, uptime, kernel, hostname, model via `/proc` + `/sys`); `CpuTimes` delta computation stored in `DaemonInner`; web UI System section with progress bars (CPU/RAM/temp) auto-refreshed every 5s; interactive atomic installer script (`scripts/hincyray-install.sh`, archinstall-style: staging -> backup -> atomic `mv` -> verify -> commit/rollback).
-* v0.1 status: `docs/hincyray-v0.1-status.md`. Entware install runbook: `docs/hincyray-entware-install.md`. Longer plan: `docs/keenetic-client-roadmap.md`. Benchmark: `docs/benchmark-tun2socks-vs-redirect.md`.
-* Never put real subscription URLs or tokens in docs, tests, or commits; use the placeholder `https://provider.example/sub/<token>`.
+- `Cargo.toml`, first-party `Cargo.lock`, README EN/RU, CHANGELOG, installer download version, installer contract, and `docs/releases/vX.Y.Z.md` must agree.
+- Inspect status/diff/log and stage only intended files. Never stage user-owned scratch documents or secrets.
+- GitHub Release tag must target the pushed release commit and attach the hash-verified aarch64 `hincyray` artifact.
+- Detailed history belongs in `CHANGELOG.md` and `docs/releases/`, not this file.

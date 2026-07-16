@@ -296,6 +296,36 @@ fn benchmark_profile(
     }
 }
 
+/// Verify a failover candidate through its real proxy protocol, not merely by
+/// opening the server's TCP port. Failover is accepted only when every HTTPS
+/// sample succeeds; a partially working profile would recreate user-visible
+/// flapping immediately after the switch.
+pub fn verify_profile_for_failover(profile: &Profile, mihomo_path: &str) -> BenchResult {
+    let result = benchmark_profile(
+        profile,
+        BenchMethod::Head,
+        DEFAULT_PROBE_URL,
+        DEFAULT_DOWNLOAD_URL,
+        DEFAULT_UPLOAD_URL,
+        mihomo_path,
+        false,
+        false,
+    );
+    strict_failover_result(result)
+}
+
+fn strict_failover_result(mut result: BenchResult) -> BenchResult {
+    if result.success && result.loss_percent > 0.0 {
+        result.success = false;
+        result.score = 0;
+        result.error = Some(format!(
+            "failover verification rejected partial availability ({:.1}% loss)",
+            result.loss_percent
+        ));
+    }
+    result
+}
+
 struct Metrics {
     latency_ms: u32,
     jitter_ms: u32,
@@ -378,19 +408,13 @@ fn run_via_temp_mihomo(
         .flush()
         .map_err(|e| format!("flush Mihomo config: {e}"))?;
 
-    let stderr_file = NamedTempFile::new().map_err(|e| format!("temp stderr: {e}"))?;
-    let stderr_writer = stderr_file.reopen().map_err(|e| e.to_string())?;
+    let process_log = NamedTempFile::new().map_err(|e| format!("temp Mihomo log: {e}"))?;
 
-    let child = Command::new(mihomo_path)
-        .arg("-f")
-        .arg(config_file.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_writer))
-        .spawn()
+    let child = spawn_mihomo_with_combined_log(mihomo_path, config_file.path(), &process_log)
         .map_err(|error| format!("Mihomo spawn ({mihomo_path}): {error}"))?;
     let mut guard = ChildGuard { child: Some(child) };
 
-    wait_until_socks_ready(port, guard.as_mut(), stderr_file.path())?;
+    wait_until_socks_ready(port, guard.as_mut(), process_log.path())?;
 
     let mut latencies = Vec::new();
     let mut failures = 0usize;
@@ -458,22 +482,14 @@ fn run_speed_via_mihomo(
             .flush()
             .map_err(|e| format!("flush Mihomo config: {e}"))?;
 
-        let stderr_file = NamedTempFile::new().map_err(|e| format!("temp Mihomo stderr: {e}"))?;
-        let stderr_writer = stderr_file
-            .reopen()
-            .map_err(|e| format!("reopen Mihomo stderr: {e}"))?;
+        let process_log = NamedTempFile::new().map_err(|e| format!("temp Mihomo log: {e}"))?;
 
-        let child = Command::new(mihomo_path)
-            .arg("-f")
-            .arg(config_file.path())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr_writer))
-            .spawn()
+        let child = spawn_mihomo_with_combined_log(mihomo_path, config_file.path(), &process_log)
             .map_err(|e| format!("spawn Mihomo at {mihomo_path}: {e}"))?;
         let mut guard = ChildGuard { child: Some(child) };
 
-        wait_until_socks_ready(port, guard.as_mut(), stderr_file.path())?;
-        Ok((port, config_file, stderr_file, guard))
+        wait_until_socks_ready(port, guard.as_mut(), process_log.path())?;
+        Ok((port, config_file, process_log, guard))
     };
 
     let (port, _config_file, _stderr_file, _guard) = match setup() {
@@ -516,17 +532,47 @@ fn reserve_local_port() -> Result<u16, String> {
     Ok(port)
 }
 
-fn wait_until_socks_ready(port: u16, child: &mut Child, stderr_path: &Path) -> Result<(), String> {
+/// Spawn a temporary Mihomo process while preserving both output streams in a
+/// single ordered log. Mihomo writes startup diagnostics to stdout on some
+/// platforms and stderr on others; dropping either stream turns an actionable
+/// configuration/runtime error into an opaque exit status.
+fn spawn_mihomo_with_combined_log(
+    mihomo_path: &str,
+    config_path: &Path,
+    process_log: &NamedTempFile,
+) -> std::io::Result<Child> {
+    let (stdout, stderr) = combined_process_log_files(process_log)?;
+    Command::new(mihomo_path)
+        .arg("-f")
+        .arg(config_path)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+}
+
+fn combined_process_log_files(
+    process_log: &NamedTempFile,
+) -> std::io::Result<(std::fs::File, std::fs::File)> {
+    let stdout = process_log.reopen()?;
+    let stderr = stdout.try_clone()?;
+    Ok((stdout, stderr))
+}
+
+fn wait_until_socks_ready(
+    port: u16,
+    child: &mut Child,
+    process_log_path: &Path,
+) -> Result<(), String> {
     let started = Instant::now();
     while started.elapsed() < XRAY_READY_TIMEOUT {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            let stderr_tail = read_tail(stderr_path, 500);
+            let process_log_tail = read_tail(process_log_path, 500);
             return Err(format!(
                 "benchmark core exited early: {status}{tail}",
-                tail = if stderr_tail.is_empty() {
+                tail = if process_log_tail.is_empty() {
                     String::new()
                 } else {
-                    format!("; {stderr_tail}")
+                    format!("; {process_log_tail}")
                 }
             ));
         }
@@ -824,17 +870,10 @@ fn spawn_bench_mihomo(profile: &Profile) -> Option<(u16, ChildGuard)> {
     let mut config_file = NamedTempFile::with_suffix(".yaml").ok()?;
     config_file.write_all(config_yaml.as_bytes()).ok()?;
     config_file.flush().ok()?;
-    let stderr_file = NamedTempFile::new().ok()?;
-    let stderr_writer = stderr_file.reopen().ok()?;
-    let child = Command::new("mihomo")
-        .arg("-f")
-        .arg(config_file.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_writer))
-        .spawn()
-        .ok()?;
+    let process_log = NamedTempFile::new().ok()?;
+    let child = spawn_mihomo_with_combined_log("mihomo", config_file.path(), &process_log).ok()?;
     let mut guard = ChildGuard { child: Some(child) };
-    wait_until_socks_ready(port, guard.as_mut(), stderr_file.path()).ok()?;
+    wait_until_socks_ready(port, guard.as_mut(), process_log.path()).ok()?;
     Some((port, guard))
 }
 
@@ -1118,6 +1157,53 @@ fn unlock_score_pct(unlock_count: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_process_log_preserves_stdout_and_stderr_streams() {
+        let process_log = NamedTempFile::new().expect("process log");
+        let (mut stdout, mut stderr) =
+            combined_process_log_files(&process_log).expect("combined log handles");
+
+        writeln!(stdout, "stdout diagnostic").expect("write stdout");
+        writeln!(stderr, "stderr diagnostic").expect("write stderr");
+        stdout.flush().expect("flush stdout");
+        stderr.flush().expect("flush stderr");
+
+        let output = std::fs::read_to_string(process_log.path()).expect("read process log");
+        assert!(output.contains("stdout diagnostic"));
+        assert!(output.contains("stderr diagnostic"));
+    }
+
+    #[test]
+    fn failover_verification_rejects_partial_protocol_availability() {
+        let result = BenchResult {
+            profile_id: 7,
+            profile_name: "flapping".to_owned(),
+            profile_raw: "vless://flapping".to_owned(),
+            method: "head".to_owned(),
+            latency_ms: 200,
+            jitter_ms: 100,
+            download_mbps: None,
+            upload_mbps: None,
+            download_error: None,
+            upload_error: None,
+            loss_percent: 33.333,
+            score: 42,
+            success: true,
+            error: None,
+            timestamp: 1,
+        };
+
+        let strict = strict_failover_result(result);
+        assert!(!strict.success);
+        assert_eq!(strict.score, 0);
+        assert!(
+            strict
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("partial availability"))
+        );
+    }
 
     #[test]
     fn bench_method_parses_case_insensitive() {

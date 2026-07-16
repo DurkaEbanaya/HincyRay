@@ -79,7 +79,7 @@ def main() -> None:
             'register_runtime_tree',
             'acquire_transaction_lock',
             'release_transaction_lock',
-            'VERSION="0.21.0"',
+            'VERSION="0.21.6"',
             'releases/download/v${VERSION}/hincyray',
             'Required dependencies unavailable after opkg install',
         ],

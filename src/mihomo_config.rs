@@ -1610,7 +1610,14 @@ pub fn build_mihomo_router_config(
             .filter(|provider| provider.enabled && provider.target == target)
         {
             let target_name = match target {
-                GeoBaseRuleTarget::Active => PROXY_ACTIVE_NAME,
+                // GeoBase Active is a broad routing intent, not a raw outbound
+                // identity.  It must therefore use the same direct-fallback
+                // group as regular `active` routing rules.  Sending a large
+                // generated RULE-SET directly to `proxy-active` bypasses the
+                // `[proxy-active, DIRECT]` safety group and can make all
+                // policy-marked clients lose internet when the upstream server
+                // flaps or dies.
+                GeoBaseRuleTarget::Active => PROXY_NAME,
                 GeoBaseRuleTarget::Direct => DIRECT_NAME,
             };
             rules.push(format!("RULE-SET,{},{}", provider.name, target_name));
@@ -6776,7 +6783,13 @@ mod tests {
             "/opt/etc/hincyray/geobase/static.txt"
         );
         let rules = router_rules(&yaml);
-        assert!(rules.contains(&"RULE-SET,geobase-vpn,proxy-active".to_owned()));
+        assert!(rules.contains(&"RULE-SET,geobase-vpn,proxy".to_owned()));
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.starts_with("RULE-SET,") && rule.ends_with(",proxy-active")),
+            "broad GeoBase rules must target the fallback group, not raw proxy-active"
+        );
         assert!(rules.contains(&"RULE-SET,geobase-static,DIRECT".to_owned()));
     }
 
@@ -6835,7 +6848,7 @@ mod tests {
                 "DSCP,4,DIRECT",
                 "DOMAIN,raw.example,DIRECT",
                 "DOMAIN-SUFFIX,auto.example,proxy",
-                "RULE-SET,active-second-in-input,proxy-active",
+                "RULE-SET,active-second-in-input,proxy",
                 "RULE-SET,direct-first-in-input,DIRECT",
                 "RULE-SET,ru-bypass,proxy",
                 "GEOIP,RU,DIRECT",

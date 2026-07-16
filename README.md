@@ -1,4 +1,4 @@
-# HincyRay v0.21.1
+# HincyRay v0.21.6
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,28 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.21.6
+
+v0.21.6 adds a virtual Dead Servers lifecycle group with atomic bulk move/restore, preserves each profile's subscription/manual provenance, and excludes dead profiles from automatic selection while retaining explicit diagnostics. Routing keeps its `srv-v1` identity contract; lifecycle, Deep Bench, and quality history use canonical `srv-v2` references that survive display renames and equivalent URL serialization.
+
+On upgrade, raw lifecycle values and resolvable current-profile `srv-v1` values migrate to `srv-v2` automatically. Legacy orphan `srv-v1` Trash entries remain restorable. Do not use lifecycle refs as `server:` routing targets: routing intentionally remains backed by `server_route_registry` and `srv-v1`.
+
+### v0.21.5
+
+v0.21.5 makes automatic failover evidence-based: benchmark history only orders candidates, while every replacement server must pass a fresh zero-loss HTTPS check through its real proxy protocol before HincyRay switches. Candidate identity is raw-link based and remains correct across subscription reindexing.
+
+### v0.21.4
+
+v0.21.4 preserves both stdout and stderr from every temporary Mihomo benchmark process. Early process exits now return the real startup/configuration diagnostic instead of an opaque exit code, preventing runner failures from being mistaken for bad proxy profiles.
+
+### v0.21.3
+
+v0.21.3 makes subscription refresh non-destructive: HTTP success without a supported proxy profile is reported as a content failure, and an empty refresh can never replace an existing subscription group. Removing a group remains an explicit user action.
+
+### v0.21.2
+
+v0.21.2 is a router hotfix for GeoBase Active routing: broad generated Active rule providers now use the Mihomo fallback group `proxy` instead of raw `proxy-active`, so upstream flaps fall back safely instead of breaking policy-marked clients.
 
 ### v0.21.1
 
@@ -314,7 +336,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v0.21.1 gate results are recorded in [`docs/releases/v0.21.1.md`](docs/releases/v0.21.1.md); v0.21.0 router deployment evidence remains in [`docs/releases/v0.21.0.md`](docs/releases/v0.21.0.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v0.21.6 gate results are recorded in [`docs/releases/v0.21.6.md`](docs/releases/v0.21.6.md); v0.21.5 router deployment evidence remains in [`docs/releases/v0.21.5.md`](docs/releases/v0.21.5.md).
 
 ## Installation
 
@@ -360,6 +382,10 @@ Embedded Fluent/Acrylic panel with RU/EN i18n, light/dark themes, desktop/sideba
 | `POST` | `/api/profiles/update` | Update profile name and/or block_quic |
 | `POST` | `/api/profiles/block-quic` | Toggle block_quic flag on a profile |
 | `POST` | `/api/active-profile` | Set active profile, regenerate config, restart core |
+| `GET` | `/api/trash` | List the virtual Dead Servers lifecycle projection |
+| `POST` | `/api/trash/move` | Atomically move non-active lifecycle refs to Dead Servers |
+| `POST` | `/api/trash/restore` | Atomically restore lifecycle refs, including legacy orphan v1 entries |
+| `POST` | `/api/trash/purge-gone` | Purge Dead Servers entries no longer present in profiles |
 | `GET` | `/api/mihomo-config` | Applied generated Mihomo config, with secrets redacted |
 | `GET` | `/api/mihomo-config/preview` | Non-mutating preview of the desired generated config, with secrets redacted |
 | `POST` | `/api/core/start` | Start Mihomo core |

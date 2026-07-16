@@ -245,13 +245,16 @@ fn run_mihomo_test(profile: &Profile, settings: &TestSettings) -> Result<Metrics
         .write_all(config_yaml.as_bytes())
         .map_err(|error| error.to_string())?;
     config_file.flush().map_err(|error| error.to_string())?;
-    let stderr_file = NamedTempFile::new().map_err(|error| error.to_string())?;
-    let stderr_writer = stderr_file.reopen().map_err(|error| error.to_string())?;
+    let process_log = NamedTempFile::new().map_err(|error| error.to_string())?;
+    let stdout_writer = process_log.reopen().map_err(|error| error.to_string())?;
+    let stderr_writer = stdout_writer
+        .try_clone()
+        .map_err(|error| error.to_string())?;
 
     let mut child = Command::new("mihomo")
         .arg("-f")
         .arg(config_file.path())
-        .stdout(Stdio::null())
+        .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::from(stderr_writer))
         .spawn()
         .map_err(|error| format!("mihomo не запустился: {error}"))?;
@@ -259,7 +262,7 @@ fn run_mihomo_test(profile: &Profile, settings: &TestSettings) -> Result<Metrics
     let result = run_proxy_metrics(port, &mut child, settings);
     stop_child(&mut child);
 
-    result.map_err(|error| append_core_stderr("mihomo", error, stderr_file.path()))
+    result.map_err(|error| append_core_stderr("mihomo", error, process_log.path()))
 }
 
 fn reserve_local_port() -> Result<u16, String> {

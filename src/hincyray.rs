@@ -823,18 +823,17 @@ pub struct HincyrayState {
     /// v0.20: Deep Bench settings (scheduled quality testing).
     #[serde(default)]
     pub deep_bench: DeepBenchSettings,
-    /// v0.20: Trash bin — raw share-links of servers marked as poor
-    /// quality (composite_score < 30 for 3+ consecutive days). Survives
-    /// subscription refresh because it is keyed by raw, not by profile
-    /// id. A profile whose raw is in this set is shown in the "Trash"
-    /// virtual group in the UI.
-    #[serde(default)]
-    pub trash_raws: std::collections::HashSet<String>,
-    /// v0.20: Unix timestamp when each raw was promoted to trash.
+    /// Opaque canonical server references assigned to the virtual
+    /// "Dead Servers" lifecycle group. Profile provenance remains in
+    /// `Profile.group`; lifecycle membership survives subscription refresh,
+    /// profile renumbering, and display-name changes.
+    #[serde(default, alias = "trash_raws")]
+    pub dead_server_refs: std::collections::HashSet<String>,
+    /// Unix timestamp when each canonical server reference was promoted.
     /// Used for garbage collection (purge entries older than 90 days
     /// that are no longer present in any subscription).
-    #[serde(default)]
-    pub trash_promoted_at: std::collections::HashMap<String, u64>,
+    #[serde(default, alias = "trash_promoted_at")]
+    pub dead_promoted_at: std::collections::HashMap<String, u64>,
     /// v0.20: Daily quality snapshots — persisted to a separate file
     /// (`/opt/etc/hincyray/quality-history.json`) to avoid bloating
     /// state.json. Loaded lazily by `/api/deep-bench/history`.
@@ -885,8 +884,8 @@ impl Default for HincyrayState {
             memory_guard: MemoryGuardSettings::default(),
             safe_mode_enabled: false,
             deep_bench: DeepBenchSettings::default(),
-            trash_raws: std::collections::HashSet::new(),
-            trash_promoted_at: std::collections::HashMap::new(),
+            dead_server_refs: std::collections::HashSet::new(),
+            dead_promoted_at: std::collections::HashMap::new(),
             quality_history: Vec::new(),
         }
     }
@@ -1038,7 +1037,9 @@ pub enum ProfileFilter {
     All,
     /// Test only profiles whose `group` matches the subscription URL.
     Subscription(String),
-    /// Test only profiles whose `raw` is in the given list.
+    /// Test only profiles whose opaque canonical server reference is in the
+    /// given list. Explicit scope is deliberate diagnostics and may include
+    /// profiles assigned to Dead Servers.
     Explicit(Vec<String>),
 }
 
@@ -1119,16 +1120,18 @@ impl UnlockTestResult {
     }
 }
 
-/// v0.20: One row of quality history. Stored by `profile_raw` (not
-/// `profile_id`) so it survives subscription refresh — when a profile
-/// is removed and re-added by `replace_subscription_profiles`, its
-/// id changes but its raw share-link stays the same.
+/// v0.20: One row of quality history. Stored by opaque canonical server
+/// reference (not `profile_id` or a credential-bearing share link) so it
+/// survives subscription refresh, profile renumbering, and display-name
+/// changes without exposing connection secrets through the history API.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DailyQualitySnapshot {
     /// YYYYMMDD (e.g. 20260707 for 2026-07-07).
     pub date: u32,
-    /// Raw share-link — the stable identity across subscription refresh.
-    pub profile_raw: String,
+    /// Opaque canonical server identity. The alias reads legacy history files;
+    /// `load_quality_history` converts their raw values before returning them.
+    #[serde(default, alias = "profile_raw")]
+    pub server_ref: String,
     /// Snapshot of profile name at test time (for UI display when the
     /// profile is no longer in any subscription).
     pub profile_name: String,
@@ -1726,7 +1729,7 @@ impl RoutingTarget {
             "reject" => Ok(Self::Reject),
             _ if value.starts_with("server:") => {
                 let server_ref = &value[7..];
-                if valid_server_ref(server_ref) {
+                if valid_routing_server_ref(server_ref) {
                     Ok(Self::Server(server_ref.to_owned()))
                 } else {
                     Err(format!("malformed server target {value:?}"))
@@ -1741,14 +1744,24 @@ impl RoutingTarget {
     }
 }
 
-fn valid_server_ref(value: &str) -> bool {
+fn valid_routing_server_ref(value: &str) -> bool {
     value.len() == 39
         && value.starts_with("srv-v1-")
         && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_lifecycle_ref(value: &str) -> bool {
+    value.len() == 39
+        && (value.starts_with("srv-v1-") || value.starts_with("srv-v2-"))
+        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn canonical_profile_raw(profile: &Profile) -> String {
-    let raw = profile.raw.trim();
+    canonical_profile_raw_from_raw(&profile.raw)
+}
+
+fn canonical_profile_raw_from_raw(raw: &str) -> String {
+    let raw = raw.trim();
     let Some((scheme, payload)) = raw.split_once("://") else {
         return raw.split('#').next().unwrap_or(raw).to_owned();
     };
@@ -1776,6 +1789,37 @@ fn canonical_profile_raw(profile: &Profile) -> String {
     raw.split('#').next().unwrap_or(raw).to_owned()
 }
 
+fn canonical_lifecycle_identity(profile: &Profile) -> String {
+    canonical_lifecycle_identity_from_raw(&profile.raw)
+}
+
+fn canonical_lifecycle_identity_from_raw(raw: &str) -> String {
+    let legacy_canonical = canonical_profile_raw_from_raw(raw);
+    if legacy_canonical.starts_with("vmess-json:") {
+        return legacy_canonical;
+    }
+    let Ok(mut url) = url::Url::parse(raw.trim()) else {
+        return legacy_canonical;
+    };
+    url.set_fragment(None);
+    if let Some(url::Host::Domain(domain)) = url.host() {
+        let normalized = domain.to_lowercase();
+        if normalized != domain && url.set_host(Some(&normalized)).is_err() {
+            return legacy_canonical;
+        }
+    }
+    let mut query: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    query.sort_by(|left, right| left.0.cmp(&right.0));
+    url.set_query(None);
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query);
+    }
+    url.to_string()
+}
+
 fn server_ref_for_canonical(canonical: &str) -> String {
     let digest = sha256(canonical.as_bytes());
     let mut hex = String::with_capacity(32);
@@ -1784,6 +1828,105 @@ fn server_ref_for_canonical(canonical: &str) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     format!("srv-v1-{hex}")
+}
+
+fn lifecycle_ref_for_canonical(canonical: &str) -> String {
+    let digest = sha256(canonical.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for byte in &digest[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!("srv-v2-{hex}")
+}
+
+fn profile_server_ref(profile: &Profile) -> String {
+    lifecycle_ref_for_canonical(&canonical_lifecycle_identity(profile))
+}
+
+fn migrate_lifecycle_ref(value: &str, profiles: &[Profile]) -> (String, bool) {
+    if value.starts_with("srv-v2-") && valid_lifecycle_ref(value) {
+        return (value.to_owned(), false);
+    }
+    if value.starts_with("srv-v1-") && valid_lifecycle_ref(value) {
+        if let Some(profile) = profiles
+            .iter()
+            .find(|profile| server_ref_for_canonical(&canonical_profile_raw(profile)) == value)
+        {
+            return (profile_server_ref(profile), true);
+        }
+        return (value.to_owned(), false);
+    }
+    (
+        lifecycle_ref_for_canonical(&canonical_lifecycle_identity_from_raw(value)),
+        true,
+    )
+}
+
+fn profile_is_dead(state: &HincyrayState, profile: &Profile) -> bool {
+    state
+        .dead_server_refs
+        .contains(&profile_server_ref(profile))
+}
+
+fn migrate_legacy_dead_server_refs(state: &mut HincyrayState) -> bool {
+    let legacy_refs = std::mem::take(&mut state.dead_server_refs);
+    let legacy_promoted = std::mem::take(&mut state.dead_promoted_at);
+    let original_refs = legacy_refs.clone();
+    let original_promoted = legacy_promoted.clone();
+    let mut changed = false;
+    for value in legacy_refs {
+        let (server_ref, migrated) = migrate_lifecycle_ref(&value, &state.profiles);
+        changed |= migrated;
+        state.dead_server_refs.insert(server_ref.clone());
+        if let Some(promoted_at) = legacy_promoted.get(&value).copied() {
+            state.dead_promoted_at.insert(server_ref, promoted_at);
+        }
+    }
+    for (value, promoted_at) in legacy_promoted {
+        let (server_ref, migrated) = migrate_lifecycle_ref(&value, &state.profiles);
+        changed |= migrated;
+        if state.dead_server_refs.contains(&server_ref) {
+            state
+                .dead_promoted_at
+                .entry(server_ref)
+                .or_insert(promoted_at);
+        }
+    }
+    changed
+        || state.dead_server_refs != original_refs
+        || state.dead_promoted_at != original_promoted
+}
+
+fn migrate_legacy_deep_bench_filter_refs(state: &mut HincyrayState) -> bool {
+    let profiles = state.profiles.clone();
+    let ProfileFilter::Explicit(values) = &mut state.deep_bench.profile_filter else {
+        return false;
+    };
+    let mut changed = false;
+    let mut unique = HashSet::new();
+    for value in std::mem::take(values) {
+        let (server_ref, migrated) = migrate_lifecycle_ref(&value, &profiles);
+        changed |= migrated;
+        if !unique.insert(server_ref.clone()) {
+            changed = true;
+        }
+    }
+    *values = unique.into_iter().collect();
+    changed
+}
+
+fn reconcile_active_dead_server_membership(state: &mut HincyrayState) -> bool {
+    let Some(active_ref) = state
+        .active_profile_id
+        .and_then(|id| state.profiles.iter().find(|profile| profile.id == id))
+        .map(profile_server_ref)
+    else {
+        return false;
+    };
+    let removed = state.dead_server_refs.remove(&active_ref);
+    let removed_timestamp = state.dead_promoted_at.remove(&active_ref).is_some();
+    removed || removed_timestamp
 }
 
 fn sync_server_route_registry(state: &mut HincyrayState) {
@@ -3184,7 +3327,14 @@ fn load_state_with_hasher(
     // The old generic-SOCKS probe obeyed routing rules and could cache a
     // false negative for 24h. Invalidate non-promoted timestamps exactly
     // once after switching to forced `proxy-active` EC probes.
-    let mut migration_changed = routing_identity_changed || auth_migration.changed();
+    let dead_servers_changed = migrate_legacy_dead_server_refs(&mut state);
+    let deep_bench_filter_changed = migrate_legacy_deep_bench_filter_refs(&mut state);
+    let active_dead_membership_changed = reconcile_active_dead_server_membership(&mut state);
+    let mut migration_changed = routing_identity_changed
+        || auth_migration.changed()
+        || dead_servers_changed
+        || deep_bench_filter_changed
+        || active_dead_membership_changed;
     if let AuthMigration::Disabled(error) = auth_migration {
         eprintln!("hincyray: failed to migrate Web UI password: {error}");
     }
@@ -3566,6 +3716,9 @@ fn resolve_target<'a>(
                 .iter()
                 .find(|p| canonical_profile_raw(p) == entry.canonical_raw)
                 .ok_or_else(|| format!("server ref {server_ref} is stale"))?;
+            if profile_is_dead(state, profile) {
+                return Ok((PROXY_NAME.to_owned(), Some(active)));
+            }
             if canonical_profile_raw(active) == entry.canonical_raw {
                 return Ok((PROXY_ACTIVE_NAME.to_owned(), Some(profile)));
             }
@@ -3608,12 +3761,15 @@ fn validate_routing_targets(
                     .iter()
                     .find(|e| e.server_ref == server_ref)
                     .ok_or_else(|| format!("unknown server ref {server_ref}"))?;
-                if !state
+                let profile = state
                     .profiles
                     .iter()
-                    .any(|p| canonical_profile_raw(p) == entry.canonical_raw)
-                {
+                    .find(|profile| canonical_profile_raw(profile) == entry.canonical_raw);
+                let Some(profile) = profile else {
                     return Err(format!("server ref {server_ref} is stale"));
+                };
+                if profile_is_dead(state, profile) {
+                    continue;
                 }
                 refs.insert(server_ref);
             }
@@ -3692,6 +3848,9 @@ fn pinned_route_observer_catalog(state: &HincyrayState) -> Vec<(String, String, 
         else {
             continue;
         };
+        if profile_is_dead(state, profile) {
+            continue;
+        }
         if canonical_profile_raw(active) == entry.canonical_raw {
             continue;
         }
@@ -4276,6 +4435,7 @@ fn dispatch_from(
                 .map(|profile| {
                     json!({
                         "id": profile.id,
+                        "server_ref": profile_server_ref(profile),
                         "name": profile.name,
                         "protocol": profile.protocol.to_string(),
                         "transport": profile.transport(),
@@ -4283,6 +4443,7 @@ fn dispatch_from(
                         "port": profile.port,
                         "active": active_id == Some(profile.id),
                         "group": profile.group,
+                        "dead": profile_is_dead(&inner.state, profile),
                         "block_quic": profile.block_quic,
                     })
                 })
@@ -4323,6 +4484,7 @@ fn dispatch_from(
         ("GET", "/api/deep-bench/history") => handle_deep_bench_history(daemon),
         // v0.20: Trash bin endpoints.
         ("GET", "/api/trash") => handle_trash_list(daemon),
+        ("POST", "/api/trash/move") => handle_trash_move(body, daemon),
         ("POST", "/api/trash/restore") => handle_trash_restore(body, daemon),
         ("POST", "/api/trash/purge-gone") => handle_trash_purge_gone(daemon),
         ("POST", "/api/subscriptions/refresh") => handle_subscriptions_refresh(daemon),
@@ -5986,17 +6148,36 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    // Decide which profiles to benchmark. Either an explicit `profile_ids`
-    // array (single ping if length 1) or all imported profiles.
-    let requested_ids: Option<Vec<usize>> =
-        value
-            .get("profile_ids")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as usize))
-                    .collect()
-            });
+    // Decide benchmark scope under the state lock. Subscription membership is
+    // resolved by the daemon so browser filtering/collapse/reindexing cannot
+    // widen or narrow the group test. Normal scopes exclude Dead Servers;
+    // explicit ids remain available for deliberate single-server diagnostics.
+    let subscription_url = value
+        .get("subscription_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_owned);
+    let requested_ids = match value.get("profile_ids") {
+        None => None,
+        Some(Value::Array(values)) => {
+            let mut ids = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(id) = value.as_u64().and_then(|id| usize::try_from(id).ok()) else {
+                    return json_error(400, "profile_ids must contain only non-negative integers");
+                };
+                ids.push(id);
+            }
+            Some(ids)
+        }
+        Some(_) => return json_error(400, "profile_ids must be an array"),
+    };
+    if subscription_url.is_some() && requested_ids.is_some() {
+        return json_error(
+            400,
+            "subscription_url and profile_ids are mutually exclusive",
+        );
+    }
 
     let (profiles, core_path) = {
         let inner = lock(&daemon.inner);
@@ -6008,15 +6189,13 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
                     .to_string(),
             );
         }
-        let profiles: Vec<Profile> = match requested_ids {
-            Some(ids) if !ids.is_empty() => inner
-                .state
-                .profiles
-                .iter()
-                .filter(|p| ids.contains(&p.id))
-                .cloned()
-                .collect(),
-            _ => inner.state.profiles.clone(),
+        let profiles = match select_profiles_for_quick_bench(
+            &inner.state,
+            subscription_url.as_deref(),
+            requested_ids.as_deref(),
+        ) {
+            Ok(profiles) => profiles,
+            Err((status, error)) => return json_error(status, &error),
         };
         (profiles, inner.state.mihomo_path.clone())
     };
@@ -6070,6 +6249,56 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         "running": snapshot.running,
     });
     (200, "application/json", response.to_string())
+}
+
+fn select_profiles_for_quick_bench(
+    state: &HincyrayState,
+    subscription_url: Option<&str>,
+    requested_ids: Option<&[usize]>,
+) -> Result<Vec<Profile>, (u16, String)> {
+    if subscription_url.is_some() && requested_ids.is_some() {
+        return Err((
+            400,
+            "subscription_url and profile_ids are mutually exclusive".to_owned(),
+        ));
+    }
+    if let Some(url) = subscription_url {
+        if !state.subscriptions.iter().any(|source| source.url == url) {
+            return Err((404, "subscription not found".to_owned()));
+        }
+        return Ok(state
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile.group.as_deref() == Some(url) && !profile_is_dead(state, profile)
+            })
+            .cloned()
+            .collect());
+    }
+    if let Some(ids) = requested_ids {
+        if ids.is_empty() {
+            return Err((400, "profile_ids must not be empty".to_owned()));
+        }
+        let requested: HashSet<usize> = ids.iter().copied().collect();
+        if let Some(missing) = requested
+            .iter()
+            .find(|id| !state.profiles.iter().any(|profile| profile.id == **id))
+        {
+            return Err((404, format!("profile not found: {missing}")));
+        }
+        return Ok(state
+            .profiles
+            .iter()
+            .filter(|profile| requested.contains(&profile.id))
+            .cloned()
+            .collect());
+    }
+    Ok(state
+        .profiles
+        .iter()
+        .filter(|profile| !profile_is_dead(state, profile))
+        .cloned()
+        .collect())
 }
 
 fn handle_bench_stop(daemon: &Daemon) -> (u16, &'static str, String) {
@@ -6185,6 +6414,7 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
             let favorite = favorites.iter().any(|raw| raw == &profile.raw);
             json!({
                 "profile_id": profile.id,
+                "server_ref": profile_server_ref(profile),
                 "name": profile.name,
                 "protocol": profile.protocol.to_string(),
                 "transport": profile.transport(),
@@ -6193,6 +6423,7 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
                 "active": active_id == Some(profile.id),
                 "favorite": favorite,
                 "group": profile.group,
+                "dead": profile_is_dead(&inner.state, profile),
                 "last_latency_ms": stat.filter(|s| s.has_latency).map(|s| s.last_latency_ms),
                 "last_jitter_ms": stat.filter(|s| s.has_jitter).map(|s| s.last_jitter_ms),
                 "last_download_mbps": stat.filter(|s| s.has_download).map(|s| s.last_download_mbps),
@@ -7011,19 +7242,21 @@ fn handle_deep_bench_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static
                 }
             }
             "explicit" => {
-                let raws: Vec<String> = obj
+                let server_refs: Vec<String> = obj
                     .get("value")
                     .and_then(Value::as_array)
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .filter_map(Value::as_str)
+                            .filter(|server_ref| valid_lifecycle_ref(server_ref))
+                            .map(str::to_owned)
                             .collect()
                     })
                     .unwrap_or_default();
-                if raws.is_empty() {
+                if server_refs.is_empty() {
                     ProfileFilter::All
                 } else {
-                    ProfileFilter::Explicit(raws)
+                    ProfileFilter::Explicit(server_refs)
                 }
             }
             _ => s.profile_filter.clone(),
@@ -7127,7 +7360,7 @@ fn handle_deep_bench_status(daemon: &Daemon) -> (u16, &'static str, String) {
 fn handle_deep_bench_history(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
     let history = if inner.state.quality_history.is_empty() {
-        load_quality_history(&daemon.state_path)
+        load_quality_history(&daemon.state_path, &inner.state.profiles)
     } else {
         inner.state.quality_history.clone()
     };
@@ -7150,16 +7383,25 @@ fn handle_trash_list(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
     let entries: Vec<Value> = inner
         .state
-        .trash_raws
+        .dead_server_refs
         .iter()
-        .map(|raw| {
-            let promoted = inner.state.trash_promoted_at.get(raw).copied().unwrap_or(0);
-            // Find profile name if still in profiles list.
-            let profile = inner.state.profiles.iter().find(|p| &p.raw == raw);
+        .map(|server_ref| {
+            let promoted = inner
+                .state
+                .dead_promoted_at
+                .get(server_ref)
+                .copied()
+                .unwrap_or(0);
+            let profile = inner
+                .state
+                .profiles
+                .iter()
+                .find(|profile| profile_server_ref(profile) == *server_ref);
             json!({
-                "raw": raw,
+                "server_ref": server_ref,
                 "name": profile.map(|p| p.name.clone()).unwrap_or_else(|| "(gone)".to_owned()),
                 "profile_id": profile.map(|p| p.id),
+                "group": profile.and_then(|p| p.group.clone()),
                 "promoted_at_unix": promoted,
                 "still_in_profiles": profile.is_some(),
             })
@@ -7172,28 +7414,199 @@ fn handle_trash_list(daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
-fn handle_trash_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return json_error(400, "invalid JSON body");
-    };
-    let Some(raw) = value.get("raw").and_then(Value::as_str) else {
-        return json_error(400, "missing 'raw' field");
-    };
-    let mut inner = lock(&daemon.inner);
-    let existed = inner.state.trash_raws.remove(raw);
-    inner.state.trash_promoted_at.remove(raw);
-    if existed {
-        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
-            return json_error(500, &format!("persist failed: {error}"));
+fn parse_server_refs(body: &str) -> Result<Vec<String>, String> {
+    let value: Value = serde_json::from_str(body).map_err(|_| "invalid JSON body".to_owned())?;
+    let refs = value
+        .get("server_refs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing 'server_refs' array".to_owned())?;
+    let mut unique = HashSet::new();
+    for server_ref in refs.iter().filter_map(Value::as_str) {
+        if !valid_lifecycle_ref(server_ref) {
+            return Err(format!("invalid server_ref: {server_ref}"));
         }
-        (
-            200,
-            "application/json",
-            json!({"ok": true, "restored": raw}).to_string(),
-        )
-    } else {
-        json_error(404, &format!("raw not in trash: {raw}"))
+        unique.insert(server_ref.to_owned());
     }
+    if unique.is_empty() {
+        return Err("server_refs must not be empty".to_owned());
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn dead_membership_affects_running_dataplane(
+    state: &HincyrayState,
+    changed_refs: &HashSet<String>,
+) -> bool {
+    if !state.split_routing.enabled || state.active_profile_id.is_none() || changed_refs.is_empty()
+    {
+        return false;
+    }
+    state
+        .routing_rules
+        .iter()
+        .filter(|rule| rule.enabled)
+        .map(|rule| rule.target.as_str())
+        .chain(
+            state
+                .device_routes
+                .iter()
+                .filter(|route| route.enabled)
+                .map(|route| route.target.as_str()),
+        )
+        .filter_map(|target| match RoutingTarget::parse(target).ok()? {
+            RoutingTarget::Server(server_ref) => {
+                let entry = state
+                    .server_route_registry
+                    .iter()
+                    .find(|entry| entry.server_ref == server_ref)?;
+                state
+                    .profiles
+                    .iter()
+                    .find(|profile| canonical_profile_raw(profile) == entry.canonical_raw)
+                    .map(profile_server_ref)
+            }
+            _ => None,
+        })
+        .any(|server_ref| changed_refs.contains(&server_ref))
+}
+
+fn mutate_dead_server_membership<T>(
+    daemon: &Daemon,
+    mutate: impl FnOnce(&mut HincyrayState) -> Result<T, (u16, String)>,
+) -> Result<T, (u16, String)> {
+    let _apply = daemon
+        .apply
+        .lock()
+        .map_err(|_| (500, "config apply lock is poisoned".to_owned()))?;
+    let (result, previous_refs, previous_promoted, activate_dataplane) = {
+        let mut inner = lock(&daemon.inner);
+        let previous_refs = inner.state.dead_server_refs.clone();
+        let previous_promoted = inner.state.dead_promoted_at.clone();
+        let mut candidate = inner.state.clone();
+        let result = mutate(&mut candidate)?;
+        inner.state.dead_server_refs = candidate.dead_server_refs;
+        inner.state.dead_promoted_at = candidate.dead_promoted_at;
+        let changed_refs: HashSet<String> = previous_refs
+            .symmetric_difference(&inner.state.dead_server_refs)
+            .cloned()
+            .collect();
+        let membership_changed =
+            !changed_refs.is_empty() || previous_promoted != inner.state.dead_promoted_at;
+        if !membership_changed {
+            return Ok(result);
+        }
+        let activate_dataplane = inner.core.is_running()
+            && dead_membership_affects_running_dataplane(&inner.state, &changed_refs);
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            inner.state.dead_server_refs = previous_refs;
+            inner.state.dead_promoted_at = previous_promoted;
+            return Err((500, format!("persist failed: {error}")));
+        }
+        inner.dirty = false;
+        (result, previous_refs, previous_promoted, activate_dataplane)
+    };
+
+    if activate_dataplane
+        && let Err(error) =
+            activate_current_config_locked(daemon, false, false, GeoBaseProjection::Applied)
+    {
+        let rollback = {
+            let mut inner = lock(&daemon.inner);
+            inner.state.dead_server_refs = previous_refs;
+            inner.state.dead_promoted_at = previous_promoted;
+            match persist_state(&daemon.state_path, &inner.state) {
+                Ok(()) => {
+                    inner.dirty = false;
+                    "restored".to_owned()
+                }
+                Err(rollback_error) => {
+                    inner.dirty = true;
+                    format!("failed ({rollback_error})")
+                }
+            }
+        };
+        return Err((
+            500,
+            format!(
+                "Dead Servers dataplane activation failed: {error}; state rollback: {rollback}"
+            ),
+        ));
+    }
+
+    Ok(result)
+}
+
+fn handle_trash_move(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let refs = match parse_server_refs(body) {
+        Ok(refs) => refs,
+        Err(error) => return json_error(400, &error),
+    };
+    let moved = match mutate_dead_server_membership(daemon, |state| {
+        let active_ref = state
+            .active_profile_id
+            .and_then(|id| state.profiles.iter().find(|profile| profile.id == id))
+            .map(profile_server_ref);
+        for server_ref in &refs {
+            if !state
+                .profiles
+                .iter()
+                .any(|profile| profile_server_ref(profile) == *server_ref)
+            {
+                return Err((404, format!("server not found: {server_ref}")));
+            }
+            if active_ref.as_deref() == Some(server_ref) {
+                return Err((
+                    409,
+                    "active profile cannot be moved to Dead Servers".to_owned(),
+                ));
+            }
+        }
+        let now = unix_now();
+        for server_ref in &refs {
+            state.dead_server_refs.insert(server_ref.clone());
+            state
+                .dead_promoted_at
+                .entry(server_ref.clone())
+                .or_insert(now);
+        }
+        Ok(refs.clone())
+    }) {
+        Ok(moved) => moved,
+        Err((status, error)) => return json_error(status, &error),
+    };
+    (
+        200,
+        "application/json",
+        json!({"ok": true, "moved": moved}).to_string(),
+    )
+}
+
+fn handle_trash_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let refs = match parse_server_refs(body) {
+        Ok(refs) => refs,
+        Err(error) => return json_error(400, &error),
+    };
+    let restored = match mutate_dead_server_membership(daemon, |state| {
+        if let Some(missing) = refs
+            .iter()
+            .find(|server_ref| !state.dead_server_refs.contains(*server_ref))
+        {
+            return Err((404, format!("server not in Dead Servers: {missing}")));
+        }
+        for server_ref in &refs {
+            state.dead_server_refs.remove(server_ref);
+            state.dead_promoted_at.remove(server_ref);
+        }
+        Ok(refs.clone())
+    }) {
+        Ok(restored) => restored,
+        Err((status, error)) => return json_error(status, &error),
+    };
+    (
+        200,
+        "application/json",
+        json!({"ok": true, "restored": restored}).to_string(),
+    )
 }
 
 fn handle_trash_purge_gone(daemon: &Daemon) -> (u16, &'static str, String) {
@@ -7227,11 +7640,20 @@ fn json_error(code: u16, msg: &str) -> (u16, &'static str, String) {
 /// All profiles are re-indexed with sequential IDs and
 /// `active_profile_id` is updated to point to the active profile by
 /// its `raw` string. Returns the number of fresh profiles added.
+///
+/// An empty set is never a valid replacement: only the explicit delete API
+/// may erase a subscription group. This remains an invariant even if a future
+/// loader accidentally reports a transport-successful but empty response.
 fn replace_subscription_profiles(
     state: &mut HincyrayState,
     url: &str,
     fresh: Vec<Profile>,
-) -> usize {
+) -> Result<usize, String> {
+    if fresh.is_empty() {
+        return Err(format!(
+            "refusing to replace subscription {url} with an empty profile set"
+        ));
+    }
     let active_raw = state
         .active_profile_id
         .and_then(|id| state.profiles.iter().find(|p| p.id == id))
@@ -7266,7 +7688,7 @@ fn replace_subscription_profiles(
         .and_then(|raw| state.profiles.iter().find(|p| &p.raw == raw))
         .map(|p| p.id);
 
-    added
+    Ok(added)
 }
 
 /// Remove a subscription source and all its profiles from the state.
@@ -7391,11 +7813,6 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
             .map(|p| p.raw.clone())
             .collect();
         let previous_count = previous_raw.len();
-        let stored = inner
-            .state
-            .subscriptions
-            .iter_mut()
-            .find(|s| s.url == source.url);
         match outcome {
             SubscriptionLoadOutcome::Ok(report) => {
                 let count = report.profiles.len();
@@ -7403,29 +7820,63 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
                     report.profiles.iter().map(|p| p.raw.clone()).collect();
                 let added_for_source = fresh_raw.difference(&previous_raw).count();
                 let removed_for_source = previous_raw.difference(&fresh_raw).count();
-                if let Some(stored) = stored {
-                    stored.last_loaded_unix = Some(now);
-                    stored.last_error = None;
-                    stored.profile_count = count;
+                match replace_subscription_profiles(&mut inner.state, &source.url, report.profiles)
+                {
+                    Ok(added) => {
+                        if let Some(stored) = inner
+                            .state
+                            .subscriptions
+                            .iter_mut()
+                            .find(|s| s.url == source.url)
+                        {
+                            stored.last_loaded_unix = Some(now);
+                            stored.last_error = None;
+                            stored.profile_count = count;
+                        }
+                        added_total += added;
+                        refreshed += 1;
+                        entries.push(SubscriptionRefreshEntry {
+                            url: source.url.clone(),
+                            status: "ok".to_owned(),
+                            previous_count,
+                            new_count: count,
+                            added: added_for_source,
+                            removed: removed_for_source,
+                            changed: 0,
+                            error: None,
+                        });
+                    }
+                    Err(error) => {
+                        if let Some(stored) = inner
+                            .state
+                            .subscriptions
+                            .iter_mut()
+                            .find(|s| s.url == source.url)
+                        {
+                            stored.last_error = Some(error.clone());
+                        }
+                        errors.push(error);
+                        entries.push(SubscriptionRefreshEntry {
+                            url: source.url.clone(),
+                            status: "error".to_owned(),
+                            previous_count,
+                            new_count: previous_count,
+                            added: 0,
+                            removed: 0,
+                            changed: 0,
+                            error: errors.last().cloned(),
+                        });
+                    }
                 }
-                let added =
-                    replace_subscription_profiles(&mut inner.state, &source.url, report.profiles);
-                added_total += added;
-                refreshed += 1;
-                entries.push(SubscriptionRefreshEntry {
-                    url: source.url.clone(),
-                    status: "ok".to_owned(),
-                    previous_count,
-                    new_count: count,
-                    added: added_for_source,
-                    removed: removed_for_source,
-                    changed: 0,
-                    error: None,
-                });
             }
             SubscriptionLoadOutcome::Failed { attempts } => {
                 let error = SubscriptionLoadOutcome::format_error(&attempts);
-                if let Some(stored) = stored {
+                if let Some(stored) = inner
+                    .state
+                    .subscriptions
+                    .iter_mut()
+                    .find(|s| s.url == source.url)
+                {
                     stored.last_error = Some(error.clone());
                 }
                 errors.push(error);
@@ -7566,11 +8017,6 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
         .map(|p| p.raw.clone())
         .collect();
     let previous_count = previous_raw.len();
-    let stored = inner
-        .state
-        .subscriptions
-        .iter_mut()
-        .find(|s| s.url == source.url);
     match outcome {
         SubscriptionLoadOutcome::Ok(report) => {
             let count = report.profiles.len();
@@ -7578,84 +8024,118 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
                 report.profiles.iter().map(|p| p.raw.clone()).collect();
             let added_for_source = fresh_raw.difference(&previous_raw).count();
             let removed_for_source = previous_raw.difference(&fresh_raw).count();
-            if let Some(stored) = stored {
-                stored.last_loaded_unix = Some(now);
-                stored.last_error = None;
-                stored.profile_count = count;
-            }
-            // Replace all profiles belonging to this subscription with
-            // the fresh set — removes stale entries, prevents duplicates.
-            let added =
-                replace_subscription_profiles(&mut inner.state, &source.url, report.profiles);
-            let refresh_report = SubscriptionRefreshReport {
-                timestamp: now,
-                refreshed: 1,
-                added,
-                removed: removed_for_source,
-                changed: 0,
-                failed: 0,
-                entries: vec![SubscriptionRefreshEntry {
-                    url: source.url.clone(),
-                    status: "ok".to_owned(),
+            match replace_subscription_profiles(&mut inner.state, &source.url, report.profiles) {
+                Ok(added) => {
+                    if let Some(stored) = inner
+                        .state
+                        .subscriptions
+                        .iter_mut()
+                        .find(|s| s.url == source.url)
+                    {
+                        stored.last_loaded_unix = Some(now);
+                        stored.last_error = None;
+                        stored.profile_count = count;
+                    }
+                    let refresh_report = SubscriptionRefreshReport {
+                        timestamp: now,
+                        refreshed: 1,
+                        added,
+                        removed: removed_for_source,
+                        changed: 0,
+                        failed: 0,
+                        entries: vec![SubscriptionRefreshEntry {
+                            url: source.url.clone(),
+                            status: "ok".to_owned(),
+                            previous_count,
+                            new_count: count,
+                            added: added_for_source,
+                            removed: removed_for_source,
+                            changed: 0,
+                            error: None,
+                        }],
+                    };
+                    inner.state.last_subscription_refresh_report = Some(refresh_report.clone());
+                    let _ = persist_state(&daemon.state_path, &inner.state);
+                    let response = json!({
+                        "url": source.url,
+                        "refreshed": 1,
+                        "added": added,
+                        "profile_count": count,
+                        "errors": Vec::<String>::new(),
+                        "report": refresh_report,
+                    });
+                    (200, "application/json", response.to_string())
+                }
+                Err(error) => subscription_refresh_error_response(
+                    &mut inner,
+                    &daemon.state_path,
+                    &source.url,
+                    now,
                     previous_count,
-                    new_count: count,
-                    added: added_for_source,
-                    removed: removed_for_source,
-                    changed: 0,
-                    error: None,
-                }],
-            };
-            inner.state.last_subscription_refresh_report = Some(refresh_report.clone());
-            let _ = persist_state(&daemon.state_path, &inner.state);
-            let response = json!({
-                "url": source.url,
-                "refreshed": 1,
-                "added": added,
-                "profile_count": count,
-                "errors": Vec::<String>::new(),
-                "report": refresh_report,
-            });
-            (200, "application/json", response.to_string())
+                    error,
+                ),
+            }
         }
         SubscriptionLoadOutcome::Failed { attempts } => {
             let error = SubscriptionLoadOutcome::format_error(&attempts);
-            if let Some(stored) = stored {
-                stored.last_error = Some(error.clone());
-            }
-            let refresh_report = SubscriptionRefreshReport {
-                timestamp: now,
-                refreshed: 0,
-                added: 0,
-                removed: 0,
-                changed: 0,
-                failed: 1,
-                entries: vec![SubscriptionRefreshEntry {
-                    url: source.url.clone(),
-                    status: "error".to_owned(),
-                    previous_count,
-                    new_count: previous_count,
-                    added: 0,
-                    removed: 0,
-                    changed: 0,
-                    error: Some(error.clone()),
-                }],
-            };
-            inner.state.last_subscription_refresh_report = Some(refresh_report.clone());
-            let _ = persist_state(&daemon.state_path, &inner.state);
-            (
-                200,
-                "application/json",
-                json!({
-                    "url": source.url,
-                    "refreshed": 0,
-                    "added": 0,
-                    "errors": [error],
-                    "report": refresh_report,
-                })
-                .to_string(),
+            subscription_refresh_error_response(
+                &mut inner,
+                &daemon.state_path,
+                &source.url,
+                now,
+                previous_count,
+                error,
             )
         }
     }
+}
+
+/// Record a failed single-subscription refresh without touching the existing
+/// group. Both transport/parse failures and rejected state mutations use this
+/// path, so their externally visible preservation semantics cannot diverge.
+fn subscription_refresh_error_response(
+    inner: &mut DaemonInner,
+    state_path: &Path,
+    url: &str,
+    now: u64,
+    previous_count: usize,
+    error: String,
+) -> (u16, &'static str, String) {
+    if let Some(stored) = inner.state.subscriptions.iter_mut().find(|s| s.url == url) {
+        stored.last_error = Some(error.clone());
+    }
+    let refresh_report = SubscriptionRefreshReport {
+        timestamp: now,
+        refreshed: 0,
+        added: 0,
+        removed: 0,
+        changed: 0,
+        failed: 1,
+        entries: vec![SubscriptionRefreshEntry {
+            url: url.to_owned(),
+            status: "error".to_owned(),
+            previous_count,
+            new_count: previous_count,
+            added: 0,
+            removed: 0,
+            changed: 0,
+            error: Some(error.clone()),
+        }],
+    };
+    inner.state.last_subscription_refresh_report = Some(refresh_report.clone());
+    let _ = persist_state(state_path, &inner.state);
+    (
+        200,
+        "application/json",
+        json!({
+            "url": url,
+            "refreshed": 0,
+            "added": 0,
+            "errors": [error],
+            "report": refresh_report,
+        })
+        .to_string(),
+    )
 }
 
 fn handle_subscriptions_list(daemon: &Daemon) -> (u16, &'static str, String) {
@@ -15340,7 +15820,7 @@ fn find_best_profile_by_score(
     }
     let mut best: Option<(usize, u32)> = None;
     for profile in &state.profiles {
-        if excluded_profiles.contains(&profile.id) {
+        if excluded_profiles.contains(&profile.id) || profile_is_dead(state, profile) {
             continue;
         }
         let Some(stat) = state.stats.iter().find(|s| s.profile_raw == profile.raw) else {
@@ -15366,7 +15846,7 @@ fn find_best_profile_by_smart_score(
     let now = unix_now();
     let mut best: Option<(usize, f32)> = None;
     for profile in &state.profiles {
-        if excluded_profiles.contains(&profile.id) {
+        if excluded_profiles.contains(&profile.id) || profile_is_dead(state, profile) {
             continue;
         }
         let Some(stat) = state.stats.iter().find(|s| s.profile_raw == profile.raw) else {
@@ -15385,6 +15865,147 @@ fn find_best_profile_by_smart_score(
         }
     }
     best.map(|(id, _)| id)
+}
+
+/// Rank failover candidates by historical quality while keeping identity and
+/// eligibility tied to the immutable raw profile descriptor. Historical data
+/// only determines probe order; every candidate is protocol-verified before a
+/// switch.
+fn ranked_failover_candidates(
+    state: &HincyrayState,
+    excluded_raws: &HashSet<String>,
+) -> Vec<Profile> {
+    let now = unix_now();
+    let mut ranked: Vec<(Profile, f32)> = state
+        .profiles
+        .iter()
+        .filter(|profile| !excluded_raws.contains(&profile.raw) && !profile_is_dead(state, profile))
+        .filter_map(|profile| {
+            let stat = state
+                .stats
+                .iter()
+                .find(|stat| stat.profile_raw == profile.raw)?;
+            if stat.success_count == 0 || stat.cooldown_until_unix > now {
+                return None;
+            }
+            let score = if state.smart_select.enabled {
+                if stat.success_count < state.smart_select.min_successes {
+                    return None;
+                }
+                (stat.ewma_score
+                    - stat.consecutive_failures as f32 * state.smart_select.failure_penalty)
+                    .max(0.0)
+            } else {
+                stat.last_score as f32
+            };
+            Some((profile.clone(), score))
+        })
+        .collect();
+    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+    ranked.into_iter().map(|(profile, _)| profile).collect()
+}
+
+const MAX_VERIFIED_FAILOVER_CANDIDATES: usize = 8;
+
+/// Verify candidates outside the daemon mutex, then resolve the winning raw
+/// descriptor against current state immediately before the transactional
+/// switch. A concurrent user switch or subscription refresh aborts this
+/// failover attempt instead of applying a stale numeric id.
+fn attempt_verified_failover(
+    daemon: &Daemon,
+    failed_active_raw: &str,
+    rejected_raws: &mut HashSet<String>,
+) -> bool {
+    rejected_raws.insert(failed_active_raw.to_owned());
+    let (candidates, mihomo_path) = {
+        let inner = lock(&daemon.inner);
+        (
+            ranked_failover_candidates(&inner.state, rejected_raws),
+            inner.state.mihomo_path.clone(),
+        )
+    };
+
+    for candidate in candidates
+        .into_iter()
+        .take(MAX_VERIFIED_FAILOVER_CANDIDATES)
+    {
+        eprintln!(
+            "hincyray: protocol-verifying failover candidate {}",
+            candidate.id
+        );
+        let result = crate::benchmark::verify_profile_for_failover(&candidate, &mihomo_path);
+        let accepted = result.success;
+        let candidate_raw = candidate.raw.clone();
+        let candidate_name = candidate.name.clone();
+        apply_bench_result(daemon, result);
+        if !accepted {
+            rejected_raws.insert(candidate_raw);
+            continue;
+        }
+
+        let mut inner = lock(&daemon.inner);
+        let current_raw = inner
+            .state
+            .active_profile_id
+            .and_then(|id| inner.state.profiles.iter().find(|profile| profile.id == id))
+            .map(|profile| profile.raw.as_str());
+        if current_raw != Some(failed_active_raw) {
+            eprintln!(
+                "hincyray: verified failover aborted because active profile changed concurrently"
+            );
+            return false;
+        }
+        let Some(candidate_id) = inner
+            .state
+            .profiles
+            .iter()
+            .find(|profile| profile.raw == candidate_raw)
+            .map(|profile| profile.id)
+        else {
+            eprintln!(
+                "hincyray: verified candidate disappeared during subscription refresh: {candidate_name}"
+            );
+            rejected_raws.insert(candidate_raw);
+            continue;
+        };
+        eprintln!("hincyray: verified failover to profile {candidate_id} ({candidate_name})");
+        if apply_active_profile(&mut inner, daemon, candidate_id).is_ok() {
+            return true;
+        }
+        record_profile_health_failure(&mut inner.state, &candidate_raw, unix_now());
+        inner.dirty = true;
+        rejected_raws.insert(candidate_raw);
+        eprintln!("hincyray: verified candidate could not be applied; trying the next candidate");
+    }
+
+    eprintln!("hincyray: no protocol-verified alternative profile for failover");
+    false
+}
+
+fn record_profile_health_failure(state: &mut HincyrayState, profile_raw: &str, now: u64) {
+    let stats_idx = match state
+        .stats
+        .iter()
+        .position(|stat| stat.profile_raw == profile_raw)
+    {
+        Some(index) => index,
+        None => {
+            state.stats.push(ProfileStats {
+                profile_raw: profile_raw.to_owned(),
+                ..ProfileStats::default()
+            });
+            state.stats.len() - 1
+        }
+    };
+    let cooldown_secs = state.smart_select.cooldown_secs;
+    let failure_penalty = state.smart_select.failure_penalty;
+    let stat = &mut state.stats[stats_idx];
+    stat.failure_count = stat.failure_count.saturating_add(1);
+    stat.consecutive_failures = stat.consecutive_failures.saturating_add(1);
+    stat.cooldown_until_unix = now.saturating_add(cooldown_secs);
+    stat.ewma_score = (stat.ewma_score - failure_penalty).max(0.0);
+    stat.last_checked_unix = now;
+    stat.last_error = Some("active profile failed Mihomo fallback health threshold".to_owned());
 }
 
 // ─── Mihomo auto-update ───────────────────────────────────────────
@@ -15604,12 +16225,18 @@ fn download_and_install_mihomo(
 /// the same mechanism as `handle_bench_start` but uses the TCP method
 /// (lightweight, no temp Xray processes) and covers all profiles.
 fn start_auto_benchmark(daemon: &Daemon) {
-    let profiles = {
+    let profiles: Vec<Profile> = {
         let inner = lock(&daemon.inner);
         if inner.bench.is_running() {
             return;
         }
-        inner.state.profiles.clone()
+        inner
+            .state
+            .profiles
+            .iter()
+            .filter(|profile| !profile_is_dead(&inner.state, profile))
+            .cloned()
+            .collect()
     };
     if profiles.is_empty() {
         return;
@@ -15643,6 +16270,7 @@ fn start_auto_benchmark(daemon: &Daemon) {
 }
 
 enum ActiveProfileApplyError {
+    Ineligible(String),
     InvalidConfig(String),
     Runtime(String),
 }
@@ -15650,6 +16278,7 @@ enum ActiveProfileApplyError {
 impl ActiveProfileApplyError {
     fn http_status(&self) -> u16 {
         match self {
+            Self::Ineligible(_) => 409,
             Self::InvalidConfig(_) => 400,
             Self::Runtime(_) => 500,
         }
@@ -15657,7 +16286,9 @@ impl ActiveProfileApplyError {
 
     fn message(&self) -> &str {
         match self {
-            Self::InvalidConfig(message) | Self::Runtime(message) => message,
+            Self::Ineligible(message) | Self::InvalidConfig(message) | Self::Runtime(message) => {
+                message
+            }
         }
     }
 }
@@ -15675,6 +16306,21 @@ fn apply_active_profile(
     daemon: &Daemon,
     profile_id: usize,
 ) -> Result<(), ActiveProfileApplyError> {
+    let Some(profile) = inner
+        .state
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        return Err(ActiveProfileApplyError::Ineligible(format!(
+            "profile not found: {profile_id}"
+        )));
+    };
+    if profile_is_dead(&inner.state, profile) {
+        return Err(ActiveProfileApplyError::Ineligible(
+            "profile in Dead Servers cannot be activated; restore it first".to_owned(),
+        ));
+    }
     let previous_profile_id = inner.state.active_profile_id;
     let geo_dir = geo_dir_from_state(&inner.state);
 
@@ -15918,7 +16564,7 @@ fn start_watchdog(
     thread::spawn(move || {
         let mut bench_was_running = false;
         let mut restart_backoff_secs: u64 = 0;
-        let mut failover_rejected_profiles = HashSet::new();
+        let mut failover_rejected_profiles: HashSet<String> = HashSet::new();
         let mut watchdog_tick: u64 = 0;
         let mut last_bypass_update_unix: u64 = 0;
         let mut pending_auto_vpn_domains: VecDeque<AutoVpnCandidate> = VecDeque::new();
@@ -16173,67 +16819,84 @@ fn start_watchdog(
                     } else {
                         None
                     };
-                    let mut inner = lock(&daemon.inner);
-                    if healthy {
-                        if inner.failover_fail_count > 0 {
-                            match latency_ms {
-                                Some(ms) => {
-                                    eprintln!("hincyray: health check recovered ({ms}ms)");
-                                }
-                                None => {
-                                    eprintln!("hincyray: health check recovered");
+                    let failed_active_raw = {
+                        let mut inner = lock(&daemon.inner);
+                        if healthy {
+                            if inner.failover_fail_count > 0 {
+                                match latency_ms {
+                                    Some(ms) => {
+                                        eprintln!("hincyray: health check recovered ({ms}ms)");
+                                    }
+                                    None => {
+                                        eprintln!("hincyray: health check recovered");
+                                    }
                                 }
                             }
-                        }
-                        inner.failover_fail_count = 0;
-                        failover_rejected_profiles.clear();
-                    } else {
-                        let prev_count = inner.failover_fail_count;
-                        inner.failover_fail_count += 1;
-                        const FAILOVER_THRESHOLD: u32 = 3;
-                        // Only log the first failure (transition from healthy)
-                        // to avoid spamming the log with repeated failures.
-                        if prev_count == 0 {
-                            let reason = match group_state.as_ref() {
-                                Ok(v) => {
-                                    let now = v.get("now").and_then(Value::as_str).unwrap_or("?");
-                                    let alive =
-                                        v.get("alive").and_then(Value::as_bool).unwrap_or(false);
-                                    format!("now={now} alive={alive}")
-                                }
-                                Err(error) => error.to_string(),
-                            };
-                            eprintln!(
-                                "hincyray: health check failed (1/{FAILOVER_THRESHOLD}) — fallback group: {reason}"
-                            );
-                        }
-                        if inner.failover_fail_count >= FAILOVER_THRESHOLD {
-                            if auto_switch {
-                                if let Some(id) = active_profile_id {
-                                    failover_rejected_profiles.insert(id);
-                                }
-                                if let Some(next_id) = find_best_profile_by_score(
-                                    &inner.state,
-                                    &failover_rejected_profiles,
-                                ) {
-                                    eprintln!("hincyray: failover to profile {next_id}");
-                                    switch_active_profile(&mut inner, &daemon, next_id);
+                            inner.failover_fail_count = 0;
+                            failover_rejected_profiles.clear();
+                            None
+                        } else {
+                            let prev_count = inner.failover_fail_count;
+                            inner.failover_fail_count += 1;
+                            const FAILOVER_THRESHOLD: u32 = 3;
+                            if prev_count == 0 {
+                                let reason = match group_state.as_ref() {
+                                    Ok(v) => {
+                                        let now =
+                                            v.get("now").and_then(Value::as_str).unwrap_or("?");
+                                        let alive = v
+                                            .get("alive")
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        format!("now={now} alive={alive}")
+                                    }
+                                    Err(error) => error.to_string(),
+                                };
+                                eprintln!(
+                                    "hincyray: health check failed (1/{FAILOVER_THRESHOLD}) — fallback group: {reason}"
+                                );
+                            }
+                            if inner.failover_fail_count >= FAILOVER_THRESHOLD {
+                                if auto_switch {
+                                    let active_raw = active_profile_id.and_then(|id| {
+                                        inner
+                                            .state
+                                            .profiles
+                                            .iter()
+                                            .find(|profile| profile.id == id)
+                                            .map(|profile| profile.raw.clone())
+                                    });
+                                    if let Some(ref raw) = active_raw {
+                                        record_profile_health_failure(
+                                            &mut inner.state,
+                                            raw,
+                                            unix_now(),
+                                        );
+                                        inner.dirty = true;
+                                    }
+                                    inner.failover_fail_count = 0;
+                                    active_raw
                                 } else {
-                                    eprintln!("hincyray: no alternative profile for failover");
+                                    if prev_count < FAILOVER_THRESHOLD {
+                                        eprintln!(
+                                            "hincyray: proxy unreachable, \
+                                             mihomo fallback to DIRECT (auto-switch disabled)"
+                                        );
+                                    }
+                                    inner.failover_fail_count = FAILOVER_THRESHOLD;
+                                    None
                                 }
-                                inner.failover_fail_count = 0;
                             } else {
-                                // Only log once when first crossing threshold
-                                if prev_count < FAILOVER_THRESHOLD {
-                                    eprintln!(
-                                        "hincyray: proxy unreachable, \
-                                         mihomo fallback to DIRECT (auto-switch disabled)"
-                                    );
-                                }
-                                // Cap at threshold — don't reset, avoid log spam
-                                inner.failover_fail_count = FAILOVER_THRESHOLD;
+                                None
                             }
                         }
+                    };
+                    if let Some(failed_raw) = failed_active_raw {
+                        let _ = attempt_verified_failover(
+                            &daemon,
+                            &failed_raw,
+                            &mut failover_rejected_profiles,
+                        );
                     }
                 } else {
                     // Fallback: no external controller, use SOCKS curl.
@@ -16241,45 +16904,63 @@ fn start_watchdog(
                     // to DIRECT, SOCKS health check will pass (through
                     // DIRECT). Enable EC for accurate proxy health monitoring.
                     let healthy = socks_health_check(socks_port);
-                    let mut inner = lock(&daemon.inner);
-                    if healthy {
-                        if inner.failover_fail_count > 0 {
-                            eprintln!("hincyray: health check recovered");
-                        }
-                        inner.failover_fail_count = 0;
-                        failover_rejected_profiles.clear();
-                    } else {
-                        let prev_count = inner.failover_fail_count;
-                        inner.failover_fail_count += 1;
-                        const FAILOVER_THRESHOLD: u32 = 3;
-                        if prev_count == 0 {
-                            eprintln!("hincyray: health check failed (1/{FAILOVER_THRESHOLD})");
-                        }
-                        if inner.failover_fail_count >= FAILOVER_THRESHOLD {
-                            if auto_switch {
-                                if let Some(id) = active_profile_id {
-                                    failover_rejected_profiles.insert(id);
-                                }
-                                if let Some(next_id) = find_best_profile_by_score(
-                                    &inner.state,
-                                    &failover_rejected_profiles,
-                                ) {
-                                    eprintln!("hincyray: failover to profile {next_id}");
-                                    switch_active_profile(&mut inner, &daemon, next_id);
+                    let failed_active_raw = {
+                        let mut inner = lock(&daemon.inner);
+                        if healthy {
+                            if inner.failover_fail_count > 0 {
+                                eprintln!("hincyray: health check recovered");
+                            }
+                            inner.failover_fail_count = 0;
+                            failover_rejected_profiles.clear();
+                            None
+                        } else {
+                            let prev_count = inner.failover_fail_count;
+                            inner.failover_fail_count += 1;
+                            const FAILOVER_THRESHOLD: u32 = 3;
+                            if prev_count == 0 {
+                                eprintln!("hincyray: health check failed (1/{FAILOVER_THRESHOLD})");
+                            }
+                            if inner.failover_fail_count >= FAILOVER_THRESHOLD {
+                                if auto_switch {
+                                    let active_raw = active_profile_id.and_then(|id| {
+                                        inner
+                                            .state
+                                            .profiles
+                                            .iter()
+                                            .find(|profile| profile.id == id)
+                                            .map(|profile| profile.raw.clone())
+                                    });
+                                    if let Some(ref raw) = active_raw {
+                                        record_profile_health_failure(
+                                            &mut inner.state,
+                                            raw,
+                                            unix_now(),
+                                        );
+                                        inner.dirty = true;
+                                    }
+                                    inner.failover_fail_count = 0;
+                                    active_raw
                                 } else {
-                                    eprintln!("hincyray: no alternative profile for failover");
+                                    if prev_count < FAILOVER_THRESHOLD {
+                                        eprintln!(
+                                            "hincyray: proxy unreachable, \
+                                             mihomo fallback to DIRECT (auto-switch disabled)"
+                                        );
+                                    }
+                                    inner.failover_fail_count = FAILOVER_THRESHOLD;
+                                    None
                                 }
-                                inner.failover_fail_count = 0;
                             } else {
-                                if prev_count < FAILOVER_THRESHOLD {
-                                    eprintln!(
-                                        "hincyray: proxy unreachable, \
-                                         mihomo fallback to DIRECT (auto-switch disabled)"
-                                    );
-                                }
-                                inner.failover_fail_count = FAILOVER_THRESHOLD;
+                                None
                             }
                         }
+                    };
+                    if let Some(failed_raw) = failed_active_raw {
+                        let _ = attempt_verified_failover(
+                            &daemon,
+                            &failed_raw,
+                            &mut failover_rejected_profiles,
+                        );
                     }
                 }
             }
@@ -16931,25 +17612,30 @@ fn first_kv_kb(text: &str, prefix: &str) -> Option<u64> {
 }
 
 /// v0.20: Filter the profile list according to the Deep Bench selector.
-/// `ProfileFilter::All` returns every profile; `Subscription(url)`
-/// returns profiles whose `group` matches the URL; `Explicit(raws)`
-/// returns profiles whose `raw` is in the list (preserving the order
-/// in which they appear in `state.profiles`, not the filter order).
+/// Normal All/Subscription scopes exclude Dead Servers. Explicit raw scope is
+/// deliberate diagnostics/recovery and may include dead profiles.
 fn select_profiles_for_deep_bench(state: &HincyrayState) -> Vec<Profile> {
     match &state.deep_bench.profile_filter {
-        ProfileFilter::All => state.profiles.clone(),
+        ProfileFilter::All => state
+            .profiles
+            .iter()
+            .filter(|profile| !profile_is_dead(state, profile))
+            .cloned()
+            .collect(),
         ProfileFilter::Subscription(url) => state
             .profiles
             .iter()
-            .filter(|p| p.group.as_deref() == Some(url.as_str()))
+            .filter(|profile| {
+                profile.group.as_deref() == Some(url.as_str()) && !profile_is_dead(state, profile)
+            })
             .cloned()
             .collect(),
-        ProfileFilter::Explicit(raws) => {
-            let set: std::collections::HashSet<&String> = raws.iter().collect();
+        ProfileFilter::Explicit(server_refs) => {
+            let set: std::collections::HashSet<&String> = server_refs.iter().collect();
             state
                 .profiles
                 .iter()
-                .filter(|p| set.contains(&p.raw))
+                .filter(|profile| set.contains(&profile_server_ref(profile)))
                 .cloned()
                 .collect()
         }
@@ -17124,7 +17810,7 @@ fn run_deep_bench(
                 );
                 snapshots.push(DailyQualitySnapshot {
                     date: today,
-                    profile_raw: profile.raw.clone(),
+                    server_ref: profile_server_ref(profile),
                     profile_name: profile.name.clone(),
                     quick_score,
                     stability: Some(stability),
@@ -17137,7 +17823,7 @@ fn run_deep_bench(
                 // record as low-score so we don't promote it.
                 snapshots.push(DailyQualitySnapshot {
                     date: today,
-                    profile_raw: profile.raw.clone(),
+                    server_ref: profile_server_ref(profile),
                     profile_name: profile.name.clone(),
                     quick_score,
                     stability: None,
@@ -17162,21 +17848,28 @@ fn run_deep_bench(
         );
     }
 
-    // ===== Persist quality history + apply trash bin auto-promote =====
-    {
+    // ===== Persist quality history, then apply lifecycle transitions =====
+    let history_persisted = {
         let mut inner = lock(&daemon.inner);
+        if inner.state.quality_history.is_empty() {
+            inner.state.quality_history =
+                load_quality_history(&daemon.state_path, &inner.state.profiles);
+        }
         // Append to in-memory quality_history.
         inner.state.quality_history.extend(snapshots.clone());
         cap_quality_history(&mut inner.state, today);
-        // Apply trash bin auto-promote/restore for tested profiles.
-        for snap in &snapshots {
-            apply_trash_bin_rules(&mut inner.state, snap, today);
-        }
         // Persist to dedicated file (state.json would bloat).
         let history_path = quality_history_path(&daemon.state_path);
-        if let Err(error) = persist_quality_history(&history_path, &inner.state.quality_history) {
-            eprintln!("hincyray: quality history persist failed: {error}");
-        }
+        let history_persisted =
+            match persist_quality_history(&history_path, &inner.state.quality_history) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("hincyray: quality history persist failed: {error}");
+                    inner.deep_bench_status.last_error =
+                        format!("quality history persist failed: {error}");
+                    false
+                }
+            };
         // Mark deep bench completed.
         inner.state.deep_bench.last_completed_date = today;
         let final_state = if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -17193,9 +17886,37 @@ fn run_deep_bench(
             ),
             started_unix,
             eta_secs: 0,
-            last_error: String::new(),
+            last_error: inner.deep_bench_status.last_error.clone(),
         };
         inner.dirty = true;
+        history_persisted
+    };
+    if !history_persisted {
+        return;
+    }
+    match mutate_dead_server_membership(&daemon, |state| {
+        Ok(snapshots
+            .iter()
+            .filter_map(|snapshot| apply_trash_bin_rules(state, snapshot, today))
+            .collect::<Vec<_>>())
+    }) {
+        Ok(transitions) => {
+            for transition in transitions {
+                match transition {
+                    DeadServerTransition::Promoted(server_ref) => {
+                        eprintln!("hincyray: auto-promoted server to Dead Servers: {server_ref}");
+                    }
+                    DeadServerTransition::Restored(server_ref) => {
+                        eprintln!("hincyray: restored server from Dead Servers: {server_ref}");
+                    }
+                }
+            }
+        }
+        Err((_, error)) => {
+            eprintln!("hincyray: Deep Bench Dead Servers transition failed: {error}");
+            let mut inner = lock(&daemon.inner);
+            inner.deep_bench_status.last_error = error;
+        }
     }
 }
 
@@ -17243,10 +17964,27 @@ fn persist_quality_history(path: &Path, history: &[DailyQualitySnapshot]) -> Res
 
 /// v0.20: Lazy-load quality history from disk into state on first
 /// access. Called by `/api/deep-bench/history` if empty.
-fn load_quality_history(state_path: &Path) -> Vec<DailyQualitySnapshot> {
+fn load_quality_history(state_path: &Path, profiles: &[Profile]) -> Vec<DailyQualitySnapshot> {
     let path = quality_history_path(state_path);
     match std::fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Ok(s) => {
+            let mut history: Vec<DailyQualitySnapshot> =
+                serde_json::from_str(&s).unwrap_or_default();
+            let mut changed = false;
+            for snapshot in &mut history {
+                let (server_ref, migrated) = migrate_lifecycle_ref(&snapshot.server_ref, profiles);
+                if migrated {
+                    snapshot.server_ref = server_ref;
+                    changed = true;
+                }
+            }
+            if changed && let Err(error) = persist_quality_history(&path, &history) {
+                eprintln!(
+                    "hincyray: failed to persist quality history identity migration: {error}"
+                );
+            }
+            history
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -17269,36 +18007,55 @@ fn cap_quality_history(state: &mut HincyrayState, today: u32) {
 /// daily snapshot. Called after each profile's Phase B result is
 /// written.
 ///
-/// - **Promote to trash**: if the last 3 daily entries for this raw
-///   all have `composite_score < 30`, the raw is added to
-///   `state.trash_raws` and timestamped in `trash_promoted_at`.
-/// - **Restore from trash**: if the latest entry has
-///   `composite_score > 50`, the raw is removed from trash_raws.
-fn apply_trash_bin_rules(state: &mut HincyrayState, snapshot: &DailyQualitySnapshot, _today: u32) {
-    let raw = &snapshot.profile_raw;
+/// - **Promote to dead**: if the last 3 daily entries for this canonical
+///   server all have `composite_score < 30`, its opaque server reference is
+///   added to `state.dead_server_refs`.
+/// - **Restore**: if the latest entry has `composite_score > 50`, the server
+///   reference is removed from the virtual group.
+#[derive(Debug, PartialEq, Eq)]
+enum DeadServerTransition {
+    Promoted(String),
+    Restored(String),
+}
+
+fn apply_trash_bin_rules(
+    state: &mut HincyrayState,
+    snapshot: &DailyQualitySnapshot,
+    _today: u32,
+) -> Option<DeadServerTransition> {
+    let server_ref = snapshot.server_ref.clone();
     let now = unix_now();
-    // Last 3 entries for this raw (including today).
+    // Last 3 entries for this canonical server (including today).
     let recent: Vec<u32> = state
         .quality_history
         .iter()
         .rev()
-        .filter(|s| &s.profile_raw == raw)
+        .filter(|s| s.server_ref == server_ref)
         .take(3)
         .map(|s| s.composite_score)
         .collect();
     // Promote: 3+ consecutive bad days.
-    if recent.len() >= 3 && recent.iter().all(|&s| s < 30) && state.trash_raws.insert(raw.clone()) {
-        state.trash_promoted_at.insert(raw.clone(), now);
-        eprintln!("hincyray: auto-promoted to trash: {raw}");
+    let active_ref = state
+        .active_profile_id
+        .and_then(|id| state.profiles.iter().find(|profile| profile.id == id))
+        .map(profile_server_ref);
+    if recent.len() >= 3
+        && recent.iter().all(|&score| score < 30)
+        && active_ref.as_deref() != Some(&server_ref)
+        && state.dead_server_refs.insert(server_ref.clone())
+    {
+        state.dead_promoted_at.insert(server_ref.clone(), now);
+        return Some(DeadServerTransition::Promoted(server_ref));
     }
     // Restore: latest score is good.
     if let Some(latest) = recent.first()
         && *latest > 50
-        && state.trash_raws.remove(raw)
+        && state.dead_server_refs.remove(&server_ref)
     {
-        state.trash_promoted_at.remove(raw);
-        eprintln!("hincyray: restored from trash: {raw}");
+        state.dead_promoted_at.remove(&server_ref);
+        return Some(DeadServerTransition::Restored(server_ref));
     }
+    None
 }
 
 /// v0.20: Garbage-collect trash entries for raws that no longer appear
@@ -17307,25 +18064,24 @@ fn apply_trash_bin_rules(state: &mut HincyrayState, snapshot: &DailyQualitySnaps
 fn purge_stale_trash(state: &mut HincyrayState) -> usize {
     let now = unix_now();
     let cutoff = now.saturating_sub(90 * 86_400);
-    let live_raws: std::collections::HashSet<String> =
-        state.profiles.iter().map(|p| p.raw.clone()).collect();
-    let before = state.trash_raws.len();
-    state.trash_raws.retain(|raw| {
+    let live_refs: HashSet<String> = state.profiles.iter().map(profile_server_ref).collect();
+    let before = state.dead_server_refs.len();
+    state.dead_server_refs.retain(|server_ref| {
         // Keep if still in profiles OR promoted recently.
-        if live_raws.contains(raw) {
+        if live_refs.contains(server_ref) {
             return true;
         }
         state
-            .trash_promoted_at
-            .get(raw)
+            .dead_promoted_at
+            .get(server_ref)
             .copied()
             .map(|t| t > cutoff)
             .unwrap_or(false)
     });
     state
-        .trash_promoted_at
-        .retain(|raw, _| state.trash_raws.contains(raw));
-    before.saturating_sub(state.trash_raws.len())
+        .dead_promoted_at
+        .retain(|server_ref, _| state.dead_server_refs.contains(server_ref));
+    before.saturating_sub(state.dead_server_refs.len())
 }
 
 fn run_scheduled_maintenance(
@@ -18668,6 +19424,86 @@ mod tests {
 
         let rejected = HashSet::from([1]);
         assert_eq!(find_best_profile_by_score(&state, &rejected), Some(2));
+    }
+
+    #[test]
+    fn failover_ranking_uses_raw_identity_and_excludes_trash_and_cooldown() {
+        let mut state = HincyrayState::default();
+        state.smart_select.enabled = true;
+        state.smart_select.min_successes = 1;
+        state.profiles = vec![
+            make_profile(40, "current", "raw-current", None),
+            make_profile(2, "trashed-best", "raw-trash", None),
+            make_profile(99, "cooldown", "raw-cooldown", None),
+            make_profile(7, "verified-next", "raw-next", None),
+        ];
+        state
+            .dead_server_refs
+            .insert(profile_server_ref(&state.profiles[1]));
+        state.stats = vec![
+            ProfileStats {
+                profile_raw: "raw-current".to_owned(),
+                success_count: 10,
+                ewma_score: 100.0,
+                ..ProfileStats::default()
+            },
+            ProfileStats {
+                profile_raw: "raw-trash".to_owned(),
+                success_count: 10,
+                ewma_score: 99.0,
+                ..ProfileStats::default()
+            },
+            ProfileStats {
+                profile_raw: "raw-cooldown".to_owned(),
+                success_count: 10,
+                ewma_score: 98.0,
+                cooldown_until_unix: unix_now() + 60,
+                ..ProfileStats::default()
+            },
+            ProfileStats {
+                profile_raw: "raw-next".to_owned(),
+                success_count: 3,
+                ewma_score: 50.0,
+                ..ProfileStats::default()
+            },
+        ];
+
+        let excluded = HashSet::from(["raw-current".to_owned()]);
+        let candidates = ranked_failover_candidates(&state, &excluded);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].raw, "raw-next");
+        assert_eq!(candidates[0].id, 7);
+    }
+
+    #[test]
+    fn profile_health_failure_creates_raw_keyed_cooldown() {
+        let mut state = HincyrayState::default();
+        state.smart_select.cooldown_secs = 120;
+        state.smart_select.failure_penalty = 9.0;
+        state.stats.push(ProfileStats {
+            profile_raw: "raw-failed".to_owned(),
+            ewma_score: 30.0,
+            ..ProfileStats::default()
+        });
+
+        record_profile_health_failure(&mut state, "raw-failed", 1_000);
+
+        let stat = state
+            .stats
+            .iter()
+            .find(|stat| stat.profile_raw == "raw-failed")
+            .expect("failed profile stats");
+        assert_eq!(stat.failure_count, 1);
+        assert_eq!(stat.consecutive_failures, 1);
+        assert_eq!(stat.cooldown_until_unix, 1_120);
+        assert_eq!(stat.ewma_score, 21.0);
+        assert_eq!(stat.last_checked_unix, 1_000);
+        assert!(
+            stat.last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("fallback health threshold"))
+        );
     }
 
     #[test]
@@ -20291,7 +21127,8 @@ mod tests {
             make_profile(1, "SubNew", "raw5", None),
         ];
 
-        let added = replace_subscription_profiles(&mut state, url, fresh);
+        let added = replace_subscription_profiles(&mut state, url, fresh)
+            .expect("non-empty subscription replacement should succeed");
 
         // Both fresh profiles are added (old subscription profiles were
         // removed, so no dedup collision except with Direct/raw4).
@@ -20328,13 +21165,67 @@ mod tests {
             make_profile(1, "Sub2", "raw2", None),
         ];
 
-        let _added = replace_subscription_profiles(&mut state, url, fresh);
+        let _added = replace_subscription_profiles(&mut state, url, fresh)
+            .expect("non-empty subscription replacement should succeed");
 
         assert_eq!(state.profiles.len(), 2);
         // Active should point to the profile with raw1 (now at index 0).
         assert_eq!(state.active_profile_id, Some(0));
         assert_eq!(state.profiles[0].raw, "raw1");
         assert_eq!(state.profiles[0].name, "Sub1-updated");
+    }
+
+    #[test]
+    fn dead_server_membership_survives_subscription_refresh_and_display_rename() {
+        let mut state = HincyrayState::default();
+        let url = "https://provider.example/sub";
+        let old_raw = "vless://11111111-1111-1111-1111-111111111111@one.example:443#Old%20Name";
+        let refreshed_raw =
+            "vless://11111111-1111-1111-1111-111111111111@one.example:443#New%20Name";
+        state
+            .profiles
+            .push(make_profile(9, "Old Name", old_raw, Some(url)));
+        let server_ref = profile_server_ref(&state.profiles[0]);
+        state.dead_server_refs.insert(server_ref.clone());
+
+        replace_subscription_profiles(
+            &mut state,
+            url,
+            vec![make_profile(0, "New Name", refreshed_raw, None)],
+        )
+        .expect("refresh replacement");
+
+        assert_eq!(profile_server_ref(&state.profiles[0]), server_ref);
+        assert!(profile_is_dead(&state, &state.profiles[0]));
+        assert_eq!(state.profiles[0].group.as_deref(), Some(url));
+    }
+
+    #[test]
+    fn lifecycle_v2_identity_normalizes_url_syntax_without_losing_repeated_values() {
+        let first = "VLESS://11111111-1111-1111-1111-111111111111@EXAMPLE.COM:443?type=ws&alpn=h2&alpn=http%2F1.1&security=tls&host=cdn.example#First";
+        let reordered = "vless://11111111-1111-1111-1111-111111111111@example.com:443?host=cdn.example&security=tls&alpn=h2&alpn=http%2F1.1&type=ws#Renamed";
+        let changed = "vless://11111111-1111-1111-1111-111111111111@example.com:443?host=other.example&security=tls&alpn=h2&alpn=http%2F1.1&type=ws#Renamed";
+
+        let canonical = canonical_lifecycle_identity_from_raw(first);
+        assert_eq!(canonical, canonical_lifecycle_identity_from_raw(reordered));
+        assert_eq!(
+            url::Url::parse(&canonical)
+                .expect("canonical lifecycle URL")
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("alpn".to_owned(), "h2".to_owned()),
+                ("alpn".to_owned(), "http/1.1".to_owned()),
+                ("host".to_owned(), "cdn.example".to_owned()),
+                ("security".to_owned(), "tls".to_owned()),
+                ("type".to_owned(), "ws".to_owned()),
+            ]
+        );
+        assert_ne!(
+            lifecycle_ref_for_canonical(&canonical),
+            lifecycle_ref_for_canonical(&canonical_lifecycle_identity_from_raw(changed))
+        );
     }
 
     #[test]
@@ -20348,15 +21239,497 @@ mod tests {
             make_profile(1, "Sub2", "raw2", None),
         ];
 
-        let added1 = replace_subscription_profiles(&mut state, url, fresh.clone());
+        let added1 = replace_subscription_profiles(&mut state, url, fresh.clone())
+            .expect("non-empty subscription replacement should succeed");
         assert_eq!(added1, 2);
         assert_eq!(state.profiles.len(), 2);
 
         // Second refresh with the same profiles: old ones removed, new
         // ones added — total should still be 2, not 4.
-        let added2 = replace_subscription_profiles(&mut state, url, fresh);
+        let added2 = replace_subscription_profiles(&mut state, url, fresh)
+            .expect("non-empty subscription replacement should succeed");
         assert_eq!(added2, 2);
         assert_eq!(state.profiles.len(), 2);
+    }
+
+    #[test]
+    fn replace_subscription_profiles_rejects_empty_set_without_mutating_state() {
+        let mut state = HincyrayState::default();
+        let url = "https://provider.example/sub";
+        state
+            .profiles
+            .push(make_profile(0, "Sub1", "raw1", Some(url)));
+        state
+            .profiles
+            .push(make_profile(1, "Sub2", "raw2", Some(url)));
+        state.profiles.push(make_profile(2, "Direct", "raw3", None));
+        state.active_profile_id = Some(1);
+
+        let before: Vec<(usize, String, Option<String>)> = state
+            .profiles
+            .iter()
+            .map(|profile| (profile.id, profile.raw.clone(), profile.group.clone()))
+            .collect();
+        let error = replace_subscription_profiles(&mut state, url, Vec::new())
+            .expect_err("empty refresh must be rejected before state mutation");
+
+        assert!(error.contains("refusing to replace subscription"));
+        let after: Vec<(usize, String, Option<String>)> = state
+            .profiles
+            .iter()
+            .map(|profile| (profile.id, profile.raw.clone(), profile.group.clone()))
+            .collect();
+        assert_eq!(after, before);
+        assert_eq!(state.active_profile_id, Some(1));
+    }
+
+    #[test]
+    fn dead_server_legacy_state_and_history_migrate_without_raw_api_identity() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let raw = "vless://11111111-1111-1111-1111-111111111111@legacy.example:443#Legacy";
+        let expected_ref = lifecycle_ref_for_canonical(&canonical_lifecycle_identity_from_raw(raw));
+        let mut state = HincyrayState::default();
+        state.dead_server_refs.insert(raw.to_owned());
+        state.dead_promoted_at.insert(raw.to_owned(), 123);
+        state.deep_bench.profile_filter = ProfileFilter::Explicit(vec![raw.to_owned()]);
+        persist_state(&state_path, &state).expect("persist legacy-compatible state");
+
+        let migrated = load_state(&state_path);
+        assert_eq!(
+            migrated.dead_server_refs,
+            HashSet::from([expected_ref.clone()])
+        );
+        assert_eq!(migrated.dead_promoted_at.get(&expected_ref), Some(&123));
+        assert_eq!(
+            migrated.deep_bench.profile_filter,
+            ProfileFilter::Explicit(vec![expected_ref.clone()])
+        );
+        let persisted: Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("read migrated state"))
+                .expect("parse migrated state");
+        assert_eq!(persisted["dead_server_refs"], json!([expected_ref.clone()]));
+        assert_eq!(
+            persisted["deep_bench"]["profile_filter"]["value"],
+            json!([expected_ref.clone()])
+        );
+
+        let history_path = quality_history_path(&state_path);
+        fs::write(
+            &history_path,
+            json!([{
+                "date": 20260716,
+                "profile_raw": raw,
+                "profile_name": "Legacy",
+                "quick_score": 10,
+                "composite_score": 9
+            }])
+            .to_string(),
+        )
+        .expect("write legacy history");
+        let history = load_quality_history(&state_path, &[]);
+        assert_eq!(history[0].server_ref, expected_ref);
+        let api_json = serde_json::to_string(&history).expect("serialize history API");
+        assert!(api_json.contains("server_ref"));
+        assert!(!api_json.contains("profile_raw"));
+        assert!(!api_json.contains("vless://"));
+    }
+
+    #[test]
+    fn dead_server_batch_handlers_are_atomic_and_reject_active_profile() {
+        let (_dir, daemon) = test_daemon();
+        let (active_ref, first_ref, second_ref) = {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![
+                make_profile(0, "Active", "raw-active", None),
+                make_profile(1, "First", "raw-first", Some("group-a")),
+                make_profile(2, "Second", "raw-second", Some("group-b")),
+            ];
+            inner.state.active_profile_id = Some(0);
+            (
+                profile_server_ref(&inner.state.profiles[0]),
+                profile_server_ref(&inner.state.profiles[1]),
+                profile_server_ref(&inner.state.profiles[2]),
+            )
+        };
+
+        let (status, _, _) = handle_trash_move(
+            &json!({"server_refs": [first_ref.clone(), active_ref]}).to_string(),
+            &daemon,
+        );
+        assert_eq!(status, 409);
+        assert!(lock(&daemon.inner).state.dead_server_refs.is_empty());
+
+        let unknown_ref = server_ref_for_canonical("unknown-server");
+        let (status, _, _) = handle_trash_move(
+            &json!({"server_refs": [first_ref.clone(), unknown_ref.clone()]}).to_string(),
+            &daemon,
+        );
+        assert_eq!(status, 404);
+        assert!(lock(&daemon.inner).state.dead_server_refs.is_empty());
+
+        let (status, _, _) = handle_trash_move(
+            &json!({"server_refs": [first_ref.clone(), second_ref.clone()]}).to_string(),
+            &daemon,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            lock(&daemon.inner).state.dead_server_refs,
+            HashSet::from([first_ref.clone(), second_ref.clone()])
+        );
+
+        let (_, _, list_body) = handle_trash_list(&daemon);
+        assert!(!list_body.contains("raw-first"));
+        assert!(!list_body.contains("raw-second"));
+
+        let (status, _, _) = handle_trash_restore(
+            &json!({"server_refs": [first_ref.clone(), unknown_ref]}).to_string(),
+            &daemon,
+        );
+        assert_eq!(status, 404);
+        assert_eq!(
+            lock(&daemon.inner).state.dead_server_refs,
+            HashSet::from([first_ref.clone(), second_ref.clone()])
+        );
+
+        let (status, _, _) = handle_trash_restore(
+            &json!({"server_refs": [first_ref, second_ref]}).to_string(),
+            &daemon,
+        );
+        assert_eq!(status, 200);
+        assert!(lock(&daemon.inner).state.dead_server_refs.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_v1_is_rejected_for_current_move_but_restores_legacy_orphan() {
+        let (_dir, daemon) = test_daemon();
+        let (legacy_current_ref, orphan_ref) = {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles.push(make_profile(
+                0,
+                "Current",
+                "vless://11111111-1111-1111-1111-111111111111@current.example:443#Current",
+                None,
+            ));
+            let legacy_current_ref =
+                server_ref_for_canonical(&canonical_profile_raw(&inner.state.profiles[0]));
+            let orphan_ref = server_ref_for_canonical("legacy-orphan");
+            inner.state.dead_server_refs.insert(orphan_ref.clone());
+            (legacy_current_ref, orphan_ref)
+        };
+
+        let (status, _, body) = handle_trash_move(
+            &json!({"server_refs": [legacy_current_ref]}).to_string(),
+            &daemon,
+        );
+        assert_eq!(status, 404, "{body}");
+
+        let (status, _, body) = handle_trash_restore(
+            &json!({"server_refs": [orphan_ref.clone()]}).to_string(),
+            &daemon,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !lock(&daemon.inner)
+                .state
+                .dead_server_refs
+                .contains(&orphan_ref)
+        );
+    }
+
+    #[test]
+    fn dead_membership_dataplane_scope_is_only_enabled_pinned_routes() {
+        let mut state = HincyrayState {
+            profiles: vec![
+                sample_profile(0, "Active", "active.example"),
+                sample_profile(1, "Pinned", "pinned.example"),
+            ],
+            active_profile_id: Some(0),
+            ..Default::default()
+        };
+        state.split_routing.enabled = true;
+        sync_server_route_registry(&mut state);
+        let pinned_ref = state
+            .server_route_registry
+            .iter()
+            .find(|entry| entry.canonical_raw == canonical_profile_raw(&state.profiles[1]))
+            .expect("pinned routing ref")
+            .server_ref
+            .clone();
+        let changed = HashSet::from([profile_server_ref(&state.profiles[1])]);
+        assert!(!dead_membership_affects_running_dataplane(&state, &changed));
+
+        state.routing_rules.push(RoutingRule {
+            enabled: false,
+            target: format!("server:{pinned_ref}"),
+            domains: vec!["disabled.example".to_owned()],
+            ..Default::default()
+        });
+        assert!(!dead_membership_affects_running_dataplane(&state, &changed));
+        state.routing_rules[0].enabled = true;
+        assert!(dead_membership_affects_running_dataplane(&state, &changed));
+
+        state.routing_rules.clear();
+        state.device_routes.push(DeviceRoute {
+            enabled: true,
+            target: format!("server:{pinned_ref}"),
+            ..Default::default()
+        });
+        assert!(dead_membership_affects_running_dataplane(&state, &changed));
+        state.split_routing.enabled = false;
+        assert!(!dead_membership_affects_running_dataplane(&state, &changed));
+    }
+
+    #[test]
+    fn dead_membership_candidate_error_cannot_partially_mutate_live_state() {
+        let (_dir, daemon) = test_daemon();
+        let server_ref = server_ref_for_canonical("candidate-error");
+        let error =
+            mutate_dead_server_membership(&daemon, |candidate| -> Result<(), (u16, String)> {
+                candidate.dead_server_refs.insert(server_ref.clone());
+                candidate.dead_promoted_at.insert(server_ref.clone(), 123);
+                Err((409, "injected candidate rejection".to_owned()))
+            })
+            .expect_err("candidate mutation must reject");
+        assert_eq!(error.0, 409);
+        let inner = lock(&daemon.inner);
+        assert!(inner.state.dead_server_refs.is_empty());
+        assert!(inner.state.dead_promoted_at.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_membership_activation_failure_rolls_back_only_lifecycle_fields() {
+        let dir = TempDir::new().expect("temp dir");
+        let script = dir.path().join("fake-mihomo.sh");
+        let marker = dir.path().join("new-config-started");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then exit 0; fi\nwhile [ $# -gt 0 ]; do if [ \"$1\" = \"-f\" ]; then shift; cfg=$1; fi; shift; done\nif grep -q OLD \"$cfg\"; then sleep 30; else touch '{}'; sleep 1; exit 1; fi\n",
+                marker.display()
+            ),
+        )
+        .expect("fake mihomo");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut state = HincyrayState {
+            profiles: vec![
+                sample_profile(0, "Active", "active.example"),
+                sample_profile(1, "Pinned", "pinned.example"),
+            ],
+            active_profile_id: Some(0),
+            mihomo_path: script.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        state.split_routing.enabled = true;
+        sync_server_route_registry(&mut state);
+        let pinned_ref = state
+            .server_route_registry
+            .iter()
+            .find(|entry| entry.canonical_raw == canonical_profile_raw(&state.profiles[1]))
+            .expect("pinned routing ref")
+            .server_ref
+            .clone();
+        let pinned_lifecycle_ref = profile_server_ref(&state.profiles[1]);
+        state.routing_rules.push(RoutingRule {
+            enabled: true,
+            target: format!("server:{pinned_ref}"),
+            domains: vec!["pinned.example".to_owned()],
+            ..Default::default()
+        });
+        let daemon = Daemon::new(
+            state,
+            dir.path().join("state.json"),
+            dir.path().join("mihomo-config.yaml"),
+        );
+        atomic_write_config(&daemon.mihomo_config_path, b"OLD exact bytes\n").expect("old config");
+        {
+            let mut inner = lock(&daemon.inner);
+            inner
+                .core
+                .start(
+                    script.to_str().expect("script path"),
+                    &daemon.mihomo_config_path,
+                    None,
+                )
+                .expect("old core");
+        }
+
+        let request_daemon = daemon.clone();
+        let request_ref = pinned_lifecycle_ref.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let request = thread::spawn(move || {
+            let result = handle_trash_move(
+                &json!({"server_refs": [request_ref]}).to_string(),
+                &request_daemon,
+            );
+            result_tx.send(result).expect("send request result");
+        });
+        let mut early_result = None;
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            if let Ok(result) = result_rx.try_recv() {
+                early_result = Some(result);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            marker.exists(),
+            "new runtime config was not started; early result: {early_result:?}"
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.traffic_total_up_bytes = 777;
+            persist_state(&daemon.state_path, &inner.state).expect("persist concurrent update");
+        }
+        let (status, _, body) = match early_result {
+            Some(result) => result,
+            None => result_rx.recv().expect("receive request result"),
+        };
+        request.join().expect("request thread");
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("state rollback: restored"), "{body}");
+        assert_eq!(
+            fs::read(&daemon.mihomo_config_path).expect("rolled back config"),
+            b"OLD exact bytes\n"
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            assert!(!inner.state.dead_server_refs.contains(&pinned_lifecycle_ref));
+            assert_eq!(inner.state.traffic_total_up_bytes, 777);
+            assert!(inner.core.is_running());
+            let _ = inner.core.stop();
+        }
+        let persisted = load_state(&daemon.state_path);
+        assert!(!persisted.dead_server_refs.contains(&pinned_lifecycle_ref));
+        assert_eq!(persisted.traffic_total_up_bytes, 777);
+    }
+
+    #[test]
+    fn dead_server_cannot_be_activated_until_restored() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@dead.example:443#Dead",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            let server_ref = profile_server_ref(&inner.state.profiles[0]);
+            inner.state.dead_server_refs.insert(server_ref);
+        }
+
+        let (status, _, body) = handle_set_active(r#"{"profile_id":0}"#, &daemon);
+        assert_eq!(status, 409, "{body}");
+        assert!(body.contains("restore it first"));
+        assert_eq!(lock(&daemon.inner).state.active_profile_id, None);
+    }
+
+    #[test]
+    fn startup_reconciles_legacy_active_dead_membership() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let mut state = HincyrayState::default();
+        state
+            .profiles
+            .push(make_profile(0, "Active", "raw-active", None));
+        state.active_profile_id = Some(0);
+        let active_ref = profile_server_ref(&state.profiles[0]);
+        state.dead_server_refs.insert(active_ref.clone());
+        state.dead_promoted_at.insert(active_ref.clone(), 123);
+        persist_state(&state_path, &state).expect("persist contradictory legacy state");
+
+        let loaded = load_state(&state_path);
+        assert_eq!(loaded.active_profile_id, Some(0));
+        assert!(!loaded.dead_server_refs.contains(&active_ref));
+        assert!(!loaded.dead_promoted_at.contains_key(&active_ref));
+        let persisted: Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("read reconciled state"))
+                .expect("parse reconciled state");
+        assert_eq!(persisted["dead_server_refs"], json!([]));
+        assert_eq!(persisted["dead_promoted_at"], json!({}));
+    }
+
+    #[test]
+    fn benchmark_scopes_exclude_dead_unless_explicitly_requested() {
+        let subscription = "https://provider.example/sub";
+        let mut state = HincyrayState::default();
+        state.subscriptions.push(StoredSubscription {
+            url: subscription.to_owned(),
+            ..Default::default()
+        });
+        state.profiles = vec![
+            make_profile(10, "Dead", "raw-dead", Some(subscription)),
+            make_profile(20, "Live subscription", "raw-live-sub", Some(subscription)),
+            make_profile(30, "Live manual", "raw-live-manual", None),
+        ];
+        let dead_ref = profile_server_ref(&state.profiles[0]);
+        state.dead_server_refs.insert(dead_ref.clone());
+
+        let all_ids: HashSet<usize> = select_profiles_for_quick_bench(&state, None, None)
+            .expect("all quick scope")
+            .into_iter()
+            .map(|profile| profile.id)
+            .collect();
+        assert_eq!(all_ids, HashSet::from([20, 30]));
+        let subscription_ids: Vec<usize> =
+            select_profiles_for_quick_bench(&state, Some(subscription), None)
+                .expect("subscription quick scope")
+                .into_iter()
+                .map(|profile| profile.id)
+                .collect();
+        assert_eq!(subscription_ids, vec![20]);
+        let explicit_ids: Vec<usize> = select_profiles_for_quick_bench(&state, None, Some(&[10]))
+            .expect("explicit diagnostic scope")
+            .into_iter()
+            .map(|profile| profile.id)
+            .collect();
+        assert_eq!(explicit_ids, vec![10]);
+        assert_eq!(
+            select_profiles_for_quick_bench(&state, None, Some(&[999]))
+                .expect_err("unknown explicit id must reject whole scope")
+                .0,
+            404
+        );
+
+        state.deep_bench.profile_filter = ProfileFilter::All;
+        let deep_all: HashSet<usize> = select_profiles_for_deep_bench(&state)
+            .into_iter()
+            .map(|profile| profile.id)
+            .collect();
+        assert_eq!(deep_all, HashSet::from([20, 30]));
+        state.deep_bench.profile_filter = ProfileFilter::Subscription(subscription.to_owned());
+        assert_eq!(select_profiles_for_deep_bench(&state)[0].id, 20);
+        state.deep_bench.profile_filter = ProfileFilter::Explicit(vec![dead_ref]);
+        assert_eq!(select_profiles_for_deep_bench(&state)[0].id, 10);
+    }
+
+    #[test]
+    fn trash_promotion_uses_canonical_identity_across_display_renames() {
+        let mut state = HincyrayState::default();
+        let server_ref = server_ref_for_canonical("raw-server-without-fragment");
+        for (date, name) in [
+            (20260714, "First"),
+            (20260715, "Second"),
+            (20260716, "Third"),
+        ] {
+            state.quality_history.push(DailyQualitySnapshot {
+                date,
+                server_ref: server_ref.clone(),
+                profile_name: name.to_owned(),
+                composite_score: 20,
+                ..Default::default()
+            });
+        }
+        let latest = state
+            .quality_history
+            .last()
+            .cloned()
+            .expect("latest snapshot");
+        apply_trash_bin_rules(&mut state, &latest, latest.date);
+        assert!(state.dead_server_refs.contains(&server_ref));
     }
 
     #[test]
@@ -22886,6 +24259,14 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
     }
 
     #[test]
+    fn lifecycle_v2_ref_cannot_cross_into_routing_target_contract() {
+        let lifecycle_ref = profile_server_ref(&sample_profile(0, "Lifecycle", "one.example"));
+        assert!(valid_lifecycle_ref(&lifecycle_ref));
+        assert!(!valid_routing_server_ref(&lifecycle_ref));
+        assert!(RoutingTarget::parse(&format!("server:{lifecycle_ref}")).is_err());
+    }
+
+    #[test]
     fn server_routing_legacy_target_migrates_before_reindex() {
         let mut state = HincyrayState {
             profiles: vec![
@@ -22988,7 +24369,7 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         let response: Value = serde_json::from_str(&body).expect("routing response");
         let server = &response["servers"][0];
         assert_eq!(server["name"], "Safe");
-        assert!(server["ref"].as_str().is_some_and(valid_server_ref));
+        assert!(server["ref"].as_str().is_some_and(valid_routing_server_ref));
         assert!(server.get("raw").is_none());
         assert!(server.get("canonical_raw").is_none());
         assert!(!body.contains("11111111-1111-1111-1111-111111111111"));
@@ -23042,6 +24423,72 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
                 .expect("members")
                 .iter()
                 .any(|member| member == DIRECT_NAME || member == PROXY_NAME)
+        );
+    }
+
+    #[test]
+    fn dead_pinned_server_falls_back_to_active_without_destroying_route_intent() {
+        let mut state = HincyrayState {
+            profiles: vec![
+                sample_profile(0, "Active", "active.example"),
+                sample_profile(1, "Pinned", "pinned.example"),
+            ],
+            active_profile_id: Some(0),
+            ..Default::default()
+        };
+        state.split_routing.enabled = true;
+        sync_server_route_registry(&mut state);
+        let pinned_ref = state
+            .server_route_registry
+            .iter()
+            .find(|entry| entry.canonical_raw.contains("pinned.example"))
+            .expect("pinned ref")
+            .server_ref
+            .clone();
+        let target = format!("server:{pinned_ref}");
+        state.routing_rules.push(RoutingRule {
+            enabled: true,
+            name: "Pinned".to_owned(),
+            target: target.clone(),
+            domains: vec!["pinned.example".to_owned()],
+            ..Default::default()
+        });
+        let pinned_lifecycle_ref = profile_server_ref(&state.profiles[1]);
+        state.dead_server_refs.insert(pinned_lifecycle_ref.clone());
+
+        assert!(validate_routing_targets(&state, &state.routing_rules, &[]).is_ok());
+        let yaml = build_daemon_config(&state, &[]).expect("dead target falls back");
+        let config: Value = serde_yaml::from_str(&yaml).expect("yaml");
+        assert_eq!(state.routing_rules[0].target, target);
+        assert!(
+            config["rules"]
+                .as_array()
+                .expect("rules")
+                .iter()
+                .any(|rule| rule == "DOMAIN-SUFFIX,pinned.example,proxy")
+        );
+        assert!(
+            !config["proxies"]
+                .as_array()
+                .expect("proxies")
+                .iter()
+                .any(|proxy| proxy["name"] == format!("srv-out-{}", &pinned_ref[7..]))
+        );
+        assert!(pinned_route_observer_catalog(&state).is_empty());
+
+        state.dead_server_refs.remove(&pinned_lifecycle_ref);
+        let restored_yaml = build_daemon_config(&state, &[]).expect("restored target");
+        let restored: Value = serde_yaml::from_str(&restored_yaml).expect("restored yaml");
+        assert!(
+            restored["rules"]
+                .as_array()
+                .expect("rules")
+                .iter()
+                .any(|rule| rule.as_str()
+                    == Some(&format!(
+                        "DOMAIN-SUFFIX,pinned.example,srv-route-{}",
+                        &pinned_ref[7..]
+                    )))
         );
     }
 

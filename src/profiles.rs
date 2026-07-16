@@ -348,12 +348,35 @@ pub fn load_subscription_detailed_via_proxy_with_hwid(
         (decoded, parsed) = parse_subscription_response(&response);
     }
 
+    require_subscription_profiles(source, response.len(), decoded.chars().count(), &parsed)?;
+
     Ok(SubscriptionLoadReport {
         profiles: parsed.profiles,
         response_bytes: response.len(),
         decoded_chars: decoded.chars().count(),
         unsupported_placeholders: parsed.unsupported_placeholders,
     })
+}
+
+/// A successful HTTP exchange is not a successful subscription refresh unless
+/// its body contains at least one supported profile.  Providers can return a
+/// 2xx HTML challenge, maintenance page, empty document, or a format we do not
+/// support; treating any of those as an empty successful set would allow a
+/// caller to replace and erase an existing subscription group.
+fn require_subscription_profiles(
+    source: &SubscriptionSource,
+    response_bytes: usize,
+    decoded_chars: usize,
+    parsed: &ParseOutput,
+) -> Result<(), String> {
+    if !parsed.profiles.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "{}: subscription response contained no supported profiles (response_bytes={response_bytes}, decoded_chars={decoded_chars}, unsupported_placeholders={})",
+        source.url, parsed.unsupported_placeholders
+    ))
 }
 
 enum SubscriptionRequestMode {
@@ -1074,8 +1097,39 @@ fn percent_decode_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SubscriptionSource, load_subscription_detailed_via_proxy, parse_input};
+    use super::{
+        SubscriptionSource, load_subscription_detailed_via_proxy, parse_input,
+        require_subscription_profiles,
+    };
     use base64::Engine as _;
+    use std::{io::Write, net::TcpListener, thread};
+
+    fn empty_subscription_response_source(
+        body: &'static str,
+    ) -> (SubscriptionSource, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local subscription listener");
+        let address = listener.local_addr().expect("listener address");
+        let worker = thread::spawn(move || {
+            // A non-profile response triggers the loader's documented Happ
+            // fallback, so serve both request modes deterministically.
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("subscription request");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("subscription response");
+            }
+        });
+        (
+            SubscriptionSource {
+                url: format!("http://{address}/subscription"),
+            },
+            worker,
+        )
+    }
 
     #[test]
     fn parses_subscription_urls_from_rtf_text() {
@@ -1261,6 +1315,45 @@ https://provider.example/sub/token-b}"#;
             error.contains("proxy"),
             "error should mention proxy marker: {error}"
         );
+    }
+
+    #[test]
+    fn rejects_successful_subscription_bodies_without_supported_profiles() {
+        let source = SubscriptionSource {
+            url: "https://provider.example/sub/empty".to_owned(),
+        };
+
+        for body in [
+            "",
+            "PGh0bWw+PGJvZHk+VGVtcG9yYXJpbHkgdW5hdmFpbGFibGU8L2JvZHk+PC9odG1sPg==",
+            "eyJzdGF0dXMiOiJtYWludGVuYW5jZSJ9",
+        ] {
+            let parsed = parse_input(body);
+            let error = require_subscription_profiles(&source, body.len(), body.len(), &parsed)
+                .expect_err("an empty parsed subscription must not be successful");
+            assert!(
+                error.contains("contained no supported profiles"),
+                "unexpected error for {body:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn loader_rejects_http_ok_responses_without_supported_profiles() {
+        for body in [
+            "",
+            "<html><body>Temporarily unavailable</body></html>",
+            r#"{"status":"maintenance"}"#,
+        ] {
+            let (source, worker) = empty_subscription_response_source(body);
+            let error = load_subscription_detailed_via_proxy(&source, None)
+                .expect_err("HTTP 200 without profiles must fail the subscription load");
+            worker.join().expect("subscription server");
+            assert!(
+                error.contains("contained no supported profiles"),
+                "unexpected error for {body:?}: {error}"
+            );
+        }
     }
 
     #[test]

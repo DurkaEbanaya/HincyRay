@@ -491,6 +491,12 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .routing-visual-table th{position:sticky;top:0;background:color-mix(in srgb,var(--surface-2) 96%,var(--surface));z-index:1;text-align:left;color:var(--muted);font-weight:600}
 .routing-visual-table tr:hover td{background:color-mix(in srgb,var(--accent) 5%,transparent)}
 .profiles-table-wrap table th:first-child,.profiles-table-wrap table td:first-child{position:sticky;left:0;z-index:2;background:var(--surface)}
+.dead-server-bulk{display:none;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:color-mix(in srgb,var(--accent) 8%,var(--surface));box-shadow:var(--shadow)}
+.dead-server-bulk.visible{display:flex}
+.dead-server-row td{background:color-mix(in srgb,var(--danger) 5%,var(--surface))!important}
+.profile-select,.profile-group-select{width:16px;height:16px;vertical-align:middle;accent-color:var(--accent)}
+.profile-select{margin:0 7px 0 0}.profile-group-select{margin:0 7px 0 4px}
+.profile-provenance{font-size:10px;color:var(--muted);margin-top:2px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .routing-route-detail{font-size:10px;color:var(--muted);margin-top:3px;word-break:break-all}
 .result-badge.info{background:var(--accent-soft);color:var(--accent)}
 .result-pre{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px;font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:240px;overflow-y:auto;margin-top:6px}
@@ -1062,11 +1068,18 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
             </select>
             <input type="text" placeholder="Поиск профиля…" id="profileSearch" oninput="filterProfiles(this.value)" style="flex:1;min-width:200px">
           </div>
+          <div class="dead-server-bulk" id="deadServerBulk" aria-live="polite">
+            <strong id="deadServerSelectedCount">Выбрано: 0</strong>
+            <span id="deadServerSelectedBreakdown" style="font-size:12px;color:var(--muted)"></span>
+            <button class="btn btn-danger btn-sm" id="deadServerMoveSelected" onclick="moveSelectedToDeadServers()">В Дохлые серверы</button>
+            <button class="btn btn-sm" id="deadServerRestoreSelected" onclick="restoreSelectedDeadServers()">↩ Восстановить</button>
+            <button class="btn btn-sm" onclick="clearServerSelection()">Снять выбор</button>
+          </div>
           <div class="profiles-table-wrap">
             <table class="tbl tbl-compact" id="profilesTable">
               <thead>
                 <tr>
-                  <th>★</th><th>ID</th><th onclick="sortByColumn(2)" style="cursor:pointer">Имя</th><th onclick="sortByColumn(3)" style="cursor:pointer">Протокол</th><th onclick="sortByColumn(4)" style="cursor:pointer">Балл</th><th></th><th onclick="sortByColumn(6)" style="cursor:pointer">Задержка</th><th onclick="sortByColumn(7)" style="cursor:pointer">Скорость</th><th onclick="sortByColumn(8)" style="cursor:pointer">Отдача</th><th onclick="sortByColumn(9)" style="cursor:pointer">EWMA</th><th onclick="sortByColumn(10)" style="cursor:pointer">Джиттер</th><th onclick="sortByColumn(11)" style="cursor:pointer">Потери</th><th onclick="sortByColumn(12)" style="cursor:pointer">Ошибки</th><th onclick="sortByColumn(13)" style="cursor:pointer">Cooldown</th><th onclick="sortByColumn(14)" style="cursor:pointer">Транспорт</th><th onclick="sortByColumn(15)" style="cursor:pointer">Адрес</th>
+                  <th>☑ ★</th><th>ID</th><th onclick="sortByColumn(2)" style="cursor:pointer">Имя</th><th onclick="sortByColumn(3)" style="cursor:pointer">Протокол</th><th onclick="sortByColumn(4)" style="cursor:pointer">Балл</th><th></th><th onclick="sortByColumn(6)" style="cursor:pointer">Задержка</th><th onclick="sortByColumn(7)" style="cursor:pointer">Скорость</th><th onclick="sortByColumn(8)" style="cursor:pointer">Отдача</th><th onclick="sortByColumn(9)" style="cursor:pointer">EWMA</th><th onclick="sortByColumn(10)" style="cursor:pointer">Джиттер</th><th onclick="sortByColumn(11)" style="cursor:pointer">Потери</th><th onclick="sortByColumn(12)" style="cursor:pointer">Ошибки</th><th onclick="sortByColumn(13)" style="cursor:pointer">Cooldown</th><th onclick="sortByColumn(14)" style="cursor:pointer">Транспорт</th><th onclick="sortByColumn(15)" style="cursor:pointer">Адрес</th>
                 </tr>
               </thead>
               <tbody id="profilesBody"></tbody>
@@ -2723,7 +2736,9 @@ const I18N = {
   'Поиск профиля…':'Search profiles…','Название группы':'Group name','Не менять':'Leave unchanged',
   'example.com':'example.com','192.168.2.35':'192.168.2.35','443':'443',
   // Misc
-  'Показывать подсказки':'Show tooltips',
+  'Показывать подсказки':'Show tooltips','Дохлые серверы':'Dead Servers','Выбрано':'Selected','Живые':'Live',
+  'Выбрать группу':'Select group','Выбрать сервер':'Select server','Снять выбор':'Clear selection',
+  'В Дохлые серверы':'Move to Dead Servers','Серверы перемещены в Дохлые серверы':'Servers moved to Dead Servers','Серверы восстановлены':'Servers restored',
   'При наведении на поля настроек появляются всплывающие пояснения':'Hover over settings fields to see explanatory tooltips',
   'Параметры acrylic-эффекта боковой панели':'Parameters for sidebar acrylic effect',
   'Прозрачность':'Opacity','Размытие':'Blur','Насыщенность':'Saturation','Шум':'Noise','Блик':'Gloss',
@@ -3128,6 +3143,8 @@ function saveCollapsedGroups() {
   try { localStorage.setItem('hr_collapsed_groups', JSON.stringify([...collapsedGroups])); } catch(e) {}
 }
 const collapsedGroups = loadCollapsedGroups();
+const DEAD_SERVERS_GROUP_KEY = 'virtual:dead-servers';
+const selectedServerRefs = new Set();
 
 // Current sort state: { key, dir } where dir is 'asc' or 'desc'.
 // key values: 'id','name','protocol','score','last_latency_ms','last_download_mbps',
@@ -3210,45 +3227,126 @@ function subscriptionForGroup(group) {
   return (MOCK.subscriptions || []).find(s => s.url === group) || null;
 }
 
-function renderProfiles(data) {
-  const body = document.getElementById('profilesBody');
-  if (!body) return;
-  const sorted = applyProfileSort(data);
-  const groups = sorted.reduce((acc, p) => {
-    const key = p.group || t('Без группы');
-    (acc[key] ||= []).push(p);
-    return acc;
-  }, {});
-  const NUM_COLS = 16; // must match thead
-  body.innerHTML = Object.entries(groups).map(([group, items]) => {
-    const groupAttr = attrEscape(group);
-    const groupJs = jsStringAttr(group);
-    const isCollapsed = collapsedGroups.has(group);
-    const display = isCollapsed ? 'none' : '';
-    const arrow = isCollapsed ? '▸' : '▾';
-    const sub = subscriptionForGroup(group);
-    const subRefresh = sub ? `<button class="btn btn-sm" data-url="${attrEscape(sub.url)}" onclick="refreshSubscriptionByButton(this)">↻</button>` : '';
-    const groupIds = items.map(p => p.id);
-    const groupActions = `
-        <button class="btn btn-sm" onclick="benchGroup([${groupIds.join(',')}])" title="${t('Тест группы')}">⚡</button>
-        ${subRefresh}
-        <button class="btn btn-sm" onclick="shareProfileGroup(${groupJs})">⤴ ${t('Поделиться / QR')}</button>
-        <button class="btn-icon btn-sm" onclick="deleteProfileGroup(${groupJs})" title="${t('Удалить подписку?')}">✕</button>`;
-    return `<tr class="profile-group-row" data-profile-group="${groupAttr}">
-      <td colspan="${NUM_COLS}" style="font-weight:600">
-        <button class="btn btn-sm" onclick="toggleProfileGroup(${groupJs})">${arrow}</button>
-        <span>${htmlEscape(shortGroupName(group))}</span>
-        <span class="badge badge-info">${items.length}</span>
-        ${groupActions}
-      </td>
-    </tr>` + items.map(p => `<tr data-profile-row="${groupAttr}" style="display:${display};${p.active?'background:var(--accent-soft)':''}">
-    <td><span class="star ${p.favorite?'on':''}" onclick="toggleFav(${p.id})">★</span></td>
+function profileGroupDescriptors(data) {
+  const sourceGroups = new Map();
+  const deadItems = [];
+  data.forEach(profile => {
+    if (profile.dead) {
+      deadItems.push(profile);
+      return;
+    }
+    const key = `source:${profile.group || ''}`;
+    if (!sourceGroups.has(key)) sourceGroups.set(key, {key, source:profile.group, dead:false, items:[]});
+    sourceGroups.get(key).items.push(profile);
+  });
+  const groups = [...sourceGroups.values()];
+  if (deadItems.length) groups.push({key:DEAD_SERVERS_GROUP_KEY, source:null, dead:true, items:deadItems});
+  return groups;
+}
+
+function toggleServerSelection(serverRef, selected) {
+  if (!serverRef) return;
+  if (selected) selectedServerRefs.add(serverRef);
+  else selectedServerRefs.delete(serverRef);
+  renderProfiles(MOCK.profiles);
+}
+
+function toggleProfileGroupSelection(groupKey, selected) {
+  document.querySelectorAll('#profilesBody tr[data-profile-row]').forEach(row => {
+    if (row.dataset.profileRow !== groupKey) return;
+    const checkbox = row.querySelector('input[data-server-ref]');
+    if (!checkbox || checkbox.disabled) return;
+    if (selected) selectedServerRefs.add(checkbox.dataset.serverRef);
+    else selectedServerRefs.delete(checkbox.dataset.serverRef);
+  });
+  renderProfiles(MOCK.profiles);
+}
+
+function selectedProfiles() {
+  return MOCK.profiles.filter(profile => selectedServerRefs.has(profile.server_ref));
+}
+
+function updateDeadServerBulkBar() {
+  const selected = selectedProfiles();
+  const live = selected.filter(profile => !profile.dead && !profile.active);
+  const dead = selected.filter(profile => profile.dead);
+  const bar = document.getElementById('deadServerBulk');
+  if (!bar) return;
+  bar.classList.toggle('visible', selected.length > 0);
+  safeSet('deadServerSelectedCount', `${t('Выбрано')}: ${selected.length}`);
+  safeSet('deadServerSelectedBreakdown', `${t('Живые')}: ${live.length} · ${t('Дохлые серверы')}: ${dead.length}`);
+  const move = document.getElementById('deadServerMoveSelected');
+  const restore = document.getElementById('deadServerRestoreSelected');
+  if (move) move.style.display = live.length ? '' : 'none';
+  if (restore) restore.style.display = dead.length ? '' : 'none';
+}
+
+function clearServerSelection() {
+  selectedServerRefs.clear();
+  renderProfiles(MOCK.profiles);
+}
+
+function moveSelectedToDeadServers() {
+  const server_refs = selectedProfiles().filter(profile => !profile.dead && !profile.active).map(profile => profile.server_ref);
+  if (!server_refs.length) return;
+  api('POST','/api/trash/move',{server_refs}).then(() => {
+    server_refs.forEach(serverRef => selectedServerRefs.delete(serverRef));
+    showToast('success',t('Серверы перемещены в Дохлые серверы'));
+    return refreshDashboard();
+  }).catch(() => {});
+}
+
+function restoreDeadServers(serverRefs) {
+  const server_refs = [...new Set((serverRefs || []).filter(Boolean))];
+  if (!server_refs.length) return Promise.resolve();
+  return api('POST','/api/trash/restore',{server_refs}).then(() => {
+    server_refs.forEach(serverRef => selectedServerRefs.delete(serverRef));
+    showToast('success',t('Серверы восстановлены'));
+    return Promise.all([refreshDashboard(), loadTrash()]);
+  });
+}
+
+function restoreSelectedDeadServers() {
+  return restoreDeadServers(selectedProfiles().filter(profile => profile.dead).map(profile => profile.server_ref)).catch(() => {});
+}
+
+function renderProfileGroup(descriptor) {
+  const {key, source, dead, items} = descriptor;
+  const groupAttr = attrEscape(key);
+  const groupJs = jsStringAttr(key);
+  const isCollapsed = collapsedGroups.has(key);
+  const display = isCollapsed ? 'none' : '';
+  const arrow = isCollapsed ? '▸' : '▾';
+  const sub = dead ? null : subscriptionForGroup(source);
+  const subRefresh = sub ? `<button class="btn btn-sm" data-url="${attrEscape(sub.url)}" onclick="refreshSubscriptionByButton(this)">↻</button>` : '';
+  const groupIds = items.map(profile => profile.id);
+  const benchmarkAction = sub ? `benchSubscription(${jsStringAttr(sub.url)})` : `benchGroup([${groupIds.join(',')}])`;
+  const groupActions = dead ? '' : `<button class="btn btn-sm" onclick="${benchmarkAction}" title="${t('Тест группы')}">⚡</button>
+    ${subRefresh}
+    <button class="btn btn-sm" onclick="shareProfileGroup(${jsStringAttr(source || t('Без группы'))})">⤴ ${t('Поделиться / QR')}</button>
+    <button class="btn-icon btn-sm" onclick="deleteProfileGroup(${jsStringAttr(source || t('Без группы'))})" title="${t('Удалить подписку?')}">✕</button>`;
+  const selectable = items.filter(profile => !profile.active && profile.server_ref);
+  const groupChecked = selectable.length > 0 && selectable.every(profile => selectedServerRefs.has(profile.server_ref));
+  const groupLabel = dead ? t('Дохлые серверы') : shortGroupName(source || t('Без группы'));
+  const header = `<tr class="profile-group-row" data-profile-group="${groupAttr}"><td colspan="16" style="font-weight:600">
+    <button class="btn btn-sm" onclick="toggleProfileGroup(${groupJs})">${arrow}</button>
+    <input class="profile-group-select" type="checkbox" ${groupChecked?'checked':''} ${selectable.length?'':'disabled'} onchange="toggleProfileGroupSelection(${groupJs},this.checked)" aria-label="${attrEscape(t('Выбрать группу'))}">
+    <span>${htmlEscape(groupLabel)}</span> <span class="badge badge-info">${items.length}</span> ${groupActions}
+  </td></tr>`;
+  return header + items.map(profile => renderProfileRow(profile, key, display)).join('');
+}
+
+function renderProfileRow(p, groupKey, display) {
+  const disabled = p.active || !p.server_ref;
+  const provenance = p.dead ? `<div class="profile-provenance" title="${attrEscape(p.group || t('Без группы'))}">${htmlEscape(shortGroupName(p.group || t('Без группы')))}</div>` : '';
+  return `<tr data-profile-row="${attrEscape(groupKey)}" class="${p.dead?'dead-server-row':''}" style="display:${display};${p.active?'background:var(--accent-soft)':''}">
+    <td><input class="profile-select" type="checkbox" data-server-ref="${attrEscape(p.server_ref || '')}" ${selectedServerRefs.has(p.server_ref)?'checked':''} ${disabled?'disabled':''} onchange="toggleServerSelection(this.dataset.serverRef,this.checked)" aria-label="${attrEscape(t('Выбрать сервер'))}"><span class="star ${p.favorite?'on':''}" onclick="toggleFav(${p.id})">★</span></td>
     <td class="mono" style="color:var(--muted)">${p.id}</td>
-    <td style="font-weight:${p.active?'600':'400'};max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${htmlEscape(p.name)}</td>
+    <td style="font-weight:${p.active?'600':'400'};max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${htmlEscape(p.name)}${provenance}</td>
     <td><span class="badge badge-info" style="font-size:10px">${htmlEscape(p.protocol)}</span></td>
     <td class="mono" style="font-weight:600;color:${(p.score??0)>=80?'var(--success)':(p.score??0)>=60?'var(--warning)':'var(--danger)'}">${p.score ?? '—'}</td>
     <td style="white-space:nowrap">
-      ${!p.active?`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`:`<span class="badge badge-success">${t('Активен')}</span>`}
+      ${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}
       <button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="${t('Тест сервера')}">⚡</button>
       <button class="btn-icon btn-sm" onclick="editProfileName(${p.id})" title="${t('Переименовать')}">✎</button>
       <button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button>
@@ -3263,13 +3361,20 @@ function renderProfiles(data) {
     <td class="mono" style="font-size:11px">${p.cooldown_until_unix ? formatTime(p.cooldown_until_unix) : '—'}</td>
     <td class="mono" style="font-size:11px;color:var(--muted)">${htmlEscape(p.transport)}</td>
     <td class="mono" style="font-size:11px;color:var(--muted)">${htmlEscape(p.address)}:${htmlEscape(p.port)}</td>
-  </tr>`).join('');
-  }).join('');
+  </tr>`;
+}
+
+function renderProfiles(data) {
+  const body = document.getElementById('profilesBody');
+  if (!body) return;
+  const sorted = applyProfileSort(data);
+  body.innerHTML = profileGroupDescriptors(sorted).map(renderProfileGroup).join('');
   // Update count badge
   const badge = document.getElementById('profileCountBadge');
   if (badge) badge.textContent = data.length;
   // Update sort arrows in thead.
   updateSortArrows();
+  updateDeadServerBulkBar();
   renderFavorites(MOCK.profiles);
 }
 
@@ -3302,7 +3407,7 @@ function renderFavorites(data) {
     <td><span class="badge badge-info" style="font-size:10px">${htmlEscape(p.protocol)}</span></td>
     <td class="mono" style="font-weight:600;color:${(p.score??0)>=80?'var(--success)':(p.score??0)>=60?'var(--warning)':'var(--danger)'}">${p.score ?? '—'}</td>
     <td style="white-space:nowrap">
-      ${!p.active?`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`:`<span class="badge badge-success">${t('Активен')}</span>`}
+      ${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}
       <button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="${t('Тест сервера')}">⚡</button>
       <button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button>
     </td>
@@ -3338,19 +3443,19 @@ function toggleFav(id) {
   if(p) p.favorite=!p.favorite;
   renderProfiles(MOCK.profiles);
 }
-function toggleProfileGroup(group) {
-  if (collapsedGroups.has(group)) {
-    collapsedGroups.delete(group);
+function toggleProfileGroup(groupKey) {
+  if (collapsedGroups.has(groupKey)) {
+    collapsedGroups.delete(groupKey);
   } else {
-    collapsedGroups.add(group);
+    collapsedGroups.add(groupKey);
   }
   saveCollapsedGroups();
   // Toggle DOM immediately without full re-render.
-  const rows = Array.from(document.querySelectorAll('[data-profile-row]')).filter(row => row.dataset.profileRow === group);
-  const collapsed = collapsedGroups.has(group);
+  const rows = Array.from(document.querySelectorAll('[data-profile-row]')).filter(row => row.dataset.profileRow === groupKey);
+  const collapsed = collapsedGroups.has(groupKey);
   rows.forEach(row => { row.style.display = collapsed ? 'none' : ''; });
   // Update arrow.
-  const headerRow = Array.from(document.querySelectorAll('[data-profile-group]')).find(row => row.dataset.profileGroup === group);
+  const headerRow = Array.from(document.querySelectorAll('[data-profile-group]')).find(row => row.dataset.profileGroup === groupKey);
   const header = headerRow && headerRow.querySelector('button');
   if (header) header.textContent = collapsed ? '▸' : '▾';
 }
@@ -4891,19 +4996,27 @@ function benchGroup(ids) {
   startBenchWithIds(ids);
 }
 
+function benchSubscription(subscriptionUrl) {
+  if (!subscriptionUrl) return;
+  startBenchScope({subscription_url:subscriptionUrl}, true);
+}
+
 function startBenchWithIds(ids) {
+  startBenchScope({profile_ids:ids}, ids.length > 1);
+}
+
+function startBenchScope(scope, isGroup) {
   const tog = metricToggles();
-  const body = {
+  const body = Object.assign({
     method: document.getElementById('benchMethod')?.value || 'tcp',
     probe_url: document.getElementById('benchProbe')?.value || '',
     download_url: document.getElementById('benchDL')?.value || '',
     upload_url: document.getElementById('benchUL')?.value || '',
-    profile_ids: ids,
     test_download: tog.download,
     test_upload: tog.upload,
-  };
+  }, scope);
   // Track whether this is a group test (for summary bar visibility).
-  window.benchIsGroup = ids.length > 1;
+  window.benchIsGroup = isGroup;
   const progressEl = document.getElementById('benchProgress');
   if (progressEl) progressEl.style.display = 'block';
   api('POST','/api/bench/start', body).then(() => {
@@ -5685,8 +5798,10 @@ function normalizeProfiles(statsData, profilesData) {
   if (profilesData && Array.isArray(profilesData.profiles)) {
     return profilesData.profiles.map(p => {
       const st = statsMap[p.id];
-      if (!st) return p;
+      if (!st) return Object.assign({dead:false}, p);
       return Object.assign({}, p, {
+        server_ref: p.server_ref || st.server_ref,
+        dead: p.dead ?? st.dead ?? false,
         favorite: st.favorite ?? p.favorite ?? false,
         last_latency_ms: st.last_latency_ms ?? null,
         last_jitter_ms: st.last_jitter_ms ?? null,
@@ -5891,7 +6006,7 @@ function normalizeConnections(data, limit = 50) {
     };
   });
 }
-function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>null), api('GET','/api/profiles').catch(()=>null)]).then(([stats,profiles]) => { MOCK.profiles = normalizeProfiles(stats, profiles); renderProfiles(MOCK.profiles); }); }
+function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>null), api('GET','/api/profiles').catch(()=>null)]).then(([stats,profiles]) => { MOCK.profiles = normalizeProfiles(stats, profiles); const liveRefs = new Set(MOCK.profiles.map(profile => profile.server_ref).filter(Boolean)); [...selectedServerRefs].forEach(serverRef => { if (!liveRefs.has(serverRef)) selectedServerRefs.delete(serverRef); }); renderProfiles(MOCK.profiles); }); }
 function loadRouting() { return api('GET','/api/routing').then(d => {
   MOCK.routing_rules = d.rules || d.routing_rules || [];
   MOCK.routing_servers = Array.isArray(d.servers) ? d.servers : [];
@@ -6179,22 +6294,22 @@ function renderDeepBenchExplicit() {
   if (!list) return;
   const filtered = DB_EXPLICIT_PROFILES.filter(p => (p.name || '').toLowerCase().includes(search));
   list.innerHTML = filtered.map(p => {
-    const checked = DB_EXPLICIT_SELECTED.has(p.raw) ? 'checked' : '';
+    const checked = DB_EXPLICIT_SELECTED.has(p.server_ref) ? 'checked' : '';
     return `<label style="display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer">
-      <input type="checkbox" data-raw="${escapeAttr(p.raw)}" ${checked} onchange="dbToggleExplicit('${escapeAttr(p.raw)}', this.checked)">
+      <input type="checkbox" data-server-ref="${escapeAttr(p.server_ref)}" ${checked} onchange="dbToggleExplicit('${escapeAttr(p.server_ref)}', this.checked)">
       <span>${escapeHtml(p.name || '')}</span>
       <span style="font-size:11px;color:var(--text-muted);margin-left:auto">${p.protocol || ''}</span>
     </label>`;
   }).join('') || '<div style="color:var(--text-muted);padding:8px">Нет профилей</div>';
 }
 
-function dbToggleExplicit(raw, on) {
-  if (on) DB_EXPLICIT_SELECTED.add(raw);
-  else DB_EXPLICIT_SELECTED.delete(raw);
+function dbToggleExplicit(serverRef, on) {
+  if (on) DB_EXPLICIT_SELECTED.add(serverRef);
+  else DB_EXPLICIT_SELECTED.delete(serverRef);
 }
 
 function dbExplicitSelectAll(on) {
-  if (on) DB_EXPLICIT_PROFILES.forEach(p => DB_EXPLICIT_SELECTED.add(p.raw));
+  if (on) DB_EXPLICIT_PROFILES.forEach(p => DB_EXPLICIT_SELECTED.add(p.server_ref));
   else DB_EXPLICIT_SELECTED.clear();
   renderDeepBenchExplicit();
 }
@@ -6293,12 +6408,12 @@ function loadDeepBenchHistory() {
       container.innerHTML = '<div style="color:var(--text-muted)">Пока нет результатов. Запустите первое тестирование.</div>';
       return;
     }
-    // Group by raw → {date: snapshot}.
-    const byRaw = new Map();
+    // Group by opaque canonical server reference → {date: snapshot}.
+    const byServerRef = new Map();
     const dates = new Set();
     history.forEach(s => {
-      if (!byRaw.has(s.profile_raw)) byRaw.set(s.profile_raw, { name: s.profile_name, days: new Map() });
-      byRaw.get(s.profile_raw).days.set(s.date, s);
+      if (!byServerRef.has(s.server_ref)) byServerRef.set(s.server_ref, { name: s.profile_name, days: new Map() });
+      byServerRef.get(s.server_ref).days.set(s.date, s);
       dates.add(s.date);
     });
     const sortedDates = Array.from(dates).sort();
@@ -6306,17 +6421,17 @@ function loadDeepBenchHistory() {
     const header = `<tr><th style="text-align:left;padding:4px 8px">Профиль</th>` +
       sortedDates.map(d => `<th style="padding:4px 6px;text-align:center">${formatDateCell(d)}</th>`).join('') +
       `<th style="padding:4px 8px">Trend</th></tr>`;
-    const rows = Array.from(byRaw.entries()).sort((a, b) => {
+    const rows = Array.from(byServerRef.entries()).sort((a, b) => {
       const aScore = latestDeepBenchScore(a[1].days, sortedDates);
       const bScore = latestDeepBenchScore(b[1].days, sortedDates);
       return bScore - aScore || String(a[1].name).localeCompare(String(b[1].name), 'ru');
-    }).map(([raw, info]) => {
+    }).map(([serverRef, info]) => {
       const cells = sortedDates.map(d => {
         const s = info.days.get(d);
         if (!s) return `<td style="padding:4px 6px;text-align:center;color:var(--text-muted)">—</td>`;
         const score = s.composite_score;
         const bg = scoreColor(score);
-        return `<td style="padding:4px 6px;text-align:center;background:${bg};color:#fff;font-weight:600" title="${escapeAttr(scoreBreakdownTitle(s, raw))}">${score}</td>`;
+        return `<td style="padding:4px 6px;text-align:center;background:${bg};color:#fff;font-weight:600" title="${escapeAttr(scoreBreakdownTitle(s, serverRef))}">${score}</td>`;
       });
       // Trend: last - first.
       const days = info.days;
@@ -6342,7 +6457,7 @@ function latestDeepBenchScore(days, sortedDates) {
   return -1;
 }
 
-function scoreBreakdownTitle(snapshot, raw) {
+function scoreBreakdownTitle(snapshot, serverRef) {
   const stability = snapshot.stability || {};
   const unlock = snapshot.unlock || {};
   const unlockCount = ['github', 'cloudflare', 'google', 'telegram']
@@ -6368,7 +6483,7 @@ function scoreBreakdownTitle(snapshot, raw) {
     speedSource ? `Источник скорости: ${speedSource}` : `Источник скорости: ${speedError ? 'нет успешного замера' : 'не указан'}`,
     speedError ? `Ошибка скорости: ${speedError}` : null,
     `Разблокировка: ${unlockCount}/4 → ${Math.round(unlockPart)}/100 ×25%`,
-    `Сырой профиль: ${raw}`,
+    `Server ref: ${serverRef}`,
   ].filter(Boolean).join('\n');
 }
 
@@ -6403,13 +6518,13 @@ function loadTrash() {
         <td style="padding:4px 8px">${escapeHtml(e.name)}</td>
         <td style="padding:4px 8px">${e.still_in_profiles ? '✅ в подписке' : '❌ удалён'}</td>
         <td style="padding:4px 8px">${e.promoted_at_unix ? new Date(e.promoted_at_unix * 1000).toLocaleDateString('ru-RU') : '—'}</td>
-        <td style="padding:4px 8px"><button class="btn" onclick="restoreTrash('${escapeAttr(e.raw)}')">↩ Восстановить</button></td>
+        <td style="padding:4px 8px"><button class="btn" onclick="restoreTrash('${escapeAttr(e.server_ref)}')">↩ Восстановить</button></td>
       </tr>`).join('')}</tbody></table>`;
   }).catch(() => {});
 }
 
-function restoreTrash(raw) {
-  apiAction('POST', '/api/trash/restore', { raw }, 'Сервер восстановлен из мусора', loadTrash);
+function restoreTrash(serverRef) {
+  restoreDeadServers([serverRef]).catch(() => {});
 }
 
 function purgeGoneTrash() {

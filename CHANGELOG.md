@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.21.6 - 2026-07-16
+
+- Added the virtual Dead Servers lifecycle group without overwriting subscription/manual provenance, including atomic batch move/restore APIs, active-profile protection, startup reconciliation, and transactional Mihomo dataplane activation with field-scoped rollback.
+- Split immutable identity by contract: routing targets remain `srv-v1`, while Dead Servers, Deep Bench, selectors, and quality history use canonical lifecycle `srv-v2` references. Legacy current-profile refs migrate at startup; orphan v1 Trash entries remain restorable.
+- Canonical lifecycle identity now ignores display fragments, normalizes URL scheme and domain-host case, deterministically orders query keys without losing repeated values, and canonicalizes VMess JSON without its display name. Connection-setting changes still produce a different identity.
+- Excluded Dead Servers from automatic/all/subscription benchmark and selection scopes while preserving explicit diagnostics, and kept enabled pinned routing intent on active fallback until restore.
+- Added the Web UI virtual group, bulk selection/actions, provenance display, lifecycle-aware benchmark/history projections, and regression coverage across frontend/API, migration, routing, activation, and rollback contracts.
+- Gates: full Rust/frontend/installer gate passed locally; Rust tests report 488 passed. The aarch64 artifact was hash-verified, deployed to Keenetic Giga with complete binary/state/history/config rollback coverage, and passed independent lifecycle projections plus router E2E.
+
+## v0.21.5 - 2026-07-16
+
+- Replaced historical-score-only failover with protocol-verified failover: history now orders candidates, but a candidate must pass every fresh HTTPS sample through its own temporary Mihomo instance before the daemon switches to it.
+- Moved failover identity from mutable numeric profile IDs to immutable raw profile descriptors, with a final under-lock re-resolution before transactional activation. Concurrent profile refreshes or user switches can no longer redirect failover to a different object.
+- Failed active profiles and failed candidates receive persisted raw-keyed cooldowns; Trash Bin entries and profiles already in cooldown are excluded. Each failover cycle is bounded to the top eight eligible candidates.
+- Added regression coverage for strict rejection of partial protocol availability, raw-keyed exclusions, Trash/cooldown filtering, and health-failure cooldown state.
+
+## v0.21.4 - 2026-07-16
+
+- Fixed temporary Mihomo process diagnostics across router benchmarks, speed tests, Deep Bench, and desktop tests: stdout and stderr are now preserved in one ordered process log instead of discarding stdout.
+- Early Mihomo exits now include the actual bounded startup/configuration diagnostic rather than an opaque `exit status: 1`, making shared runner failures distinguishable from real proxy-profile failures.
+- Added regression coverage proving diagnostics written to both process streams survive in the combined log.
+
+## v0.21.3 - 2026-07-16
+
+- Fixed destructive subscription refresh: a successful HTTP response that contains zero supported profiles is now a content error, including empty, HTML/challenge, maintenance, and unsupported JSON responses.
+- Made subscription replacement transactional at the state boundary: an empty profile set is rejected before any existing group profile, ID, or active-profile state can change. Only the explicit subscription/group deletion APIs may erase a group.
+- Added regression coverage for HTTP 200 empty-content responses and for preserving a populated subscription group when an empty replacement is rejected.
+
+## v0.21.2 - 2026-07-16
+
+- Hotfix: GeoBase Active rule providers now target the `proxy` fallback group instead of the raw `proxy-active` outbound. This preserves Mihomo's `[proxy-active, DIRECT]` safety path when the active upstream server flaps or times out, preventing policy-marked clients from losing internet on broad generated GeoBase rules.
+- Added regression coverage forbidding broad GeoBase `RULE-SET,...,proxy-active` targets; Active routing intent now matches ordinary `active` route rules by resolving through the fallback group.
+
 ## v0.21.1 - 2026-07-15
 
 - Completed the remaining v0.21 control-plane contracts instead of leaving them as release-note promises.

@@ -1,4 +1,4 @@
-# HincyRay v0.21.1
+# HincyRay v0.21.6
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,28 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 Демон `ndm` в Keenetic пересоздаёт все iptables chains при изменениях конфигурации, событиях WAN и обновлении DHCP. HincyRay устанавливает hook-скрипт в `/opt/etc/ndm/netfilter.d/hincyray.sh`, который **ndm вызывает сам** после каждой перезагрузки firewall, переустанавливая все правила атомарно. Watchdog каждые 10 секунд — запасная страховка.
 
 ## Возможности
+
+### v0.21.6
+
+v0.21.6 добавляет виртуальную lifecycle-группу «Дохлые серверы» с атомарным массовым переносом/восстановлением, сохраняет subscription/manual provenance профиля и исключает dead-профили из автоматического выбора, не запрещая явную диагностику. Routing сохраняет контракт identity `srv-v1`, а lifecycle, Deep Bench и quality history используют canonical `srv-v2`, устойчивый к переименованию и эквивалентной сериализации URL.
+
+При обновлении raw lifecycle values и разрешимые `srv-v1` текущих профилей автоматически мигрируют в `srv-v2`. Legacy orphan-записи Trash с `srv-v1` остаются восстанавливаемыми. Lifecycle refs нельзя использовать как routing target `server:`: routing намеренно остаётся на `server_route_registry` и `srv-v1`.
+
+### v0.21.5
+
+v0.21.5 делает automatic failover доказательным: benchmark history только определяет порядок кандидатов, а каждый replacement server обязан пройти свежую HTTPS-проверку без потерь через реальный proxy protocol до переключения. Identity привязана к raw-link и не ломается при переиндексации подписки.
+
+### v0.21.4
+
+v0.21.4 сохраняет stdout и stderr каждого временного процесса Mihomo при benchmark. При раннем завершении API теперь возвращает реальную bounded startup/configuration diagnostic вместо непрозрачного exit code, поэтому сбой runner больше нельзя спутать с плохим proxy-профилем.
+
+### v0.21.3
+
+v0.21.3 делает обновление подписок неразрушающим: HTTP-успех без поддерживаемого proxy-профиля становится content error, а пустое обновление никогда не может заменить существующую группу. Удаление группы остаётся только явным действием пользователя.
+
+### v0.21.2
+
+v0.21.2 — hotfix для router GeoBase Active routing: широкие generated Active rule providers теперь используют fallback group Mihomo `proxy`, а не raw `proxy-active`, поэтому при флапе upstream policy-marked клиенты получают безопасный fallback вместо потери интернета.
 
 ### v0.21.1
 
@@ -282,7 +304,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Текущие gates v0.21.1 зафиксированы в [`docs/releases/v0.21.1.md`](docs/releases/v0.21.1.md); подтверждение router deploy v0.21.0 остаётся в [`docs/releases/v0.21.0.md`](docs/releases/v0.21.0.md).
+Команда Playwright запускает fixture-backed browser smoke suite. Текущие gates v0.21.6 зафиксированы в [`docs/releases/v0.21.6.md`](docs/releases/v0.21.6.md); подтверждение router deploy v0.21.5 остаётся в [`docs/releases/v0.21.5.md`](docs/releases/v0.21.5.md).
 
 ## Установка
 
@@ -328,6 +350,10 @@ http://<ip-роутера>:8088/
 | `POST` | `/api/profiles/update` | Обновить имя профиля и/или block_quic |
 | `POST` | `/api/profiles/block-quic` | Тоггл флага block_quic на профиле |
 | `POST` | `/api/active-profile` | Установка активного профиля, регенерация конфига, перезапуск ядра |
+| `GET` | `/api/trash` | Список виртуальной lifecycle-проекции «Дохлые серверы» |
+| `POST` | `/api/trash/move` | Атомарно перенести неактивные lifecycle refs в Dead Servers |
+| `POST` | `/api/trash/restore` | Атомарно восстановить lifecycle refs, включая legacy orphan v1 |
+| `POST` | `/api/trash/purge-gone` | Удалить отсутствующие в profiles записи Dead Servers |
 | `GET` | `/api/mihomo-config` | Применённый сгенерированный Mihomo-конфиг с редактированными секретами |
 | `GET` | `/api/mihomo-config/preview` | Неизменяющий preview желаемого конфига с редактированными секретами |
 | `POST` | `/api/core/start` | Запуск ядра Mihomo |

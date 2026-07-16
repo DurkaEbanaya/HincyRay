@@ -161,6 +161,22 @@ REQUIRED_MARKERS = [
     "function loadOperationalSafety()",
     "function explainConnectionResource(button)",
     "sessionStorage.getItem('hincyray_token')",
+    "deadServerBulk",
+    "const DEAD_SERVERS_GROUP_KEY = 'virtual:dead-servers';",
+    "const selectedServerRefs = new Set();",
+    "function profileGroupDescriptors(data)",
+    "if (profile.dead)",
+    "groups.push({key:DEAD_SERVERS_GROUP_KEY",
+    "data-server-ref=",
+    "api('POST','/api/trash/move',{server_refs})",
+    "api('POST','/api/trash/restore',{server_refs})",
+    "function benchSubscription(subscriptionUrl)",
+    "{subscription_url:subscriptionUrl}",
+    "server_ref: p.server_ref || st.server_ref",
+    "dead: p.dead ?? st.dead ?? false",
+    "const byServerRef = new Map();",
+    "s.server_ref",
+    "p.dead?`<span class=\"badge badge-danger\">${t('Дохлые серверы')}</span>`",
 ]
 
 FORBIDDEN_MARKERS = [
@@ -196,6 +212,11 @@ FORBIDDEN_MARKERS = [
     "function aggregateDeviceTraffic(conns)",
     "api('GET','/api/routing',undefined,true),\n    api('GET','/api/status'",
     "localStorage.setItem('hincyray_token'",
+    "s.profile_raw",
+    "data-raw=",
+    "DB_EXPLICIT_SELECTED.add(p.raw)",
+    "apiAction('POST', '/api/trash/restore', { raw }",
+    "Сырой профиль: ${raw}",
 ]
 
 GEOBASE_DOM_IDS = [
@@ -269,6 +290,14 @@ SYSTEM_DOM_IDS = [
     "sysRamBar",
     "sysTempBar",
     "sysMemoryCard",
+]
+
+DEAD_SERVERS_DOM_IDS = [
+    "deadServerBulk",
+    "deadServerSelectedCount",
+    "deadServerSelectedBreakdown",
+    "deadServerMoveSelected",
+    "deadServerRestoreSelected",
 ]
 
 
@@ -389,11 +418,38 @@ if (JSON.stringify(parsed) !== JSON.stringify(expected)) throw new Error(JSON.st
     return None
 
 
+def verify_dead_server_projection(html_text: str) -> str | None:
+    try:
+        projection = js_function(html_text, "profileGroupDescriptors")
+    except ValueError as error:
+        return str(error)
+    program = f"""
+const DEAD_SERVERS_GROUP_KEY = 'virtual:dead-servers';
+{projection}
+const input = [
+  {{id:1,group:'Дохлые серверы',dead:false}},
+  {{id:2,group:'subscription-a',dead:true}},
+  {{id:3,group:'subscription-a',dead:false}}
+];
+const groups = profileGroupDescriptors(input);
+const virtual = groups.find(group => group.key === DEAD_SERVERS_GROUP_KEY);
+const realNamed = groups.find(group => group.source === 'Дохлые серверы');
+if (!virtual || virtual.items.length !== 1 || virtual.items[0].id !== 2) throw new Error('bad virtual group');
+if (!realNamed || realNamed.dead || realNamed.items[0].id !== 1) throw new Error('real group collision');
+if (input[1].group !== 'subscription-a') throw new Error('profile provenance mutated');
+"""
+    result = subprocess.run(["node", "-e", program], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return (result.stderr or result.stdout).strip()
+    return None
+
+
 def main() -> int:
     html_text = HTML.read_text(encoding="utf-8")
     missing_markers = [marker for marker in REQUIRED_MARKERS if marker not in html_text]
     forbidden_markers = [marker for marker in FORBIDDEN_MARKERS if marker in html_text]
     missing_system_ids = [dom_id for dom_id in SYSTEM_DOM_IDS if not dom_id_exists(html_text, dom_id)]
+    missing_dead_server_ids = [dom_id for dom_id in DEAD_SERVERS_DOM_IDS if not dom_id_exists(html_text, dom_id)]
     missing_geobase_ids = [dom_id for dom_id in GEOBASE_DOM_IDS if not dom_id_exists(html_text, dom_id)]
     duplicate_geobase_ids = [dom_id for dom_id in GEOBASE_DOM_IDS if dom_id_count(html_text, dom_id) > 1]
     nav = nav_sections(html_text)
@@ -409,9 +465,10 @@ def main() -> int:
     missing_routes = [(method, path) for method, path in missing_routes if not path.endswith("/")]
     sort_error = verify_nullable_sort(html_text)
     geobase_parser_error = verify_geobase_network_parser(html_text)
+    dead_server_projection_error = verify_dead_server_projection(html_text)
     rule_target_markup = re.search(r'<select id="ruleTarget">(?P<body>.*?)</select>', html_text, re.S)
     numeric_profile_targets = re.findall(r"profile:\d+", rule_target_markup.group("body") if rule_target_markup else "")
-    if missing_markers or forbidden_markers or numeric_profile_targets or missing_system_ids or missing_geobase_ids or duplicate_geobase_ids or missing_geobase_routes or nav_without_panel or nav_without_map or map_without_panel or missing_routes or sort_error or geobase_parser_error:
+    if missing_markers or forbidden_markers or numeric_profile_targets or missing_system_ids or missing_dead_server_ids or missing_geobase_ids or duplicate_geobase_ids or missing_geobase_routes or nav_without_panel or nav_without_map or map_without_panel or missing_routes or sort_error or geobase_parser_error or dead_server_projection_error:
         if missing_markers:
             print("Missing required UI markers:")
             for marker in missing_markers:
@@ -427,6 +484,10 @@ def main() -> int:
         if missing_system_ids:
             print("System renderer writes to missing DOM ids:")
             for dom_id in missing_system_ids:
+                print(f"  - {dom_id}")
+        if missing_dead_server_ids:
+            print("Dead Servers controls are missing required DOM ids:")
+            for dom_id in missing_dead_server_ids:
                 print(f"  - {dom_id}")
         if missing_geobase_ids:
             print("GeoBase Constructor is missing required DOM ids:")
@@ -460,6 +521,8 @@ def main() -> int:
             print(f"Nullable profile sorting contract failed: {sort_error}")
         if geobase_parser_error:
             print(f"GeoBase network parser contract failed: {geobase_parser_error}")
+        if dead_server_projection_error:
+            print(f"Dead Servers virtual projection contract failed: {dead_server_projection_error}")
         return 1
     print(f"frontend contract ok: {len(used)} UI routes checked")
     return 0
