@@ -643,7 +643,7 @@ impl XrayVpnTestApp {
             ui.add_space(22.0);
             Frame::default()
                 .fill(command_bar_fill())
-                .stroke(Stroke::new(1.0, surface_border()))
+                .stroke(Stroke::new(1.0_f32, surface_border()))
                 .inner_margin(Margin::symmetric(10, 8))
                 .show(ui, |ui| {
                     ui.set_width((ui.available_width() - 44.0).max(700.0));
@@ -720,7 +720,7 @@ impl XrayVpnTestApp {
     fn render_input_panel(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
         Frame::default()
             .fill(acrylic_fill())
-            .stroke(Stroke::new(1.0, surface_border()))
+            .stroke(Stroke::new(1.0_f32, surface_border()))
             .inner_margin(Margin::same(14))
             .corner_radius(2)
             .show(ui, |ui| {
@@ -745,7 +745,7 @@ impl XrayVpnTestApp {
 
                     Frame::default()
                         .fill(editor_fill())
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(55, 58, 64)))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(55, 58, 64)))
                         .inner_margin(Margin::same(8))
                         .show(ui, |ui| {
                             let editor_height = (height - 190.0).max(240.0);
@@ -773,7 +773,7 @@ impl XrayVpnTestApp {
         Frame::default()
             .fill(Color32::from_rgba_unmultiplied(0, 120, 215, 22))
             .stroke(Stroke::new(
-                1.0,
+                1.0_f32,
                 Color32::from_rgba_unmultiplied(0, 120, 215, 60),
             ))
             .inner_margin(Margin::symmetric(8, 6))
@@ -803,7 +803,7 @@ impl XrayVpnTestApp {
     fn render_results_panel(&mut self, ui: &mut egui::Ui, width: f32, height: f32) {
         Frame::default()
             .fill(content_fill())
-            .stroke(Stroke::new(1.0, surface_border()))
+            .stroke(Stroke::new(1.0_f32, surface_border()))
             .inner_margin(Margin::same(14))
             .corner_radius(2)
             .show(ui, |ui| {
@@ -843,7 +843,7 @@ impl XrayVpnTestApp {
     fn render_empty_state(&self, ui: &mut egui::Ui, width: f32, height: f32) {
         Frame::default()
             .fill(Color32::from_rgb(18, 20, 23))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 50)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(42, 45, 50)))
             .inner_margin(Margin::same(18))
             .show(ui, |ui| {
                 ui.set_min_size(egui::vec2((width - 44.0).max(300.0), height.max(260.0)));
@@ -870,7 +870,7 @@ impl XrayVpnTestApp {
         let mut selection_changed = false;
         Frame::default()
             .fill(Color32::from_rgb(18, 20, 23))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(42, 45, 50)))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(42, 45, 50)))
             .inner_margin(Margin::same(6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1192,7 +1192,7 @@ impl XrayVpnTestApp {
         painter.rect_stroke(
             rect,
             4.0,
-            Stroke::new(1.0, Color32::from_rgb(50, 55, 64)),
+            Stroke::new(1.0_f32, Color32::from_rgb(50, 55, 64)),
             egui::StrokeKind::Outside,
         );
 
@@ -1218,7 +1218,7 @@ impl XrayVpnTestApp {
             let y = graph.bottom() - graph.height() * line as f32 / 4.0;
             painter.line_segment(
                 [egui::pos2(graph.left(), y), egui::pos2(graph.right(), y)],
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 18)),
             );
         }
 
@@ -1240,7 +1240,7 @@ impl XrayVpnTestApp {
         }
         painter.add(egui::Shape::line(
             points,
-            Stroke::new(1.5, Color32::from_rgb(0, 120, 215)),
+            Stroke::new(1.5_f32, Color32::from_rgb(0, 120, 215)),
         ));
     }
 
@@ -1346,7 +1346,7 @@ fn metric_tile(ui: &mut egui::Ui, label: &str, value: String) {
     Frame::default()
         .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 12))
         .stroke(Stroke::new(
-            1.0,
+            1.0_f32,
             Color32::from_rgba_unmultiplied(255, 255, 255, 18),
         ))
         .inner_margin(Margin::symmetric(10, 8))
