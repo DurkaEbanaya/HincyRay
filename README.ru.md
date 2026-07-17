@@ -316,6 +316,8 @@ sh scripts/hincyray-install.sh
 
 Установщик проверяет kernel modules, создаёт директорию ndm hook, устанавливает бинарник, init-скрипт и состояние по умолчанию. Staging → backup → atomic `mv` → verify → commit/rollback.
 
+Репозиторий приватный. Перед запуском установщика скопируйте release-бинарник в `/tmp/hincyray` (или задайте `HINCYRAY_BIN_PATH`). Альтернатива — `HINCYRAY_GITHUB_TOKEN` с правом чтения: установщик структурно находит точный asset `hincyray` через authenticated GitHub Releases API и не помещает token в URL или log message.
+
 См. [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md) для ручной установки.
 
 ## Веб-панель

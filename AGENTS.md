@@ -109,6 +109,7 @@ Live verified v0.21.6 artifact SHA256: `2cc66ab3ccd65d7351f599493e3d0cb05187116b
 ## Release
 
 - `Cargo.toml`, first-party `Cargo.lock`, README EN/RU, CHANGELOG, installer download version, installer contract, and `docs/releases/vX.Y.Z.md` must agree.
+- The GitHub repository is private. Installer downloads must use a local `HINCYRAY_BIN_PATH` or authenticated API resolution with `HINCYRAY_GITHUB_TOKEN`; never assume a public `releases/download` URL or expose the token in URLs/logs.
 - Inspect status/diff/log and stage only intended files. Never stage user-owned scratch documents or secrets.
 - GitHub Release tag must target the pushed release commit and attach the hash-verified aarch64 `hincyray` artifact.
 - Detailed history belongs in `CHANGELOG.md` and `docs/releases/`, not this file.

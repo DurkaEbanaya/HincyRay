@@ -19,6 +19,7 @@
 #
 # Environment variables (all optional):
 #   HINCYRAY_BIN_PATH   — path to pre-built hincyray binary (default: /tmp/hincyray)
+#   HINCYRAY_GITHUB_TOKEN — token with read access for private GitHub release downloads
 #   HINCYRAY_XRAY_ZIP   — path to xray zip (default: /tmp/xray.zip)
 #   HINCYRAY_LISTEN     — bind address (default: 0.0.0.0:8088)
 #   HINCYRAY_SUB_URL    — subscription URL to import automatically
@@ -97,6 +98,20 @@ ask_default() {
 }
 
 check_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+github_get() {
+    url="$1"
+    output="$2"
+    accept="$3"
+    token="${HINCYRAY_GITHUB_TOKEN:-}"
+    [ -n "$token" ] || return 1
+    {
+        printf 'header = "Authorization: Bearer %s"\n' "$token"
+        printf 'header = "Accept: %s"\n' "$accept"
+        printf 'header = "X-GitHub-Api-Version: 2022-11-28"\n'
+    } | curl --fail --silent --show-error --location \
+        --config - --output "$output" "$url"
+}
 
 # ── Atomic infrastructure ────────────────────────────────────────────
 
@@ -403,15 +418,24 @@ stage_binary() {
     fi
 
     if [ ! -f "$BIN_PATH" ]; then
-        DOWNLOAD_URL="${GITHUB}/releases/download/v${VERSION}/hincyray"
-        if [ "$HAVE_CURL" -eq 1 ] && ask_yn "Binary not found. Download from GitHub releases?"; then
-            info "Downloading from ${DOWNLOAD_URL}..."
-            if curl -sSL -o "${STAGING}/sbin/hincyray" "$DOWNLOAD_URL" 2>/dev/null && [ -s "${STAGING}/sbin/hincyray" ]; then
+        RELEASE_API="https://api.github.com/repos/DurkaEbanaya/HincyRay/releases/tags/v${VERSION}"
+        if [ "$HAVE_CURL" -eq 1 ] && [ -n "${HINCYRAY_GITHUB_TOKEN:-}" ] && ask_yn "Binary not found. Download the private GitHub release?"; then
+            info "Resolving the v${VERSION} release asset through GitHub API..."
+            github_get "$RELEASE_API" "${STAGING}/release.json" "application/vnd.github+json" \
+                || die "GitHub release lookup failed; verify HINCYRAY_GITHUB_TOKEN read access"
+            ASSET_API=$(jq -r '.assets[] | select(.name == "hincyray") | .url' "${STAGING}/release.json" | sed -n '1p')
+            rm -f "${STAGING}/release.json"
+            [ -n "$ASSET_API" ] && [ "$ASSET_API" != "null" ] \
+                || die "GitHub release v${VERSION} has no hincyray asset"
+            info "Downloading the authenticated hincyray asset..."
+            if github_get "$ASSET_API" "${STAGING}/sbin/hincyray" "application/octet-stream" && [ -s "${STAGING}/sbin/hincyray" ]; then
                 ok "Downloaded to staging"
             else
                 die "Download failed. Copy the binary manually: scp -P 222 -O hincyray root@<router>:/tmp/hincyray"
             fi
         else
+            [ -n "${HINCYRAY_GITHUB_TOKEN:-}" ] \
+                || err "This repository is private; automatic download requires HINCYRAY_GITHUB_TOKEN."
             err "Copy the binary to the router first:"
             err "  scp -P 222 -O hincyray root@<router-ip>:/tmp/hincyray"
             die "Cannot proceed without binary"
@@ -676,9 +700,9 @@ stage_wifi_script() {
             fi
         done
         # Try downloading from GitHub.
-        if [ "$HAVE_CURL" -eq 1 ]; then
-            URL="${GITHUB}/raw/v${VERSION}/scripts/wifi-segment-setup.sh"
-            if curl -sSL -o "${STAGING}/etc/hincyray/wifi-segment-setup.sh" "$URL" 2>/dev/null && [ -s "${STAGING}/etc/hincyray/wifi-segment-setup.sh" ]; then
+        if [ "$HAVE_CURL" -eq 1 ] && [ -n "${HINCYRAY_GITHUB_TOKEN:-}" ]; then
+            URL="https://raw.githubusercontent.com/DurkaEbanaya/HincyRay/v${VERSION}/scripts/wifi-segment-setup.sh"
+            if github_get "$URL" "${STAGING}/etc/hincyray/wifi-segment-setup.sh" "application/vnd.github.raw" && [ -s "${STAGING}/etc/hincyray/wifi-segment-setup.sh" ]; then
                 ok "WiFi setup script downloaded to staging"
                 return 0
             fi

@@ -348,6 +348,8 @@ sh scripts/hincyray-install.sh
 
 The installer checks for kernel modules, creates the ndm hook directory, installs the binary, init script, and default state. Staging → backup → atomic `mv` → verify → commit/rollback.
 
+The repository is private. Copy the release binary to `/tmp/hincyray` (or set `HINCYRAY_BIN_PATH`) before running the installer. Alternatively, set `HINCYRAY_GITHUB_TOKEN` to a token with read access; the installer resolves the exact `hincyray` asset through the authenticated GitHub Releases API and never places the token in a URL or log message.
+
 See [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md) for manual installation.
 
 ## Web panel

@@ -9,6 +9,7 @@
 - Added the Web UI virtual group, bulk selection/actions, provenance display, lifecycle-aware benchmark/history projections, and regression coverage across frontend/API, migration, routing, activation, and rollback contracts.
 - Made desktop egui stroke widths explicitly `f32`, keeping the all-features build compatible with the stable compiler's `float_literal_f32_fallback` lint under `-D warnings`.
 - Made the local subscription HTTP fixture consume bounded request headers before replying, preserving the strict empty-content assertion without Linux TCP-reset races.
+- Corrected private-repository installation: automatic downloads now require `HINCYRAY_GITHUB_TOKEN`, resolve the exact release asset through GitHub's authenticated API, and keep credentials out of URLs and logs; local `HINCYRAY_BIN_PATH` remains credential-free.
 - Gates: full Rust/frontend/installer gate passed locally; Rust tests report 488 passed. The aarch64 artifact was hash-verified, deployed to Keenetic Giga with complete binary/state/history/config rollback coverage, and passed independent lifecycle projections plus router E2E.
 
 ## v0.21.5 - 2026-07-16
