@@ -1102,7 +1102,30 @@ mod tests {
         require_subscription_profiles,
     };
     use base64::Engine as _;
-    use std::{io::Write, net::TcpListener, thread};
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        thread,
+        time::Duration,
+    };
+
+    fn read_http_request_head(stream: &mut TcpStream) {
+        const MAX_HEADER_BYTES: usize = 16 * 1024;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("subscription request timeout");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while request.len() < MAX_HEADER_BYTES {
+            let read = stream.read(&mut chunk).expect("subscription request head");
+            assert!(read > 0, "subscription request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return;
+            }
+        }
+        panic!("subscription request headers exceed {MAX_HEADER_BYTES} bytes");
+    }
 
     fn empty_subscription_response_source(
         body: &'static str,
@@ -1114,6 +1137,7 @@ mod tests {
             // fallback, so serve both request modes deterministically.
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().expect("subscription request");
+                read_http_request_head(&mut stream);
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
