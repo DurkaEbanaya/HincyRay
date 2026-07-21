@@ -13,6 +13,7 @@
 //! because Entware ships it; if `curl` is missing the HEAD/GET methods
 //! return a clear error.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -20,6 +21,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,6 +45,8 @@ const DOWNLOAD_MAX_SECS: u64 = 3;
 const SUSTAINED_DOWNLOAD_MAX_SECS: u64 = 15;
 const XRAY_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const QUICK_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const QUICK_BENCH_WORKERS: usize = 8;
 
 /// Benchmark method requested by the API or web UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +55,7 @@ pub enum BenchMethod {
     Tcp,
     Head,
     Get,
+    Quick,
 }
 
 impl BenchMethod {
@@ -59,6 +64,7 @@ impl BenchMethod {
             "tcp" => Some(Self::Tcp),
             "head" => Some(Self::Head),
             "get" => Some(Self::Get),
+            "quick" => Some(Self::Quick),
             _ => None,
         }
     }
@@ -68,6 +74,7 @@ impl BenchMethod {
             Self::Tcp => "tcp",
             Self::Head => "head",
             Self::Get => "get",
+            Self::Quick => "quick",
         }
     }
 }
@@ -142,34 +149,96 @@ pub fn run_bench(
     }
 
     thread::spawn(move || {
-        for profile in &profiles {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            {
-                let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-                state.current_profile_id = Some(profile.id);
-                state.current_profile_name = Some(profile.name.clone());
-                state.last_updated = unix_now();
-            }
-
-            let result = benchmark_profile(
-                profile,
-                method,
-                &probe_url,
-                &download_url,
-                &upload_url,
-                &core_path,
-                test_download,
-                test_upload,
+        if method == BenchMethod::Quick {
+            let queue = Arc::new(Mutex::new(VecDeque::from(profiles)));
+            let (sender, receiver) = mpsc::channel();
+            let worker_count = QUICK_BENCH_WORKERS.min(
+                queue
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .len(),
             );
-
-            on_result(result.clone());
-            {
+            let mut workers = Vec::with_capacity(worker_count);
+            for _ in 0..worker_count {
+                let queue = Arc::clone(&queue);
+                let sender = sender.clone();
+                let cancel = Arc::clone(&cancel);
+                let job = Arc::clone(&job);
+                workers.push(thread::spawn(move || {
+                    loop {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let profile = queue
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .pop_front();
+                        let Some(profile) = profile else { break };
+                        {
+                            let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
+                            state.current_profile_id = Some(profile.id);
+                            state.current_profile_name = Some(profile.name.clone());
+                            state.last_updated = unix_now();
+                        }
+                        if sender
+                            .send(benchmark_profile(
+                                &profile,
+                                BenchMethod::Quick,
+                                "",
+                                "",
+                                "",
+                                "",
+                                false,
+                                false,
+                            ))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }));
+            }
+            drop(sender);
+            for result in receiver {
+                on_result(result.clone());
                 let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
                 state.results.push(result);
                 state.completed += 1;
                 state.last_updated = unix_now();
+            }
+            for worker in workers {
+                let _ = worker.join();
+            }
+        } else {
+            for profile in &profiles {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                {
+                    let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
+                    state.current_profile_id = Some(profile.id);
+                    state.current_profile_name = Some(profile.name.clone());
+                    state.last_updated = unix_now();
+                }
+
+                let result = benchmark_profile(
+                    profile,
+                    method,
+                    &probe_url,
+                    &download_url,
+                    &upload_url,
+                    &core_path,
+                    test_download,
+                    test_upload,
+                );
+
+                on_result(result.clone());
+                {
+                    let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
+                    state.results.push(result);
+                    state.completed += 1;
+                    state.last_updated = unix_now();
+                }
             }
         }
 
@@ -216,6 +285,7 @@ fn benchmark_profile(
     // Step 1: Latency probe — TCP (direct) or HEAD/GET (via temp xray).
     let latency_outcome = match method {
         BenchMethod::Tcp => run_tcp(profile),
+        BenchMethod::Quick => run_quick_tcp(profile),
         BenchMethod::Head | BenchMethod::Get => {
             run_via_temp_mihomo(profile, method, probe_url, core_path)
         }
@@ -224,7 +294,7 @@ fn benchmark_profile(
     // Step 2: Speed metrics are independent of the selected latency method.
     // Always execute every requested speed stage through a temporary Mihomo
     // instance; GET must not silently skip upload or bypass request flags.
-    let need_speed = test_download || test_upload;
+    let need_speed = method != BenchMethod::Quick && (test_download || test_upload);
 
     let speed_metrics = if need_speed {
         run_speed_via_mihomo(
@@ -357,7 +427,36 @@ fn run_tcp(profile: &Profile) -> Result<Metrics, String> {
     })
 }
 
+fn run_quick_tcp(profile: &Profile) -> Result<Metrics, String> {
+    let port = profile.port.unwrap_or(443);
+    if profile.address.is_empty() {
+        return Err("profile has empty address".to_owned());
+    }
+    let (latencies, failures) =
+        tcp_probe_with_timeout(&profile.address, port, 1, QUICK_TCP_CONNECT_TIMEOUT);
+    let Some(latency) = latencies.first() else {
+        return Err(format!(
+            "quick tcp connect {}:{} failed {failures}/1",
+            profile.address, port
+        ));
+    };
+    Ok(Metrics {
+        latency_ms: latency.as_millis().min(u128::from(u32::MAX)) as u32,
+        jitter_ms: 0,
+        loss_percent: 0.0,
+    })
+}
+
 pub(crate) fn tcp_probe(host: &str, port: u16, attempts: usize) -> (Vec<Duration>, usize) {
+    tcp_probe_with_timeout(host, port, attempts, TCP_CONNECT_TIMEOUT)
+}
+
+fn tcp_probe_with_timeout(
+    host: &str,
+    port: u16,
+    attempts: usize,
+    connect_timeout: Duration,
+) -> (Vec<Duration>, usize) {
     let mut latencies = Vec::new();
     let mut failures = 0usize;
     let target = (host, port).to_socket_addrs();
@@ -377,7 +476,7 @@ pub(crate) fn tcp_probe(host: &str, port: u16, attempts: usize) -> (Vec<Duration
         // Try each resolved address; succeed on the first that connects.
         let mut ok = false;
         for addr in &addrs {
-            if TcpStream::connect_timeout(addr, TCP_CONNECT_TIMEOUT).is_ok() {
+            if TcpStream::connect_timeout(addr, connect_timeout).is_ok() {
                 ok = true;
                 break;
             }
@@ -1210,7 +1309,43 @@ mod tests {
         assert_eq!(BenchMethod::parse_method("TCP"), Some(BenchMethod::Tcp));
         assert_eq!(BenchMethod::parse_method("Head"), Some(BenchMethod::Head));
         assert_eq!(BenchMethod::parse_method("get"), Some(BenchMethod::Get));
+        assert_eq!(BenchMethod::parse_method("QUICK"), Some(BenchMethod::Quick));
         assert_eq!(BenchMethod::parse_method("quic"), None);
+    }
+
+    #[test]
+    fn quick_benchmark_uses_one_tcp_probe_without_speed_stages() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("local listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let profile = Profile {
+            id: 9,
+            name: "quick".to_owned(),
+            protocol: Protocol::Vless,
+            address: "127.0.0.1".to_owned(),
+            port: Some(port),
+            raw: format!("vless://11111111-1111-1111-1111-111111111111@127.0.0.1:{port}#quick"),
+            selected: false,
+            block_quic: false,
+            group: None,
+        };
+
+        let result = benchmark_profile(
+            &profile,
+            BenchMethod::Quick,
+            "",
+            "",
+            "",
+            "/definitely/missing/mihomo",
+            true,
+            true,
+        );
+
+        assert!(result.success);
+        assert_eq!(result.method, "quick");
+        assert_eq!(result.jitter_ms, 0);
+        assert_eq!(result.loss_percent, 0.0);
+        assert_eq!(result.download_mbps, None);
+        assert_eq!(result.upload_mbps, None);
     }
 
     #[test]

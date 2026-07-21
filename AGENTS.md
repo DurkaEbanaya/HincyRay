@@ -1,4 +1,4 @@
-# HincyRay v0.21.6 (`xray-vpn-test`)
+# HincyRay v0.21.7 (`xray-vpn-test`)
 
 Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 and the feature-gated `xray-vpn-test` desktop diagnostics app. Router mode uses Mihomo with iptables NAT REDIRECT (TCP 10810) and mangle TPROXY (UDP 10811); there is no TUN/tun2socks path.
 
@@ -35,6 +35,7 @@ Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 a
 - Manual and automatic Dead Servers transitions share the serialized `mutate_dead_server_membership()` boundary. Validate the whole batch before mutation; active profiles cannot be moved; persistence/dataplane failures must roll lifecycle fields back without erasing unrelated state.
 - Automatic/all/subscription scopes exclude dead profiles. Explicit diagnostic requests may include them. Enabled pinned routes preserve intent and use active fallback while their target is dead.
 - Router DNS is always present because firewall rules unconditionally redirect port 53 to Mihomo on 1053. `dns.enabled` is a desktop-Xray concept.
+- DIRECT routes use configured local DNS servers by default so their name resolution does not depend on VPN upstream health.
 - Redir and TPROXY listeners must stay on separate ports. The ndm hook is the primary firewall-reload mechanism; watchdog reinstall is a safety net.
 - `geoip.metadb` must be present locally and `geo-auto-update: false`; router startup must not depend on blocked GitHub downloads.
 - Mihomo fallback group `proxy` is the canonical upstream-health decider. The daemon reads its state; do not add duplicate periodic upstream probes.
@@ -104,7 +105,7 @@ Before replacing the live binary:
 5. Verify active profile, fallback group, firewall/TPROXY, and router E2E.
 6. On any failure restore the complete rollback set and verify the previous version health.
 
-Live verified v0.21.6 artifact SHA256: `2cc66ab3ccd65d7351f599493e3d0cb05187116b102afaec347070922eb188f5`. Deployment evidence is in `docs/releases/v0.21.6.md`.
+Live verified v0.21.7 artifact SHA256: `fec81f8a7e65495e8d4414ce25a760670d1249a8f7d2244fc69925c8e4b21734`. Deployment evidence is in `docs/releases/v0.21.7.md`.
 
 ## Release
 

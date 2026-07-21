@@ -1,4 +1,4 @@
-# HincyRay v0.21.6
+# HincyRay v0.21.7
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,12 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.21.7
+
+v0.21.7 keeps DIRECT/RU routes usable when the VPN upstream is unavailable by resolving DIRECT destinations through the configured local DNS servers. It also adds a selected-server Quick Test that runs one bounded TCP probe per profile with up to eight profiles in parallel.
+
+Background auto-VPN learning no longer restarts Mihomo when it discovers a domain. Learned exceptions are persisted and applied on the next explicit routing apply or core restart, avoiding a router-wide connection interruption. The duplicate auto-switch controls now remain synchronized in the Web UI.
 
 ### v0.21.6
 
@@ -336,7 +342,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v0.21.6 gate results are recorded in [`docs/releases/v0.21.6.md`](docs/releases/v0.21.6.md); v0.21.5 router deployment evidence remains in [`docs/releases/v0.21.5.md`](docs/releases/v0.21.5.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v0.21.7 gate and router deployment results are recorded in [`docs/releases/v0.21.7.md`](docs/releases/v0.21.7.md).
 
 ## Installation
 

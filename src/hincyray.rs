@@ -6116,7 +6116,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             "application/json",
             json!({
                 "error": "unknown method",
-                "supported": ["tcp", "head", "get"],
+                "supported": ["tcp", "head", "get", "quick"],
             })
             .to_string(),
         );
@@ -12926,11 +12926,10 @@ fn run_auto_vpn_learning(
     }
     prune_auto_vpn_metadata(&mut inner.state.split_routing);
     inner.dirty = true;
-    if changed
-        && inner.core.is_running()
-        && let Err(error) = restart_core_locked(&mut inner, daemon)
-    {
-        eprintln!("hincyray: auto VPN exception apply failed: {error}");
+    if changed {
+        eprintln!(
+            "hincyray: auto VPN exceptions changed; deferred until the next explicit routing apply"
+        );
     }
     true
 }

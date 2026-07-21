@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.21.7 - 2026-07-21
+
+- Kept DIRECT and RU whitelist routes independent of VPN upstream health by using configured local DNS servers as Mihomo `direct-nameserver` defaults while preserving explicit advanced DNS overrides.
+- Added a selected-server Quick Test mode: one one-second TCP reachability probe per profile, bounded to eight parallel workers, with no download/upload stages or temporary Mihomo process.
+- Stopped background auto-VPN learning from restarting Mihomo after a learned-domain change. Learned exceptions persist and take effect on the next explicit routing apply or core restart, avoiding router-wide connection interruption.
+- Synchronized both Web UI auto-switch controls and documented deferred auto-VPN exception application.
+- Gates: 490 Rust tests, 114 frontend routes, 12 Playwright tests, fmt/check/both clippy profiles/installer/diff all passed. The aarch64 artifact was deployed with a complete rollback set and passed DIRECT/VPN probes, fallback/firewall checks, live parallel Quick Test, and router E2E.
+
 ## v0.21.6 - 2026-07-16
 
 - Added the virtual Dead Servers lifecycle group without overwriting subscription/manual provenance, including atomic batch move/restore APIs, active-profile protection, startup reconciliation, and transactional Mihomo dataplane activation with field-scoped rollback.

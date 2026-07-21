@@ -1817,7 +1817,8 @@ pub fn build_mihomo_router_config(
 ///
 /// Uses `fake-ip` enhanced mode so clients get fake IPs (198.18.x.x)
 /// and Mihomo can sniff the real domain from the TLS/HTTP SNI.  All
-/// DNS queries go through the remote (proxied) servers — no
+/// Proxy-bound queries use remote servers, while DIRECT outbounds use the
+/// configured local servers so direct routes do not depend on VPN health. No
 /// `nameserver-policy` with `geosite:cn` is used because:
 ///   1. It triggers MMDB (geoip.metadb) loading which blocks startup
 ///      when the file is missing and GitHub is unreachable.
@@ -1871,8 +1872,13 @@ fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeat
     if !features.dns_proxy_server_nameserver.is_empty() {
         dns_config["proxy-server-nameserver"] = json!(features.dns_proxy_server_nameserver);
     }
-    if !features.dns_direct_nameserver.is_empty() {
-        dns_config["direct-nameserver"] = json!(features.dns_direct_nameserver);
+    let direct_nameservers = if features.dns_direct_nameserver.is_empty() {
+        &dns.local_servers
+    } else {
+        &features.dns_direct_nameserver
+    };
+    if !direct_nameservers.is_empty() {
+        dns_config["direct-nameserver"] = json!(direct_nameservers);
     }
     if let Some(follow) = features.dns_direct_nameserver_follow_policy {
         dns_config["direct-nameserver-follow-policy"] = json!(follow);
@@ -4639,6 +4645,19 @@ mod tests {
                 .expect("direct-nameserver")[0]
                 .as_str(),
             Some("system")
+        );
+    }
+
+    #[test]
+    fn dns_uses_local_servers_for_direct_routes_by_default() {
+        let config = build_test_router_config(&default_features());
+        let dns = config.get("dns").expect("dns");
+        assert_eq!(
+            dns.get("direct-nameserver")
+                .and_then(Value::as_array)
+                .expect("direct-nameserver")[0]
+                .as_str(),
+            Some("223.5.5.5")
         );
     }
 
