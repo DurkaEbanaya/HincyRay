@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.22.0 - 2026-07-22
+
+- Replaced Quick Test's server-port/CDN smoke checks with real per-profile service validation. YouTube now bootstraps a visitor-bound `ANDROID_VR` Innertube player response and serves a bounded 512 KiB direct video range through the tested profile using only Rust and `curl`; no Python, `yt-dlp`, JavaScript runtime, or TUN path is required.
+- Added authorized Telegram media validation through `grammers`: a serialized per-profile probe resolves a configured public peer, loads one selected message, and downloads one bounded media chunk through the temporary profile SOCKS listener.
+- Added Telegram provisioning/status/confirm/delete APIs and Web UI, including login-code and optional 2FA flows. API hash, phone, login code, and password are never returned or written to `state.json`; private config and SQLite session files use mode `0600`, and the delete action attempts Telegram sign-out before removing local session files.
+- Versioned persisted service results as contract v4 so obsolete CDN, MTProto handshake, and failed intermediate extractor results cannot appear as current green/red `YT` or `TG` indicators. Quick Test runs profiles sequentially because one Telegram session must not be shared by concurrent clients.
+- Added compact profile `YT`/`TG` indicators and a persisted metric-column gear menu without widening the default table. Browser coverage verifies provisioning payloads and confirms credentials are not persisted in browser storage.
+- Removed the unused oversized RKN bypass subsystem and legacy router `geoip.dat` path; MetaCubeX `geosite.dat` + `geoip.metadb` remain the supported geo assets. The installer no longer stages or removes `geoip.dat`.
+- Simplified managed GeoBase projection: with `MATCH,proxy`, automatically classified Active domains remain in the manifest but no redundant Active provider is loaded; static Active networks remain explicit. Renamed the GeoIP preset to “RU IP Direct (advanced)” and consolidated the UI around RU Direct, managed GeoBase, and bounded Always VPN overrides.
+- Live validation on Keenetic Giga found and removed a PyInstaller `/tmp` memory spike from the rejected `yt-dlp` prototype. The final native probe completed a three-profile YT+TG batch with all checks green, no Python/QuickJS processes, and approximately 197 MiB minimum `MemAvailable`; router E2E passed.
+- Release gates: 487 Rust tests, 118 frontend routes, 14 Playwright tests, fmt/check/both clippy profiles/installer/diff, aarch64 release build, and live router E2E passed.
+
 ## v0.21.7 - 2026-07-21
 
 - Kept DIRECT and RU whitelist routes independent of VPN upstream health by using configured local DNS servers as Mihomo `direct-nameserver` defaults while preserving explicit advanced DNS overrides.

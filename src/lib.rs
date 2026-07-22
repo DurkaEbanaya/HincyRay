@@ -11,6 +11,7 @@ pub mod hincyray_webui;
 pub mod mihomo_config;
 pub mod profiles;
 pub mod scoring;
+pub mod telegram_probe;
 pub mod xray_config;
 
 // Desktop GUI surface: only compiled when the `desktop` feature is on.

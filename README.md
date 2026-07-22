@@ -1,4 +1,4 @@
-# HincyRay v0.21.7
+# HincyRay v0.22.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -43,9 +43,17 @@ Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN eve
 
 ## Features
 
+### v0.22.0
+
+v0.22.0 turns Quick Test into real, per-profile service validation. YouTube uses a narrow native Innertube bootstrap and downloads a bounded 512 KiB `googlevideo.com` range through the tested profile; it needs only Rust, Mihomo, and `curl`—no Python, `yt-dlp`, JavaScript runtime, or TUN path. Telegram signs in through a dedicated Web UI flow and downloads one bounded chunk from a configured media message through the same temporary profile runtime.
+
+Telegram API credentials and authorization state are kept outside `state.json`: private config and SQLite session files use mode `0600`, API responses never return the API hash, phone, login code, or 2FA password, and the Web UI provides an explicit revoke/delete action. Versioned `YT`/`TG` indicators discard obsolete smoke results, while the profile metric gear keeps wide diagnostic columns optional.
+
+Routing is smaller and more predictable: the legacy oversized RKN bypass subsystem and router `geoip.dat` path are removed. Supported router geo assets are MetaCubeX `geosite.dat` and `geoip.metadb`; managed GeoBase avoids a redundant Active provider under `MATCH,proxy`, while static Active networks remain explicit.
+
 ### v0.21.7
 
-v0.21.7 keeps DIRECT/RU routes usable when the VPN upstream is unavailable by resolving DIRECT destinations through the configured local DNS servers. It also adds a selected-server Quick Test that runs one bounded TCP probe per profile with up to eight profiles in parallel.
+v0.21.7 keeps DIRECT/RU routes usable when the VPN upstream is unavailable by resolving DIRECT destinations through the configured local DNS servers. It introduced the selected-server Quick Test entry point that v0.22.0 upgrades to end-to-end service validation.
 
 Background auto-VPN learning no longer restarts Mihomo when it discovers a domain. Learned exceptions are persisted and applied on the next explicit routing apply or core restart, avoiding a router-wide connection interruption. The duplicate auto-switch controls now remain synchronized in the Web UI.
 
@@ -127,8 +135,8 @@ Web UI sharing and audit hardening:
 
 ### v0.17.0
 
-- **RKN Bypass**: v0.17 introduced routing of domains blocked in Russia through proxy. The implementation now uses a preprocessed domain list derived from `itworksig/rublacklist`; although originally enabled by default, the current safe default is off because very large lists can exceed the memory budget of a 512 MB router. The Web UI exposes the source URL and update interval.
-- **Reset to factory defaults**: v0.17 added one-click routing reset. The current reset restores safe defaults, including RKN Bypass off, and clears user/raw rules. The Web UI calls `POST /api/routing/reset` with `{"apply":true}`, so state persistence, config regeneration, core restart, and rollback on activation failure are one backend transaction.
+- **Simplified routing lists**: the oversized legacy RKN list was removed in favor of managed GeoBase, GeoSite RU Direct, and the bounded Always VPN override list.
+- **Reset to factory defaults**: one-click reset restores safe RU Direct, MATCH, and port-mode defaults and clears user/raw rules. The Web UI calls `POST /api/routing/reset` with `{"apply":true}`, so persistence, config regeneration, core restart, and rollback are one backend transaction.
 - **Configurable sniffer override-destination**: toggle in the DNS section to control Mihomo's `override-destination` sniffer setting. Default `true` — ensures domain rules match even when clients use DoH/DoT (SNI is extracted into the destination field). `saveDns()` now calls `/api/routing/apply` after saving so DNS changes take effect immediately.
 - 339 tests, 0 clippy warnings.
 - Router E2E verified on Keenetic Giga: bypass list downloaded (24 MB, 744,070 rules, ~5s), Mihomo RSS 157 MB, toggle on/off verified in config, reset restores factory defaults.
@@ -342,7 +350,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v0.21.7 gate and router deployment results are recorded in [`docs/releases/v0.21.7.md`](docs/releases/v0.21.7.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v0.22.0 gate and router deployment results are recorded in [`docs/releases/v0.22.0.md`](docs/releases/v0.22.0.md).
 
 ## Installation
 
@@ -510,6 +518,7 @@ Use the web panel's "Per-Device Routing" section:
 - [`docs/hincyray-v0.1-status.md`](docs/hincyray-v0.1-status.md) — version status.
 - [`docs/keenetic-client-roadmap.md`](docs/keenetic-client-roadmap.md) — product roadmap.
 - [`docs/architecture-v0.21.md`](docs/architecture-v0.21.md) — v0.21 module/API contracts and router operational model.
+- [`docs/architecture-v0.22.md`](docs/architecture-v0.22.md) — Quick Test service contracts, Telegram secret/session boundary, and simplified routing assets.
 
 ## State migration
 

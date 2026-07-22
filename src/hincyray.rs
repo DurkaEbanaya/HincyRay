@@ -35,7 +35,7 @@ use tempfile::NamedTempFile;
 
 use crate::benchmark::{
     BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL,
-    DEFAULT_UPLOAD_URL, SharedJob, run_bench,
+    DEFAULT_UPLOAD_URL, QuickProbeConfig, ResourceTestResult, SharedJob, run_bench,
 };
 use crate::geobase::{
     self, Classification, DomainClassification, GeoBaseArtifactKind, GeoBaseGenerationInput,
@@ -66,12 +66,16 @@ use crate::hincyray_security::{
 use crate::hincyray_webui::index_html;
 use crate::mihomo_config::{
     DIRECT_NAME, MihomoFeatures, PROXY_ACTIVE_NAME, PROXY_NAME, PinnedServerRoute, REJECT_NAME,
-    RKN_BYPASS_DEFAULT_INTERVAL, RKN_BYPASS_DEFAULT_URL, build_mihomo_config,
-    build_mihomo_router_config,
+    build_mihomo_config, build_mihomo_router_config,
 };
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionSource, load_subscription_detailed_via_proxy_with_hwid,
     parse_input,
+};
+use crate::telegram_probe::{
+    ConfirmResult, LoginState, TelegramProbeConfig, confirm_login as telegram_confirm_login,
+    load_config as load_telegram_config, request_login_code as telegram_request_login_code,
+    revoke_and_delete as telegram_revoke_and_delete, save_config as save_telegram_config,
 };
 use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule};
 use crate::xray_config::{GeoBaseRuleBehavior, GeoBaseRuleProvider, GeoBaseRuleTarget};
@@ -130,47 +134,6 @@ pub fn run() -> Result<(), String> {
     let daemon = Daemon::new(state, state_path, mihomo_config_path);
     let mihomo_log_path = resolve_log_dir().join("mihomo.log");
     let mihomo_log_cursor = MihomoLogCursor::start_at_end(&mihomo_log_path);
-
-    // v0.19.7: Prepare RKN bypass list in domain format before generating
-    // the Mihomo config. The rule provider uses `type: file, behavior: domain`
-    // so the file must exist (or be empty) before Mihomo starts.
-    //
-    // On startup we only:
-    //   1. Ensure the directory + an empty file exist (so Mihomo can start).
-    //   2. If the file exists but is in the old `DOMAIN,xxx` classical format,
-    //      preprocess it in-place to bare domain names (migration).
-    // We do NOT download on startup — that would block for 60s when GitHub
-    // is unreachable, leaving the router without proxy. The watchdog
-    // (Phase 11) handles downloads through the SOCKS proxy once the core
-    // is running.
-    {
-        let inner = lock(&daemon.inner);
-        let split = &inner.state.split_routing;
-        if split.rkn_bypass_enabled
-            && let Some(geo_dir) = geo_dir_from_state(&inner.state)
-        {
-            let bypass_path = Path::new(&geo_dir)
-                .join("rule-providers")
-                .join("ru-bypass.list");
-            if let Some(parent) = bypass_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if !bypass_path.exists() {
-                let _ = fs::write(&bypass_path, "");
-                eprintln!("hincyray: bypass list not found, created empty file");
-            } else {
-                // Migrate: if the file is in old `DOMAIN,xxx` format, preprocess
-                // it in-place to bare domain names for `behavior: domain`.
-                match preprocess_bypass_list_in_place(&bypass_path) {
-                    Ok(true) => {
-                        eprintln!("hincyray: bypass list migrated from classical to domain format")
-                    }
-                    Ok(false) => {} // already in domain format
-                    Err(e) => eprintln!("hincyray: bypass list migration failed: {e}"),
-                }
-            }
-        }
-    }
 
     // Regenerate config from state on startup so the transparent proxy
     // inbounds are included when split routing is enabled.
@@ -395,6 +358,7 @@ struct DaemonInner {
     /// absolute deadlines; login throttling is keyed by observed peer IP.
     sessions: HashMap<String, WebSession>,
     login_limiter: LoginLimiter,
+    telegram_login: Option<LoginState>,
     /// v0.20: Deep Bench runtime — background thread + cancel flag.
     /// Separate from `bench` so a running deep bench does not block
     /// manual quick benches from the UI (the daemon decides which to
@@ -1365,9 +1329,9 @@ fn routing_presets() -> Vec<RoutingPreset> {
             clear_existing: true,
         },
         RoutingPreset {
-            id: "ru-direct",
-            name: "RU Direct",
-            description: "Russian destination IPs go direct, rest through VPN",
+            id: "ru-ip-direct",
+            name: "RU IP Direct (advanced)",
+            description: "All Russian destination IPs go direct, independently of the RU Direct GeoSite mode",
             rules: vec![RoutingRule {
                 enabled: true,
                 name: "RU IPs direct".to_owned(),
@@ -1423,9 +1387,9 @@ fn routing_presets() -> Vec<RoutingPreset> {
             clear_existing: false,
         },
         RoutingPreset {
-            id: "ru-direct-ad-block",
-            name: "RU Direct + Ad Block",
-            description: "Russian destination IPs direct + block ads",
+            id: "ru-ip-direct-ad-block",
+            name: "RU IP Direct + Ad Block (advanced)",
+            description: "All Russian destination IPs direct + block ads",
             rules: vec![
                 RoutingRule {
                     enabled: true,
@@ -1486,6 +1450,8 @@ pub struct ProfileStats {
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_checked_unix: u64,
+    #[serde(default)]
+    pub resource_tests: Vec<ResourceTestResult>,
     #[serde(default)]
     pub ewma_score: f32,
     #[serde(default)]
@@ -1585,17 +1551,6 @@ pub struct SplitRoutingSettings {
     /// Empty string (old state) is migrated in `load_state()`.
     #[serde(default)]
     pub match_target: String,
-    /// v0.17: RKN Bypass — injects a RULE-SET provider with domains
-    /// blocked in Russia, routing them through proxy. Also injects
-    /// GEOIP,RU,DIRECT and GEOIP,CN,DIRECT.
-    #[serde(default)]
-    pub rkn_bypass_enabled: bool,
-    /// v0.17: URL for the RKN bypass rule provider.
-    #[serde(default = "default_rkn_bypass_url")]
-    pub rkn_bypass_url: String,
-    /// v0.17: Update interval for the RKN bypass rule provider (seconds).
-    #[serde(default = "default_rkn_bypass_interval")]
-    pub rkn_bypass_interval: u32,
 }
 
 impl Default for SplitRoutingSettings {
@@ -1622,9 +1577,6 @@ impl Default for SplitRoutingSettings {
             auto_vpn_learning_enabled: false,
             auto_vpn_probe_contract_version: AUTO_VPN_PROBE_CONTRACT_VERSION,
             match_target: String::new(),
-            rkn_bypass_enabled: false,
-            rkn_bypass_url: default_rkn_bypass_url(),
-            rkn_bypass_interval: default_rkn_bypass_interval(),
         }
     }
 }
@@ -1655,14 +1607,6 @@ fn default_geo_asset_path() -> String {
     } else {
         String::new()
     }
-}
-
-fn default_rkn_bypass_url() -> String {
-    RKN_BYPASS_DEFAULT_URL.to_owned()
-}
-
-fn default_rkn_bypass_interval() -> u32 {
-    RKN_BYPASS_DEFAULT_INTERVAL
 }
 
 /// Policy-routing rule. `kind`/`pattern`/`target` existed as a v0.1
@@ -2086,6 +2030,14 @@ fn default_mihomo_path() -> String {
     "mihomo".to_owned()
 }
 
+fn benchmark_mihomo_path(configured: &str) -> String {
+    if configured.trim().is_empty() {
+        default_mihomo_path()
+    } else {
+        configured.to_owned()
+    }
+}
+
 fn default_auto_update_interval_hours() -> u32 {
     24
 }
@@ -2109,6 +2061,7 @@ impl Daemon {
                 prev_cpu_per_core: Vec::new(),
                 sessions: HashMap::new(),
                 login_limiter: LoginLimiter::default(),
+                telegram_login: None,
                 deep_bench_cancel: None,
                 deep_bench_handle: None,
                 deep_bench_active: false,
@@ -3209,6 +3162,14 @@ fn resolve_mihomo_config_path(state_path: &Path) -> PathBuf {
     state_path.with_file_name("mihomo-config.yaml")
 }
 
+fn telegram_config_path(state_path: &Path) -> PathBuf {
+    state_path.with_file_name("telegram-probe.json")
+}
+
+fn telegram_session_path(state_path: &Path) -> PathBuf {
+    state_path.with_file_name("telegram.session")
+}
+
 fn load_state(state_path: &Path) -> HincyrayState {
     load_state_with_hasher(state_path, hash_password)
 }
@@ -3394,9 +3355,6 @@ fn deserialize_persisted_state_with_hasher(
     {
         split
             .entry("auto_vpn_learning_enabled")
-            .or_insert(Value::Bool(true));
-        split
-            .entry("rkn_bypass_enabled")
             .or_insert(Value::Bool(true));
         split
             .entry("ru_direct_mode")
@@ -3679,9 +3637,6 @@ fn build_routing_context<'a>(
         ru_direct_exceptions: normalize_route_items(&state.split_routing.ru_direct_exceptions),
         auto_vpn_exceptions: normalize_route_items(&state.split_routing.auto_vpn_exceptions),
         match_target: state.split_routing.match_target.clone(),
-        rkn_bypass_enabled: state.split_routing.rkn_bypass_enabled && !state.safe_mode_enabled,
-        rkn_bypass_url: state.split_routing.rkn_bypass_url.clone(),
-        rkn_bypass_interval: state.split_routing.rkn_bypass_interval,
         mihomo_home: geo_dir_from_state(state),
         geobase_rule_providers: geobase_rule_providers.to_vec(),
     };
@@ -3915,8 +3870,7 @@ fn geo_dir_from_state(state: &HincyrayState) -> Option<String> {
     if path.is_empty() {
         return None;
     }
-    // `geo_asset_path` is the directory that contains geoip.dat,
-    // geosite.dat, and geoip.metadb — e.g. "/opt/etc/hincyray".
+    // `geo_asset_path` contains geosite.dat and geoip.metadb.
     // Mihomo's `-d` flag expects exactly this directory, not its
     // parent.  If the path points to a file (not a directory), fall
     // back to its parent.
@@ -4472,6 +4426,12 @@ fn dispatch_from(
         ("GET", "/api/bench/status") => handle_bench_status(daemon),
         ("POST", "/api/bench/start") => handle_bench_start(body, daemon),
         ("POST", "/api/bench/stop") => handle_bench_stop(daemon),
+        ("GET", "/api/telegram-probe/status") => handle_telegram_probe_status(daemon),
+        ("POST", "/api/telegram-probe/request-code") => {
+            handle_telegram_probe_request_code(body, daemon)
+        }
+        ("POST", "/api/telegram-probe/confirm") => handle_telegram_probe_confirm(body, daemon),
+        ("POST", "/api/telegram-probe/delete") => handle_telegram_probe_delete(daemon),
         ("GET", "/api/stats") => handle_stats(daemon),
         ("POST", "/api/favorites/toggle") => handle_favorites_toggle(body, daemon),
         ("GET", "/api/favorites") => handle_favorites_list(daemon),
@@ -4839,7 +4799,11 @@ fn handle_get_mihomo_config(daemon: &Daemon) -> (u16, &'static str, String) {
 fn handle_get_mihomo_config_preview(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
     let projection = GeoBaseProjection::Desired;
-    let providers = match project_geobase_rule_providers(daemon, projection) {
+    let providers = match project_geobase_rule_providers(
+        daemon,
+        projection,
+        inner.state.split_routing.match_target.trim() == "direct",
+    ) {
         Ok(providers) => providers,
         Err(error) => return json_error(400, &error),
     };
@@ -5532,18 +5496,20 @@ impl GeoBaseProjection {
 fn project_geobase_rule_providers(
     daemon: &Daemon,
     projection: GeoBaseProjection,
+    include_active: bool,
 ) -> Result<Vec<GeoBaseRuleProvider>, String> {
     let manifest = daemon
         .geobase_store()
         .load_manifest()
         .map_err(|error| format!("GeoBase manifest: {error}"))?;
-    project_geobase_manifest(daemon, &manifest, projection)
+    project_geobase_manifest(daemon, &manifest, projection, include_active)
 }
 
 fn project_geobase_manifest(
     daemon: &Daemon,
     manifest: &geobase::GeoBaseManifest,
     projection: GeoBaseProjection,
+    include_active: bool,
 ) -> Result<Vec<GeoBaseRuleProvider>, String> {
     let bases = match projection {
         GeoBaseProjection::Desired => &manifest.bases,
@@ -5583,7 +5549,7 @@ fn project_geobase_manifest(
             GeoBaseArtifactKind::Domain,
         )?;
 
-        if record.lists.active.count > 0 {
+        if include_active && record.lists.active.count > 0 {
             providers.push(GeoBaseRuleProvider {
                 enabled: true,
                 name: geobase_provider_name(&record.id, "a"),
@@ -5694,7 +5660,11 @@ fn build_authoritative_daemon_config(
     state: &HincyrayState,
     daemon: &Daemon,
 ) -> Result<String, String> {
-    let providers = project_geobase_rule_providers(daemon, GeoBaseProjection::Applied)?;
+    let providers = project_geobase_rule_providers(
+        daemon,
+        GeoBaseProjection::Applied,
+        state.split_routing.match_target.trim() == "direct",
+    )?;
     build_daemon_config(state, &providers)
 }
 
@@ -5711,7 +5681,12 @@ fn config_plan(
         GeoBaseProjection::Desired => (manifest.generation, manifest.bases.clone()),
         GeoBaseProjection::Applied => (manifest.applied_generation, manifest.applied_bases.clone()),
     };
-    let providers = project_geobase_manifest(daemon, &manifest, projection)?;
+    let providers = project_geobase_manifest(
+        daemon,
+        &manifest,
+        projection,
+        state.split_routing.match_target.trim() == "direct",
+    )?;
     let config = build_daemon_config(state, &providers)?;
     Ok((config, generation, bases))
 }
@@ -5943,7 +5918,11 @@ fn activate_current_config_locked(
                 && final_state.split_routing.tproxy_available
                     != state.split_routing.tproxy_available
             {
-                let providers = project_geobase_rule_providers(daemon, projection)?;
+                let providers = project_geobase_rule_providers(
+                    daemon,
+                    projection,
+                    final_state.split_routing.match_target.trim() == "direct",
+                )?;
                 config_yaml = build_daemon_config(&final_state, &providers)?;
                 let validation = validate_mihomo_config_yaml(
                     &final_state.mihomo_path,
@@ -6197,7 +6176,8 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             Ok(profiles) => profiles,
             Err((status, error)) => return json_error(status, &error),
         };
-        (profiles, inner.state.mihomo_path.clone())
+        let core_path = benchmark_mihomo_path(&inner.state.mihomo_path);
+        (profiles, core_path)
     };
 
     if profiles.is_empty() {
@@ -6214,6 +6194,12 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
     let on_result = Box::new(move |result: BenchResult| {
         apply_bench_result(&daemon_for_callback, result);
     });
+    let quick_probe = (method == BenchMethod::Quick).then(|| QuickProbeConfig {
+        telegram_session_path: telegram_session_path(&daemon.state_path)
+            .to_string_lossy()
+            .into_owned(),
+        telegram: load_telegram_config(&telegram_config_path(&daemon.state_path)).ok(),
+    });
 
     let handle = run_bench(
         profiles,
@@ -6222,6 +6208,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         download_url,
         upload_url,
         core_path,
+        quick_probe,
         test_download,
         test_upload,
         Arc::clone(&job),
@@ -6318,6 +6305,121 @@ fn handle_bench_stop(daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
+fn handle_telegram_probe_status(daemon: &Daemon) -> (u16, &'static str, String) {
+    let config_path = telegram_config_path(&daemon.state_path);
+    let session_path = telegram_session_path(&daemon.state_path);
+    let config = load_telegram_config(&config_path).ok();
+    let pending = {
+        let inner = lock(&daemon.inner);
+        inner.telegram_login.is_some()
+    };
+    let authorized =
+        config.as_ref().is_some_and(|config| config.authorized) && session_path.is_file();
+    json_response(&json!({
+        "configured": config.is_some(),
+        "session_exists": session_path.is_file(),
+        "authorized": authorized,
+        "login_pending": pending,
+        "peer": config.as_ref().map(|config| config.peer.as_str()),
+        "message_id": config.as_ref().map(|config| config.message_id),
+    }))
+}
+
+fn handle_telegram_probe_request_code(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(mut config) = serde_json::from_str::<TelegramProbeConfig>(body) else {
+        return json_error(400, "invalid Telegram probe configuration");
+    };
+    if config.api_hash.len() > 128 || config.phone.len() > 32 || config.peer.len() > 128 {
+        return json_error(400, "Telegram probe fields are too long");
+    }
+    config.authorized = false;
+    if let Err(error) = save_telegram_config(&telegram_config_path(&daemon.state_path), &config) {
+        return json_error(400, &error);
+    }
+    let socks_port = lock(&daemon.inner).state.socks_port;
+    match telegram_request_login_code(
+        &telegram_session_path(&daemon.state_path),
+        &config,
+        socks_port,
+    ) {
+        Ok(login) => {
+            lock(&daemon.inner).telegram_login = Some(login);
+            json_response(&json!({"code_requested": true}))
+        }
+        Err(error) => json_error(502, &error),
+    }
+}
+
+fn handle_telegram_probe_confirm(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return json_error(400, "invalid JSON body");
+    };
+    let code = value
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let password = value
+        .get("password")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if code.len() > 32 || password.len() > 256 {
+        return json_error(400, "Telegram confirmation fields are too long");
+    }
+    let config = match load_telegram_config(&telegram_config_path(&daemon.state_path)) {
+        Ok(config) => config,
+        Err(_) => return json_error(409, "request a Telegram login code first"),
+    };
+    let (state, socks_port) = {
+        let mut inner = lock(&daemon.inner);
+        let Some(state) = inner.telegram_login.take() else {
+            return json_error(409, "request a Telegram login code first");
+        };
+        (state, inner.state.socks_port)
+    };
+    match telegram_confirm_login(
+        &telegram_session_path(&daemon.state_path),
+        config.api_id,
+        socks_port,
+        state,
+        (!code.is_empty()).then_some(code),
+        (!password.is_empty()).then_some(password),
+    ) {
+        Ok((ConfirmResult::Authorized, _)) => {
+            let mut config = config;
+            config.authorized = true;
+            if let Err(error) =
+                save_telegram_config(&telegram_config_path(&daemon.state_path), &config)
+            {
+                return json_error(500, &error);
+            }
+            json_response(&json!({"authorized": true}))
+        }
+        Ok((ConfirmResult::PasswordRequired { hint }, next_state)) => {
+            lock(&daemon.inner).telegram_login = next_state;
+            json_response(&json!({
+                "authorized": false,
+                "password_required": true,
+                "hint": hint,
+            }))
+        }
+        Err(error) => json_error(502, &error),
+    }
+}
+
+fn handle_telegram_probe_delete(daemon: &Daemon) -> (u16, &'static str, String) {
+    let config_path = telegram_config_path(&daemon.state_path);
+    let session_path = telegram_session_path(&daemon.state_path);
+    let config = load_telegram_config(&config_path).ok();
+    let socks_port = {
+        let mut inner = lock(&daemon.inner);
+        inner.telegram_login = None;
+        inner.state.socks_port
+    };
+    let revoked = telegram_revoke_and_delete(&session_path, config.as_ref(), socks_port);
+    let _ = fs::remove_file(config_path);
+    json_response(&json!({"deleted": true, "revoked": revoked}))
+}
+
 /// Apply a single benchmark result to persisted state: update the
 /// per-profile `ProfileStats`, push a `MetricSample` (capped at
 /// `MAX_HISTORY_SAMPLES`), and persist. Called from the benchmark
@@ -6349,6 +6451,9 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
         let smart_failure_penalty = inner.state.smart_select.failure_penalty;
         let smart_cooldown_secs = inner.state.smart_select.cooldown_secs;
         let stats_entry = &mut inner.state.stats[stats_idx];
+        if result.method == "quick" {
+            stats_entry.resource_tests = result.resource_tests.clone();
+        }
         if result.success {
             stats_entry.last_latency_ms = result.latency_ms;
             stats_entry.last_jitter_ms = result.jitter_ms;
@@ -6434,6 +6539,7 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
                 "failure_count": stat.map(|s| s.failure_count).unwrap_or(0),
                 "last_error": stat.and_then(|s| s.last_error.clone()),
                 "last_checked": stat.map(|s| s.last_checked_unix).unwrap_or(0),
+                "resource_tests": stat.map(|s| s.resource_tests.clone()).unwrap_or_default(),
                 "ewma_score": stat.filter(|s| s.has_ewma).map(|s| s.ewma_score),
                 "ewma_latency_ms": stat.filter(|s| s.has_ewma).map(|s| s.ewma_latency_ms),
                 "ewma_download_mbps": stat.filter(|s| s.has_download).map(|s| s.ewma_download_mbps),
@@ -8319,7 +8425,10 @@ struct ManagedRoutingRule {
     revision: u64,
 }
 
-fn managed_geobase_routing_rules(manifest: &geobase::GeoBaseManifest) -> Vec<ManagedRoutingRule> {
+fn managed_geobase_routing_rules(
+    manifest: &geobase::GeoBaseManifest,
+    match_target: &str,
+) -> Vec<ManagedRoutingRule> {
     manifest
         .applied_bases
         .iter()
@@ -8330,7 +8439,11 @@ fn managed_geobase_routing_rules(manifest: &geobase::GeoBaseManifest) -> Vec<Man
                     "active",
                     "серый список",
                     "proxy-active",
-                    base.counts.active,
+                    if match_target == "direct" {
+                        base.counts.active
+                    } else {
+                        0
+                    },
                     base.counts.static_active,
                 ),
                 (
@@ -8341,8 +8454,12 @@ fn managed_geobase_routing_rules(manifest: &geobase::GeoBaseManifest) -> Vec<Man
                     base.counts.static_direct,
                 ),
             ]
-            .map(|(target, label, outbound, domain_count, network_count)| {
-                ManagedRoutingRule {
+            .into_iter()
+            .filter(|(_, _, _, domain_count, network_count)| {
+                *domain_count > 0 || *network_count > 0
+            })
+            .map(
+                move |(target, label, outbound, domain_count, network_count)| ManagedRoutingRule {
                     id: format!("geobase:{}:{target}", base.id),
                     source: "geobase",
                     geobase_id: base.id.clone(),
@@ -8355,8 +8472,8 @@ fn managed_geobase_routing_rules(manifest: &geobase::GeoBaseManifest) -> Vec<Man
                     network_count,
                     total_count: domain_count + network_count,
                     revision: base.revision,
-                }
-            })
+                },
+            )
         })
         .collect()
 }
@@ -8414,7 +8531,7 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
         "catalog": popular_service_catalog(),
         "sources": rule_sources(),
         "conflicts": conflicts,
-        "managed_rules": managed_geobase_routing_rules(&manifest),
+        "managed_rules": managed_geobase_routing_rules(&manifest, &settings.match_target),
         "servers": servers,
         "geobase_requires_apply": manifest.requires_apply(),
     });
@@ -8641,7 +8758,11 @@ fn handle_routing_summary(daemon: &Daemon) -> (u16, &'static str, String) {
             .filter(|rule| rule.enabled)
             .count(),
         device_route_count: inner.state.device_routes.len(),
-        managed_rule_count: managed_geobase_routing_rules(&manifest).len(),
+        managed_rule_count: managed_geobase_routing_rules(
+            &manifest,
+            &inner.state.split_routing.match_target,
+        )
+        .len(),
         server_count: inner.state.profiles.len(),
         conflict_count: conflicts.len(),
         geobase_requires_apply: manifest.requires_apply(),
@@ -8699,7 +8820,12 @@ fn handle_routing_preview(daemon: &Daemon) -> (u16, &'static str, String) {
         Ok(manifest) => manifest,
         Err(error) => return json_error(500, &format!("GeoBase manifest: {error}")),
     };
-    let providers = match project_geobase_manifest(daemon, &manifest, GeoBaseProjection::Desired) {
+    let providers = match project_geobase_manifest(
+        daemon,
+        &manifest,
+        GeoBaseProjection::Desired,
+        state.split_routing.match_target.trim() == "direct",
+    ) {
         Ok(providers) => providers,
         Err(error) => return json_error(400, &error),
     };
@@ -9113,15 +9239,6 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
                 "proxy".to_owned()
             };
         }
-        if let Some(v) = value.get("rkn_bypass_enabled").and_then(Value::as_bool) {
-            inner.state.split_routing.rkn_bypass_enabled = v;
-        }
-        if let Some(v) = value.get("rkn_bypass_url").and_then(Value::as_str) {
-            inner.state.split_routing.rkn_bypass_url = v.trim().to_owned();
-        }
-        if let Some(v) = value.get("rkn_bypass_interval").and_then(Value::as_u64) {
-            inner.state.split_routing.rkn_bypass_interval = v as u32;
-        }
         if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
             return (
                 500,
@@ -9468,7 +9585,7 @@ fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
 
 /// v0.17: Reset routing policy to factory defaults.
 ///
-/// Resets: rkn_bypass, ru_direct, match_target, port_mode, proxy_ports,
+/// Resets: ru_direct, match_target, port_mode, proxy_ports,
 /// quic_mode, routing_rules, raw_rules. Infrastructure settings (enabled,
 /// auto_switch, vpn_subnet, redirect_port, policy_name, geo_asset_path)
 /// are preserved. Pass `{"apply":true}` to persist, regenerate the config,
@@ -9490,9 +9607,6 @@ fn handle_routing_reset(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
 
         // Reset routing policy fields to factory defaults.
         let s = &mut inner.state.split_routing;
-        s.rkn_bypass_enabled = false;
-        s.rkn_bypass_url = default_rkn_bypass_url();
-        s.rkn_bypass_interval = default_rkn_bypass_interval();
         s.ru_direct_mode = "off".to_owned();
         s.ru_direct_exceptions = Vec::new();
         s.auto_vpn_exceptions = Vec::new();
@@ -9714,29 +9828,13 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
 
 /// Geo database providers for geosite.dat / geoip.metadb download.
 fn geo_providers() -> Vec<Value> {
-    vec![
-        json!({
-            "id": "metacubex-lite",
-            "name": "MetaCubeX meta-rules-dat",
-            "repo": "MetaCubeX/meta-rules-dat",
-            "files": ["geosite.dat", "geoip.metadb"],
-            "recommended": true,
-        }),
-        json!({
-            "id": "loyalsoldier",
-            "name": "Loyalsoldier v2ray-rules-dat",
-            "repo": "Loyalsoldier/v2ray-rules-dat",
-            "files": ["geosite.dat", "geoip.dat"],
-            "note": "geoip.dat (не .metadb) — может не работать с Mihomo",
-        }),
-        json!({
-            "id": "v2fly",
-            "name": "v2fly domain-list-community",
-            "repo": "v2fly/domain-list-community",
-            "files": ["dlc.dat"],
-            "note": "только geosite (dlc.dat), без geoip",
-        }),
-    ]
+    vec![json!({
+        "id": "metacubex-lite",
+        "name": "MetaCubeX meta-rules-dat",
+        "repo": "MetaCubeX/meta-rules-dat",
+        "files": ["geosite.dat", "geoip.metadb"],
+        "recommended": true,
+    })]
 }
 
 fn handle_geo_providers() -> (u16, &'static str, String) {
@@ -12192,11 +12290,6 @@ fn handle_memory_estimate(daemon: &Daemon) -> (u16, &'static str, String) {
     let (_, available_kb, usage_pct) = memory_summary_from_proc();
     let current_mihomo_rss_kb = mihomo_pid.and_then(read_process_rss_kb).unwrap_or(0);
     let mut source_paths = Vec::new();
-    if state.split_routing.rkn_bypass_enabled
-        && let Some(home) = geo_dir_from_state(&state)
-    {
-        source_paths.push(PathBuf::from(home).join("rule-providers/ru-bypass.list"));
-    }
     for provider in &state.mihomo_features.rule_providers {
         if provider.provider_type == "file"
             && let Some(path) = provider.path.as_deref()
@@ -12265,7 +12358,6 @@ fn handle_memory_estimate(daemon: &Daemon) -> (u16, &'static str, String) {
         user_rules: state.routing_rules.len(),
         rule_provider_count: state.mihomo_features.rule_providers.len(),
         geobase_entries,
-        rkn_bypass_enabled: state.split_routing.rkn_bypass_enabled,
         safe_mode_enabled: state.safe_mode_enabled,
         reasons,
     })
@@ -16253,6 +16345,7 @@ fn start_auto_benchmark(daemon: &Daemon) {
         DEFAULT_DOWNLOAD_URL.to_owned(),
         DEFAULT_UPLOAD_URL.to_owned(),
         "xray".to_owned(),
+        None,
         false,
         false,
         Arc::clone(&job),
@@ -16380,168 +16473,6 @@ fn switch_active_profile(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon, p
     }
 }
 
-/// Check if a bypass list file is in the old `classical` format (contains
-/// `DOMAIN,` or `DOMAIN-SUFFIX,` prefixes) and preprocess it in-place to
-/// bare domain names for Mihomo's `behavior: domain`.
-///
-/// Returns `Ok(true)` if migration was performed, `Ok(false)` if the file
-/// is already in domain format (or empty).
-fn preprocess_bypass_list_in_place(path: &Path) -> Result<bool, String> {
-    let content = fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
-    // Detect old format: look for any line starting with `DOMAIN,` or `DOMAIN-SUFFIX,`.
-    let needs_migration = content.lines().any(|line| {
-        let line = line.trim();
-        line.starts_with("DOMAIN,") || line.starts_with("DOMAIN-SUFFIX,")
-    });
-    if !needs_migration {
-        return Ok(false);
-    }
-    // Preprocess: strip prefixes, strip trailing dots, skip unsupported types.
-    let mut output = String::with_capacity(content.len() / 2);
-    let mut converted = 0u32;
-    let mut skipped = 0u32;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(domain) = line.strip_prefix("DOMAIN,") {
-            let domain = domain.trim().trim_end_matches('.');
-            if !domain.is_empty() {
-                output.push_str(domain);
-                output.push('\n');
-                converted += 1;
-            }
-        } else if let Some(domain) = line.strip_prefix("DOMAIN-SUFFIX,") {
-            let domain = domain.trim().trim_end_matches('.');
-            if !domain.is_empty() {
-                output.push_str(domain);
-                output.push('\n');
-                converted += 1;
-            }
-        } else {
-            skipped += 1;
-        }
-    }
-    fs::write(path, &output).map_err(|e| format!("write: {e}"))?;
-    eprintln!(
-        "hincyray: bypass list preprocessed — {converted} domains converted, {skipped} unsupported rules skipped"
-    );
-    Ok(true)
-}
-
-/// Download the RKN bypass list and preprocess it to `domain` behavior format.
-///
-/// The raw bypass list uses `classical` format (`DOMAIN,xxx`, `DOMAIN-SUFFIX,xxx`,
-/// `USER-AGENT,xxx`, etc.). Mihomo's `domain` behavior expects bare domain names.
-/// This function strips `DOMAIN,` and `DOMAIN-SUFFIX,` prefixes and skips
-/// unsupported rule types (USER-AGENT, IP-CIDR, DOMAIN-KEYWORD, etc.).
-///
-/// Tries direct download first (GitHub is often accessible without proxy),
-/// then falls back to SOCKS proxy if the core is running.
-fn update_bypass_list(
-    url: &str,
-    socks_port: u16,
-    core_running: bool,
-    dest_path: &Path,
-) -> Result<(), String> {
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
-    }
-    let tmp_path = dest_path.with_extension("tmp");
-
-    // Try direct download first.
-    let mut downloaded = false;
-    let direct_status = Command::new("curl")
-        .args([
-            "-sL",
-            "--max-time",
-            "60",
-            "-H",
-            "User-Agent: hincyray",
-            "-o",
-        ])
-        .arg(&tmp_path)
-        .arg(url)
-        .status()
-        .map_err(|e| format!("curl spawn: {e}"))?;
-    if direct_status.success() && tmp_path.exists() {
-        downloaded = true;
-    }
-
-    // If direct failed and the core is running, try through SOCKS proxy.
-    if !downloaded && core_running {
-        let proxy_status = Command::new("curl")
-            .args([
-                "-sL",
-                "--max-time",
-                "120",
-                "--socks5-hostname",
-                &format!("127.0.0.1:{socks_port}"),
-                "-H",
-                "User-Agent: hincyray",
-                "-o",
-            ])
-            .arg(&tmp_path)
-            .arg(url)
-            .status()
-            .map_err(|e| format!("curl proxy spawn: {e}"))?;
-        if proxy_status.success() && tmp_path.exists() {
-            downloaded = true;
-        }
-    }
-
-    if !downloaded {
-        let _ = fs::remove_file(&tmp_path);
-        return Err("bypass list download failed (both direct and proxy)".to_owned());
-    }
-
-    // Read and preprocess: strip DOMAIN,/DOMAIN-SUFFIX, prefixes for domain behavior.
-    // Also strip trailing dots (e.g. `example.com.` → `example.com`) which
-    // Mihomo's domain behavior rejects as invalid.
-    let content = fs::read_to_string(&tmp_path).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        format!("read bypass list: {e}")
-    })?;
-    let mut output = String::with_capacity(content.len() / 2);
-    let mut skipped = 0u32;
-    let mut converted = 0u32;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(domain) = line.strip_prefix("DOMAIN,") {
-            let domain = domain.trim().trim_end_matches('.');
-            if !domain.is_empty() {
-                output.push_str(domain);
-                output.push('\n');
-                converted += 1;
-            }
-        } else if let Some(domain) = line.strip_prefix("DOMAIN-SUFFIX,") {
-            let domain = domain.trim().trim_end_matches('.');
-            if !domain.is_empty() {
-                output.push_str(domain);
-                output.push('\n');
-                converted += 1;
-            }
-        } else {
-            // Skip unsupported rule types (USER-AGENT, IP-CIDR, DOMAIN-KEYWORD, etc.)
-            skipped += 1;
-        }
-    }
-
-    fs::write(dest_path, &output).map_err(|e| {
-        let _ = fs::remove_file(&tmp_path);
-        format!("write bypass list: {e}")
-    })?;
-    let _ = fs::remove_file(&tmp_path);
-    eprintln!(
-        "hincyray: bypass list updated — {converted} domains converted, {skipped} unsupported rules skipped"
-    );
-    Ok(())
-}
-
 /// Background watchdog thread. Runs every 10 seconds and handles:
 ///
 /// 1. **Core monitoring (always)** — if the Mihomo core has crashed,
@@ -16565,7 +16496,6 @@ fn start_watchdog(
         let mut restart_backoff_secs: u64 = 0;
         let mut failover_rejected_profiles: HashSet<String> = HashSet::new();
         let mut watchdog_tick: u64 = 0;
-        let mut last_bypass_update_unix: u64 = 0;
         let mut pending_auto_vpn_domains: VecDeque<AutoVpnCandidate> = VecDeque::new();
 
         loop {
@@ -16599,10 +16529,6 @@ fn start_watchdog(
                 auto_refresh_interval_hours,
                 last_auto_refresh,
                 maintenance,
-                rkn_bypass_enabled,
-                rkn_bypass_url,
-                rkn_bypass_interval,
-                geo_asset_path,
                 auto_vpn_learning_enabled,
                 deep_bench_running,
                 deep_bench_due_now,
@@ -16639,10 +16565,6 @@ fn start_watchdog(
                     inner.state.auto_refresh_interval_hours,
                     inner.state.last_auto_refresh_unix,
                     inner.state.maintenance.clone(),
-                    inner.state.split_routing.rkn_bypass_enabled,
-                    inner.state.split_routing.rkn_bypass_url.clone(),
-                    inner.state.split_routing.rkn_bypass_interval,
-                    inner.state.split_routing.geo_asset_path.clone(),
                     inner.state.split_routing.auto_vpn_learning_enabled,
                     inner.deep_bench_active,
                     deep_bench_due(&inner.state.deep_bench, unix_now()),
@@ -17273,35 +17195,7 @@ fn start_watchdog(
                 );
             }
 
-            // --- Phase 11: RKN bypass list update ---
-            // Periodically download and preprocess the bypass list to
-            // domain format. Runs every rkn_bypass_interval seconds.
-            if rkn_bypass_enabled && !geo_asset_path.trim().is_empty() {
-                let interval_secs = u64::from(rkn_bypass_interval.max(3600));
-                let now = unix_now();
-                if now.saturating_sub(last_bypass_update_unix) >= interval_secs {
-                    let url = if rkn_bypass_url.trim().is_empty() {
-                        RKN_BYPASS_DEFAULT_URL
-                    } else {
-                        rkn_bypass_url.trim()
-                    };
-                    let bypass_path = Path::new(&geo_asset_path)
-                        .join("rule-providers")
-                        .join("ru-bypass.list");
-                    match update_bypass_list(url, socks_port, core_running, &bypass_path) {
-                        Ok(()) => {
-                            last_bypass_update_unix = now;
-                        }
-                        Err(e) => {
-                            eprintln!("hincyray: bypass list update failed: {e}");
-                            // Still update the timestamp to avoid retrying every tick.
-                            last_bypass_update_unix = now;
-                        }
-                    }
-                }
-            }
-
-            // --- Phase 12: Auto VPN exceptions ---
+            // --- Auto VPN exceptions ---
             // Mihomo's EC /logs endpoint is live-only, so periodic stream
             // sampling loses events. Consume every completed line appended
             // to Mihomo's local log instead; the cursor handles rotation and
@@ -17712,6 +17606,7 @@ fn run_deep_bench(
         download_url,
         upload_url,
         "mihomo".to_owned(),
+        None,
         /* test_download */ true,
         /* test_upload */ false,
         job.clone(),
@@ -18341,17 +18236,14 @@ mod tests {
     fn split_routing_new_defaults_are_conservative() {
         let defaults = SplitRoutingSettings::default();
         assert!(!defaults.auto_vpn_learning_enabled);
-        assert!(!defaults.rkn_bypass_enabled);
         assert_eq!(defaults.ru_direct_mode, "off");
 
         let absent: SplitRoutingSettings = serde_json::from_str("{}").expect("deserialize");
         assert!(!absent.auto_vpn_learning_enabled);
-        assert!(!absent.rkn_bypass_enabled);
         let explicit: SplitRoutingSettings =
-            serde_json::from_str(r#"{"auto_vpn_learning_enabled":true,"rkn_bypass_enabled":true}"#)
+            serde_json::from_str(r#"{"auto_vpn_learning_enabled":true}"#)
                 .expect("deserialize explicit values");
         assert!(explicit.auto_vpn_learning_enabled);
-        assert!(explicit.rkn_bypass_enabled);
     }
 
     #[test]
@@ -18362,23 +18254,19 @@ mod tests {
                 .as_object_mut()
                 .expect("split routing object");
             split.remove("auto_vpn_learning_enabled");
-            split.remove("rkn_bypass_enabled");
             split.remove("ru_direct_mode");
         }
         let state = deserialize_persisted_state(&value.to_string()).expect("legacy state");
         assert!(state.split_routing.auto_vpn_learning_enabled);
-        assert!(state.split_routing.rkn_bypass_enabled);
         assert_eq!(state.split_routing.ru_direct_mode, "geosite");
 
         let split = value["split_routing"]
             .as_object_mut()
             .expect("split routing object");
         split.insert("auto_vpn_learning_enabled".to_owned(), Value::Bool(false));
-        split.insert("rkn_bypass_enabled".to_owned(), Value::Bool(false));
         split.insert("ru_direct_mode".to_owned(), Value::String("off".to_owned()));
         let explicit = deserialize_persisted_state(&value.to_string()).expect("explicit state");
         assert!(!explicit.split_routing.auto_vpn_learning_enabled);
-        assert!(!explicit.split_routing.rkn_bypass_enabled);
         assert_eq!(explicit.split_routing.ru_direct_mode, "off");
     }
 
@@ -18643,7 +18531,7 @@ mod tests {
         create_geobase_config_generation(&daemon, "regional", true);
         create_geobase_config_generation(&daemon, "disabled", false);
 
-        let providers = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired)
+        let providers = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired, false)
             .expect("project providers");
         let base = geobase::stable_id("regional");
         assert_eq!(
@@ -18652,7 +18540,6 @@ mod tests {
                 .map(|provider| provider.name.clone())
                 .collect::<Vec<_>>(),
             vec![
-                format!("{base}-a"),
                 format!("{base}-d"),
                 format!("{base}-sa"),
                 format!("{base}-sd"),
@@ -18678,7 +18565,7 @@ mod tests {
         }
         assert!(desired_yaml.contains("behavior: domain"));
         assert!(desired_yaml.contains("behavior: ipcidr"));
-        assert!(desired_yaml.contains(&format!("RULE-SET,{base}-a,proxy")));
+        assert!(!desired_yaml.contains(&format!("RULE-SET,{base}-a,proxy")));
         assert!(desired_yaml.contains(&format!("RULE-SET,{base}-d,DIRECT")));
         assert!(desired_yaml.contains(&format!("RULE-SET,{base}-sa,proxy")));
         assert!(desired_yaml.contains(&format!("RULE-SET,{base}-sd,DIRECT")));
@@ -18686,12 +18573,27 @@ mod tests {
             .find("DOMAIN-SUFFIX,user.example,DIRECT")
             .expect("user rule");
         let managed_rule = desired_yaml
-            .find(&format!("RULE-SET,{base}-a,proxy"))
+            .find(&format!("RULE-SET,{base}-d,DIRECT"))
             .expect("managed rule");
         assert!(
             user_rule < managed_rule,
             "ordinary user rule must remain first"
         );
+    }
+
+    #[test]
+    fn geobase_projection_uses_explicit_match_mode_without_locking_daemon_state() {
+        let (_dir, daemon) = test_daemon();
+        create_geobase_config_generation(&daemon, "regional", true);
+        let _inner = lock(&daemon.inner);
+
+        let providers = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired, false)
+            .expect("project providers while daemon state is locked");
+
+        assert!(providers.iter().all(|provider| {
+            provider.target != GeoBaseRuleTarget::Active
+                || provider.behavior == GeoBaseRuleBehavior::Ipcidr
+        }));
     }
 
     #[test]
@@ -18702,7 +18604,7 @@ mod tests {
         let desired = store.load_manifest().expect("desired manifest");
         assert!(desired.requires_apply());
         assert!(
-            project_geobase_rule_providers(&daemon, GeoBaseProjection::Applied)
+            project_geobase_rule_providers(&daemon, GeoBaseProjection::Applied, false)
                 .expect("applied projection")
                 .is_empty()
         );
@@ -18711,7 +18613,7 @@ mod tests {
             .mark_applied(desired.generation)
             .expect("explicit apply snapshot");
         assert!(
-            !project_geobase_rule_providers(&daemon, GeoBaseProjection::Applied)
+            !project_geobase_rule_providers(&daemon, GeoBaseProjection::Applied, false)
                 .expect("applied projection")
                 .is_empty()
         );
@@ -18723,12 +18625,12 @@ mod tests {
                 .requires_apply()
         );
         assert!(
-            !project_geobase_rule_providers(&daemon, GeoBaseProjection::Applied)
+            !project_geobase_rule_providers(&daemon, GeoBaseProjection::Applied, false)
                 .expect("deleted base remains applied")
                 .is_empty()
         );
         assert!(
-            project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired)
+            project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired, false)
                 .expect("desired projection")
                 .is_empty()
         );
@@ -18752,7 +18654,7 @@ mod tests {
         create_geobase_config_generation(&daemon, "regional", true);
         let mut outside = geobase_config_state();
         outside.split_routing.geo_asset_path = "/definitely/not/the/geobase/store".to_owned();
-        let desired = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired)
+        let desired = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired, false)
             .expect("desired providers");
         let error = build_daemon_config(&outside, &desired)
             .expect_err("provider outside actual -d home must fail");
@@ -18771,7 +18673,7 @@ mod tests {
             .geobase_store_root
             .join(&manifest.bases[0].lists.active.file);
         fs::write(path, b"other.example\n").expect("tamper artifact");
-        let error = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired)
+        let error = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired, false)
             .expect_err("same-count tamper must fail fingerprint verification");
         assert!(error.contains("fingerprint mismatch"), "{error}");
     }
@@ -18844,7 +18746,7 @@ mod tests {
             .join(&manifest.bases[0].lists.active.file);
         fs::remove_file(active_path).expect("remove active artifact");
 
-        let error = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired)
+        let error = project_geobase_rule_providers(&daemon, GeoBaseProjection::Desired, false)
             .expect_err("missing enabled artifact must fail");
         assert!(error.contains("missing or inaccessible"), "{error}");
     }
@@ -20291,6 +20193,40 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_empty_mihomo_path_uses_path_lookup() {
+        assert_eq!(benchmark_mihomo_path(""), "mihomo");
+        assert_eq!(benchmark_mihomo_path("  "), "mihomo");
+        assert_eq!(
+            benchmark_mihomo_path("/opt/sbin/mihomo"),
+            "/opt/sbin/mihomo"
+        );
+    }
+
+    #[test]
+    fn telegram_probe_status_never_exposes_credentials() {
+        let (_dir, daemon) = test_daemon();
+        save_telegram_config(
+            &telegram_config_path(&daemon.state_path),
+            &TelegramProbeConfig {
+                api_id: 12345,
+                api_hash: "sensitive-api-hash".to_owned(),
+                phone: "+10000000000".to_owned(),
+                peer: "fixture_channel".to_owned(),
+                message_id: 42,
+                authorized: false,
+            },
+        )
+        .expect("save Telegram config");
+
+        let (status, _, body) = dispatch("GET", "/api/telegram-probe/status", "", &daemon);
+        assert_eq!(status, 200);
+        assert!(body.contains("fixture_channel"));
+        assert!(!body.contains("sensitive-api-hash"));
+        assert!(!body.contains("+10000000000"));
+        assert!(!body.contains("api_id"));
+    }
+
+    #[test]
     fn bench_start_rejects_empty_profile_set() {
         let (_dir, daemon) = test_daemon();
         let (status, _, body) =
@@ -20501,7 +20437,7 @@ mod tests {
             profile_id: 0,
             profile_name: "Demo".to_owned(),
             profile_raw: raw.clone(),
-            method: "tcp".to_owned(),
+            method: "quick".to_owned(),
             latency_ms: 80,
             jitter_ms: 4,
             download_mbps: Some(25.0),
@@ -20512,6 +20448,19 @@ mod tests {
             score: 70,
             success: true,
             error: None,
+            resource_tests: vec![ResourceTestResult {
+                contract_version: 4,
+                id: "youtube".to_owned(),
+                name: "YouTube".to_owned(),
+                attempts: 2,
+                successes: 2,
+                reachable: true,
+                stable: true,
+                avg_ttfb_ms: 120,
+                max_ttfb_ms: 140,
+                avg_download_kbps: 800.0,
+                error: None,
+            }],
             timestamp: 1_700_000_000,
         };
         apply_bench_result(&daemon, success);
@@ -20526,6 +20475,8 @@ mod tests {
         assert!(stat.has_download);
         assert!(stat.has_upload);
         assert_eq!(stat.last_score, 70);
+        assert_eq!(stat.resource_tests.len(), 1);
+        assert_eq!(stat.resource_tests[0].id, "youtube");
         assert_eq!(stat.success_count, 1);
         assert_eq!(stat.failure_count, 0);
         assert_eq!(inner.state.metrics_history.len(), 1);
@@ -20547,6 +20498,7 @@ mod tests {
             score: 0,
             success: false,
             error: Some("tcp connect failed".to_owned()),
+            resource_tests: Vec::new(),
             timestamp: 1_700_000_001,
         };
         apply_bench_result(&daemon, failure);
@@ -20581,6 +20533,7 @@ mod tests {
             score: 80,
             success: true,
             error: None,
+            resource_tests: Vec::new(),
             timestamp,
         };
         apply_bench_result(&daemon, result(Some(40.0), Some(12.0), 1));
@@ -20620,6 +20573,7 @@ mod tests {
                     score: 50,
                     success: true,
                     error: None,
+                    resource_tests: Vec::new(),
                     timestamp: 1_700_000_000 + i as u64,
                 },
             );
@@ -22339,14 +22293,14 @@ mod tests {
         let presets = value["presets"].as_array().expect("presets array");
         assert!(!presets.is_empty(), "presets should not be empty");
         let ids: Vec<&str> = presets.iter().filter_map(|p| p["id"].as_str()).collect();
-        assert!(ids.contains(&"ru-direct"), "ru-direct preset missing");
+        assert!(ids.contains(&"ru-ip-direct"), "ru-ip-direct preset missing");
         assert!(ids.contains(&"all-vpn"), "all-vpn preset missing");
         assert!(ids.contains(&"ad-block"), "ad-block preset missing");
         assert!(ids.contains(&"only-web-vpn"), "only-web-vpn preset missing");
         assert!(ids.contains(&"block-social"), "block-social preset missing");
         assert!(
-            ids.contains(&"ru-direct-ad-block"),
-            "ru-direct-ad-block preset missing"
+            ids.contains(&"ru-ip-direct-ad-block"),
+            "ru-ip-direct-ad-block preset missing"
         );
     }
 
@@ -22360,7 +22314,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_preset_apply_ru_direct_adds_geoip_rule() {
+    fn routing_preset_apply_ru_ip_direct_adds_geoip_rule() {
         let (_dir, daemon) = test_daemon();
         handle_import(
             "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
@@ -22371,7 +22325,8 @@ mod tests {
             inner.state.active_profile_id = Some(0);
             inner.state.split_routing.enabled = true;
         }
-        let (status, _, body) = handle_routing_preset_apply(r#"{"preset":"ru-direct"}"#, &daemon);
+        let (status, _, body) =
+            handle_routing_preset_apply(r#"{"preset":"ru-ip-direct"}"#, &daemon);
         assert_eq!(status, 200);
         let result: Value = serde_json::from_str(&body).expect("parse json");
         assert_eq!(result["rules_added"], json!(1));
@@ -23725,7 +23680,7 @@ ntp:
             inner.state.split_routing.enabled = true;
         }
         let (status, _, body) =
-            handle_routing_preset_apply(r#"{"preset":"ru-direct","target":"active"}"#, &daemon);
+            handle_routing_preset_apply(r#"{"preset":"ru-ip-direct","target":"active"}"#, &daemon);
         assert_eq!(status, 200);
         let result: Value = serde_json::from_str(&body).expect("parse json");
         assert_eq!(result["target_override"], json!("active"));
@@ -23736,7 +23691,7 @@ ntp:
             .routing_rules
             .iter()
             .find(|r| r.name == "RU IPs direct")
-            .expect("ru-direct rule");
+            .expect("ru-ip-direct rule");
         assert_eq!(ru_rule.target, "active");
     }
 
@@ -23801,7 +23756,7 @@ ntp:
     }
 
     #[test]
-    fn routing_get_exposes_applied_geobase_as_two_immutable_rows() {
+    fn routing_get_omits_redundant_active_domains_but_keeps_static_active() {
         let (_dir, daemon) = test_daemon();
         create_geobase_config_generation(&daemon, "regional", true);
         let store = geobase_store(&daemon);
@@ -23820,9 +23775,9 @@ ntp:
         assert_eq!(rows[0]["name"], "regional — серый список");
         assert_eq!(rows[0]["target"], "active");
         assert_eq!(rows[0]["outbound"], "proxy-active");
-        assert_eq!(rows[0]["domain_count"], 1);
+        assert_eq!(rows[0]["domain_count"], 0);
         assert_eq!(rows[0]["network_count"], 1);
-        assert_eq!(rows[0]["total_count"], 2);
+        assert_eq!(rows[0]["total_count"], 1);
         assert_eq!(rows[1]["name"], "regional — белый список");
         assert_eq!(rows[1]["target"], "direct");
         assert_eq!(rows[1]["outbound"], "DIRECT");
@@ -23839,52 +23794,6 @@ ntp:
         let pending: Value = serde_json::from_str(&pending_body).expect("pending response");
         assert_eq!(pending["managed_rules"], response["managed_rules"]);
         assert_eq!(pending["geobase_requires_apply"], true);
-    }
-
-    #[test]
-    fn rkn_bypass_disabled_by_default() {
-        let s = SplitRoutingSettings::default();
-        assert!(
-            !s.rkn_bypass_enabled,
-            "rkn_bypass_enabled should default to false"
-        );
-        assert!(
-            !s.rkn_bypass_url.is_empty(),
-            "rkn_bypass_url should have default URL"
-        );
-        assert_eq!(
-            s.rkn_bypass_interval, 86400,
-            "default interval should be 24h"
-        );
-    }
-
-    #[test]
-    fn routing_settings_accepts_rkn_bypass() {
-        let (_dir, daemon) = test_daemon();
-        let (status, _, _body) =
-            handle_routing_settings(r#"{"rkn_bypass_enabled":false}"#, &daemon);
-        assert_eq!(status, 200);
-        let inner = lock(&daemon.inner);
-        assert!(
-            !inner.state.split_routing.rkn_bypass_enabled,
-            "rkn_bypass_enabled should be false after API call"
-        );
-    }
-
-    #[test]
-    fn routing_settings_accepts_rkn_bypass_url_and_interval() {
-        let (_dir, daemon) = test_daemon();
-        let (status, _, _body) = handle_routing_settings(
-            r#"{"rkn_bypass_url":"https://custom.example/list","rkn_bypass_interval":3600}"#,
-            &daemon,
-        );
-        assert_eq!(status, 200);
-        let inner = lock(&daemon.inner);
-        assert_eq!(
-            inner.state.split_routing.rkn_bypass_url,
-            "https://custom.example/list"
-        );
-        assert_eq!(inner.state.split_routing.rkn_bypass_interval, 3600);
     }
 
     #[test]
@@ -24090,7 +23999,6 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
             let mut inner = lock(&daemon.inner);
             inner.state.active_profile_id = Some(0);
             inner.state.split_routing.enabled = true;
-            inner.state.split_routing.rkn_bypass_enabled = false;
             inner.state.split_routing.ru_direct_mode = "off".to_owned();
             inner.state.split_routing.match_target = "direct".to_owned();
             inner.state.split_routing.port_mode = PortMode::All;
@@ -24117,7 +24025,6 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         {
             let inner = lock(&daemon.inner);
             let s = &inner.state.split_routing;
-            assert!(!s.rkn_bypass_enabled, "rkn_bypass should be disabled");
             assert_eq!(s.ru_direct_mode, "off", "ru_direct_mode should be off");
             assert_eq!(s.match_target, "proxy", "match_target should be proxy");
             assert_eq!(
@@ -24154,77 +24061,6 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
             assert!(
                 inner.state.mihomo_features.raw_rules.is_empty(),
                 "raw_rules should be cleared"
-            );
-        }
-    }
-
-    #[test]
-    fn rkn_bypass_in_config_when_enabled() {
-        let (_dir, daemon) = test_daemon();
-        handle_import(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
-            &daemon,
-        );
-        {
-            let mut inner = lock(&daemon.inner);
-            inner.state.active_profile_id = Some(0);
-            inner.state.split_routing.enabled = true;
-            inner.state.split_routing.rkn_bypass_enabled = true;
-            inner.state.split_routing.ru_direct_mode = "geosite".to_owned();
-            inner.state.split_routing.match_target = "proxy".to_owned();
-        }
-        let (status, _, body) = handle_get_mihomo_config(&daemon);
-        assert_eq!(status, 200);
-        let config: Value = serde_yaml::from_str(&body).expect("parse config");
-        let rules = config["rules"].as_array().expect("rules");
-        assert!(
-            rules
-                .iter()
-                .any(|r| r.as_str() == Some("RULE-SET,ru-bypass,proxy")),
-            "config must contain RULE-SET,ru-bypass,proxy"
-        );
-        assert!(
-            rules.iter().any(|r| r.as_str() == Some("GEOIP,RU,DIRECT")),
-            "config must contain GEOIP,RU,DIRECT"
-        );
-        let providers = config["rule-providers"]
-            .as_object()
-            .expect("rule-providers");
-        assert!(
-            providers.contains_key("ru-bypass"),
-            "ru-bypass provider must exist"
-        );
-    }
-
-    #[test]
-    fn rkn_bypass_not_in_config_when_disabled() {
-        let (_dir, daemon) = test_daemon();
-        handle_import(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
-            &daemon,
-        );
-        {
-            let mut inner = lock(&daemon.inner);
-            inner.state.active_profile_id = Some(0);
-            inner.state.split_routing.enabled = true;
-            inner.state.split_routing.rkn_bypass_enabled = false;
-            inner.state.split_routing.match_target = "proxy".to_owned();
-        }
-        let (status, _, body) = handle_get_mihomo_config(&daemon);
-        assert_eq!(status, 200);
-        let config: Value = serde_yaml::from_str(&body).expect("parse config");
-        let rules = config["rules"].as_array().expect("rules");
-        assert!(
-            !rules
-                .iter()
-                .any(|r| r.as_str().unwrap_or("").starts_with("RULE-SET,ru-bypass")),
-            "config must NOT contain RULE-SET,ru-bypass when disabled"
-        );
-        let providers = config.get("rule-providers").and_then(Value::as_object);
-        if let Some(providers) = providers {
-            assert!(
-                !providers.contains_key("ru-bypass"),
-                "ru-bypass provider must NOT exist when disabled"
             );
         }
     }

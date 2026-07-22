@@ -1,4 +1,4 @@
-# HincyRay v0.21.7
+# HincyRay v0.22.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -43,9 +43,17 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 
 ## Возможности
 
+### v0.22.0
+
+v0.22.0 превращает «Быстрый тест» в настоящую per-profile проверку сервисов. YouTube использует узкий нативный Innertube bootstrap и загружает ограниченный диапазон 512 KiB с `googlevideo.com` через тестируемый профиль; нужны только Rust, Mihomo и `curl` — без Python, `yt-dlp`, JavaScript runtime и TUN. Telegram авторизуется через отдельную форму Web UI и скачивает один ограниченный chunk выбранного media message через тот же временный runtime профиля.
+
+Telegram API credentials и authorization state не попадают в `state.json`: отдельные private config и SQLite session имеют mode `0600`, API никогда не возвращает API hash, телефон, login code или 2FA password, а Web UI предоставляет явное удаление/revoke session. Версионированные индикаторы `YT`/`TG` игнорируют старые smoke-результаты; шестерёнка метрик позволяет скрывать широкие диагностические колонки.
+
+Routing стал меньше и предсказуемее: удалены legacy oversized RKN bypass subsystem и router path `geoip.dat`. Поддерживаемые geo assets роутера — MetaCubeX `geosite.dat` и `geoip.metadb`; managed GeoBase не создаёт redundant Active provider при `MATCH,proxy`, а static Active networks остаются явными.
+
 ### v0.21.7
 
-v0.21.7 сохраняет доступность DIRECT/RU-маршрутов при недоступном VPN upstream: имена DIRECT-сайтов разрешаются через настроенные локальные DNS-серверы. Также добавлен «Быстрый тест» выбранных серверов: по одному ограниченному TCP-пробнику на профиль, до восьми профилей параллельно.
+v0.21.7 сохраняет доступность DIRECT/RU-маршрутов при недоступном VPN upstream: имена DIRECT-сайтов разрешаются через настроенные локальные DNS-серверы. В этой версии появился entry point «Быстрого теста» выбранных серверов, который v0.22.0 расширяет до end-to-end проверки сервисов.
 
 Фоновое auto-VPN learning больше не перезапускает Mihomo при обнаружении домена. Исключения сохраняются и применяются при следующем явном сохранении маршрутизации или перезапуске ядра, без общего разрыва соединений. Два элемента управления auto-switch в Web UI теперь синхронизированы.
 
@@ -127,8 +135,8 @@ Hotfix: страница «Система» теперь явно показыв
 
 ### v0.17.0
 
-- **Обход блокировок РКН (RKN Bypass)**: v0.17 добавила маршрутизацию заблокированных доменов через proxy. Сейчас используется предобработанный domain-список на основе `itworksig/rublacklist`; изначально функция была включена по умолчанию, но текущий безопасный default выключен, потому что очень большие списки могут превысить memory budget роутера с 512 МБ RAM. В Web UI настраиваются URL и интервал обновления.
-- **Сброс к штатным настройкам**: v0.17 добавила однокнопочный reset маршрутизации. Сейчас он восстанавливает безопасные defaults, включая выключенный RKN Bypass, и очищает пользовательские/raw rules. Web UI вызывает `POST /api/routing/reset` с `{"apply":true}`, поэтому сохранение state, регенерация конфига, перезапуск ядра и rollback при ошибке активации выполняются одной backend-транзакцией.
+- **Упрощённые списки маршрутизации**: большой legacy-список RKN удалён; его задачи покрывают managed GeoBase, GeoSite RU Direct и ограниченный список «Всегда через VPN».
+- **Сброс к штатным настройкам**: однокнопочный reset восстанавливает безопасные RU Direct, MATCH и port-mode defaults и очищает пользовательские/raw rules. Web UI вызывает `POST /api/routing/reset` с `{"apply":true}`, поэтому сохранение, регенерация, перезапуск ядра и rollback выполняются одной backend-транзакцией.
 - **Настраиваемый sniffer override-destination**: тоггл в секции DNS для управления `override-destination` сниффера Mihomo. По умолчанию `true` — доменные правила работают даже когда клиенты используют DoH/DoT (SNI подставляется в поле назначения). `saveDns()` теперь вызывает `/api/routing/apply` после сохранения, чтобы изменения DNS вступали в силу немедленно.
 - 339 тестов, 0 clippy warnings.
 - Проверено на Keenetic Giga: список скачан (24 МБ, 744 070 правил, ~5 сек), RSS Mihomo 157 МБ, тоггл вкл/выкл проверен в конфиге, сброс восстанавливает заводские настройки.
@@ -310,7 +318,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Текущие gates и результаты router deploy v0.21.7 зафиксированы в [`docs/releases/v0.21.7.md`](docs/releases/v0.21.7.md).
+Команда Playwright запускает fixture-backed browser smoke suite. Текущие gates и результаты router deploy v0.22.0 зафиксированы в [`docs/releases/v0.22.0.md`](docs/releases/v0.22.0.md).
 
 ## Установка
 
@@ -478,6 +486,7 @@ http://<ip-роутера>:8088/
 - [`docs/hincyray-v0.1-status.md`](docs/hincyray-v0.1-status.md) — статус версий.
 - [`docs/keenetic-client-roadmap.md`](docs/keenetic-client-roadmap.md) — roadmap продукта.
 - [`docs/architecture-v0.21.md`](docs/architecture-v0.21.md) — модульные/API-контракты v0.21 и operational model роутера.
+- [`docs/architecture-v0.22.md`](docs/architecture-v0.22.md) — сервисные контракты Quick Test, граница Telegram secrets/session и упрощённые routing assets.
 
 ## Миграция состояния
 

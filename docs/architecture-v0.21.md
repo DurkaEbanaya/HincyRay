@@ -106,7 +106,7 @@ Despite the compatibility name, this endpoint is a factual current-state report,
 - `current_mihomo_rss_kb`: current Mihomo RSS from procfs when running.
 - `available_memory_kb`: current `MemAvailable`.
 - User-rule, rule-provider, and applied GeoBase entry counts.
-- RKN bypass and safe-mode state.
+- Safe-mode state and measured local rule sources.
 - `risk`: `observed-ok` or `observed-warning`, derived from configured Memory Guard thresholds.
 - `reasons`: observed threshold violations.
 
@@ -114,7 +114,7 @@ It does not claim an estimated incremental or peak memory allocation.
 
 ### `GET /api/safe-mode`
 
-Returns enabled state, core/firewall status, and the heavy optional features suppressed by safe mode: RKN bypass, managed GeoBases, proxy/rule providers, sub-rules, raw/typed rules, tunnels, and smux.
+Returns enabled state, core/firewall status, and the heavy optional features suppressed by safe mode: managed GeoBases, proxy/rule providers, sub-rules, raw/typed rules, tunnels, and smux.
 
 ### `POST /api/safe-mode`
 

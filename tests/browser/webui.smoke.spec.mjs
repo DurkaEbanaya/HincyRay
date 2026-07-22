@@ -31,6 +31,45 @@ test('page boots without JavaScript errors', async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
+test('profile table shows compact service status and configurable metric columns', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const row = page.locator('#profilesBody tr').filter({ hasText: 'Fixture Profile' });
+  await expect(row.locator('.profile-service-test.ok')).toHaveText('YT');
+  await expect(row.locator('.profile-service-test.bad')).toHaveText('TG');
+
+  await page.locator('#profileMetricSettings > button').click();
+  const uploadToggle = page.locator('#profileMetricSettings input[data-profile-metric="upload"]');
+  await expect(uploadToggle).not.toBeChecked();
+  await uploadToggle.check();
+  await expect(page.locator('#profilesTable thead [data-profile-metric="upload"]')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('hr_profile_metrics') || '[]').includes('upload'))).toBe(true);
+});
+
+test('Telegram provisioning posts secrets without persisting them in the browser', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  await page.getByText('Настройки тестирования').click();
+  await page.getByText('Telegram media probe').click();
+  await page.locator('#telegramApiId').fill('12345');
+  await page.locator('#telegramApiHash').fill('fixture-api-hash');
+  await page.locator('#telegramPhone').fill('+10000000000');
+  await page.locator('#telegramPeer').fill('fixture_channel');
+  await page.locator('#telegramMessageId').fill('42');
+  const posted = page.waitForRequest(request => request.method() === 'POST' && new URL(request.url()).pathname === '/api/telegram-probe/request-code');
+  await page.getByRole('button', { name: 'Получить код' }).click();
+  expect((await posted).postDataJSON()).toEqual({
+    api_id: 12345,
+    api_hash: 'fixture-api-hash',
+    phone: '+10000000000',
+    peer: 'fixture_channel',
+    message_id: 42,
+  });
+  await expect(page.locator('#telegramApiHash')).toHaveValue('');
+  await expect(page.locator('#telegramPhone')).toHaveValue('');
+  expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('fixture-api-hash');
+});
+
 test('login overlay authenticates and stores the bearer in sessionStorage', async ({ page }) => {
   await page.addInitScript(() => {
     window.__fixturePromptCalled = false;

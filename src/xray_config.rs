@@ -153,24 +153,11 @@ pub struct RouterExtra {
     pub ru_direct_mode: String,
     /// v0.16: Domains exempt from RU Direct (go through VPN).
     pub ru_direct_exceptions: Vec<String>,
-    /// Auto-learned high-priority VPN exceptions. These must be emitted
-    /// before broad RKN/RU Direct rules so direct GEOIP/GEOSITE rules
-    /// cannot shadow them.
+    /// High-priority VPN exceptions emitted before broad RU Direct rules.
     pub auto_vpn_exceptions: Vec<String>,
     /// v0.16: MATCH rule target — `"proxy"` (default) or `"direct"`.
     /// Controls the final fallback rule: `MATCH,proxy` or `MATCH,direct`.
     pub match_target: String,
-    /// v0.17: RKN Bypass — when true, injects a RULE-SET provider that
-    /// downloads a list of domains blocked in Russia and routes them
-    /// through proxy. Also injects GEOIP,RU,DIRECT and GEOIP,CN,DIRECT
-    /// so Russian/Chinese IPs go direct.
-    pub rkn_bypass_enabled: bool,
-    /// v0.17: URL for the RKN bypass rule provider. Defaults to
-    /// `itworksig/rublacklist` bypass.list on GitHub.
-    pub rkn_bypass_url: String,
-    /// v0.17: Update interval for the RKN bypass rule provider (seconds).
-    /// Default: 86400 (24 hours).
-    pub rkn_bypass_interval: u32,
     /// Mihomo's home directory. Managed provider paths must resolve below it.
     pub mihomo_home: Option<String>,
     /// Local GeoBase providers are Mihomo-only; legacy Xray ignores them.

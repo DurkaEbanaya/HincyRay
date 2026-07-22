@@ -9,6 +9,8 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::telegram_probe::TelegramProbeConfig;
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ReadinessCheck {
     pub id: &'static str,
@@ -127,7 +129,6 @@ pub struct MemoryEstimateResponse {
     pub user_rules: usize,
     pub rule_provider_count: usize,
     pub geobase_entries: usize,
-    pub rkn_bypass_enabled: bool,
     pub safe_mode_enabled: bool,
     pub reasons: Vec<String>,
 }
@@ -150,6 +151,42 @@ pub struct SafeModeResponse {
     pub core_status: String,
     pub firewall_status: String,
     pub suppressed: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct TelegramProbeStatusResponse {
+    pub configured: bool,
+    pub session_exists: bool,
+    pub authorized: bool,
+    pub login_pending: bool,
+    pub peer: Option<String>,
+    pub message_id: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct TelegramProbeConfirmRequest {
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct TelegramProbeCodeResponse {
+    pub code_requested: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct TelegramProbeConfirmResponse {
+    pub authorized: bool,
+    pub password_required: bool,
+    pub hint: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct TelegramProbeDeleteResponse {
+    pub deleted: bool,
+    pub revoked: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -239,6 +276,38 @@ pub fn api_endpoint_contracts() -> Vec<ApiEndpointContract> {
             mutates_state: true,
         },
         ApiEndpointContract {
+            method: "GET",
+            path: "/api/telegram-probe/status",
+            request_schema: None,
+            response_schema: "TelegramProbeStatusResponse",
+            bounded: true,
+            mutates_state: false,
+        },
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/telegram-probe/request-code",
+            request_schema: Some("TelegramProbeConfig"),
+            response_schema: "TelegramProbeCodeResponse",
+            bounded: true,
+            mutates_state: true,
+        },
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/telegram-probe/confirm",
+            request_schema: Some("TelegramProbeConfirmRequest"),
+            response_schema: "TelegramProbeConfirmResponse",
+            bounded: true,
+            mutates_state: true,
+        },
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/telegram-probe/delete",
+            request_schema: None,
+            response_schema: "TelegramProbeDeleteResponse",
+            bounded: true,
+            mutates_state: true,
+        },
+        ApiEndpointContract {
             method: "POST",
             path: "/api/mihomo-api/connections/page",
             request_schema: Some("ConnectionQueryRequest"),
@@ -305,6 +374,12 @@ pub fn openapi_document() -> Value {
                 "MemoryEstimateResponse": schema_value::<MemoryEstimateResponse>(),
                 "SafeModeRequest": schema_value::<SafeModeRequest>(),
                 "SafeModeResponse": schema_value::<SafeModeResponse>(),
+                "TelegramProbeConfig": schema_value::<TelegramProbeConfig>(),
+                "TelegramProbeStatusResponse": schema_value::<TelegramProbeStatusResponse>(),
+                "TelegramProbeConfirmRequest": schema_value::<TelegramProbeConfirmRequest>(),
+                "TelegramProbeCodeResponse": schema_value::<TelegramProbeCodeResponse>(),
+                "TelegramProbeConfirmResponse": schema_value::<TelegramProbeConfirmResponse>(),
+                "TelegramProbeDeleteResponse": schema_value::<TelegramProbeDeleteResponse>(),
             }
         }
     })

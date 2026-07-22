@@ -28,7 +28,7 @@
 
 set -eu
 
-VERSION="0.21.7"
+VERSION="0.22.0"
 GITHUB="https://github.com/DurkaEbanaya/HincyRay"
 ENTWARE="${HINCYRAY_ENTWARE:-/opt}"
 HINCYRAY_DIR="${ENTWARE}/etc/hincyray"
@@ -511,7 +511,7 @@ stage_xray() {
     info "Extracting Xray to staging..."
     cd "${STAGING}/etc/hincyray"
     if check_cmd unzip; then
-        unzip -o "${STAGING}/xray.zip" xray geoip.dat geosite.dat 2>/dev/null || \
+        unzip -o "${STAGING}/xray.zip" xray geosite.dat 2>/dev/null || \
             unzip -o "${STAGING}/xray.zip" 2>/dev/null || true
     else
         # BusyBox unzip fallback — some Entware builds lack unzip.
@@ -521,7 +521,7 @@ stage_xray() {
             python3 -c "
 import zipfile, sys
 z = zipfile.ZipFile('${STAGING}/xray.zip')
-for n in ['xray','geoip.dat','geosite.dat']:
+for n in ['xray','geosite.dat']:
     try: z.extract(n, '${STAGING}/etc/hincyray')
     except KeyError: pass
 " 2>/dev/null || true
@@ -753,7 +753,6 @@ commit_install() {
         register_runtime_tree
     else
         [ -f "${STAGING}/etc/hincyray/xray" ] && register_file "$XRAY_BIN" "etc/hincyray/xray"
-        [ -f "${STAGING}/etc/hincyray/geoip.dat" ] && register_file "${HINCYRAY_DIR}/geoip.dat" "etc/hincyray/geoip.dat"
         [ -f "${STAGING}/etc/hincyray/geosite.dat" ] && register_file "${HINCYRAY_DIR}/geosite.dat" "etc/hincyray/geosite.dat"
         [ -f "${STAGING}/etc/hincyray/wifi-segment-setup.sh" ] && register_file "${SCRIPTS_DIR}/wifi-segment-setup.sh" "etc/hincyray/scripts/wifi-segment-setup.sh"
     fi
@@ -762,7 +761,7 @@ commit_install() {
     [ -f "${STAGING}/etc/hincyray/xray" ] && register_file "$XRAY_LINK" "sbin/xray"
 
     # Create target directories if they don't exist.
-    mkdir -p "$HINCYRAY_DIR" "$LOG_DIR" "${ENTWARE}/sbin" "${ENTWARE}/etc/init.d"
+    mkdir -p "$HINCYRAY_DIR" "$LOG_DIR" "${ENTWARE}/sbin" "${ENTWARE}/bin" "${ENTWARE}/etc/init.d"
 
     # Atomic moves — each mv is atomic on the same filesystem.
     if [ -f "${STAGING}/sbin/hincyray" ]; then
@@ -780,7 +779,7 @@ commit_install() {
         ln -s "$XRAY_BIN" "$XRAY_LINK"
         ok "  → $XRAY_LINK (symlink)"
 
-        for asset in geoip.dat geosite.dat; do
+        for asset in geosite.dat; do
             if [ -f "${STAGING}/etc/hincyray/$asset" ]; then
                 atomic_install "${STAGING}/etc/hincyray/$asset" "${HINCYRAY_DIR}/$asset"
                 ok "  → ${HINCYRAY_DIR}/$asset"
@@ -1023,7 +1022,7 @@ do_uninstall() {
 
     if ask_yn "Also remove Xray?"; then
         rm -f "$XRAY_LINK" "$XRAY_BIN"
-        rm -f "${HINCYRAY_DIR}/geoip.dat" "${HINCYRAY_DIR}/geosite.dat"
+        rm -f "${HINCYRAY_DIR}/geosite.dat"
     fi
 
     if ask_yn "Remove HincyRay directory entirely?"; then

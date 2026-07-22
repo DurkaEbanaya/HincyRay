@@ -1,18 +1,18 @@
-# HincyRay Web UI v0.21: контракты контролов и актуализация аудита
+# HincyRay Web UI v0.22: контракты контролов и актуализация аудита
 
 Дата первичного аудита: 2026-07-04
 
-Актуализация: 2026-07-15
+Актуализация: 2026-07-22
 
-Версия документации: v0.21.1
+Версия документации: v0.22.0
 
 Фокус: Web UI роутерного демона `hincyray`, файл `src/webui/index.html`, backend `src/hincyray.rs`.
 
-## 0. Статус v0.21
+## 0. Статус v0.22
 
-Аудит ниже сохраняет историю найденных проблем, но его статусы v0.19 нельзя автоматически считать текущим результатом проверки v0.21.
+Аудит ниже сохраняет историю найденных проблем, но его статусы v0.19 нельзя автоматически считать текущим результатом проверки v0.22.
 
-Реализовано в v0.21:
+Реализовано в v0.21–v0.22:
 
 - Auth hardening: Argon2id вместо persisted plaintext, миграция старого state, криптографические session tokens, idle/absolute expiry, лимит сессий, per-IP login throttling и invalidation сессий при изменении auth settings.
 - Browser token хранится в `sessionStorage`, а старое значение `hincyray_token` из `localStorage` удаляется при загрузке.
@@ -27,8 +27,10 @@
 - `POST /api/mihomo-api/connections/page` фильтрует и выдаёт bounded страницу соединений по `query`, `offset`, `limit`.
 - Responsive tables автоматически получают `data-label` и превращаются в карточки; переименование профиля использует modal dialog вместо `window.prompt`.
 - Поиск соединений индексирует точно отображаемую строку флаг+host, поэтому запрос `🇷🇺 chatgpt.com` сохраняет каноническую строку.
+- Профильная таблица показывает версионированные `YT`/`TG` результаты Quick Test; gear menu сохраняет набор видимых metric columns в `localStorage`.
+- Telegram media probe имеет отдельные request-code/confirm/status/delete controls. API hash, телефон, login code и 2FA password очищаются после отправки и не сохраняются в browser storage.
 
-Полный контракт описан в [`architecture-v0.21.md`](architecture-v0.21.md). Дополнительные gates и browser E2E v0.21.1 зафиксированы в [`releases/v0.21.1.md`](releases/v0.21.1.md); live deploy v0.21.0 — в [`releases/v0.21.0.md`](releases/v0.21.0.md).
+Базовый контракт описан в [`architecture-v0.21.md`](architecture-v0.21.md), изменения Quick Test/Telegram/routing — в [`architecture-v0.22.md`](architecture-v0.22.md). Gates и live deploy зафиксированы в [`releases/v0.22.0.md`](releases/v0.22.0.md).
 
 ## 1. Важная модель: не WiFi сам по себе, а политика Keenetic
 
@@ -144,7 +146,16 @@ cargo test --all-targets --all-features — OK, 339 tests passed
 
 Backend проверяет метод и отказывает, если профилей нет или benchmark уже запущен.
 
-**Аномалии/риски:** runtime зависит от доступности Mihomo и сети. Без live-запуска на роутере подтверждён только контракт и unit-тесты.
+### Быстрый тест сервисов
+
+- Кнопка **⚡ Быстрый тест** проверяет выбранные профили последовательно.
+- `YT` означает реальную загрузку ограниченного диапазона YouTube media через временный Mihomo данного профиля.
+- `TG` означает авторизованную загрузку одного chunk настроенного Telegram media message.
+- Старые результаты других contract version не отображаются.
+- Telegram setup запрашивает API ID/hash, телефон, public peer и message ID; затем login code и при необходимости 2FA password.
+- **Удалить / revoke session** пытается завершить Telegram authorization и удаляет private local session/config.
+
+**Аномалии/риски:** runtime зависит от доступности Mihomo, YouTube Innertube и Telegram. v0.22.0 live-проверен на трёх профилях; все YT/TG результаты прошли без Python/yt-dlp/QuickJS и без memory spike.
 
 ## 7. Маршрутизация / Split Routing
 
@@ -170,14 +181,6 @@ Backend проверяет метод и отказывает, если проф
 - **↺ Штатные настройки** — `POST /api/routing/reset` с `apply:true`, backend сохраняет, применяет и откатывает state при ошибке активации.
 
 **Статус: исправлено в коде.** Формулировка заменена на “Маршрутизация Xkeen политики”; пояснение теперь явно говорит, что техническая основа — Keenetic traffic policy/connmark, а SSID/сегмент только удобный способ назначить policy группе клиентов.
-
-### RKN Bypass
-
-- **Включить обход блокировок РКН** — включает rule provider `ru-bypass`; текущий безопасный default выключен из-за стоимости очень больших списков в памяти.
-- **URL списка** — источник списка, по умолчанию `itworksig/rublacklist`.
-- **Интервал обновления** — как часто Mihomo обновляет rule provider.
-
-Ожидаемая логика конфига: заблокированные домены идут через proxy; `GEOIP,RU,DIRECT` и `GEOIP,CN,DIRECT` идут напрямую после rule-set.
 
 ### Геобаза
 

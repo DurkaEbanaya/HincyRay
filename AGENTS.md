@@ -1,4 +1,4 @@
-# HincyRay v0.21.7 (`xray-vpn-test`)
+# HincyRay v0.22.0 (`xray-vpn-test`)
 
 Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 and the feature-gated `xray-vpn-test` desktop diagnostics app. Router mode uses Mihomo with iptables NAT REDIRECT (TCP 10810) and mangle TPROXY (UDP 10811); there is no TUN/tun2socks path.
 
@@ -6,7 +6,8 @@ Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 a
 
 - `src/main.rs`, `src/bin/hincyray.rs` — thin entrypoints only.
 - `src/profiles.rs` — profile/share-link parsing and subscription loading. Plain HTTP(S) is a subscription URL; HTTP proxy profiles use `mihomo+http(s)://`.
-- `src/benchmark.rs` — shared Mihomo benchmark, stability, download, and upload execution.
+- `src/benchmark.rs` — shared Mihomo benchmark plus native YouTube and Telegram Quick Test orchestration.
+- `src/telegram_probe.rs` — serialized Telegram login/session/media probe; secrets and SQLite session stay outside `state.json`.
 - `src/scoring.rs` — shared quality scoring.
 - `src/mihomo_config.rs` — router and benchmark Mihomo YAML generation and protocol builders.
 - `src/hincyray.rs` — daemon composition root: persisted state, lifecycle identity, HTTP handlers, transactional activation, watchdog, core/firewall orchestration, Deep Bench, and Dead Servers.
@@ -36,6 +37,8 @@ Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 a
 - Automatic/all/subscription scopes exclude dead profiles. Explicit diagnostic requests may include them. Enabled pinned routes preserve intent and use active fallback while their target is dead.
 - Router DNS is always present because firewall rules unconditionally redirect port 53 to Mihomo on 1053. `dns.enabled` is a desktop-Xray concept.
 - DIRECT routes use configured local DNS servers by default so their name resolution does not depend on VPN upstream health.
+- Router geo assets are MetaCubeX `geosite.dat` + `geoip.metadb`; legacy `geoip.dat` and the oversized RKN bypass list are not runtime inputs.
+- Quick Test is sequential. YouTube uses a narrow Innertube direct-format probe with Rust + `curl`; do not add Python/yt-dlp/JS runtime. Telegram uses one private SQLite session and must not be opened by concurrent clients.
 - Redir and TPROXY listeners must stay on separate ports. The ndm hook is the primary firewall-reload mechanism; watchdog reinstall is a safety net.
 - `geoip.metadb` must be present locally and `geo-auto-update: false`; router startup must not depend on blocked GitHub downloads.
 - Mihomo fallback group `proxy` is the canonical upstream-health decider. The daemon reads its state; do not add duplicate periodic upstream probes.
@@ -105,7 +108,7 @@ Before replacing the live binary:
 5. Verify active profile, fallback group, firewall/TPROXY, and router E2E.
 6. On any failure restore the complete rollback set and verify the previous version health.
 
-Live verified v0.21.7 artifact SHA256: `fec81f8a7e65495e8d4414ce25a760670d1249a8f7d2244fc69925c8e4b21734`. Deployment evidence is in `docs/releases/v0.21.7.md`.
+Release artifact SHA256: `6a99122d61e75d039b0147c6b87789d2f0713b18f350a0dd88838f49cafe5e24`. Live verification and release evidence are recorded in `docs/releases/v0.22.0.md`.
 
 ## Release
 

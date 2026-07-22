@@ -7,13 +7,10 @@
 //! processes are cleaned up even on cancel/error via a `Drop` guard so
 //! the router is never left with stray benchmark cores.
 //!
-//! No async runtime, no extra dependencies: `std::thread`,
-//! `std::process::Command`, `std::net::TcpStream`, and the already
-//! declared `tempfile` crate. `curl` is invoked as an external binary
-//! because Entware ships it; if `curl` is missing the HEAD/GET methods
-//! return a clear error.
+//! `curl` is invoked for the generic HTTP probes. Quick Test uses a narrow
+//! YouTube Innertube flow and an authorized Telegram session for one bounded
+//! media chunk from each service.
 
-use std::collections::VecDeque;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -21,7 +18,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,6 +30,7 @@ use crate::profiles::Profile;
 #[cfg(test)]
 use crate::profiles::Protocol;
 use crate::scoring::quality_score;
+use crate::telegram_probe::{TelegramProbeConfig, probe_media};
 
 pub const DEFAULT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 pub const DEFAULT_DOWNLOAD_URL: &str = "https://proof.ovh.net/files/100Mb.dat";
@@ -45,8 +42,22 @@ const DOWNLOAD_MAX_SECS: u64 = 3;
 const SUSTAINED_DOWNLOAD_MAX_SECS: u64 = 15;
 const XRAY_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const QUICK_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-const QUICK_BENCH_WORKERS: usize = 8;
+const QUICK_RESOURCE_CONTRACT_VERSION: u8 = 4;
+const YOUTUBE_VIDEO_ID: &str = "aqz-KE-bpKQ";
+const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=aqz-KE-bpKQ&hl=en";
+const YOUTUBE_PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+const YOUTUBE_WEB_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/131 Safari/537.36";
+const YOUTUBE_VR_USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+const YOUTUBE_SIGNATURE_TIMESTAMP: u64 = 20653;
+const YOUTUBE_PAGE_MAX_BYTES: u64 = 3 * 1024 * 1024;
+const YOUTUBE_SEGMENT_BYTES: u64 = 512 * 1024;
+
+#[derive(Clone, Debug)]
+pub struct QuickProbeConfig {
+    pub telegram_session_path: String,
+    pub telegram: Option<TelegramProbeConfig>,
+}
 
 /// Benchmark method requested by the API or web UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +108,31 @@ pub struct BenchResult {
     pub score: u32,
     pub success: bool,
     pub error: Option<String>,
+    #[serde(default)]
+    pub resource_tests: Vec<ResourceTestResult>,
     pub timestamp: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResourceTestResult {
+    #[serde(default)]
+    pub contract_version: u8,
+    pub id: String,
+    pub name: String,
+    pub attempts: u32,
+    pub successes: u32,
+    pub reachable: bool,
+    pub stable: bool,
+    pub avg_ttfb_ms: u32,
+    pub max_ttfb_ms: u32,
+    pub avg_download_kbps: f32,
+    pub error: Option<String>,
+}
+
+struct QuickResourceAttempt {
+    ttfb_ms: u32,
+    total_ms: u32,
+    bytes: u64,
 }
 
 /// Live, in-progress job state shared between the worker thread and the
@@ -131,6 +166,7 @@ pub fn run_bench(
     download_url: String,
     upload_url: String,
     core_path: String,
+    quick_probe: Option<QuickProbeConfig>,
     test_download: bool,
     test_upload: bool,
     job: SharedJob,
@@ -149,96 +185,35 @@ pub fn run_bench(
     }
 
     thread::spawn(move || {
-        if method == BenchMethod::Quick {
-            let queue = Arc::new(Mutex::new(VecDeque::from(profiles)));
-            let (sender, receiver) = mpsc::channel();
-            let worker_count = QUICK_BENCH_WORKERS.min(
-                queue
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .len(),
-            );
-            let mut workers = Vec::with_capacity(worker_count);
-            for _ in 0..worker_count {
-                let queue = Arc::clone(&queue);
-                let sender = sender.clone();
-                let cancel = Arc::clone(&cancel);
-                let job = Arc::clone(&job);
-                workers.push(thread::spawn(move || {
-                    loop {
-                        if cancel.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let profile = queue
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner())
-                            .pop_front();
-                        let Some(profile) = profile else { break };
-                        {
-                            let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-                            state.current_profile_id = Some(profile.id);
-                            state.current_profile_name = Some(profile.name.clone());
-                            state.last_updated = unix_now();
-                        }
-                        if sender
-                            .send(benchmark_profile(
-                                &profile,
-                                BenchMethod::Quick,
-                                "",
-                                "",
-                                "",
-                                "",
-                                false,
-                                false,
-                            ))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }));
+        for profile in &profiles {
+            if cancel.load(Ordering::Relaxed) {
+                break;
             }
-            drop(sender);
-            for result in receiver {
-                on_result(result.clone());
+            {
+                let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
+                state.current_profile_id = Some(profile.id);
+                state.current_profile_name = Some(profile.name.clone());
+                state.last_updated = unix_now();
+            }
+
+            let result = benchmark_profile(
+                profile,
+                method,
+                &probe_url,
+                &download_url,
+                &upload_url,
+                &core_path,
+                quick_probe.as_ref(),
+                test_download,
+                test_upload,
+            );
+
+            on_result(result.clone());
+            {
                 let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
                 state.results.push(result);
                 state.completed += 1;
                 state.last_updated = unix_now();
-            }
-            for worker in workers {
-                let _ = worker.join();
-            }
-        } else {
-            for profile in &profiles {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                {
-                    let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-                    state.current_profile_id = Some(profile.id);
-                    state.current_profile_name = Some(profile.name.clone());
-                    state.last_updated = unix_now();
-                }
-
-                let result = benchmark_profile(
-                    profile,
-                    method,
-                    &probe_url,
-                    &download_url,
-                    &upload_url,
-                    &core_path,
-                    test_download,
-                    test_upload,
-                );
-
-                on_result(result.clone());
-                {
-                    let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-                    state.results.push(result);
-                    state.completed += 1;
-                    state.last_updated = unix_now();
-                }
             }
         }
 
@@ -260,6 +235,7 @@ fn benchmark_profile(
     download_url: &str,
     upload_url: &str,
     core_path: &str,
+    quick_probe: Option<&QuickProbeConfig>,
     test_download: bool,
     test_upload: bool,
 ) -> BenchResult {
@@ -279,13 +255,20 @@ fn benchmark_profile(
         score: 0,
         success: false,
         error: None,
+        resource_tests: Vec::new(),
         timestamp,
     };
 
     // Step 1: Latency probe — TCP (direct) or HEAD/GET (via temp xray).
+    let mut resource_tests = Vec::new();
     let latency_outcome = match method {
         BenchMethod::Tcp => run_tcp(profile),
-        BenchMethod::Quick => run_quick_tcp(profile),
+        BenchMethod::Quick => {
+            run_quick_resources(profile, core_path, quick_probe).map(|(metrics, tests)| {
+                resource_tests = tests;
+                metrics
+            })
+        }
         BenchMethod::Head | BenchMethod::Get => {
             run_via_temp_mihomo(profile, method, probe_url, core_path)
         }
@@ -323,6 +306,23 @@ fn benchmark_profile(
                 .as_ref()
                 .and_then(|result| result.as_ref().ok())
                 .copied();
+            let resource_error = resource_tests
+                .iter()
+                .filter(|test| !test.stable)
+                .map(|test| format!("{} {}/{}", test.name, test.successes, test.attempts))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let resources_passed = resource_error.is_empty();
+            let score = if resources_passed {
+                quality_score(
+                    metrics.latency_ms,
+                    metrics.jitter_ms,
+                    download_mbps.unwrap_or(0.0),
+                    metrics.loss_percent,
+                )
+            } else {
+                0
+            };
             BenchResult {
                 latency_ms: metrics.latency_ms,
                 jitter_ms: metrics.jitter_ms,
@@ -331,18 +331,20 @@ fn benchmark_profile(
                 download_error: speed_metrics.download.and_then(Result::err),
                 upload_error: speed_metrics.upload.and_then(Result::err),
                 loss_percent: metrics.loss_percent,
-                score: quality_score(
-                    metrics.latency_ms,
-                    metrics.jitter_ms,
-                    download_mbps.unwrap_or(0.0),
-                    metrics.loss_percent,
-                ),
-                success: true,
-                error: None,
+                score,
+                success: resources_passed,
+                error: (!resources_passed)
+                    .then(|| format!("resource checks failed: {resource_error}")),
+                resource_tests,
                 ..base()
             }
         }
         Err(error) => {
+            let resource_tests = if method == BenchMethod::Quick {
+                unavailable_quick_resource_results(&error)
+            } else {
+                Vec::new()
+            };
             // Latency failed — but speed might still work (e.g. server
             // blocks direct TCP but works through proxy). If speed test
             // succeeded, report partial success.
@@ -360,10 +362,30 @@ fn benchmark_profile(
                 download_error: speed_metrics.download.and_then(Result::err),
                 upload_error: speed_metrics.upload.and_then(Result::err),
                 error: Some(error),
+                resource_tests,
                 ..base()
             }
         }
     }
+}
+
+fn unavailable_quick_resource_results(error: &str) -> Vec<ResourceTestResult> {
+    [("youtube", "YouTube", 1), ("telegram", "Telegram", 1)]
+        .into_iter()
+        .map(|(id, name, attempts)| ResourceTestResult {
+            contract_version: QUICK_RESOURCE_CONTRACT_VERSION,
+            id: id.to_owned(),
+            name: name.to_owned(),
+            attempts,
+            successes: 0,
+            reachable: false,
+            stable: false,
+            avg_ttfb_ms: 0,
+            max_ttfb_ms: 0,
+            avg_download_kbps: 0.0,
+            error: Some(error.to_owned()),
+        })
+        .collect()
 }
 
 /// Verify a failover candidate through its real proxy protocol, not merely by
@@ -378,6 +400,7 @@ pub fn verify_profile_for_failover(profile: &Profile, mihomo_path: &str) -> Benc
         DEFAULT_DOWNLOAD_URL,
         DEFAULT_UPLOAD_URL,
         mihomo_path,
+        None,
         false,
         false,
     );
@@ -427,24 +450,371 @@ fn run_tcp(profile: &Profile) -> Result<Metrics, String> {
     })
 }
 
-fn run_quick_tcp(profile: &Profile) -> Result<Metrics, String> {
-    let port = profile.port.unwrap_or(443);
-    if profile.address.is_empty() {
-        return Err("profile has empty address".to_owned());
+fn run_quick_resources(
+    profile: &Profile,
+    mihomo_path: &str,
+    quick_probe: Option<&QuickProbeConfig>,
+) -> Result<(Metrics, Vec<ResourceTestResult>), String> {
+    let (port, _guard) = spawn_bench_mihomo_with_path(profile, mihomo_path)?;
+    let quick_probe =
+        quick_probe.ok_or_else(|| "Quick Test service probes are not configured".to_owned())?;
+    let tests = vec![
+        run_youtube_playback_probe(port),
+        run_telegram_media_probe(port, quick_probe),
+    ];
+    let samples = tests
+        .iter()
+        .flat_map(|test| [test.avg_ttfb_ms, test.max_ttfb_ms])
+        .filter(|sample| *sample > 0)
+        .map(|sample| Duration::from_millis(u64::from(sample)))
+        .collect::<Vec<_>>();
+    let attempts = tests.iter().map(|test| test.attempts).sum::<u32>();
+    let failures = tests
+        .iter()
+        .map(|test| test.attempts.saturating_sub(test.successes))
+        .sum::<u32>();
+    Ok((
+        Metrics {
+            latency_ms: average_ms(&samples),
+            jitter_ms: jitter_ms(&samples),
+            loss_percent: if attempts == 0 {
+                100.0
+            } else {
+                failures as f32 * 100.0 / attempts as f32
+            },
+        },
+        tests,
+    ))
+}
+
+fn run_youtube_playback_probe(port: u16) -> ResourceTestResult {
+    let mut successes = Vec::new();
+    let mut errors = Vec::new();
+    for _ in 0..1 {
+        match youtube_playback_attempt(port) {
+            Ok(attempt) => successes.push(attempt),
+            Err(error) => errors.push(error),
+        }
     }
-    let (latencies, failures) =
-        tcp_probe_with_timeout(&profile.address, port, 1, QUICK_TCP_CONNECT_TIMEOUT);
-    let Some(latency) = latencies.first() else {
-        return Err(format!(
-            "quick tcp connect {}:{} failed {failures}/1",
-            profile.address, port
-        ));
+    aggregate_quick_resource_probe("youtube", "YouTube", 1, &successes, &errors)
+}
+
+fn run_telegram_media_probe(port: u16, quick_probe: &QuickProbeConfig) -> ResourceTestResult {
+    let mut successes = Vec::new();
+    let mut errors = Vec::new();
+    let result = quick_probe
+        .telegram
+        .as_ref()
+        .ok_or_else(|| "Telegram probe is not configured".to_owned())
+        .and_then(|config| {
+            probe_media(Path::new(&quick_probe.telegram_session_path), config, port).map(|result| {
+                QuickResourceAttempt {
+                    ttfb_ms: result.elapsed_ms,
+                    total_ms: result.elapsed_ms.max(1),
+                    bytes: result.bytes,
+                }
+            })
+        });
+    match result {
+        Ok(attempt) => successes.push(attempt),
+        Err(error) => errors.push(error),
+    }
+    aggregate_quick_resource_probe("telegram", "Telegram", 1, &successes, &errors)
+}
+
+fn aggregate_quick_resource_probe(
+    id: &str,
+    name: &str,
+    attempts: u32,
+    successes: &[QuickResourceAttempt],
+    errors: &[String],
+) -> ResourceTestResult {
+    let success_count = successes.len() as u32;
+    let avg_ttfb_ms = successes
+        .iter()
+        .map(|attempt| u64::from(attempt.ttfb_ms))
+        .sum::<u64>()
+        .checked_div(successes.len() as u64)
+        .unwrap_or(0) as u32;
+    let max_ttfb_ms = successes
+        .iter()
+        .map(|attempt| attempt.ttfb_ms)
+        .max()
+        .unwrap_or(0);
+    let avg_download_kbps = if successes.is_empty() {
+        0.0
+    } else {
+        successes
+            .iter()
+            .map(|attempt| attempt.bytes as f32 * 8.0 / attempt.total_ms.max(1) as f32)
+            .sum::<f32>()
+            / successes.len() as f32
     };
-    Ok(Metrics {
-        latency_ms: latency.as_millis().min(u128::from(u32::MAX)) as u32,
-        jitter_ms: 0,
-        loss_percent: 0.0,
+    ResourceTestResult {
+        contract_version: QUICK_RESOURCE_CONTRACT_VERSION,
+        id: id.to_owned(),
+        name: name.to_owned(),
+        attempts,
+        successes: success_count,
+        reachable: success_count > 0,
+        stable: success_count == attempts,
+        avg_ttfb_ms,
+        max_ttfb_ms,
+        avg_download_kbps,
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
+}
+
+fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
+    let cookie_file = NamedTempFile::new().map_err(|error| format!("YouTube cookies: {error}"))?;
+    let watch_file =
+        NamedTempFile::new().map_err(|error| format!("YouTube watch page: {error}"))?;
+    let watch = Command::new("curl")
+        .arg("--socks5-hostname")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("-L")
+        .arg("--connect-timeout")
+        .arg("5")
+        .arg("--max-time")
+        .arg("20")
+        .arg("--max-filesize")
+        .arg(YOUTUBE_PAGE_MAX_BYTES.to_string())
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--user-agent")
+        .arg(YOUTUBE_WEB_USER_AGENT)
+        .arg("--cookie-jar")
+        .arg(cookie_file.path())
+        .arg("--output")
+        .arg(watch_file.path())
+        .arg(YOUTUBE_WATCH_URL)
+        .output()
+        .map_err(|error| format!("YouTube bootstrap curl: {error}"))?;
+    if !watch.status.success() {
+        return Err(format!(
+            "YouTube bootstrap rc={}: {}",
+            watch
+                .status
+                .code()
+                .map_or_else(|| "?".to_owned(), |code| code.to_string()),
+            bounded_process_error(&watch.stderr)
+        ));
+    }
+    let watch_page = std::fs::read_to_string(watch_file.path())
+        .map_err(|error| format!("read YouTube bootstrap: {error}"))?;
+    let visitor_data = embedded_json_string(&watch_page, "visitorData")
+        .ok_or_else(|| "YouTube bootstrap returned no visitor data".to_owned())?;
+    let signature_timestamp =
+        embedded_json_u64(&watch_page, "signatureTimestamp").unwrap_or(YOUTUBE_SIGNATURE_TIMESTAMP);
+    let player_body = serde_json::json!({
+        "context": {"client": {
+            "clientName": "ANDROID_VR",
+            "clientVersion": "1.65.10",
+            "deviceMake": "Oculus",
+            "deviceModel": "Quest 3",
+            "androidSdkVersion": 32,
+            "userAgent": YOUTUBE_VR_USER_AGENT,
+            "osName": "Android",
+            "osVersion": "12L",
+            "hl": "en",
+            "timeZone": "UTC",
+            "utcOffsetMinutes": 0,
+            "visitorData": visitor_data,
+        }},
+        "videoId": YOUTUBE_VIDEO_ID,
+        "playbackContext": {"contentPlaybackContext": {
+            "html5Preference": "HTML5_PREF_WANTS",
+            "signatureTimestamp": signature_timestamp,
+        }},
+        "contentCheckOk": true,
+        "racyCheckOk": true,
     })
+    .to_string();
+    let player_file = NamedTempFile::new().map_err(|error| format!("YouTube player: {error}"))?;
+    let player = Command::new("curl")
+        .arg("--socks5-hostname")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--connect-timeout")
+        .arg("5")
+        .arg("--max-time")
+        .arg("20")
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--cookie")
+        .arg(cookie_file.path())
+        .arg("--header")
+        .arg("Content-Type: application/json")
+        .arg("--header")
+        .arg("X-Youtube-Client-Name: 28")
+        .arg("--header")
+        .arg("X-Youtube-Client-Version: 1.65.10")
+        .arg("--header")
+        .arg(format!("X-Goog-Visitor-Id: {visitor_data}"))
+        .arg("--header")
+        .arg("Origin: https://www.youtube.com")
+        .arg("--user-agent")
+        .arg(YOUTUBE_VR_USER_AGENT)
+        .arg("--request")
+        .arg("POST")
+        .arg("--data")
+        .arg(player_body)
+        .arg("--output")
+        .arg(player_file.path())
+        .arg(YOUTUBE_PLAYER_URL)
+        .output()
+        .map_err(|error| format!("YouTube player curl: {error}"))?;
+    if !player.status.success() {
+        return Err(format!(
+            "YouTube player rc={}: {}",
+            player
+                .status
+                .code()
+                .map_or_else(|| "?".to_owned(), |code| code.to_string()),
+            bounded_process_error(&player.stderr)
+        ));
+    }
+    let player: serde_json::Value = serde_json::from_reader(
+        std::fs::File::open(player_file.path())
+            .map_err(|error| format!("open YouTube player response: {error}"))?,
+    )
+    .map_err(|error| format!("parse YouTube player response: {error}"))?;
+    let status = player
+        .pointer("/playabilityStatus/status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("UNKNOWN");
+    if status != "OK" {
+        let reason = player
+            .pointer("/playabilityStatus/reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no reason");
+        return Err(format!("YouTube player {status}: {reason}"));
+    }
+    let media_url = youtube_direct_media_url(&player)
+        .ok_or_else(|| "YouTube player returned no direct video format".to_owned())?;
+    curl_youtube_range(port, media_url)
+}
+
+fn embedded_json_string(source: &str, key: &str) -> Option<String> {
+    let marker = format!("\"{key}\":");
+    let value = source.get(source.find(&marker)? + marker.len()..)?;
+    serde_json::Deserializer::from_str(value)
+        .into_iter::<String>()
+        .next()?
+        .ok()
+}
+
+fn embedded_json_u64(source: &str, key: &str) -> Option<u64> {
+    let marker = format!("\"{key}\":");
+    let value = source.get(source.find(&marker)? + marker.len()..)?;
+    let digits = value
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn youtube_direct_media_url(player: &serde_json::Value) -> Option<&str> {
+    let adaptive = player
+        .pointer("/streamingData/adaptiveFormats")?
+        .as_array()?;
+    adaptive
+        .iter()
+        .find(|format| format.get("itag").and_then(serde_json::Value::as_u64) == Some(160))
+        .and_then(|format| format.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            adaptive.iter().find_map(|format| {
+                let mime = format.get("mimeType")?.as_str()?;
+                mime.starts_with("video/")
+                    .then(|| format.get("url")?.as_str())
+                    .flatten()
+            })
+        })
+}
+
+fn curl_youtube_range(port: u16, media_url: &str) -> Result<QuickResourceAttempt, String> {
+    let output_file =
+        NamedTempFile::new().map_err(|error| format!("temp YouTube media: {error}"))?;
+    let output = Command::new("curl")
+        .arg("--socks5-hostname")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("-L")
+        .arg("--connect-timeout")
+        .arg("5")
+        .arg("--max-time")
+        .arg("30")
+        .arg("--range")
+        .arg(format!("0-{}", YOUTUBE_SEGMENT_BYTES - 1))
+        .arg("--max-filesize")
+        .arg(YOUTUBE_SEGMENT_BYTES.to_string())
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--output")
+        .arg(output_file.path())
+        .arg("--write-out")
+        .arg("%{http_code} %{size_download} %{time_starttransfer} %{time_total}")
+        .arg(media_url)
+        .output()
+        .map_err(|error| format!("curl spawn: {error}"))?;
+    let metrics = parse_curl_metrics(&output.stdout)?;
+    if !output.status.success() || !(200..300).contains(&metrics.http_status) || metrics.bytes == 0
+    {
+        return Err(format!(
+            "curl rc={}, http={}, bytes={}: {}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "?".to_owned(), |code| code.to_string()),
+            metrics.http_status,
+            metrics.bytes,
+            bounded_process_error(&output.stderr)
+        ));
+    }
+    Ok(QuickResourceAttempt {
+        ttfb_ms: seconds_to_millis(metrics.ttfb_secs, 0),
+        total_ms: seconds_to_millis(metrics.total_secs, 1),
+        bytes: metrics.bytes,
+    })
+}
+
+struct CurlMetrics {
+    http_status: u16,
+    bytes: u64,
+    ttfb_secs: f64,
+    total_secs: f64,
+}
+
+fn parse_curl_metrics(output: &[u8]) -> Result<CurlMetrics, String> {
+    let raw = String::from_utf8_lossy(output);
+    let parts = raw.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return Err(format!("unexpected curl metrics: {raw}"));
+    }
+    Ok(CurlMetrics {
+        http_status: parts[0]
+            .parse::<u16>()
+            .map_err(|error| format!("curl HTTP status: {error}"))?,
+        bytes: parts[1]
+            .parse::<u64>()
+            .map_err(|error| format!("curl byte count: {error}"))?,
+        ttfb_secs: parts[2]
+            .parse::<f64>()
+            .map_err(|error| format!("curl TTFB: {error}"))?,
+        total_secs: parts[3]
+            .parse::<f64>()
+            .map_err(|error| format!("curl total time: {error}"))?,
+    })
+}
+
+fn seconds_to_millis(seconds: f64, minimum: u32) -> u32 {
+    (seconds * 1000.0)
+        .round()
+        .clamp(f64::from(minimum), f64::from(u32::MAX)) as u32
+}
+
+fn bounded_process_error(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    text.chars().take(500).collect::<String>().trim().to_owned()
 }
 
 pub(crate) fn tcp_probe(host: &str, port: u16, attempts: usize) -> (Vec<Duration>, usize) {
@@ -964,16 +1334,29 @@ struct StabilityAggregationInput {
 /// the guard alive for the duration of the tests. Returns `None` if
 /// mihomo cannot be started (config error, port exhaustion, etc.).
 fn spawn_bench_mihomo(profile: &Profile) -> Option<(u16, ChildGuard)> {
-    let port = reserve_local_port().ok()?;
-    let config_yaml = build_mihomo_bench_config(profile, "127.0.0.1", port).ok()?;
-    let mut config_file = NamedTempFile::with_suffix(".yaml").ok()?;
-    config_file.write_all(config_yaml.as_bytes()).ok()?;
-    config_file.flush().ok()?;
-    let process_log = NamedTempFile::new().ok()?;
-    let child = spawn_mihomo_with_combined_log("mihomo", config_file.path(), &process_log).ok()?;
+    spawn_bench_mihomo_with_path(profile, "mihomo").ok()
+}
+
+fn spawn_bench_mihomo_with_path(
+    profile: &Profile,
+    mihomo_path: &str,
+) -> Result<(u16, ChildGuard), String> {
+    let port = reserve_local_port()?;
+    let config_yaml = build_mihomo_bench_config(profile, "127.0.0.1", port)?;
+    let mut config_file = NamedTempFile::with_suffix(".yaml")
+        .map_err(|error| format!("temp Mihomo config: {error}"))?;
+    config_file
+        .write_all(config_yaml.as_bytes())
+        .map_err(|error| format!("write Mihomo config: {error}"))?;
+    config_file
+        .flush()
+        .map_err(|error| format!("flush Mihomo config: {error}"))?;
+    let process_log = NamedTempFile::new().map_err(|error| format!("temp Mihomo log: {error}"))?;
+    let child = spawn_mihomo_with_combined_log(mihomo_path, config_file.path(), &process_log)
+        .map_err(|error| format!("Mihomo spawn ({mihomo_path}): {error}"))?;
     let mut guard = ChildGuard { child: Some(child) };
-    wait_until_socks_ready(port, guard.as_mut(), process_log.path()).ok()?;
-    Some((port, guard))
+    wait_until_socks_ready(port, guard.as_mut(), process_log.path())?;
+    Ok((port, guard))
 }
 
 /// v0.20: Run the full Phase B observation on `profile` for `minutes`
@@ -1290,6 +1673,7 @@ mod tests {
             score: 42,
             success: true,
             error: None,
+            resource_tests: Vec::new(),
             timestamp: 1,
         };
 
@@ -1314,16 +1698,14 @@ mod tests {
     }
 
     #[test]
-    fn quick_benchmark_uses_one_tcp_probe_without_speed_stages() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("local listener");
-        let port = listener.local_addr().expect("listener address").port();
+    fn quick_benchmark_requires_proxy_protocol_runtime() {
         let profile = Profile {
             id: 9,
             name: "quick".to_owned(),
             protocol: Protocol::Vless,
             address: "127.0.0.1".to_owned(),
-            port: Some(port),
-            raw: format!("vless://11111111-1111-1111-1111-111111111111@127.0.0.1:{port}#quick"),
+            port: Some(443),
+            raw: "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443#quick".to_owned(),
             selected: false,
             block_quic: false,
             group: None,
@@ -1336,16 +1718,86 @@ mod tests {
             "",
             "",
             "/definitely/missing/mihomo",
+            None,
             true,
             true,
         );
 
-        assert!(result.success);
+        assert!(!result.success);
         assert_eq!(result.method, "quick");
-        assert_eq!(result.jitter_ms, 0);
-        assert_eq!(result.loss_percent, 0.0);
         assert_eq!(result.download_mbps, None);
         assert_eq!(result.upload_mbps, None);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Mihomo spawn"))
+        );
+        assert_eq!(result.resource_tests.len(), 2);
+        assert!(result.resource_tests.iter().all(|test| !test.stable));
+    }
+
+    #[test]
+    fn quick_resource_aggregation_rejects_partial_telegram_delivery() {
+        let attempts = [
+            QuickResourceAttempt {
+                ttfb_ms: 120,
+                total_ms: 200,
+                bytes: 20_000,
+            },
+            QuickResourceAttempt {
+                ttfb_ms: 180,
+                total_ms: 260,
+                bytes: 20_000,
+            },
+        ];
+
+        let result = aggregate_quick_resource_probe(
+            "telegram",
+            "Telegram",
+            3,
+            &attempts,
+            &["timeout".to_owned()],
+        );
+
+        assert_eq!(result.contract_version, 4);
+        assert!(result.reachable);
+        assert!(!result.stable);
+        assert_eq!(result.successes, 2);
+        assert_eq!(result.attempts, 3);
+        assert_eq!(result.avg_ttfb_ms, 150);
+        assert_eq!(result.max_ttfb_ms, 180);
+        assert!(result.avg_download_kbps > 0.0);
+        assert_eq!(result.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn parses_bounded_curl_metrics() {
+        let metrics = parse_curl_metrics(b"206 524288 0.561453 0.826157").expect("metrics");
+        assert_eq!(metrics.http_status, 206);
+        assert_eq!(metrics.bytes, 524_288);
+        assert_eq!(seconds_to_millis(metrics.ttfb_secs, 0), 561);
+        assert_eq!(seconds_to_millis(metrics.total_secs, 1), 826);
+    }
+
+    #[test]
+    fn parses_youtube_bootstrap_and_direct_format() {
+        let page = r#"before "visitorData":"visitor-123","signatureTimestamp":20653 after"#;
+        assert_eq!(
+            embedded_json_string(page, "visitorData").as_deref(),
+            Some("visitor-123")
+        );
+        assert_eq!(embedded_json_u64(page, "signatureTimestamp"), Some(20_653));
+        let player = serde_json::json!({
+            "streamingData": {"adaptiveFormats": [
+                {"itag": 251, "mimeType": "audio/webm", "url": "https://audio.example/"},
+                {"itag": 160, "mimeType": "video/mp4", "url": "https://video.example/"}
+            ]}
+        });
+        assert_eq!(
+            youtube_direct_media_url(&player),
+            Some("https://video.example/")
+        );
     }
 
     #[test]
@@ -1400,6 +1852,7 @@ mod tests {
             DEFAULT_DOWNLOAD_URL,
             DEFAULT_UPLOAD_URL,
             "/definitely/missing/mihomo",
+            None,
             false,
             false,
         );
@@ -1431,6 +1884,7 @@ mod tests {
             DEFAULT_DOWNLOAD_URL,
             DEFAULT_UPLOAD_URL,
             "xray",
+            None,
             false,
             false,
         );
@@ -1461,6 +1915,7 @@ mod tests {
             DEFAULT_DOWNLOAD_URL,
             DEFAULT_UPLOAD_URL,
             "/definitely/missing/mihomo",
+            None,
             true,
             true,
         );
@@ -1501,6 +1956,7 @@ mod tests {
             DEFAULT_DOWNLOAD_URL.to_owned(),
             DEFAULT_UPLOAD_URL.to_owned(),
             "xray".to_owned(),
+            None,
             false,
             false,
             Arc::clone(&job),
@@ -1524,6 +1980,55 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn quick_bench_passes_configured_mihomo_path() {
+        let profile = Profile {
+            id: 10,
+            name: "quick-path".to_owned(),
+            protocol: Protocol::Vless,
+            address: "127.0.0.1".to_owned(),
+            port: Some(443),
+            raw: "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443#quick-path".to_owned(),
+            selected: false,
+            block_quic: false,
+            group: None,
+        };
+        let job: SharedJob = Arc::new(Mutex::new(BenchJob::default()));
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let collected_for_callback = Arc::clone(&collected);
+        let handle = run_bench(
+            vec![profile],
+            BenchMethod::Quick,
+            String::new(),
+            String::new(),
+            String::new(),
+            "/definitely/missing/quick-mihomo".to_owned(),
+            None,
+            false,
+            false,
+            Arc::clone(&job),
+            Arc::new(AtomicBool::new(false)),
+            Box::new(move |result| {
+                collected_for_callback
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push(result);
+            }),
+        );
+
+        handle.join().expect("quick benchmark worker");
+        let results = collected
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("/definitely/missing/quick-mihomo"))
         );
     }
 }

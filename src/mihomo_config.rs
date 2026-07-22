@@ -774,16 +774,6 @@ pub struct PinnedServerRoute<'a> {
     pub profile: &'a Profile,
 }
 
-/// v0.17: Default URL for the RKN bypass rule provider.
-/// `itworksig/rublacklist` is auto-updated via GitHub Actions and
-/// contains all domains that should be routed through proxy (sites
-/// blocked in Russia + foreign services like Discord, Telegram, etc).
-pub const RKN_BYPASS_DEFAULT_URL: &str =
-    "https://raw.githubusercontent.com/itworksig/rublacklist/refs/heads/main/bypass.list";
-
-/// v0.17: Default update interval for RKN bypass (24 hours).
-pub const RKN_BYPASS_DEFAULT_INTERVAL: u32 = 86400;
-
 // ---------------------------------------------------------------------------
 // Feature application helpers
 // ---------------------------------------------------------------------------
@@ -1082,7 +1072,6 @@ fn build_rule_providers_json(providers: &[RuleProviderConfig]) -> Result<Value, 
 fn merge_router_rule_providers(
     providers: &[RuleProviderConfig],
     managed: &[GeoBaseRuleProvider],
-    rkn_bypass_enabled: bool,
     mihomo_home: Option<&str>,
 ) -> Result<Option<Value>, String> {
     let mut map = build_rule_providers_json(providers)?
@@ -1125,18 +1114,6 @@ fn merge_router_rule_providers(
         }
     }
 
-    if (rkn_bypass_enabled || !enabled_managed.is_empty())
-        && let Some(home) = home.as_deref()
-    {
-        let effective = effective_provider_path(
-            "./rule-providers/ru-bypass.list",
-            Some(home),
-            lexical_home.as_deref(),
-        )
-        .expect("absolute Mihomo home makes the RKN path normalizable");
-        insert_effective_provider_path(&mut effective_paths, effective, "ru-bypass")?;
-    }
-
     for provider in enabled_managed {
         provider.validate()?;
         let home = home
@@ -1166,21 +1143,6 @@ fn merge_router_rule_providers(
                 "behavior": behavior,
                 "format": "text",
                 "path": provider.path,
-            }),
-        );
-    }
-
-    if rkn_bypass_enabled {
-        if !names.insert("ru-bypass".to_owned()) {
-            return Err("duplicate rule provider name \"ru-bypass\"".to_owned());
-        }
-        map.insert(
-            "ru-bypass".to_owned(),
-            json!({
-                "type": "file",
-                "behavior": "domain",
-                "format": "text",
-                "path": "./rule-providers/ru-bypass.list",
             }),
         );
     }
@@ -1591,8 +1553,7 @@ pub fn build_mihomo_router_config(
     );
     rules.extend(features.raw_rules.iter().filter(|r| !r.is_empty()).cloned());
 
-    // Auto-learned VPN exceptions override all broad direct rules,
-    // including RKN's GEOIP,RU/DIRECT and RU Direct GEOSITE/TLD rules.
+    // Explicit VPN exceptions override all broad RU Direct rules.
     for domain in extra
         .auto_vpn_exceptions
         .iter()
@@ -1622,17 +1583,6 @@ pub fn build_mihomo_router_config(
             };
             rules.push(format!("RULE-SET,{},{}", provider.name, target_name));
         }
-    }
-
-    // v0.17: RKN Bypass — route domains blocked in Russia through proxy.
-    // The RULE-SET is emitted BEFORE GEOIP,RU so blocked domains that
-    // resolve to Russian IPs still go through proxy (not direct).
-    // GEOIP,CN keeps Chinese IPs direct (better latency, avoids blocking).
-    // Order: raw rules → GeoBase → RKN bypass → RU Direct → port mode → MATCH.
-    if extra.rkn_bypass_enabled {
-        rules.push(format!("RULE-SET,ru-bypass,{}", PROXY_NAME));
-        rules.push(format!("GEOIP,RU,{}", DIRECT_NAME));
-        rules.push(format!("GEOIP,CN,{}", DIRECT_NAME));
     }
 
     // v0.16: RU Direct — route Russian domains direct before port-mode
@@ -1777,17 +1727,9 @@ pub fn build_mihomo_router_config(
     }
 
     // Rule providers — user-defined entries plus validated local GeoBase sets.
-    // v0.17: RKN Bypass rule provider — auto-injected when enabled.
-    // v0.19.7: Changed from `type: http, behavior: classical` to
-    // `type: file, behavior: domain`. The classical behavior parsed 744K
-    // individual rule objects (~150MB RSS on mihomo). The domain behavior
-    // uses a memory-efficient trie (~20MB). Hincyray downloads and
-    // preprocesses the bypass list (strips `DOMAIN,`/`DOMAIN-SUFFIX,`
-    // prefixes) before mihomo loads it.
     if let Some(providers) = merge_router_rule_providers(
         &features.rule_providers,
         &extra.geobase_rule_providers,
-        extra.rkn_bypass_enabled,
         extra.mihomo_home.as_deref(),
     )? {
         config["rule-providers"] = providers;
@@ -6840,7 +6782,6 @@ mod tests {
             ],
             mihomo_home: Some("/opt/etc/hincyray".to_owned()),
             auto_vpn_exceptions: vec!["auto.example".to_owned()],
-            rkn_bypass_enabled: true,
             ru_direct_mode: "tld".to_owned(),
             port_mode: PortMode::AllowList,
             proxy_ports: vec!["443".to_owned()],
@@ -6869,9 +6810,6 @@ mod tests {
                 "DOMAIN-SUFFIX,auto.example,proxy",
                 "RULE-SET,active-second-in-input,proxy",
                 "RULE-SET,direct-first-in-input,DIRECT",
-                "RULE-SET,ru-bypass,proxy",
-                "GEOIP,RU,DIRECT",
-                "GEOIP,CN,DIRECT",
                 "DOMAIN-SUFFIX,ru,DIRECT",
                 "DOMAIN-SUFFIX,xn--p1ai,DIRECT",
                 "DST-PORT,443,proxy",
@@ -6989,22 +6927,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_provider_path_cannot_collide_with_user_or_ru_bypass_path() {
-        let extra = RouterExtra {
-            geobase_rule_providers: vec![managed_provider(
-                "geobase-active",
-                "/opt/etc/hincyray/rule-providers/ru-bypass.list",
-                GeoBaseRuleBehavior::Domain,
-                GeoBaseRuleTarget::Active,
-            )],
-            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
-            rkn_bypass_enabled: true,
-            ..RouterExtra::default()
-        };
-        let error = build_router_with_extra(&extra, &[], true, &MihomoFeatures::default())
-            .expect_err("RKN path collision must fail");
-        assert!(error.contains("duplicate effective rule provider path"));
-
+    fn managed_provider_path_cannot_collide_with_user_path() {
         let extra = RouterExtra {
             geobase_rule_providers: vec![managed_provider(
                 "geobase-active",
@@ -7253,310 +7176,6 @@ mod tests {
             ru_idx.expect("ru idx") < match_idx.expect("match idx"),
             "RU Direct rules must precede MATCH"
         );
-    }
-
-    #[test]
-    fn rkn_bypass_enabled_injects_ruleset_and_geoip() {
-        let profiles = parse_profiles(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
-        );
-        let extra = RouterExtra {
-            rkn_bypass_enabled: true,
-            ru_direct_mode: "geosite".to_owned(),
-            ..RouterExtra::default()
-        };
-        let yaml = build_mihomo_router_config(
-            &profiles[0],
-            &[],
-            &[],
-            &[],
-            "0.0.0.0",
-            10808,
-            Some(10810),
-            true,
-            QuicMode::Block,
-            false,
-            &extra,
-            &MihomoFeatures::default(),
-        )
-        .expect("config");
-        let rules = router_rules(&yaml);
-
-        assert!(
-            rules.iter().any(|r| r == "RULE-SET,ru-bypass,proxy"),
-            "RULE-SET,ru-bypass,proxy must be in rules when RKN bypass enabled"
-        );
-        assert!(
-            rules.iter().any(|r| r == "GEOIP,RU,DIRECT"),
-            "GEOIP,RU,DIRECT must be in rules when RKN bypass enabled"
-        );
-        assert!(
-            rules.iter().any(|r| r == "GEOIP,CN,DIRECT"),
-            "GEOIP,CN,DIRECT must be in rules when RKN bypass enabled"
-        );
-    }
-
-    #[test]
-    fn rkn_bypass_disabled_no_injection() {
-        let profiles = parse_profiles(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
-        );
-        let extra = RouterExtra {
-            rkn_bypass_enabled: false,
-            ..RouterExtra::default()
-        };
-        let yaml = build_mihomo_router_config(
-            &profiles[0],
-            &[],
-            &[],
-            &[],
-            "0.0.0.0",
-            10808,
-            Some(10810),
-            true,
-            QuicMode::Block,
-            false,
-            &extra,
-            &MihomoFeatures::default(),
-        )
-        .expect("config");
-        let rules = router_rules(&yaml);
-
-        assert!(
-            !rules.iter().any(|r| r.starts_with("RULE-SET,ru-bypass")),
-            "RULE-SET,ru-bypass must NOT be in rules when RKN bypass disabled"
-        );
-        assert!(
-            !rules.iter().any(|r| r == "GEOIP,RU,DIRECT"),
-            "GEOIP,RU,DIRECT must NOT be injected when RKN bypass disabled"
-        );
-    }
-
-    #[test]
-    fn rkn_bypass_provider_in_config() {
-        let profiles = parse_profiles(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
-        );
-        let extra = RouterExtra {
-            rkn_bypass_enabled: true,
-            ..RouterExtra::default()
-        };
-        let yaml = build_mihomo_router_config(
-            &profiles[0],
-            &[],
-            &[],
-            &[],
-            "0.0.0.0",
-            10808,
-            Some(10810),
-            true,
-            QuicMode::Block,
-            false,
-            &extra,
-            &MihomoFeatures::default(),
-        )
-        .expect("config");
-        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
-        let providers = config
-            .get("rule-providers")
-            .and_then(Value::as_object)
-            .expect("rule-providers must exist");
-        let bypass = providers
-            .get("ru-bypass")
-            .expect("ru-bypass provider must exist");
-        // v0.19.7: Changed from type:http/classical to type:file/domain
-        // to reduce mihomo RSS from ~150MB to ~20MB on routers.
-        assert_eq!(bypass["type"], "file");
-        assert_eq!(bypass["behavior"], "domain");
-        assert_eq!(bypass["format"], "text");
-        assert_eq!(bypass["path"], "./rule-providers/ru-bypass.list");
-    }
-
-    #[test]
-    fn rkn_bypass_custom_url() {
-        let profiles = parse_profiles(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
-        );
-        let extra = RouterExtra {
-            rkn_bypass_enabled: true,
-            rkn_bypass_url: "https://example.com/custom.list".to_owned(),
-            rkn_bypass_interval: 3600,
-            ..RouterExtra::default()
-        };
-        let yaml = build_mihomo_router_config(
-            &profiles[0],
-            &[],
-            &[],
-            &[],
-            "0.0.0.0",
-            10808,
-            Some(10810),
-            true,
-            QuicMode::Block,
-            false,
-            &extra,
-            &MihomoFeatures::default(),
-        )
-        .expect("config");
-        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
-        let bypass = config
-            .get("rule-providers")
-            .and_then(Value::as_object)
-            .and_then(|m| m.get("ru-bypass"))
-            .expect("ru-bypass provider");
-        // v0.19.7: URL/interval are no longer in the rule provider config.
-        // Hincyray downloads and preprocesses the bypass list; Mihomo loads
-        // the local file with type:file/behavior:domain.
-        assert_eq!(bypass["type"], "file");
-        assert_eq!(bypass["behavior"], "domain");
-    }
-
-    #[test]
-    fn rkn_bypass_order_before_ru_direct() {
-        let profiles = parse_profiles(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
-        );
-        let extra = RouterExtra {
-            rkn_bypass_enabled: true,
-            ru_direct_mode: "geosite".to_owned(),
-            ..RouterExtra::default()
-        };
-        let yaml = build_mihomo_router_config(
-            &profiles[0],
-            &[],
-            &[],
-            &[],
-            "0.0.0.0",
-            10808,
-            Some(10810),
-            true,
-            QuicMode::Block,
-            false,
-            &extra,
-            &MihomoFeatures::default(),
-        )
-        .expect("config");
-        let rules = router_rules(&yaml);
-
-        let ruleset_idx = rules
-            .iter()
-            .position(|r| r == "RULE-SET,ru-bypass,proxy")
-            .expect("ruleset");
-        let geoip_ru_idx = rules
-            .iter()
-            .position(|r| r == "GEOIP,RU,DIRECT")
-            .expect("geoip ru");
-        let geosite_ru_idx = rules
-            .iter()
-            .position(|r| r == "GEOSITE,category-ru,DIRECT")
-            .expect("geosite ru");
-        let match_idx = rules
-            .iter()
-            .position(|r| r.starts_with("MATCH,"))
-            .expect("match");
-
-        // RULE-SET → GEOIP,RU → GEOIP,CN → GEOSITE,category-ru → MATCH
-        assert!(ruleset_idx < geoip_ru_idx, "RULE-SET must precede GEOIP,RU");
-        assert!(
-            geoip_ru_idx < geosite_ru_idx,
-            "GEOIP,RU must precede GEOSITE,category-ru"
-        );
-        assert!(
-            geosite_ru_idx < match_idx,
-            "GEOSITE,category-ru must precede MATCH"
-        );
-    }
-
-    #[test]
-    fn auto_vpn_exceptions_precede_rkn_and_ru_direct() {
-        let profiles = parse_profiles(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
-        );
-        let extra = RouterExtra {
-            rkn_bypass_enabled: true,
-            ru_direct_mode: "geosite".to_owned(),
-            auto_vpn_exceptions: vec!["blocked.example".to_owned()],
-            ..RouterExtra::default()
-        };
-        let yaml = build_mihomo_router_config(
-            &profiles[0],
-            &[],
-            &[],
-            &[],
-            "0.0.0.0",
-            10808,
-            Some(10810),
-            true,
-            QuicMode::Block,
-            false,
-            &extra,
-            &MihomoFeatures::default(),
-        )
-        .expect("config");
-        let rules = router_rules(&yaml);
-        let auto_idx = rules
-            .iter()
-            .position(|r| r == "DOMAIN-SUFFIX,blocked.example,proxy")
-            .expect("auto vpn exception");
-        let rkn_idx = rules
-            .iter()
-            .position(|r| r == "RULE-SET,ru-bypass,proxy")
-            .expect("rkn");
-        let geoip_idx = rules
-            .iter()
-            .position(|r| r == "GEOIP,RU,DIRECT")
-            .expect("geoip ru");
-        let ru_direct_idx = rules
-            .iter()
-            .position(|r| r == "GEOSITE,category-ru,DIRECT")
-            .expect("ru direct");
-
-        assert!(auto_idx < rkn_idx, "auto VPN exception must precede RKN");
-        assert!(
-            auto_idx < geoip_idx,
-            "auto VPN exception must precede GEOIP,RU"
-        );
-        assert!(
-            auto_idx < ru_direct_idx,
-            "auto VPN exception must precede RU Direct"
-        );
-    }
-
-    #[test]
-    fn rkn_bypass_empty_url_uses_default() {
-        let profiles = parse_profiles(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
-        );
-        let extra = RouterExtra {
-            rkn_bypass_enabled: true,
-            rkn_bypass_url: "  ".to_owned(),
-            ..RouterExtra::default()
-        };
-        let yaml = build_mihomo_router_config(
-            &profiles[0],
-            &[],
-            &[],
-            &[],
-            "0.0.0.0",
-            10808,
-            Some(10810),
-            true,
-            QuicMode::Block,
-            false,
-            &extra,
-            &MihomoFeatures::default(),
-        )
-        .expect("config");
-        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
-        let bypass = config
-            .get("rule-providers")
-            .and_then(Value::as_object)
-            .and_then(|m| m.get("ru-bypass"))
-            .expect("ru-bypass provider");
-        // v0.19.7: URL is no longer in the rule provider config.
-        // The provider is always type:file/behavior:domain regardless of URL.
-        assert_eq!(bypass["type"], "file");
-        assert_eq!(bypass["behavior"], "domain");
     }
 
     #[test]

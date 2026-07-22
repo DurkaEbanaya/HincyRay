@@ -118,9 +118,6 @@ const routing = {
     ru_direct_exceptions: [],
     auto_vpn_learning_enabled: false,
     auto_vpn_exceptions: [],
-    rkn_bypass_enabled: false,
-    rkn_bypass_url: '',
-    rkn_bypass_interval: 86400,
   },
 };
 
@@ -145,7 +142,10 @@ const responses = new Map([
     model: 'Fixture Router',
   }],
   ['/api/memory-guard', { mihomo: { pid: 100, rss_kb: 1024 }, top_processes: [], warnings: [] }],
-  ['/api/stats', { stats: [{ profile_id: profile.id, score: 90, last_latency_ms: 25 }] }],
+  ['/api/stats', { stats: [{ profile_id: profile.id, score: 90, last_latency_ms: 25, resource_tests: [
+    { contract_version: 4, id: 'youtube', name: 'YouTube', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 120 },
+    { contract_version: 4, id: 'telegram', name: 'Telegram', attempts: 1, successes: 0, stable: false, avg_ttfb_ms: 240 },
+  ] }] }],
   ['/api/profiles', { profiles: [profile] }],
   ['/api/routing', routing],
   ['/api/routing/connection-context', { servers: routing.servers }],
@@ -166,6 +166,7 @@ const responses = new Map([
   ['/api/auth-settings', { enabled: false, username: 'admin' }],
   ['/api/update/status', { current_version: 'fixture', auto_update_enabled: false }],
   ['/api/bench/status', { running: false, results: [] }],
+  ['/api/telegram-probe/status', { configured: false, session_exists: false, authorized: false, login_pending: false }],
   ['/api/geo/status', {}],
   ['/api/geobases', { geobases: [] }],
   ['/api/devices', { count: 1, devices: [{ iface: 'br0', ip: '192.0.2.10', mac: 'aa:bb:cc:dd:ee:ff' }] }],
@@ -232,6 +233,18 @@ const server = http.createServer(async (request, response) => {
     }
     if (request.method === 'POST' && url.pathname === '/api/auth/login') {
       sendJson(response, 200, { token: 'fixture-token' });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/telegram-probe/request-code') {
+      sendJson(response, 200, { code_requested: true });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/telegram-probe/confirm') {
+      sendJson(response, 200, { authorized: true });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/telegram-probe/delete') {
+      sendJson(response, 200, { deleted: true, revoked: true });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/routing/rules') {
