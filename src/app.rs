@@ -1,5 +1,4 @@
 use std::{
-    cmp::Reverse,
     collections::HashSet,
     fs,
     path::PathBuf,
@@ -69,7 +68,6 @@ struct StatSample {
     timestamp: u64,
     profile_raw: String,
     profile_name: String,
-    score: u32,
     passed: bool,
     latency_ms: u32,
     download_mbps: f32,
@@ -365,7 +363,6 @@ impl XrayVpnTestApp {
                         jitter_ms: 0,
                         download_mbps: 0.0,
                         loss_percent: 0.0,
-                        score: 0,
                         status: TestStatus::Running,
                     });
                 }
@@ -377,7 +374,7 @@ impl XrayVpnTestApp {
                         self.record_stat_sample(&result);
                     }
                     self.results.push(result);
-                    self.results.sort_by_key(|result| Reverse(result.score));
+                    self.results.sort_by_key(|result| result.latency_ms);
                     self.save_state();
                 }
                 TestUpdate::Finished => {
@@ -420,7 +417,6 @@ impl XrayVpnTestApp {
             timestamp: unix_now(),
             profile_raw: profile.raw.clone(),
             profile_name: profile.name.clone(),
-            score: result.score,
             passed: matches!(result.status, TestStatus::Passed),
             latency_ms: result.latency_ms,
             download_mbps: result.download_mbps,
@@ -443,9 +439,15 @@ impl XrayVpnTestApp {
         ids.sort_by(|left, right| {
             let left_profile = self.profiles.iter().find(|profile| profile.id == *left);
             let right_profile = self.profiles.iter().find(|profile| profile.id == *right);
-            let left_score = self.result_for(*left).map_or(0, |result| result.score);
-            let right_score = self.result_for(*right).map_or(0, |result| result.score);
-            right_score.cmp(&left_score).then_with(|| {
+            let left_latency = self
+                .result_for(*left)
+                .filter(|result| matches!(result.status, TestStatus::Passed))
+                .map_or(u32::MAX, |result| result.latency_ms);
+            let right_latency = self
+                .result_for(*right)
+                .filter(|result| matches!(result.status, TestStatus::Passed))
+                .map_or(u32::MAX, |result| result.latency_ms);
+            left_latency.cmp(&right_latency).then_with(|| {
                 left_profile
                     .map(|profile| profile.name.as_str())
                     .cmp(&right_profile.map(|profile| profile.name.as_str()))
@@ -892,7 +894,6 @@ impl XrayVpnTestApp {
                             .column(Column::initial(86.0).at_least(76.0))
                             .column(Column::initial(112.0).at_least(84.0))
                             .column(Column::initial(92.0).at_least(72.0))
-                            .column(Column::initial(90.0).at_least(66.0))
                             .header(28.0, |mut header| {
                                 for title in [
                                     "",
@@ -904,7 +905,6 @@ impl XrayVpnTestApp {
                                     "Джиттер",
                                     "Скорость",
                                     "Потери",
-                                    "Оценка",
                                 ] {
                                     header.col(|ui| {
                                         ui.label(
@@ -1013,9 +1013,6 @@ impl XrayVpnTestApp {
                                         ui.label(metric_text(result.as_ref(), |value| {
                                             format!("{:.1}%", value.loss_percent)
                                         }));
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(score_text(result.as_ref()));
                                     });
                                 });
                             });
@@ -1224,9 +1221,17 @@ impl XrayVpnTestApp {
 
         let mut points = Vec::new();
         let count = samples.len().max(2) as f32;
+        let max_latency = samples
+            .iter()
+            .filter(|sample| sample.passed)
+            .map(|sample| sample.latency_ms)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f32;
         for (index, sample) in samples.iter().rev().enumerate() {
             let x = graph.left() + graph.width() * index as f32 / (count - 1.0);
-            let y = graph.bottom() - graph.height() * sample.score as f32 / 100.0;
+            let y = graph.top()
+                + graph.height() * (sample.latency_ms as f32 / max_latency).clamp(0.0, 1.0);
             points.push(egui::pos2(x, y));
             painter.circle_filled(
                 egui::pos2(x, y),
@@ -1409,27 +1414,5 @@ fn metric_text(result: Option<&TestResult>, format: impl FnOnce(&TestResult) -> 
             TestStatus::Passed => String::new(),
         },
         None => "-".to_owned(),
-    }
-}
-
-fn score_text(result: Option<&TestResult>) -> RichText {
-    match result {
-        Some(value) if matches!(value.status, TestStatus::Passed) => {
-            let color = if value.score >= 75 {
-                Color32::from_rgb(92, 220, 128)
-            } else if value.score >= 45 {
-                Color32::from_rgb(255, 196, 87)
-            } else {
-                Color32::from_rgb(255, 111, 111)
-            };
-            RichText::new(value.score.to_string()).strong().color(color)
-        }
-        Some(value) => match &value.status {
-            TestStatus::Failed(_) => RichText::new("0").color(Color32::from_rgb(255, 111, 111)),
-            TestStatus::Pending => RichText::new("-").color(Color32::GRAY),
-            TestStatus::Running => RichText::new("...").color(Color32::GRAY),
-            TestStatus::Passed => RichText::new("-"),
-        },
-        None => RichText::new("-").color(Color32::GRAY),
     }
 }

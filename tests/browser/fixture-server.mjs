@@ -8,6 +8,7 @@ const webUiPath = path.resolve(fixtureDir, '../../src/webui/index.html');
 const webUi = await readFile(webUiPath);
 const port = Number(process.env.PLAYWRIGHT_FIXTURE_PORT || 4173);
 
+const fixtureSubscriptionUrl = 'https://provider.example/sub/fixture-token';
 const profile = {
   id: 101,
   name: 'Fixture Profile',
@@ -17,9 +18,10 @@ const profile = {
   port: 443,
   active: true,
   favorite: false,
-  group: 'Fixture Group',
+  group: fixtureSubscriptionUrl,
   raw: 'vless://fixture@example.invalid:443',
 };
+const deadServerRef = 'srv-v2-fixture-dead';
 
 const canonicalConnection = {
       id: 'canonical-chatgpt',
@@ -100,7 +102,7 @@ const routing = {
       name: 'Fixture Profile',
       protocol: 'VLESS',
       address: 'fixture.proxy.test',
-      group: 'Fixture Group',
+      group: fixtureSubscriptionUrl,
       active: true,
     },
   ],
@@ -142,7 +144,7 @@ const responses = new Map([
     model: 'Fixture Router',
   }],
   ['/api/memory-guard', { mihomo: { pid: 100, rss_kb: 1024 }, top_processes: [], warnings: [] }],
-  ['/api/stats', { stats: [{ profile_id: profile.id, score: 90, last_latency_ms: 25, resource_tests: [
+  ['/api/stats', { stats: [{ profile_id: profile.id, last_latency_ms: 25, resource_tests: [
     { contract_version: 5, id: 'youtube', name: 'YouTube', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 120 },
     { contract_version: 5, id: 'telegram', name: 'Telegram', attempts: 1, successes: 0, stable: false, avg_ttfb_ms: 240 },
     { contract_version: 5, id: 'ai', name: 'AI Studio', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 180 },
@@ -154,7 +156,14 @@ const responses = new Map([
   ['/api/onboarding/status', { ready: true, checks: [] }],
   ['/api/safe-mode', { enabled: false, suppressed: [] }],
   ['/api/memory-estimate', { risk: 'observed-ok', reasons: [] }],
-  ['/api/subscriptions', { subscriptions: [] }],
+  ['/api/subscriptions', { subscriptions: [{
+    url: fixtureSubscriptionUrl,
+    title: 'Fixture VPN',
+    announcement: '🍿 Streaming servers\n🎮 Low-latency servers',
+    profile_count: 1,
+    last_loaded_unix: 1719900000,
+    last_error: null,
+  }] }],
   ['/api/subscriptions/refresh-report', { report: [] }],
   ['/api/backups', { backups: [] }],
   ['/api/traffic', { current_up_kbps: 0, current_down_kbps: 0, total_up_bytes: 0, total_down_bytes: 0 }],
@@ -167,6 +176,14 @@ const responses = new Map([
   ['/api/auth-settings', { enabled: false, username: 'admin' }],
   ['/api/update/status', { current_version: 'fixture', auto_update_enabled: false }],
   ['/api/bench/status', { running: false, results: [] }],
+  ['/api/trash', { count: 1, trash: [{
+    server_ref: deadServerRef,
+    name: 'Fixture Dead',
+    profile_id: 202,
+    group: fixtureSubscriptionUrl,
+    promoted_at_unix: 1719900000,
+    still_in_profiles: true,
+  }] }],
   ['/api/telegram-probe/status', { configured: false, session_exists: false, authorized: false, login_pending: false }],
   ['/api/geo/status', {}],
   ['/api/geobases', { geobases: [] }],

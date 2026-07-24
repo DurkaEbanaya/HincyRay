@@ -46,6 +46,97 @@ test('profile table shows compact service status and configurable metric columns
   await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('hr_profile_metrics') || '[]').includes('upload'))).toBe(true);
 });
 
+test('profile technical columns are optional and row actions stay beside the name', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const row = page.locator('#profilesBody tr').filter({ hasText: 'Fixture Profile' });
+  await expect(page.locator('#profilesTable thead [data-profile-metric="id"]')).toBeHidden();
+  await expect(page.locator('#profilesTable thead [data-profile-metric="protocol"]')).toBeHidden();
+  await expect(page.locator('#profilesTable thead [data-profile-metric="transport"]')).toBeHidden();
+  await expect(page.locator('#profilesTable thead [data-profile-metric="address"]')).toBeHidden();
+  await expect(row.locator('.profile-name-cell .profile-row-actions')).toContainText('Активен');
+  await expect(row.locator('.profile-name-cell').getByTitle('Тест сервера')).toBeVisible();
+  await expect(row.locator('.profile-name-cell').getByTitle('Переименовать')).toBeVisible();
+  await expect(row.locator('.profile-name-cell').getByTitle('Удалить')).toBeVisible();
+  const starCell = row.locator('td').first();
+  await expect(starCell.locator('.star')).toBeVisible();
+  expect(await starCell.evaluate(cell => ({ width: cell.getBoundingClientRect().width, position: getComputedStyle(cell).position }))).toEqual(expect.objectContaining({ position: 'static' }));
+  expect((await starCell.evaluate(cell => cell.getBoundingClientRect().width))).toBeLessThanOrEqual(40);
+
+  await page.locator('#profileMetricSettings > button').click();
+  await page.locator('#profileMetricSettings input[data-profile-metric="protocol"]').check();
+  await expect(page.locator('#profilesTable thead [data-profile-metric="protocol"]')).toBeVisible();
+});
+
+test('profile group shows provider title and announcement from subscription metadata', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const announcement = page.locator('#profilesBody .subscription-announcement');
+  await expect(page.locator('#profilesBody')).toContainText('Fixture VPN');
+  await expect(announcement.locator('.subscription-announcement-label')).toHaveText('От автора подписки');
+  await expect(announcement.locator('.subscription-announcement-text')).toHaveText('🍿 Streaming servers\n🎮 Low-latency servers');
+  const alignment = await announcement.evaluate(element => {
+    const table = element.closest('table');
+    const wrapper = table.parentElement;
+    const groupHeader = table.querySelector('.profile-group-row td');
+    return {
+      announcementLeft: element.getBoundingClientRect().left,
+      tableLeft: table.getBoundingClientRect().left,
+      announcementWidth: element.getBoundingClientRect().width,
+      tableWidth: table.getBoundingClientRect().width,
+      wrapperWidth: wrapper.getBoundingClientRect().width,
+      groupHeaderAlign: getComputedStyle(groupHeader).textAlign,
+    };
+  });
+  expect(Math.abs(alignment.announcementLeft - alignment.tableLeft)).toBeLessThanOrEqual(1);
+  expect(Math.abs(alignment.announcementWidth - alignment.tableWidth)).toBeLessThanOrEqual(1);
+  expect(alignment.groupHeaderAlign).toBe('left');
+  expect(alignment.tableWidth).toBeLessThan(alignment.wrapperWidth);
+  await expect(announcement).toHaveCSS('text-align', 'left');
+});
+
+test('Dead Servers supports single and bulk diagnostics, restore, and clear', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'trash');
+  const list = page.locator('#trashList');
+  await expect(list).toContainText('Fixture Dead');
+
+  const singleQuick = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/bench/start'
+  );
+  await list.getByRole('button', { name: '⚡ Быстрый тест', exact: true }).click();
+  expect((await singleQuick).postDataJSON()).toEqual(expect.objectContaining({
+    profile_ids: [202],
+    method: 'quick',
+    test_download: false,
+    test_upload: false,
+  }));
+
+  const bulkQuick = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/bench/start'
+  );
+  await page.locator('#trashQuickAll').click();
+  expect((await bulkQuick).postDataJSON()).toEqual(expect.objectContaining({
+    profile_ids: [202],
+    method: 'quick',
+    test_download: false,
+    test_upload: false,
+  }));
+
+  const restoreAll = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/trash/restore'
+  );
+  await page.locator('#trashRestoreAll').click();
+  expect((await restoreAll).postDataJSON()).toEqual({ server_refs: ['srv-v2-fixture-dead'] });
+
+  const clearAll = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/trash/clear'
+  );
+  await page.locator('#trashClearAll').click();
+  await page.locator('#confirmBtn').click();
+  expect((await clearAll).postDataJSON()).toEqual({});
+});
+
 test('Telegram provisioning posts secrets without persisting them in the browser', async ({ page }) => {
   await openFixture(page);
   await navigateTo(page, 'profiles');

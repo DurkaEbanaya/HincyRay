@@ -191,8 +191,7 @@ Hotfix: страница «Система» теперь явно показыв
 ### v0.14.0
 
 - **Rule Trace**: `POST /api/routing/trace` объясняет локальное решение роутинга для host/IP/port/protocol/source IP. Runtime-матчи `geosite:*`, `geoip:*` и `rule-set:*` помечаются как кандидаты для оценки Mihomo, а не угадываются локально.
-- **Sub-Store Lite**: лёгкая чистка уже распарсенных профилей — include/exclude-фильтры, правила переименования, дедуп по protocol/address/port, сортировка по name/group/protocol/address/score/latency и backup-before-apply. `GET/POST /api/substore-lite`, `POST /api/substore-lite/apply`.
-- **Smart Auto-Select 2.0**: EWMA score/latency/download, минимальное число успешных проверок, штраф за ошибки и cooldown для падающих профилей. Настраивается через `/api/auto-settings`.
+- **Sub-Store Lite**: лёгкая чистка уже распарсенных профилей — include/exclude-фильтры, правила переименования, дедуп по protocol/address/port, сортировка по name/group/protocol/address/latency и backup-before-apply. `GET/POST /api/substore-lite`, `POST /api/substore-lite/apply`.
 - **Бэкапы и WebDAV**: локальные state-бэкапы create/list/restore/delete плюс WebDAV upload/download. Restore валидирует JSON состояния, создаёт pre-restore backup и безопасно регенерирует runtime-конфиг.
 - **Diagnostics & Recovery**: секция веб-панели для rule trace, DNS diagnostics, unlock checks, Sub-Store Lite, бэкапов, WebDAV и закрытия соединений.
 - **Unlock checker + DNS diagnostics**: `POST /api/unlock-check` проверяет популярные сервисы; `GET /api/dns/diagnostics` проверяет локальный resolver и доступность Mihomo DNS/API.
@@ -259,7 +258,7 @@ Hotfix: страница «Система» теперь явно показыв
 
 - **Always-on watchdog**: перезапуск ядра с exponential backoff, мониторинг firewall-правил.
 - **Health-check failover**: 3 последовательных сбоя → переключение на следующий лучший профиль.
-- **Auto-benchmark + auto-select**: запланированный бенчмарк, переключение на профиль с наивысшим score.
+- **Auto-benchmark + auto-select**: запланированный бенчмарк, переключение на недавно успешный профиль с минимальной задержкой.
 - **Graceful shutdown**: SIGTERM/SIGINT останавливает ядро, удаляет iptables, сохраняет state.
 - **Восстановление после повреждения state**: повреждённый `state.json` → бэкап, свежее состояние.
 - **Системный мониторинг**: CPU/RAM/temp/load/uptime через `/proc` + `/sys`.

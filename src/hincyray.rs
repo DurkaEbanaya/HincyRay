@@ -2,7 +2,7 @@
 //!
 //! Lightweight sync HTTP server on `std::net::TcpListener`, no async
 //! runtime, no web framework. Shares `profiles`, `xray_config`, and
-//! `scoring` with the desktop app so parser/scoring logic is not
+//! benchmark execution with the desktop app so parser/probe logic is not
 //! duplicated.
 //!
 //! Default bind: `0.0.0.0:8088`. Override with `HINCYRAY_LISTEN`.
@@ -69,8 +69,8 @@ use crate::mihomo_config::{
     build_mihomo_config, build_mihomo_router_config,
 };
 use crate::profiles::{
-    HwidConfig, Profile, SubscriptionSource, load_subscription_detailed_via_proxy_with_hwid,
-    parse_input,
+    HwidConfig, Profile, SubscriptionMetadata, SubscriptionSource,
+    load_subscription_detailed_via_proxy_with_hwid, parse_input,
 };
 use crate::telegram_probe::{
     ConfirmResult, LoginState, TelegramProbeConfig, confirm_login as telegram_confirm_login,
@@ -701,8 +701,8 @@ pub struct HincyrayState {
     pub hwid_config: HwidConfig,
     /// v0.6: Auto-benchmark interval in hours (0 = disabled). When > 0,
     /// the watchdog triggers a TCP benchmark on all profiles every N
-    /// hours. If `auto_select` is true, switches to the best-scoring
-    /// profile after the benchmark completes.
+    /// hours. If `auto_select` is true, switches to the lowest-latency
+    /// recently successful profile after the benchmark completes.
     #[serde(default)]
     pub auto_bench_interval_hours: u32,
     /// v0.6: Unix timestamp of the last auto-triggered benchmark.
@@ -763,9 +763,6 @@ pub struct HincyrayState {
     /// v0.14: Sub-Store Lite profile cleanup pipeline.
     #[serde(default)]
     pub sub_store_lite: SubStoreLiteSettings,
-    /// v0.14: rolling health based auto-selection settings.
-    #[serde(default)]
-    pub smart_select: SmartSelectSettings,
     /// v0.14: scheduled maintenance window settings.
     #[serde(default)]
     pub maintenance: MaintenanceSettings,
@@ -841,7 +838,6 @@ impl Default for HincyrayState {
             mihomo_features: MihomoFeatures::default(),
             web_ui_auth: WebUiAuth::default(),
             sub_store_lite: SubStoreLiteSettings::default(),
-            smart_select: SmartSelectSettings::default(),
             maintenance: MaintenanceSettings::default(),
             last_subscription_refresh_report: None,
             undo_stack: Vec::new(),
@@ -1077,11 +1073,6 @@ impl UnlockTestResult {
         .filter(|&&r| r)
         .count() as u32
     }
-
-    /// Unlock score for composite (0..=100). 4/4 = 100, 0/4 = 0.
-    pub fn score(&self) -> u32 {
-        (self.reachable_count() * 25).min(100)
-    }
 }
 
 /// v0.20: One row of quality history. Stored by opaque canonical server
@@ -1099,8 +1090,9 @@ pub struct DailyQualitySnapshot {
     /// Snapshot of profile name at test time (for UI display when the
     /// profile is no longer in any subscription).
     pub profile_name: String,
-    /// Composite score 0-100 from Phase A (quick bench).
-    pub quick_score: u32,
+    /// Whether Phase A reached the profile successfully.
+    #[serde(default)]
+    pub phase_a_success: bool,
     /// Stability metrics from Phase B. None if the profile did not
     /// pass Phase A (filtered out as unavailable or low-quality).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1108,9 +1100,6 @@ pub struct DailyQualitySnapshot {
     /// Unlock-test result from Phase B.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlock: Option<UnlockTestResult>,
-    /// Final weighted score 0-100 combining quick_score + stability +
-    /// unlock. Used for sorting and trend display.
-    pub composite_score: u32,
 }
 
 /// v0.20: Live status of a running (or last) deep bench. Polled by
@@ -1150,7 +1139,7 @@ pub struct SubStoreLiteSettings {
     pub rename_rules: Vec<SubStoreRenameRule>,
     #[serde(default = "default_true")]
     pub deduplicate: bool,
-    /// `name`, `group`, `protocol`, `address`, `score`, or `latency`.
+    /// `name`, `group`, `protocol`, `address`, or `latency`.
     #[serde(default = "default_substore_sort")]
     pub sort_by: String,
     #[serde(default)]
@@ -1171,42 +1160,8 @@ pub struct SubStoreRenameRule {
     pub to: String,
 }
 
-/// v0.14: rolling health state added to `ProfileStats`. The old fields
-/// remain the source of truth for legacy score tables; these fields provide
-/// a smoothed selector that resists one-off fast/failed probes.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SmartSelectSettings {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_smart_min_successes")]
-    pub min_successes: u32,
-    #[serde(default = "default_smart_cooldown_secs")]
-    pub cooldown_secs: u64,
-    #[serde(default = "default_smart_failure_penalty")]
-    pub failure_penalty: f32,
-}
-
-impl Default for SmartSelectSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            min_successes: default_smart_min_successes(),
-            cooldown_secs: default_smart_cooldown_secs(),
-            failure_penalty: default_smart_failure_penalty(),
-        }
-    }
-}
-
-fn default_smart_min_successes() -> u32 {
-    1
-}
-
 fn default_smart_cooldown_secs() -> u64 {
     300
-}
-
-fn default_smart_failure_penalty() -> f32 {
-    25.0
 }
 
 /// v0.14: daily/periodic maintenance actions performed by the watchdog.
@@ -1256,7 +1211,6 @@ fn default_maintenance_interval_days() -> u32 {
 pub struct MetricSample {
     pub timestamp: u64,
     pub profile_id: usize,
-    pub score: u32,
     pub passed: bool,
     pub latency_ms: u32,
     pub download_mbps: f32,
@@ -1418,11 +1372,23 @@ fn routing_presets() -> Vec<RoutingPreset> {
 pub struct StoredSubscription {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announcement: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_loaded_unix: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default)]
     pub profile_count: usize,
+}
+
+fn apply_subscription_metadata(
+    subscription: &mut StoredSubscription,
+    metadata: SubscriptionMetadata,
+) {
+    subscription.title = metadata.title;
+    subscription.announcement = metadata.announcement;
 }
 
 /// v0.2: per-profile benchmark statistics keyed by raw share link so
@@ -1441,8 +1407,6 @@ pub struct ProfileStats {
     #[serde(default)]
     pub last_loss_percent: f32,
     #[serde(default)]
-    pub last_score: u32,
-    #[serde(default)]
     pub success_count: u32,
     #[serde(default)]
     pub failure_count: u32,
@@ -1452,8 +1416,6 @@ pub struct ProfileStats {
     pub last_checked_unix: u64,
     #[serde(default)]
     pub resource_tests: Vec<ResourceTestResult>,
-    #[serde(default)]
-    pub ewma_score: f32,
     #[serde(default)]
     pub ewma_latency_ms: f32,
     #[serde(default)]
@@ -1472,8 +1434,6 @@ pub struct ProfileStats {
     pub has_upload: bool,
     #[serde(default)]
     pub has_loss: bool,
-    #[serde(default)]
-    pub has_score: bool,
     #[serde(default)]
     pub has_ewma: bool,
 }
@@ -3210,7 +3170,6 @@ fn load_state_with_hasher(
             stat.has_latency = true;
             stat.has_jitter = true;
             stat.has_loss = true;
-            stat.has_score = true;
             stat.has_ewma = true;
         }
         stat.has_download |= stat.last_download_mbps > 0.0;
@@ -4371,7 +4330,6 @@ fn dispatch_from(
                 "hwid": inner.state.hwid_config.hwid,
                 "proxy_group_enabled": inner.state.mihomo_features.proxy_group.enabled,
                 "ec_enabled": inner.state.mihomo_features.external_controller.enabled,
-                "smart_select": inner.state.smart_select,
                 "maintenance": inner.state.maintenance,
             });
             (200, "application/json", response.to_string())
@@ -4446,6 +4404,7 @@ fn dispatch_from(
         ("GET", "/api/trash") => handle_trash_list(daemon),
         ("POST", "/api/trash/move") => handle_trash_move(body, daemon),
         ("POST", "/api/trash/restore") => handle_trash_restore(body, daemon),
+        ("POST", "/api/trash/clear") => handle_trash_clear(daemon),
         ("POST", "/api/trash/purge-gone") => handle_trash_purge_gone(daemon),
         ("POST", "/api/subscriptions/refresh") => handle_subscriptions_refresh(daemon),
         ("GET", "/api/subscriptions/refresh-report") => handle_subscriptions_refresh_report(daemon),
@@ -4607,12 +4566,16 @@ fn handle_import(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
         }
     }
     let mut errors: Vec<String> = Vec::new();
-    // Stored per-source outcome so we can update `subscriptions` meta
-    // after merging profiles. `Ok` carries only the count since the
-    // profiles themselves are moved into `incoming`.
+    // Stored per-source outcome so we can update subscription metadata
+    // after moving the profiles into `incoming`.
     enum StoredOutcome {
-        Ok { count: usize },
-        Failed { error: String },
+        Ok {
+            count: usize,
+            metadata: SubscriptionMetadata,
+        },
+        Failed {
+            error: String,
+        },
     }
     let mut loaded_subs: Vec<(SubscriptionSource, StoredOutcome)> = Vec::new();
 
@@ -4638,7 +4601,10 @@ fn handle_import(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
                     }
                 }
                 incoming.extend(sub_profiles);
-                StoredOutcome::Ok { count }
+                StoredOutcome::Ok {
+                    count,
+                    metadata: report.metadata,
+                }
             }
             SubscriptionLoadOutcome::Failed { attempts } => {
                 let error = SubscriptionLoadOutcome::format_error(&attempts);
@@ -4693,6 +4659,8 @@ fn handle_import(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
         } else {
             inner.state.subscriptions.push(StoredSubscription {
                 url: source.url.clone(),
+                title: None,
+                announcement: None,
                 last_loaded_unix: None,
                 last_error: None,
                 profile_count: 0,
@@ -4704,10 +4672,11 @@ fn handle_import(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
                 .expect("just pushed a subscription entry")
         };
         match outcome {
-            StoredOutcome::Ok { count } => {
+            StoredOutcome::Ok { count, metadata } => {
                 entry.last_loaded_unix = Some(now);
                 entry.last_error = None;
                 entry.profile_count = *count;
+                apply_subscription_metadata(entry, metadata.clone());
             }
             StoredOutcome::Failed { error } => {
                 entry.last_error = Some(error.clone());
@@ -6448,8 +6417,6 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
     };
 
     {
-        let smart_failure_penalty = inner.state.smart_select.failure_penalty;
-        let smart_cooldown_secs = inner.state.smart_select.cooldown_secs;
         let stats_entry = &mut inner.state.stats[stats_idx];
         if result.method == "quick" {
             stats_entry.resource_tests = result.resource_tests.clone();
@@ -6468,9 +6435,7 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
                 stats_entry.has_upload = true;
             }
             stats_entry.last_loss_percent = result.loss_percent;
-            stats_entry.last_score = result.score;
             stats_entry.has_loss = true;
-            stats_entry.has_score = true;
             stats_entry.last_error = result
                 .download_error
                 .clone()
@@ -6482,8 +6447,7 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
         } else {
             stats_entry.failure_count = stats_entry.failure_count.saturating_add(1);
             stats_entry.consecutive_failures = stats_entry.consecutive_failures.saturating_add(1);
-            stats_entry.ewma_score = (stats_entry.ewma_score - smart_failure_penalty).max(0.0);
-            stats_entry.cooldown_until_unix = now.saturating_add(smart_cooldown_secs);
+            stats_entry.cooldown_until_unix = now.saturating_add(default_smart_cooldown_secs());
             stats_entry.last_error = result.error.clone();
         }
         stats_entry.last_checked_unix = now;
@@ -6492,7 +6456,6 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
     inner.state.metrics_history.push(MetricSample {
         timestamp: now,
         profile_id: result.profile_id,
-        score: result.score,
         passed: result.success,
         latency_ms: result.latency_ms,
         download_mbps: result.download_mbps.unwrap_or(0.0),
@@ -6512,7 +6475,7 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
     let stats = &inner.state.stats;
     let profiles = &inner.state.profiles;
 
-    let mut entries: Vec<Value> = profiles
+    let entries: Vec<Value> = profiles
         .iter()
         .map(|profile| {
             let stat = stats.iter().find(|s| s.profile_raw == profile.raw);
@@ -6534,13 +6497,11 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
                 "last_download_mbps": stat.filter(|s| s.has_download).map(|s| s.last_download_mbps),
                 "last_upload_mbps": stat.filter(|s| s.has_upload).map(|s| s.last_upload_mbps),
                 "last_loss_percent": stat.filter(|s| s.has_loss).map(|s| s.last_loss_percent),
-                "score": stat.filter(|s| s.has_score).map(|s| s.last_score),
                 "success_count": stat.map(|s| s.success_count).unwrap_or(0),
                 "failure_count": stat.map(|s| s.failure_count).unwrap_or(0),
                 "last_error": stat.and_then(|s| s.last_error.clone()),
                 "last_checked": stat.map(|s| s.last_checked_unix).unwrap_or(0),
                 "resource_tests": stat.map(|s| s.resource_tests.clone()).unwrap_or_default(),
-                "ewma_score": stat.filter(|s| s.has_ewma).map(|s| s.ewma_score),
                 "ewma_latency_ms": stat.filter(|s| s.has_ewma).map(|s| s.ewma_latency_ms),
                 "ewma_download_mbps": stat.filter(|s| s.has_download).map(|s| s.ewma_download_mbps),
                 "consecutive_failures": stat.map(|s| s.consecutive_failures).unwrap_or(0),
@@ -6548,13 +6509,6 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
             })
         })
         .collect();
-    // Sort by score descending so the rating table is meaningful by default.
-    entries.sort_by(|a, b| {
-        let sa = a.get("score").and_then(Value::as_u64).unwrap_or(0);
-        let sb = b.get("score").and_then(Value::as_u64).unwrap_or(0);
-        sb.cmp(&sa)
-    });
-
     let response = json!({
         "stats": entries,
         "favorites_count": favorites.len(),
@@ -6565,7 +6519,6 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
 
 fn update_smart_ewma(stats: &mut ProfileStats, result: &BenchResult) {
     const ALPHA: f32 = 0.35;
-    stats.ewma_score = ewma(stats.ewma_score, result.score as f32, ALPHA);
     stats.ewma_latency_ms = ewma(stats.ewma_latency_ms, result.latency_ms as f32, ALPHA);
     if let Some(download_mbps) = result.download_mbps {
         stats.ewma_download_mbps = ewma(stats.ewma_download_mbps, download_mbps, ALPHA);
@@ -6713,25 +6666,31 @@ fn handle_profile_add(body: &str, daemon: &Daemon) -> (u16, &'static str, String
 
         let mut all_profiles: Vec<Profile> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
-        let mut sub_outcomes: Vec<(SubscriptionSource, usize, Option<String>)> = Vec::new();
+        let mut sub_outcomes: Vec<(
+            SubscriptionSource,
+            usize,
+            Option<SubscriptionMetadata>,
+            Option<String>,
+        )> = Vec::new();
 
         for source in &parsed.subscriptions {
             let outcome = load_subscription_for_daemon(source, &proxy_info, &hwid);
             match outcome {
                 SubscriptionLoadOutcome::Ok(report) => {
                     let count = report.profiles.len();
+                    let metadata = report.metadata;
                     for mut profile in report.profiles {
                         if profile.group.is_none() {
                             profile.group = Some(source.url.clone());
                         }
                         all_profiles.push(profile);
                     }
-                    sub_outcomes.push((source.clone(), count, None));
+                    sub_outcomes.push((source.clone(), count, Some(metadata), None));
                 }
                 SubscriptionLoadOutcome::Failed { attempts } => {
                     let error = SubscriptionLoadOutcome::format_error(&attempts);
                     errors.push(error.clone());
-                    sub_outcomes.push((source.clone(), 0, Some(error)));
+                    sub_outcomes.push((source.clone(), 0, None, Some(error)));
                 }
             }
         }
@@ -6751,7 +6710,7 @@ fn handle_profile_add(body: &str, daemon: &Daemon) -> (u16, &'static str, String
 
         // Persist subscription sources for later refresh.
         let now = unix_now();
-        for (source, count, error) in &sub_outcomes {
+        for (source, count, metadata, error) in &sub_outcomes {
             let stored = inner
                 .state
                 .subscriptions
@@ -6762,6 +6721,8 @@ fn handle_profile_add(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             } else {
                 inner.state.subscriptions.push(StoredSubscription {
                     url: source.url.clone(),
+                    title: None,
+                    announcement: None,
                     last_loaded_unix: None,
                     last_error: None,
                     profile_count: 0,
@@ -6776,6 +6737,9 @@ fn handle_profile_add(body: &str, daemon: &Daemon) -> (u16, &'static str, String
                 entry.last_loaded_unix = Some(now);
                 entry.last_error = None;
                 entry.profile_count = *count;
+                if let Some(metadata) = metadata {
+                    apply_subscription_metadata(entry, metadata.clone());
+                }
             } else {
                 entry.last_error = error.clone();
             }
@@ -7715,6 +7679,79 @@ fn handle_trash_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
     )
 }
 
+fn handle_trash_clear(daemon: &Daemon) -> (u16, &'static str, String) {
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    let mut inner = lock(&daemon.inner);
+    let mut candidate = inner.state.clone();
+    let dead_refs = candidate.dead_server_refs.clone();
+    let removed_raws: HashSet<String> = candidate
+        .profiles
+        .iter()
+        .filter(|profile| dead_refs.contains(&profile_server_ref(profile)))
+        .map(|profile| profile.raw.clone())
+        .collect();
+    let removed_profiles = removed_raws.len();
+    let removed_entries = dead_refs.len();
+    if removed_entries == 0 {
+        return json_response(&json!({
+            "ok": true,
+            "removed_profiles": 0,
+            "removed_entries": 0,
+        }));
+    }
+
+    push_undo_snapshot(&mut candidate, "Clear Dead Servers".to_owned());
+    let active_raw = candidate
+        .active_profile_id
+        .and_then(|id| candidate.profiles.iter().find(|profile| profile.id == id))
+        .map(|profile| profile.raw.clone());
+    candidate
+        .profiles
+        .retain(|profile| !removed_raws.contains(&profile.raw));
+    reassign_profile_ids(&mut candidate.profiles);
+    candidate.active_profile_id = active_raw.as_ref().and_then(|raw| {
+        candidate
+            .profiles
+            .iter()
+            .find(|profile| &profile.raw == raw)
+            .map(|profile| profile.id)
+    });
+    candidate
+        .favorites
+        .retain(|raw| !removed_raws.contains(raw));
+    candidate
+        .stats
+        .retain(|stat| !removed_raws.contains(&stat.profile_raw));
+    candidate.dead_server_refs.clear();
+    candidate.dead_promoted_at.clear();
+    let group_counts: HashMap<String, usize> = candidate
+        .profiles
+        .iter()
+        .filter_map(|profile| profile.group.clone())
+        .fold(HashMap::new(), |mut counts, group| {
+            *counts.entry(group).or_default() += 1;
+            counts
+        });
+    for subscription in &mut candidate.subscriptions {
+        subscription.profile_count = group_counts.get(&subscription.url).copied().unwrap_or(0);
+    }
+    sync_server_route_registry(&mut candidate);
+    if let Err(error) = persist_state(&daemon.state_path, &candidate) {
+        return json_error(500, &format!("persist failed: {error}"));
+    }
+    inner.state = candidate;
+    inner.dirty = false;
+    json_response(&json!({
+        "ok": true,
+        "removed_profiles": removed_profiles,
+        "removed_entries": removed_entries,
+        "profile_count": inner.state.profiles.len(),
+    }))
+}
+
 fn handle_trash_purge_gone(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
     let purged = purge_stale_trash(&mut inner.state);
@@ -7922,6 +7959,7 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
         match outcome {
             SubscriptionLoadOutcome::Ok(report) => {
                 let count = report.profiles.len();
+                let metadata = report.metadata;
                 let fresh_raw: HashSet<String> =
                     report.profiles.iter().map(|p| p.raw.clone()).collect();
                 let added_for_source = fresh_raw.difference(&previous_raw).count();
@@ -7938,6 +7976,7 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
                             stored.last_loaded_unix = Some(now);
                             stored.last_error = None;
                             stored.profile_count = count;
+                            apply_subscription_metadata(stored, metadata);
                         }
                         added_total += added;
                         refreshed += 1;
@@ -8126,6 +8165,7 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
     match outcome {
         SubscriptionLoadOutcome::Ok(report) => {
             let count = report.profiles.len();
+            let metadata = report.metadata;
             let fresh_raw: HashSet<String> =
                 report.profiles.iter().map(|p| p.raw.clone()).collect();
             let added_for_source = fresh_raw.difference(&previous_raw).count();
@@ -8141,6 +8181,7 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
                         stored.last_loaded_unix = Some(now);
                         stored.last_error = None;
                         stored.profile_count = count;
+                        apply_subscription_metadata(stored, metadata);
                     }
                     let refresh_report = SubscriptionRefreshReport {
                         timestamp: now,
@@ -8253,6 +8294,8 @@ fn handle_subscriptions_list(daemon: &Daemon) -> (u16, &'static str, String) {
         .map(|s| {
             json!({
                 "url": s.url,
+                "title": s.title,
+                "announcement": s.announcement,
                 "profile_count": s.profile_count,
                 "last_loaded_unix": s.last_loaded_unix,
                 "last_error": s.last_error,
@@ -11170,7 +11213,6 @@ fn handle_auto_settings_get(daemon: &Daemon) -> (u16, &'static str, String) {
             "auto_refresh_enabled": inner.state.auto_refresh_enabled,
             "auto_refresh_interval_hours": inner.state.auto_refresh_interval_hours,
             "last_auto_refresh_unix": inner.state.last_auto_refresh_unix,
-            "smart_select": inner.state.smart_select,
             "maintenance": inner.state.maintenance,
         })
         .to_string(),
@@ -11208,9 +11250,6 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
     {
         inner.state.auto_refresh_interval_hours = v as u32;
     }
-    if let Some(smart) = value.get("smart_select") {
-        apply_smart_settings(&mut inner.state.smart_select, smart);
-    }
     if let Some(maintenance) = value.get("maintenance") {
         apply_maintenance_settings(&mut inner.state.maintenance, maintenance);
     }
@@ -11224,26 +11263,10 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
             "auto_switch": inner.state.split_routing.auto_switch,
             "auto_refresh_enabled": inner.state.auto_refresh_enabled,
             "auto_refresh_interval_hours": inner.state.auto_refresh_interval_hours,
-            "smart_select": inner.state.smart_select,
             "maintenance": inner.state.maintenance,
         })
         .to_string(),
     )
-}
-
-fn apply_smart_settings(settings: &mut SmartSelectSettings, value: &Value) {
-    if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
-        settings.enabled = v;
-    }
-    if let Some(v) = value.get("min_successes").and_then(Value::as_u64) {
-        settings.min_successes = (v as u32).max(1);
-    }
-    if let Some(v) = value.get("cooldown_secs").and_then(Value::as_u64) {
-        settings.cooldown_secs = v;
-    }
-    if let Some(v) = value.get("failure_penalty").and_then(Value::as_f64) {
-        settings.failure_penalty = (v as f32).clamp(0.0, 1000.0);
-    }
 }
 
 fn apply_maintenance_settings(settings: &mut MaintenanceSettings, value: &Value) {
@@ -14216,11 +14239,6 @@ fn sort_profiles_for_substore(profiles: &mut [Profile], stats: &[ProfileStats], 
         .map(|stat| (stat.profile_raw.clone(), stat.clone()))
         .collect();
     match sort_by {
-        "score" => profiles.sort_by(|a, b| {
-            let sa = stat_map.get(&a.raw).map(|s| s.last_score).unwrap_or(0);
-            let sb = stat_map.get(&b.raw).map(|s| s.last_score).unwrap_or(0);
-            sb.cmp(&sa).then_with(|| a.name.cmp(&b.name))
-        }),
         "latency" => profiles.sort_by(|a, b| {
             let la = stat_map
                 .get(&a.raw)
@@ -15929,19 +15947,9 @@ fn socks_health_check(socks_port: u16) -> bool {
         .unwrap_or(false)
 }
 
-/// Find the profile with the highest `last_score` from `ProfileStats`
-/// that is not in `excluded_profiles` and has at least one successful
-/// probe. A zero score is still a valid low-priority fallback: some
-/// endpoints pass latency/health probes but score zero because the short
-/// download test produced no measurable throughput on the router.
-/// Returns the profile id, or None if no candidate exists.
-fn find_best_profile_by_score(
-    state: &HincyrayState,
-    excluded_profiles: &HashSet<usize>,
-) -> Option<usize> {
-    if state.smart_select.enabled {
-        return find_best_profile_by_smart_score(state, excluded_profiles);
-    }
+/// Find the lowest-latency eligible profile with a successful probe.
+fn find_best_profile(state: &HincyrayState, excluded_profiles: &HashSet<usize>) -> Option<usize> {
+    let now = unix_now();
     let mut best: Option<(usize, u32)> = None;
     for profile in &state.profiles {
         if excluded_profiles.contains(&profile.id) || profile_is_dead(state, profile) {
@@ -15950,42 +15958,14 @@ fn find_best_profile_by_score(
         let Some(stat) = state.stats.iter().find(|s| s.profile_raw == profile.raw) else {
             continue;
         };
-        if stat.success_count == 0 {
+        if stat.success_count == 0 || stat.cooldown_until_unix > now || !stat.has_latency {
             continue;
         }
         if best
-            .map(|(_, score)| stat.last_score > score)
+            .map(|(_, latency)| stat.last_latency_ms < latency)
             .unwrap_or(true)
         {
-            best = Some((profile.id, stat.last_score));
-        }
-    }
-    best.map(|(id, _)| id)
-}
-
-fn find_best_profile_by_smart_score(
-    state: &HincyrayState,
-    excluded_profiles: &HashSet<usize>,
-) -> Option<usize> {
-    let now = unix_now();
-    let mut best: Option<(usize, f32)> = None;
-    for profile in &state.profiles {
-        if excluded_profiles.contains(&profile.id) || profile_is_dead(state, profile) {
-            continue;
-        }
-        let Some(stat) = state.stats.iter().find(|s| s.profile_raw == profile.raw) else {
-            continue;
-        };
-        if stat.success_count < state.smart_select.min_successes {
-            continue;
-        }
-        if stat.cooldown_until_unix > now {
-            continue;
-        }
-        let failure_penalty = stat.consecutive_failures as f32 * state.smart_select.failure_penalty;
-        let effective = (stat.ewma_score - failure_penalty).max(0.0);
-        if best.map(|(_, score)| effective > score).unwrap_or(true) {
-            best = Some((profile.id, effective));
+            best = Some((profile.id, stat.last_latency_ms));
         }
     }
     best.map(|(id, _)| id)
@@ -16000,7 +15980,7 @@ fn ranked_failover_candidates(
     excluded_raws: &HashSet<String>,
 ) -> Vec<Profile> {
     let now = unix_now();
-    let mut ranked: Vec<(Profile, f32)> = state
+    let mut ranked: Vec<(Profile, u32)> = state
         .profiles
         .iter()
         .filter(|profile| !excluded_raws.contains(&profile.raw) && !profile_is_dead(state, profile))
@@ -16012,20 +15992,11 @@ fn ranked_failover_candidates(
             if stat.success_count == 0 || stat.cooldown_until_unix > now {
                 return None;
             }
-            let score = if state.smart_select.enabled {
-                if stat.success_count < state.smart_select.min_successes {
-                    return None;
-                }
-                (stat.ewma_score
-                    - stat.consecutive_failures as f32 * state.smart_select.failure_penalty)
-                    .max(0.0)
-            } else {
-                stat.last_score as f32
-            };
-            Some((profile.clone(), score))
+            stat.has_latency
+                .then_some((profile.clone(), stat.last_latency_ms))
         })
         .collect();
-    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+    ranked.sort_by_key(|(_, latency)| *latency);
     ranked.into_iter().map(|(profile, _)| profile).collect()
 }
 
@@ -16121,13 +16092,10 @@ fn record_profile_health_failure(state: &mut HincyrayState, profile_raw: &str, n
             state.stats.len() - 1
         }
     };
-    let cooldown_secs = state.smart_select.cooldown_secs;
-    let failure_penalty = state.smart_select.failure_penalty;
     let stat = &mut state.stats[stats_idx];
     stat.failure_count = stat.failure_count.saturating_add(1);
     stat.consecutive_failures = stat.consecutive_failures.saturating_add(1);
-    stat.cooldown_until_unix = now.saturating_add(cooldown_secs);
-    stat.ewma_score = (stat.ewma_score - failure_penalty).max(0.0);
+    stat.cooldown_until_unix = now.saturating_add(default_smart_cooldown_secs());
     stat.last_checked_unix = now;
     stat.last_error = Some("active profile failed Mihomo fallback health threshold".to_owned());
 }
@@ -16514,11 +16482,11 @@ fn switch_active_profile(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon, p
 ///    tun2socks if dead, reinstall iptables rules wiped by ndm.
 /// 3. **Health check + failover (auto_switch)** — probe the SOCKS
 ///    tunnel with a short curl request. After 3 consecutive failures,
-///    switch to the next-best profile by benchmark score.
+///    switch to the lowest-latency recently successful profile.
 /// 4. **Auto-benchmark (auto_bench_interval_hours > 0)** — trigger a
 ///    TCP benchmark on all profiles on a schedule.
 /// 5. **Auto-select (auto_select)** — when a benchmark finishes,
-///    switch to the highest-scoring profile.
+///    switch to the lowest-latency recently successful profile.
 fn start_watchdog(
     daemon: Daemon,
     mihomo_log_path: PathBuf,
@@ -16934,9 +16902,9 @@ fn start_watchdog(
 
             // --- Phase 5: Auto-select after benchmark ---
             if bench_was_running && !bench_running && auto_select {
-                eprintln!("hincyray: benchmark finished, auto-selecting best profile");
+                eprintln!("hincyray: benchmark finished, auto-selecting lowest-latency profile");
                 let mut inner = lock(&daemon.inner);
-                if let Some(best_id) = find_best_profile_by_score(&inner.state, &HashSet::new())
+                if let Some(best_id) = find_best_profile(&inner.state, &HashSet::new())
                     && Some(best_id) != inner.state.active_profile_id
                 {
                     eprintln!("hincyray: auto-switching to profile {best_id}");
@@ -17034,9 +17002,7 @@ fn start_watchdog(
                         .is_some_and(|id| !inner.state.profiles.iter().any(|p| p.id == id));
 
                     if active_removed || inner.state.active_profile_id.is_none() {
-                        if let Some(best_id) =
-                            find_best_profile_by_score(&inner.state, &HashSet::new())
-                        {
+                        if let Some(best_id) = find_best_profile(&inner.state, &HashSet::new()) {
                             eprintln!(
                                 "hincyray: auto-refresh: active profile removed, switching to best #{best_id}"
                             );
@@ -17044,7 +17010,7 @@ fn start_watchdog(
                         } else if let Some(first) = inner.state.profiles.first() {
                             let first_id = first.id;
                             eprintln!(
-                                "hincyray: auto-refresh: no scored profiles, switching to first #{first_id}"
+                                "hincyray: auto-refresh: no tested profiles, switching to first #{first_id}"
                             );
                             switch_active_profile(&mut inner, &daemon, first_id);
                         } else {
@@ -17660,14 +17626,14 @@ fn run_deep_bench(
         return;
     }
 
-    // Filter: keep profiles with success==true && score>0.
+    // Filter: keep profiles that passed Phase A.
     let passed: Vec<&Profile> = profiles
         .iter()
         .filter(|p| {
             phase_a_results
                 .iter()
                 .find(|r| r.profile_raw == p.raw)
-                .map(|r| r.success && r.score > 0)
+                .map(|r| r.success)
                 .unwrap_or(false)
         })
         .collect();
@@ -17721,41 +17687,31 @@ fn run_deep_bench(
                 last_error: String::new(),
             };
         }
-        let quick_score = phase_a_results
+        let phase_a_success = phase_a_results
             .iter()
             .find(|r| r.profile_raw == profile.raw)
-            .map(|r| r.score)
-            .unwrap_or(0);
+            .is_some_and(|r| r.success);
         match crate::benchmark::run_stability_and_unlock(profile, stability_minutes, &cancel) {
             Some((stability, unlock)) => {
-                let composite = crate::benchmark::composite_quality_score(
-                    stability.latency_avg,
-                    stability.latency_stddev,
-                    stability.loss_percent,
-                    stability.sustained_download_mbps,
-                    unlock.reachable_count(),
-                );
                 snapshots.push(DailyQualitySnapshot {
                     date: today,
                     server_ref: profile_server_ref(profile),
                     profile_name: profile.name.clone(),
-                    quick_score,
+                    phase_a_success,
                     stability: Some(stability),
                     unlock: Some(unlock),
-                    composite_score: composite,
                 });
             }
             None => {
                 // Profile passed Phase A but failed Phase B spawn —
-                // record as low-score so we don't promote it.
+                // Record the failed Phase B attempt without synthesizing a score.
                 snapshots.push(DailyQualitySnapshot {
                     date: today,
                     server_ref: profile_server_ref(profile),
                     profile_name: profile.name.clone(),
-                    quick_score,
+                    phase_a_success,
                     stability: None,
                     unlock: None,
-                    composite_score: 0,
                 });
             }
         }
@@ -17775,8 +17731,8 @@ fn run_deep_bench(
         );
     }
 
-    // ===== Persist quality history, then apply lifecycle transitions =====
-    let history_persisted = {
+    // ===== Persist raw quality history =====
+    {
         let mut inner = lock(&daemon.inner);
         if inner.state.quality_history.is_empty() {
             inner.state.quality_history =
@@ -17787,16 +17743,10 @@ fn run_deep_bench(
         cap_quality_history(&mut inner.state, today);
         // Persist to dedicated file (state.json would bloat).
         let history_path = quality_history_path(&daemon.state_path);
-        let history_persisted =
-            match persist_quality_history(&history_path, &inner.state.quality_history) {
-                Ok(()) => true,
-                Err(error) => {
-                    eprintln!("hincyray: quality history persist failed: {error}");
-                    inner.deep_bench_status.last_error =
-                        format!("quality history persist failed: {error}");
-                    false
-                }
-            };
+        if let Err(error) = persist_quality_history(&history_path, &inner.state.quality_history) {
+            eprintln!("hincyray: quality history persist failed: {error}");
+            inner.deep_bench_status.last_error = format!("quality history persist failed: {error}");
+        }
         // Mark deep bench completed.
         inner.state.deep_bench.last_completed_date = today;
         let final_state = if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -17816,34 +17766,6 @@ fn run_deep_bench(
             last_error: inner.deep_bench_status.last_error.clone(),
         };
         inner.dirty = true;
-        history_persisted
-    };
-    if !history_persisted {
-        return;
-    }
-    match mutate_dead_server_membership(&daemon, |state| {
-        Ok(snapshots
-            .iter()
-            .filter_map(|snapshot| apply_trash_bin_rules(state, snapshot, today))
-            .collect::<Vec<_>>())
-    }) {
-        Ok(transitions) => {
-            for transition in transitions {
-                match transition {
-                    DeadServerTransition::Promoted(server_ref) => {
-                        eprintln!("hincyray: auto-promoted server to Dead Servers: {server_ref}");
-                    }
-                    DeadServerTransition::Restored(server_ref) => {
-                        eprintln!("hincyray: restored server from Dead Servers: {server_ref}");
-                    }
-                }
-            }
-        }
-        Err((_, error)) => {
-            eprintln!("hincyray: Deep Bench Dead Servers transition failed: {error}");
-            let mut inner = lock(&daemon.inner);
-            inner.deep_bench_status.last_error = error;
-        }
     }
 }
 
@@ -17928,61 +17850,6 @@ fn cap_quality_history(state: &mut HincyrayState, today: u32) {
         let excess = state.quality_history.len() - max_entries;
         state.quality_history.drain(0..excess);
     }
-}
-
-/// v0.20: Apply trash bin auto-promote / restore rules for a single
-/// daily snapshot. Called after each profile's Phase B result is
-/// written.
-///
-/// - **Promote to dead**: if the last 3 daily entries for this canonical
-///   server all have `composite_score < 30`, its opaque server reference is
-///   added to `state.dead_server_refs`.
-/// - **Restore**: if the latest entry has `composite_score > 50`, the server
-///   reference is removed from the virtual group.
-#[derive(Debug, PartialEq, Eq)]
-enum DeadServerTransition {
-    Promoted(String),
-    Restored(String),
-}
-
-fn apply_trash_bin_rules(
-    state: &mut HincyrayState,
-    snapshot: &DailyQualitySnapshot,
-    _today: u32,
-) -> Option<DeadServerTransition> {
-    let server_ref = snapshot.server_ref.clone();
-    let now = unix_now();
-    // Last 3 entries for this canonical server (including today).
-    let recent: Vec<u32> = state
-        .quality_history
-        .iter()
-        .rev()
-        .filter(|s| s.server_ref == server_ref)
-        .take(3)
-        .map(|s| s.composite_score)
-        .collect();
-    // Promote: 3+ consecutive bad days.
-    let active_ref = state
-        .active_profile_id
-        .and_then(|id| state.profiles.iter().find(|profile| profile.id == id))
-        .map(profile_server_ref);
-    if recent.len() >= 3
-        && recent.iter().all(|&score| score < 30)
-        && active_ref.as_deref() != Some(&server_ref)
-        && state.dead_server_refs.insert(server_ref.clone())
-    {
-        state.dead_promoted_at.insert(server_ref.clone(), now);
-        return Some(DeadServerTransition::Promoted(server_ref));
-    }
-    // Restore: latest score is good.
-    if let Some(latest) = recent.first()
-        && *latest > 50
-        && state.dead_server_refs.remove(&server_ref)
-    {
-        state.dead_promoted_at.remove(&server_ref);
-        return Some(DeadServerTransition::Restored(server_ref));
-    }
-    None
 }
 
 /// v0.20: Garbage-collect trash entries for raws that no longer appear
@@ -19265,7 +19132,7 @@ mod tests {
     }
 
     #[test]
-    fn best_profile_selector_uses_zero_score_success_as_fallback() {
+    fn best_profile_selector_requires_a_successful_latency_probe() {
         let mut state = HincyrayState::default();
         state.profiles = vec![
             Profile {
@@ -19296,20 +19163,22 @@ mod tests {
         state.stats = vec![
             ProfileStats {
                 profile_raw: state.profiles[0].raw.clone(),
-                last_score: 90,
+                last_latency_ms: 10,
+                has_latency: true,
                 success_count: 0,
                 failure_count: 3,
                 ..ProfileStats::default()
             },
             ProfileStats {
                 profile_raw: state.profiles[1].raw.clone(),
-                last_score: 0,
+                last_latency_ms: 80,
+                has_latency: true,
                 success_count: 5,
                 ..ProfileStats::default()
             },
         ];
 
-        assert_eq!(find_best_profile_by_score(&state, &HashSet::new()), Some(2));
+        assert_eq!(find_best_profile(&state, &HashSet::new()), Some(2));
     }
 
     #[test]
@@ -19344,33 +19213,35 @@ mod tests {
         state.stats = vec![
             ProfileStats {
                 profile_raw: state.profiles[0].raw.clone(),
-                last_score: 90,
+                last_latency_ms: 10,
+                has_latency: true,
                 success_count: 1,
                 ..ProfileStats::default()
             },
             ProfileStats {
                 profile_raw: state.profiles[1].raw.clone(),
-                last_score: 10,
+                last_latency_ms: 50,
+                has_latency: true,
                 success_count: 1,
                 ..ProfileStats::default()
             },
         ];
 
         let rejected = HashSet::from([1]);
-        assert_eq!(find_best_profile_by_score(&state, &rejected), Some(2));
+        assert_eq!(find_best_profile(&state, &rejected), Some(2));
     }
 
     #[test]
     fn failover_ranking_uses_raw_identity_and_excludes_trash_and_cooldown() {
-        let mut state = HincyrayState::default();
-        state.smart_select.enabled = true;
-        state.smart_select.min_successes = 1;
-        state.profiles = vec![
-            make_profile(40, "current", "raw-current", None),
-            make_profile(2, "trashed-best", "raw-trash", None),
-            make_profile(99, "cooldown", "raw-cooldown", None),
-            make_profile(7, "verified-next", "raw-next", None),
-        ];
+        let mut state = HincyrayState {
+            profiles: vec![
+                make_profile(40, "current", "raw-current", None),
+                make_profile(2, "trashed-best", "raw-trash", None),
+                make_profile(99, "cooldown", "raw-cooldown", None),
+                make_profile(7, "verified-next", "raw-next", None),
+            ],
+            ..Default::default()
+        };
         state
             .dead_server_refs
             .insert(profile_server_ref(&state.profiles[1]));
@@ -19378,26 +19249,30 @@ mod tests {
             ProfileStats {
                 profile_raw: "raw-current".to_owned(),
                 success_count: 10,
-                ewma_score: 100.0,
+                last_latency_ms: 20,
+                has_latency: true,
                 ..ProfileStats::default()
             },
             ProfileStats {
                 profile_raw: "raw-trash".to_owned(),
                 success_count: 10,
-                ewma_score: 99.0,
+                last_latency_ms: 1,
+                has_latency: true,
                 ..ProfileStats::default()
             },
             ProfileStats {
                 profile_raw: "raw-cooldown".to_owned(),
                 success_count: 10,
-                ewma_score: 98.0,
+                last_latency_ms: 2,
+                has_latency: true,
                 cooldown_until_unix: unix_now() + 60,
                 ..ProfileStats::default()
             },
             ProfileStats {
                 profile_raw: "raw-next".to_owned(),
                 success_count: 3,
-                ewma_score: 50.0,
+                last_latency_ms: 30,
+                has_latency: true,
                 ..ProfileStats::default()
             },
         ];
@@ -19413,11 +19288,8 @@ mod tests {
     #[test]
     fn profile_health_failure_creates_raw_keyed_cooldown() {
         let mut state = HincyrayState::default();
-        state.smart_select.cooldown_secs = 120;
-        state.smart_select.failure_penalty = 9.0;
         state.stats.push(ProfileStats {
             profile_raw: "raw-failed".to_owned(),
-            ewma_score: 30.0,
             ..ProfileStats::default()
         });
 
@@ -19430,8 +19302,7 @@ mod tests {
             .expect("failed profile stats");
         assert_eq!(stat.failure_count, 1);
         assert_eq!(stat.consecutive_failures, 1);
-        assert_eq!(stat.cooldown_until_unix, 1_120);
-        assert_eq!(stat.ewma_score, 21.0);
+        assert_eq!(stat.cooldown_until_unix, 1_300);
         assert_eq!(stat.last_checked_unix, 1_000);
         assert!(
             stat.last_error
@@ -20315,16 +20186,16 @@ mod tests {
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0]["name"], "Demo");
         for field in [
-            "score",
             "last_latency_ms",
             "last_jitter_ms",
             "last_download_mbps",
             "last_upload_mbps",
             "last_loss_percent",
-            "ewma_score",
         ] {
             assert!(stats[0][field].is_null(), "{field} must be null");
         }
+        assert!(stats[0].get("score").is_none());
+        assert!(stats[0].get("ewma_score").is_none());
         assert_eq!(stats[0]["favorite"], false);
         assert_eq!(stats[0]["active"], false);
     }
@@ -20478,7 +20349,6 @@ mod tests {
             download_error: None,
             upload_error: None,
             loss_percent: 0.0,
-            score: 70,
             success: true,
             error: None,
             resource_tests: vec![ResourceTestResult {
@@ -20507,7 +20377,6 @@ mod tests {
         assert_eq!(stat.last_upload_mbps, 8.0);
         assert!(stat.has_download);
         assert!(stat.has_upload);
-        assert_eq!(stat.last_score, 70);
         assert_eq!(stat.resource_tests.len(), 1);
         assert_eq!(stat.resource_tests[0].id, "youtube");
         assert_eq!(stat.success_count, 1);
@@ -20528,7 +20397,6 @@ mod tests {
             download_error: None,
             upload_error: None,
             loss_percent: 100.0,
-            score: 0,
             success: false,
             error: Some("tcp connect failed".to_owned()),
             resource_tests: Vec::new(),
@@ -20563,7 +20431,6 @@ mod tests {
             download_error: None,
             upload_error: None,
             loss_percent: 0.0,
-            score: 80,
             success: true,
             error: None,
             resource_tests: Vec::new(),
@@ -20603,7 +20470,6 @@ mod tests {
                     download_error: None,
                     upload_error: None,
                     loss_percent: 0.0,
-                    score: 50,
                     success: true,
                     error: None,
                     resource_tests: Vec::new(),
@@ -21319,6 +21185,8 @@ mod tests {
         assert!(api_json.contains("server_ref"));
         assert!(!api_json.contains("profile_raw"));
         assert!(!api_json.contains("vless://"));
+        assert!(!api_json.contains("quick_score"));
+        assert!(!api_json.contains("composite_score"));
     }
 
     #[test]
@@ -21384,6 +21252,55 @@ mod tests {
         );
         assert_eq!(status, 200);
         assert!(lock(&daemon.inner).state.dead_server_refs.is_empty());
+    }
+
+    #[test]
+    fn dead_server_clear_removes_profiles_and_related_state() {
+        let (_dir, daemon) = test_daemon();
+        let subscription = "https://provider.example/sub/fixture";
+        let dead_ref = {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![
+                make_profile(0, "Dead", "raw-dead", Some(subscription)),
+                make_profile(1, "Active", "raw-active", Some(subscription)),
+            ];
+            inner.state.active_profile_id = Some(1);
+            inner.state.subscriptions.push(StoredSubscription {
+                url: subscription.to_owned(),
+                profile_count: 2,
+                ..Default::default()
+            });
+            inner.state.favorites.push("raw-dead".to_owned());
+            inner.state.stats.push(ProfileStats {
+                profile_raw: "raw-dead".to_owned(),
+                success_count: 1,
+                ..Default::default()
+            });
+            let dead_ref = profile_server_ref(&inner.state.profiles[0]);
+            inner
+                .state
+                .dead_server_refs
+                .extend([dead_ref.clone(), server_ref_for_canonical("legacy-orphan")]);
+            inner.state.dead_promoted_at.insert(dead_ref.clone(), 123);
+            dead_ref
+        };
+
+        let (status, _, body) = handle_trash_clear(&daemon);
+
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("clear response");
+        assert_eq!(response["removed_profiles"], 1);
+        assert_eq!(response["removed_entries"], 2);
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles.len(), 1);
+        assert_eq!(inner.state.profiles[0].id, 0);
+        assert_eq!(inner.state.profiles[0].raw, "raw-active");
+        assert_eq!(inner.state.active_profile_id, Some(0));
+        assert_eq!(inner.state.subscriptions[0].profile_count, 1);
+        assert!(inner.state.favorites.is_empty());
+        assert!(inner.state.stats.is_empty());
+        assert!(inner.state.dead_server_refs.is_empty());
+        assert!(!inner.state.dead_promoted_at.contains_key(&dead_ref));
     }
 
     #[test]
@@ -21690,32 +21607,6 @@ mod tests {
         assert_eq!(select_profiles_for_deep_bench(&state)[0].id, 20);
         state.deep_bench.profile_filter = ProfileFilter::Explicit(vec![dead_ref]);
         assert_eq!(select_profiles_for_deep_bench(&state)[0].id, 10);
-    }
-
-    #[test]
-    fn trash_promotion_uses_canonical_identity_across_display_renames() {
-        let mut state = HincyrayState::default();
-        let server_ref = server_ref_for_canonical("raw-server-without-fragment");
-        for (date, name) in [
-            (20260714, "First"),
-            (20260715, "Second"),
-            (20260716, "Third"),
-        ] {
-            state.quality_history.push(DailyQualitySnapshot {
-                date,
-                server_ref: server_ref.clone(),
-                profile_name: name.to_owned(),
-                composite_score: 20,
-                ..Default::default()
-            });
-        }
-        let latest = state
-            .quality_history
-            .last()
-            .cloned()
-            .expect("latest snapshot");
-        apply_trash_bin_rules(&mut state, &latest, latest.date);
-        assert!(state.dead_server_refs.contains(&server_ref));
     }
 
     #[test]
@@ -23573,32 +23464,6 @@ ntp:
         assert_eq!(state.profiles[0].name, "Hong Kong 01");
         assert_eq!(report["filtered"], json!(1));
         assert_eq!(report["deduplicated"], json!(1));
-    }
-
-    #[test]
-    fn smart_selector_uses_ewma_and_skips_cooldown() {
-        let mut state = HincyrayState::default();
-        state.smart_select.enabled = true;
-        state.profiles = vec![
-            sample_profile(1, "cooldown", "a.example"),
-            sample_profile(2, "stable", "b.example"),
-        ];
-        state.stats = vec![
-            ProfileStats {
-                profile_raw: state.profiles[0].raw.clone(),
-                success_count: 5,
-                ewma_score: 99.0,
-                cooldown_until_unix: unix_now() + 60,
-                ..Default::default()
-            },
-            ProfileStats {
-                profile_raw: state.profiles[1].raw.clone(),
-                success_count: 2,
-                ewma_score: 50.0,
-                ..Default::default()
-            },
-        ];
-        assert_eq!(find_best_profile_by_score(&state, &HashSet::new()), Some(2));
     }
 
     #[test]

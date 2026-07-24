@@ -10,7 +10,6 @@ pub mod hincyray_security;
 pub mod hincyray_webui;
 pub mod mihomo_config;
 pub mod profiles;
-pub mod scoring;
 pub mod telegram_probe;
 pub mod xray_config;
 

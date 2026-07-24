@@ -29,7 +29,6 @@ use crate::mihomo_config::build_mihomo_bench_config;
 use crate::profiles::Profile;
 #[cfg(test)]
 use crate::profiles::Protocol;
-use crate::scoring::quality_score;
 use crate::telegram_probe::{TelegramProbeConfig, probe_media};
 
 pub const DEFAULT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
@@ -109,7 +108,6 @@ pub struct BenchResult {
     pub download_error: Option<String>,
     pub upload_error: Option<String>,
     pub loss_percent: f32,
-    pub score: u32,
     pub success: bool,
     pub error: Option<String>,
     #[serde(default)]
@@ -256,7 +254,6 @@ fn benchmark_profile(
         download_error: None,
         upload_error: None,
         loss_percent: 100.0,
-        score: 0,
         success: false,
         error: None,
         resource_tests: Vec::new(),
@@ -317,16 +314,6 @@ fn benchmark_profile(
                 .collect::<Vec<_>>()
                 .join(", ");
             let resources_passed = resource_error.is_empty();
-            let score = if resources_passed {
-                quality_score(
-                    metrics.latency_ms,
-                    metrics.jitter_ms,
-                    download_mbps.unwrap_or(0.0),
-                    metrics.loss_percent,
-                )
-            } else {
-                0
-            };
             BenchResult {
                 latency_ms: metrics.latency_ms,
                 jitter_ms: metrics.jitter_ms,
@@ -335,7 +322,6 @@ fn benchmark_profile(
                 download_error: speed_metrics.download.and_then(Result::err),
                 upload_error: speed_metrics.upload.and_then(Result::err),
                 loss_percent: metrics.loss_percent,
-                score,
                 success: resources_passed,
                 error: (!resources_passed)
                     .then(|| format!("resource checks failed: {resource_error}")),
@@ -418,7 +404,6 @@ pub fn verify_profile_for_failover(profile: &Profile, mihomo_path: &str) -> Benc
 fn strict_failover_result(mut result: BenchResult) -> BenchResult {
     if result.success && result.loss_percent > 0.0 {
         result.success = false;
-        result.score = 0;
         result.error = Some(format!(
             "failover verification rejected partial availability ({:.1}% loss)",
             result.loss_percent
@@ -1697,62 +1682,6 @@ pub fn run_unlock_test(port: u16) -> UnlockTestResult {
     }
 }
 
-/// v0.20: Compute the composite quality score (0-100) from the
-/// available inputs. Weights:
-///   25% latency (avg ms)        — ≤50ms → 100, ≥500ms → 0, linear
-///   15% jitter (stddev)         — ≤5ms → 100, ≥100ms → 0, linear
-///   20% stability (drop rate)   — 0% → 100, ≥30% → 0, linear
-///   15% speed (sustained Mbps)  — ≥50 → 100, 0 → 0, linear
-///   25% unlock (4 services)     — 4/4 → 100, 0/4 → 0
-pub fn composite_quality_score(
-    latency_avg_ms: u32,
-    latency_stddev: u32,
-    loss_percent: f32,
-    sustained_mbps: f32,
-    unlock_count: u32,
-) -> u32 {
-    let latency_score = if latency_avg_ms == 0 {
-        0.0
-    } else if latency_avg_ms <= 50 {
-        100.0
-    } else if latency_avg_ms >= 500 {
-        0.0
-    } else {
-        100.0 - (latency_avg_ms as f64 - 50.0) * 100.0 / 450.0
-    };
-    let jitter_score = if latency_stddev <= 5 {
-        100.0
-    } else if latency_stddev >= 100 {
-        0.0
-    } else {
-        100.0 - (latency_stddev as f64 - 5.0) * 100.0 / 95.0
-    };
-    let stability_score = if loss_percent <= 0.0 {
-        100.0
-    } else if loss_percent >= 30.0 {
-        0.0
-    } else {
-        100.0 - loss_percent as f64 * 100.0 / 30.0
-    };
-    let speed_score = if sustained_mbps >= 50.0 {
-        100.0
-    } else {
-        sustained_mbps as f64 * 100.0 / 50.0
-    };
-    let unlock_score = (unlock_score_pct(unlock_count)) as f64;
-    let composite = 0.25 * latency_score
-        + 0.15 * jitter_score
-        + 0.20 * stability_score
-        + 0.15 * speed_score
-        + 0.25 * unlock_score;
-    composite.round().clamp(0.0, 100.0) as u32
-}
-
-/// Unlock-test contribution to composite (0-100). 4/4 → 100.
-fn unlock_score_pct(unlock_count: u32) -> u32 {
-    (unlock_count.min(4) * 25).min(100)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1787,7 +1716,6 @@ mod tests {
             download_error: None,
             upload_error: None,
             loss_percent: 33.333,
-            score: 42,
             success: true,
             error: None,
             resource_tests: Vec::new(),
@@ -1796,7 +1724,6 @@ mod tests {
 
         let strict = strict_failover_result(result);
         assert!(!strict.success);
-        assert_eq!(strict.score, 0);
         assert!(
             strict
                 .error

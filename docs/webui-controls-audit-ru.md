@@ -352,7 +352,7 @@ Backend: `POST /api/routing-presets/apply` с `apply:true`, чтобы preset с
 - **Pipeline активен** — сохраняет `enabled`.
 - **Include filter** — оставить только профили, где есть ключевые слова.
 - **Exclude filter** — исключить профили по ключевым словам.
-- **Сортировка** — визуально `name/group/protocol/address/score/latency`.
+- **Сортировка** — визуально `name/group/protocol/address/latency`.
 - **Rename rules** — строки вида `старое → новое`.
 - **Deduplicate** — удалить дубли по protocol/address/port.
 - **Сохранить** — `POST /api/substore-lite`.
@@ -368,7 +368,6 @@ Backend: `POST /api/routing-presets/apply` с `apply:true`, чтобы preset с
 - **Auto-refresh interval** — интервал обновления подписок.
 - **Failover Auto-switch** — переключение при сбое.
 - **Текущие подряд ошибки** — runtime-счётчик watchdog; отображается read-only.
-- **Smart Auto-Select 2.0** — min success, cooldown, failure penalty.
 - **Сохранить/Загрузить** — `POST/GET /api/auto-settings`.
 
 **Статус: исправлено в коде.** UI больше не отправляет `failover_fail_count` в `POST /api/auto-settings`; поле стало read-only отображением runtime-состояния.

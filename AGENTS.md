@@ -8,7 +8,6 @@ Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 a
 - `src/profiles.rs` — profile/share-link parsing and subscription loading. Plain HTTP(S) is a subscription URL; HTTP proxy profiles use `mihomo+http(s)://`.
 - `src/benchmark.rs` — shared Mihomo benchmark plus native YouTube, Telegram, and AI Studio Quick Test orchestration.
 - `src/telegram_probe.rs` — serialized Telegram login/session/media probe; secrets and SQLite session stay outside `state.json`.
-- `src/scoring.rs` — shared quality scoring.
 - `src/mihomo_config.rs` — router and benchmark Mihomo YAML generation and protocol builders.
 - `src/hincyray.rs` — daemon composition root: persisted state, lifecycle identity, HTTP handlers, transactional activation, watchdog, core/firewall orchestration, Deep Bench, and Dead Servers.
 - `src/geobase.rs` — managed GeoBase storage/generation.
@@ -89,7 +88,7 @@ Target: Keenetic Giga KN-1012, Entware aarch64. SSH is `root@192.168.1.1:222`; u
 
 Use `/opt/etc/init.d/S99hincyray start|stop|restart|status` exclusively. Never stop HincyRay with `pgrep -f`, `pkill -f`, `killall`, `pidof`, or argv/name scans; the init script owns the PID file and verifies `/proc/<pid>/exe`.
 
-Router BusyBox lacks `python3`, `bc`, `timeout`, `iw`, and `iwconfig`; its `jq` has no regex/ONIGURUMA support. Use `curl --max-time`, bounded projections, and BusyBox-compatible syntax.
+Router BusyBox lacks `python3`, `bc`, `timeout`, `install`, `iw`, and `iwconfig`; its `jq` has no regex/ONIGURUMA support. Use `curl --max-time`, bounded projections, and BusyBox-compatible syntax.
 
 ## Build and deploy
 
@@ -109,6 +108,15 @@ Before replacing the live binary:
 4. Start through the init script and wait for both the expected `/api/health` version and `core_status=running`; core startup is asynchronous after init returns.
 5. Verify active profile, fallback group, firewall/TPROXY, and router E2E.
 6. On any failure restore the complete rollback set and verify the previous version health.
+
+Use this repeatable live-update sequence; do not improvise a different installer path:
+
+1. `scp -O` the patched binary to `/opt/etc/hincyray/hincyray.stage` while the daemon is running, then verify its SHA256 remotely.
+2. Create one timestamped rollback directory under `/opt/etc/hincyray/` containing `/opt/sbin/hincyray`, `state.json`, `quality-history.json`, and `mihomo-config.yaml` when present.
+3. Arm a shell `trap` that stops via `S99hincyray`, restores that complete set with BusyBox `cp -p`, runs `chmod 0755 /opt/sbin/hincyray`, and starts via `S99hincyray` on any failure.
+4. Stop via `S99hincyray`; replace the binary with `cp` plus `chmod 0755` (BusyBox has no `install`); verify installed SHA; start via `S99hincyray`.
+5. Poll bounded `/api/health` and `/api/safe-mode` until the expected version, `core_status=running`, and `firewall_status=running`; only then disarm the trap and remove the staged file.
+6. Verify active profile, fallback group, routing/firewall, the changed live behavior, and bounded router E2E. Keep the rollback directory and report its path.
 
 Release artifact SHA256: `6a99122d61e75d039b0147c6b87789d2f0713b18f350a0dd88838f49cafe5e24`. Live verification and release evidence are recorded in `docs/releases/v0.22.0.md`.
 

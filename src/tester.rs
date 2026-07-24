@@ -19,7 +19,6 @@ use url::Url;
 
 use crate::mihomo_config::build_mihomo_bench_config;
 use crate::profiles::{Profile, Protocol};
-use crate::scoring::quality_score;
 use crate::xray_config::{build_xray_config, percent_decode, query_value};
 
 #[derive(Clone, Debug)]
@@ -37,7 +36,6 @@ pub struct TestResult {
     pub jitter_ms: u32,
     pub download_mbps: f32,
     pub loss_percent: f32,
-    pub score: u32,
     pub status: TestStatus,
 }
 
@@ -107,12 +105,6 @@ fn benchmark_profile(profile: &Profile, settings: &TestSettings) -> TestResult {
             jitter_ms: metrics.jitter_ms,
             download_mbps: metrics.download_mbps,
             loss_percent: metrics.loss_percent,
-            score: quality_score(
-                metrics.latency_ms,
-                metrics.jitter_ms,
-                metrics.download_mbps,
-                metrics.loss_percent,
-            ),
             status: TestStatus::Passed,
         },
         Err(error) => TestResult {
@@ -121,7 +113,6 @@ fn benchmark_profile(profile: &Profile, settings: &TestSettings) -> TestResult {
             jitter_ms: 0,
             download_mbps: 0.0,
             loss_percent: 100.0,
-            score: 0,
             status: TestStatus::Failed(error),
         },
     }

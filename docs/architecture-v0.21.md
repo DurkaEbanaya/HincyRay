@@ -26,7 +26,7 @@ There is no TUN device or tun2socks process. Mihomo config is generated output; 
 | `hincyray_webui` | Embedded Web UI asset boundary; HTTP routing does not know the asset filesystem layout |
 | `mihomo_config` | Typed Mihomo YAML and routing rule generation; no process or HTTP ownership |
 | `geobase` | Revisioned desired/applied manifests, artifact validation, quotas, and garbage collection |
-| `profiles` / `scoring` / `benchmark` | Parsing, shared scoring, and benchmark execution independent of daemon transport |
+| `profiles` / `benchmark` | Parsing and benchmark execution independent of daemon transport |
 
 `src/main.rs` and `src/bin/hincyray.rs` remain thin entrypoints. Shared modules compile in the no-default-features router build; desktop modules remain feature-gated.
 

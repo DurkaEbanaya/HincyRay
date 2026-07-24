@@ -4,7 +4,7 @@
 
 ---
 
-HincyRay is a lightweight VPN/proxy client for Keenetic routers. It ships a router daemon (`hincyray`) that reuses the parser and quality scoring from the `XrayVpnTest` desktop tool, and exposes an embedded web panel on the router LAN.
+HincyRay is a lightweight VPN/proxy client for Keenetic routers. It ships a router daemon (`hincyray`) that reuses the parser and benchmark engine from the `XrayVpnTest` desktop tool, and exposes an embedded web panel on the router LAN.
 
 The daemon uses **Mihomo (Clash.Meta)** as the single proxy core, supporting VLESS (Reality/xhttp), VMess, Trojan, Shadowsocks, ShadowsocksR, Snell, HTTP, SOCKS, AnyTLS, Hysteria v1/v2 (port hopping), WireGuard, TUIC, SSH, MASQUE, OpenVPN, and Tailscale. Transparent proxying via iptables NAT REDIRECT (TCP) + TPROXY (UDP) — no tun2socks, no TUN device.
 
@@ -223,8 +223,7 @@ Web UI sharing and audit hardening:
 ### v0.14.0
 
 - **Rule Trace**: `POST /api/routing/trace` explains local routing decisions for host/IP/port/protocol/source IP requests. Runtime-owned `geosite:*`, `geoip:*`, and `rule-set:*` matches are reported as Mihomo evaluation candidates instead of being guessed locally.
-- **Sub-Store Lite**: lightweight parsed-profile cleanup with include/exclude filters, rename rules, dedup by protocol/address/port, sorting by name/group/protocol/address/score/latency, and backup-before-apply. `GET/POST /api/substore-lite`, `POST /api/substore-lite/apply`.
-- **Smart Auto-Select 2.0**: EWMA score/latency/download metrics, minimum-success gating, failure penalty, and cooldown for failing profiles. Configured through `/api/auto-settings`.
+- **Sub-Store Lite**: lightweight parsed-profile cleanup with include/exclude filters, rename rules, dedup by protocol/address/port, sorting by name/group/protocol/address/latency, and backup-before-apply. `GET/POST /api/substore-lite`, `POST /api/substore-lite/apply`.
 - **Backups and WebDAV**: local state backups with create/list/restore/delete plus WebDAV upload/download. Restore validates state JSON, creates a pre-restore backup, then regenerates runtime config safely.
 - **Diagnostics & Recovery**: web panel section for rule trace, DNS diagnostics, unlock checks, Sub-Store Lite, backups, WebDAV, and connection closing.
 - **Unlock checker + DNS diagnostics**: `POST /api/unlock-check` probes common services; `GET /api/dns/diagnostics` checks local resolver behavior and Mihomo DNS/API availability.
@@ -291,7 +290,7 @@ Web UI sharing and audit hardening:
 
 - **Always-on watchdog**: core restart with exponential backoff, firewall rule monitoring.
 - **Health-check failover**: 3 consecutive failures → switch to next-best profile.
-- **Auto-benchmark + auto-select**: scheduled benchmark, switch to highest-scoring profile.
+- **Auto-benchmark + auto-select**: scheduled benchmark, switch to the lowest-latency recently successful profile.
 - **Graceful shutdown**: SIGTERM/SIGINT stops core, removes iptables, persists state.
 - **State corruption recovery**: corrupted `state.json` → backup, fresh state.
 - **System monitoring**: CPU/RAM/temp/load/uptime via `/proc` + `/sys`.

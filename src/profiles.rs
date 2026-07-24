@@ -11,6 +11,8 @@ use url::Url;
 
 const MAX_SUBSCRIPTION_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SUBSCRIPTION_DECODE_LAYERS: usize = 4;
+const MAX_SUBSCRIPTION_TITLE_CHARS: usize = 256;
+const MAX_SUBSCRIPTION_ANNOUNCEMENT_CHARS: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
@@ -240,9 +242,16 @@ pub struct ParseOutput {
 #[derive(Clone, Debug)]
 pub struct SubscriptionLoadReport {
     pub profiles: Vec<Profile>,
+    pub metadata: SubscriptionMetadata,
     pub response_bytes: usize,
     pub decoded_chars: usize,
     pub unsupported_placeholders: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionMetadata {
+    pub title: Option<String>,
+    pub announcement: Option<String>,
 }
 
 pub fn parse_profiles(input: &str) -> Vec<Profile> {
@@ -372,6 +381,7 @@ pub fn load_subscription_detailed_via_proxy_with_hwid(
             Ok(()) => {
                 return Ok(SubscriptionLoadReport {
                     profiles: parsed.profiles,
+                    metadata: fetched.metadata,
                     response_bytes: fetched.response_bytes,
                     decoded_chars: decoded.chars().count(),
                     unsupported_placeholders: parsed.unsupported_placeholders,
@@ -421,6 +431,7 @@ impl SubscriptionRequestMode {
 
 struct FetchedSubscription {
     text: String,
+    metadata: SubscriptionMetadata,
     response_bytes: usize,
 }
 
@@ -506,6 +517,18 @@ fn fetch_subscription(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let metadata = SubscriptionMetadata {
+        title: subscription_header_text(
+            response.headers().get("profile-title"),
+            MAX_SUBSCRIPTION_TITLE_CHARS,
+            true,
+        ),
+        announcement: subscription_header_text(
+            response.headers().get("announce"),
+            MAX_SUBSCRIPTION_ANNOUNCEMENT_CHARS,
+            false,
+        ),
+    };
     let mut bytes = Vec::new();
     response
         .take(MAX_SUBSCRIPTION_RESPONSE_BYTES + 1)
@@ -537,8 +560,49 @@ fn fetch_subscription(
     })?;
     Ok(FetchedSubscription {
         text,
+        metadata,
         response_bytes,
     })
+}
+
+fn subscription_header_text(
+    value: Option<&reqwest::header::HeaderValue>,
+    max_chars: usize,
+    single_line: bool,
+) -> Option<String> {
+    let raw = value?.to_str().ok()?.trim();
+    if raw.is_empty() || raw.len() > max_chars.saturating_mul(8).saturating_add(16) {
+        return None;
+    }
+    let decoded = if raw
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("base64:"))
+    {
+        let encoded = &raw[7..];
+        [
+            &general_purpose::STANDARD,
+            &general_purpose::STANDARD_NO_PAD,
+            &general_purpose::URL_SAFE,
+            &general_purpose::URL_SAFE_NO_PAD,
+        ]
+        .into_iter()
+        .find_map(|engine| engine.decode(encoded).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())?
+    } else {
+        percent_decode_str(raw).decode_utf8_lossy().into_owned()
+    };
+    let normalized = decoded.replace("\r\n", "\n").replace('\r', "\n");
+    let cleaned: String = normalized
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .take(max_chars)
+        .collect();
+    let cleaned = if single_line {
+        cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        cleaned.trim().to_owned()
+    };
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 fn decode_http_content(bytes: &[u8], encoding: &str) -> Result<Vec<u8>, String> {
@@ -682,11 +746,41 @@ fn decode_subscription_body(body: &str) -> String {
 }
 
 fn extract_candidates(input: &str) -> Vec<String> {
-    input
-        .split(|character: char| {
-            character.is_whitespace() || matches!(character, '"' | '\'' | '<' | '>')
+    input.lines().flat_map(extract_line_candidates).collect()
+}
+
+fn extract_line_candidates(line: &str) -> Vec<String> {
+    let starts: Vec<usize> = line
+        .match_indices("://")
+        .filter_map(|(separator, _)| {
+            let bytes = line.as_bytes();
+            let mut start = separator;
+            while start > 0
+                && (bytes[start - 1].is_ascii_alphanumeric()
+                    || matches!(bytes[start - 1], b'+' | b'-' | b'.'))
+            {
+                start -= 1;
+            }
+            (start < separator).then_some(start)
         })
-        .filter_map(clean_candidate)
+        .collect();
+
+    starts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, start)| {
+            let next = starts.get(index + 1).copied().unwrap_or(line.len());
+            let mut value = &line[*start..next];
+            if let Some(end) = value.find(['"', '\'', '<', '>']) {
+                value = &value[..end];
+            }
+            if !value.contains('#')
+                && let Some(end) = value.find(char::is_whitespace)
+            {
+                value = &value[..end];
+            }
+            clean_candidate(value)
+        })
         .collect()
 }
 
@@ -694,7 +788,7 @@ fn clean_candidate(value: &str) -> Option<String> {
     let cleaned = value.trim().trim_matches(|character| {
         matches!(
             character,
-            '\\' | '{' | '}' | ',' | ';' | ')' | '(' | '[' | ']' | '\u{00a0}'
+            '\\' | '{' | '}' | ',' | ';' | ')' | '(' | '\u{00a0}'
         )
     });
 
@@ -1343,7 +1437,7 @@ mod tests {
             let body = encoder.finish().expect("finish gzip");
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nProfile-Title: base64:Rml4dHVyZSBWUE4=\r\nAnnounce: base64:8J+UpSBTZXJ2ZXJzIGZvciBzdHJlYW1pbmcK8J+OrSBMb3cgbGF0ZW5jeQ==\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .expect("subscription headers");
@@ -1357,6 +1451,11 @@ mod tests {
         worker.join().expect("subscription worker");
         assert_eq!(report.profiles.len(), 1);
         assert_eq!(report.profiles[0].name, "Compressed");
+        assert_eq!(report.metadata.title.as_deref(), Some("Fixture VPN"));
+        assert_eq!(
+            report.metadata.announcement.as_deref(),
+            Some("🔥 Servers for streaming\n🎭 Low latency")
+        );
     }
 
     #[test]
@@ -1445,6 +1544,18 @@ https://provider.example/sub/token-b}"#;
 
         assert_eq!(output.profiles.len(), 1);
         assert_eq!(output.profiles[0].name, "DE");
+    }
+
+    #[test]
+    fn preserves_spaces_and_emoji_in_subscription_profile_names() {
+        let output = parse_input(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Germany 92 → [📃 Белые списки]\n\
+             vless://22222222-2222-2222-2222-222222222222@example.net:443?security=tls#🍿 YouTube без рекламы",
+        );
+
+        assert_eq!(output.profiles.len(), 2);
+        assert_eq!(output.profiles[0].name, "Germany 92 → [📃 Белые списки]");
+        assert_eq!(output.profiles[1].name, "🍿 YouTube без рекламы");
     }
 
     #[test]
