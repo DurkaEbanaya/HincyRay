@@ -42,7 +42,7 @@ The configured public peer and message ID identify one operator-selected media m
 
 ### AI Studio
 
-The daemon opens `aistudio.google.com` through the same temporary profile SOCKS listener with bounded time and response size. Request failures and redirects to Google AI's `available-regions` page are reported as a failed `AI` result.
+The daemon opens the protected AI Studio new-chat route through the same temporary profile SOCKS listener with bounded time and response size. Request failures, redirects to Google AI's `available-regions` page, and Google sign-in redirects are reported as failed `AI` results. Google now makes the final region/account decision in an authenticated `GetLoggingContext` RPC, so an anonymous public `/welcome` response is not evidence of usable AI Studio access.
 
 ## Secret and session boundary
 

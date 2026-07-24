@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Added a bounded AI Studio regional-availability check to Quick Test and bumped persisted service results to contract v5 with `YT`/`TG`/`AI` indicators.
+- Made AI Studio validation fail closed on Google sign-in redirects instead of treating the anonymous public `/welcome` page as usable regional access.
 - Kept routing-rule deletions in desired state when Mihomo validation or activation cannot run, reporting the pending apply instead of restoring the deleted rule.
 - Reworked subscription loading into a bounded transport/content pipeline: direct and proxy paths stay separate, Happ client identity retries HTTP/content incompatibility, gzip/deflate and nested gzip/base64 layers decode before format detection, and transport failures are not redundantly retried with another User-Agent.
 

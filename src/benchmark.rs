@@ -52,8 +52,9 @@ const YOUTUBE_VR_USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1
 const YOUTUBE_SIGNATURE_TIMESTAMP: u64 = 20653;
 const YOUTUBE_PAGE_MAX_BYTES: u64 = 3 * 1024 * 1024;
 const YOUTUBE_SEGMENT_BYTES: u64 = 512 * 1024;
-const AI_STUDIO_URL: &str = "https://aistudio.google.com/";
+const AI_STUDIO_URL: &str = "https://aistudio.google.com/prompts/new_chat";
 const AI_STUDIO_UNAVAILABLE_URL: &str = "https://ai.google.dev/gemini-api/docs/available-regions";
+const AI_STUDIO_SIGN_IN_URL: &str = "https://accounts.google.com/";
 const AI_STUDIO_PAGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -829,6 +830,12 @@ fn ai_studio_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
     {
         return Err("AI Studio redirected to the unsupported-region page".to_owned());
     }
+    if ai_studio_sign_in_required(&metrics.final_url) {
+        return Err(
+            "AI Studio requires Google sign-in; regional access cannot be verified anonymously"
+                .to_owned(),
+        );
+    }
     if !output.status.success() || !(200..300).contains(&metrics.base.http_status) {
         return Err(format!(
             "AI Studio rc={}, http={}: {}",
@@ -851,6 +858,12 @@ fn ai_studio_region_unavailable(url: &str) -> bool {
     url.trim()
         .to_ascii_lowercase()
         .starts_with(AI_STUDIO_UNAVAILABLE_URL)
+}
+
+fn ai_studio_sign_in_required(url: &str) -> bool {
+    url.trim()
+        .to_ascii_lowercase()
+        .starts_with(AI_STUDIO_SIGN_IN_URL)
 }
 
 struct CurlMetrics {
@@ -1895,6 +1908,10 @@ mod tests {
             "https://ai.google.dev/gemini-api/docs/available-regions?hl=en"
         ));
         assert!(!ai_studio_region_unavailable(&metrics.final_url));
+        assert!(ai_studio_sign_in_required(
+            "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Faistudio.google.com"
+        ));
+        assert!(!ai_studio_sign_in_required(&metrics.final_url));
     }
 
     #[test]

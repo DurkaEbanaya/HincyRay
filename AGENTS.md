@@ -39,7 +39,7 @@ Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 a
 - Router DNS is always present because firewall rules unconditionally redirect port 53 to Mihomo on 1053. `dns.enabled` is a desktop-Xray concept.
 - DIRECT routes use configured local DNS servers by default so their name resolution does not depend on VPN upstream health.
 - Router geo assets are MetaCubeX `geosite.dat` + `geoip.metadb`; legacy `geoip.dat` and the oversized RKN bypass list are not runtime inputs.
-- Quick Test is sequential. YouTube uses a narrow Innertube direct-format probe with Rust + `curl`; AI Studio checks page access and the unsupported-region redirect. Do not add Python/yt-dlp/JS runtime. Telegram uses one private SQLite session and must not be opened by concurrent clients.
+- Quick Test is sequential. YouTube uses a narrow Innertube direct-format probe with Rust + `curl`; AI Studio checks a protected route and fails on unsupported-region or sign-in redirects because anonymous `/welcome` is not proof of access. Do not add Python/yt-dlp/JS runtime. Telegram uses one private SQLite session and must not be opened by concurrent clients.
 - Redir and TPROXY listeners must stay on separate ports. The ndm hook is the primary firewall-reload mechanism; watchdog reinstall is a safety net.
 - `geoip.metadb` must be present locally and `geo-auto-update: false`; router startup must not depend on blocked GitHub downloads.
 - Mihomo fallback group `proxy` is the canonical upstream-health decider. The daemon reads its state; do not add duplicate periodic upstream probes.
