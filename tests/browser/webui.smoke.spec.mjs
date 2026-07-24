@@ -35,7 +35,7 @@ test('profile table shows compact service status and configurable metric columns
   await openFixture(page);
   await navigateTo(page, 'profiles');
   const row = page.locator('#profilesBody tr').filter({ hasText: 'Fixture Profile' });
-  await expect(row.locator('.profile-service-test.ok')).toHaveText('YT');
+  await expect(row.locator('.profile-service-test')).toHaveText(['YT', 'TG', 'AI']);
   await expect(row.locator('.profile-service-test.bad')).toHaveText('TG');
 
   await page.locator('#profileMetricSettings > button').click();

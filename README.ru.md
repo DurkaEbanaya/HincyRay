@@ -212,6 +212,7 @@ Hotfix: страница «Система» теперь явно показыв
 - **Hysteria2 port hopping**: query-параметры `mport`/`ports` и `hopInterval`/`hop_interval` парсятся из share-ссылок, попадают в Mihomo как поля `ports` + `hop-interval`.
 - **Profile CRUD API**: `POST /api/profiles/add` (парсинг share-ссылки), `POST /api/profiles/delete` (удаление по ID, реиндексация), `POST /api/profiles/update` (переименование, тоггл block_quic). Текущий Web UI предоставляет add/delete и переименование через dialog.
 - **Автообновление подписок**: watchdog Phase 7 обновляет все подписки с настраиваемым интервалом. По умолчанию отключено. Если активный профиль удалён при обновлении, авто-выбирается лучший доступный.
+- **Совместимая загрузка подписок**: каждый сетевой путь выполняет bounded HTTP/content decoding до парсинга профилей, включая gzip/deflate и вложенные base64 payloads. Happ-compatible identity повторяется при HTTP/content rejection, а DNS/TLS/timeout сразу переводят загрузку на следующий direct/SOCKS/HTTP путь без повторения того же transport failure.
 - **Статистика трафика**: накопительные счётчики байт upload/download, сохраняемые в state. Скорость в реальном времени через Mihomo `/traffic` API. `GET /api/traffic`, `GET /api/mihomo-api/traffic`, `GET /api/mihomo-api/memory`.
 - **Лог соединений**: сохраняемый лог соединений, прошедших через прокси (хост, исходный IP, chain, правило, upload/download). Лимит 500 записей. `GET /api/connection-log`.
 - **API speed test**: `POST /api/mihomo-api/speed-test` скачивает файл 10 МБ через SOCKS-прокси и возвращает Mbps, затраченное время и количество байт. URL по умолчанию: Cloudflare.
@@ -391,7 +392,7 @@ http://<ip-роутера>:8088/
 | `GET` | `/api/routing/preview` | Non-mutating сравнение hash desired/applied config и эффекты apply |
 | `POST` | `/api/routing/explain` | Объяснить routing нормализованного host/IP с optional source/port/network context |
 | `POST` | `/api/routing/settings` | Сохранить настройки роутинга; `{"apply":true}` сохраняет и применяет атомарно |
-| `POST` | `/api/routing/rules` | Сохранить правила роутинга; `{"rules":[...],"apply":true}` сохраняет и применяет атомарно |
+| `POST` | `/api/routing/rules` | Сохранить правила; при ошибке применения добавления/изменения откатываются, а удаления остаются сохранёнными с `requires_apply:true` |
 | `POST` | `/api/routing/apply` | Перегенерировать конфиг + перезапуск ядра + перезапуск firewall |
 | `POST` | `/api/routing/resource-route` | Создать/обновить правило для наблюдаемого host/IP ресурса, применить конфиг, опционально закрыть совпавшие соединения |
 | `GET` | `/api/routing-presets` | Встроенные routing presets |

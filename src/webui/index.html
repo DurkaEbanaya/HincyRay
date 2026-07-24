@@ -3214,9 +3214,9 @@ function profileMetricStyle(metric) {
 }
 
 function profileServiceTestsHtml(resourceTests) {
-  const tests = Array.isArray(resourceTests) ? resourceTests.filter(test => test.contract_version === 4) : [];
+  const tests = Array.isArray(resourceTests) ? resourceTests.filter(test => test.contract_version === 5) : [];
   if (!tests.length) return '';
-  return `<div class="profile-service-tests">${[['youtube','YT'],['telegram','TG']].map(([id,label]) => {
+  return `<div class="profile-service-tests">${[['youtube','YT'],['telegram','TG'],['ai','AI']].map(([id,label]) => {
     const result = tests.find(test => test.id === id);
     if (!result) return '';
     const ok = result.stable === true;
@@ -3924,8 +3924,12 @@ function restoreRoutingRule(idx) {
 }
 
 function saveRoutingRulesToBackend(afterFn) {
-  api('POST','/api/routing/rules',{rules:MOCK.routing_rules, apply:true}).then(()=>{
-    showToast('success', t('Правила сохранены и применены'));
+  api('POST','/api/routing/rules',{rules:MOCK.routing_rules, apply:true}).then(result=>{
+    if (result.applied === false) {
+      showToast('warning', `${t('Правила сохранены, но не применены')}: ${result.activation_error || t('требуется повторное применение')}`);
+    } else {
+      showToast('success', t('Правила сохранены и применены'));
+    }
     if (afterFn) afterFn();
   });
 }
@@ -5705,7 +5709,12 @@ function doImport() {
   const group = document.getElementById('importGroup').value;
   if(!text.trim()) return showToast('error',t('Вставьте ссылки для импорта'));
   api('POST','/api/profiles/import',{text,group:group||undefined})
-    .then(()=>showToast('success',t('Импорт запущен')))
+    .then(result=>{
+      if (Array.isArray(result.errors) && result.errors.length) {
+        throw new Error(result.errors.join('\n'));
+      }
+      showToast('success',t('Импорт запущен'));
+    })
     .catch(err => showSubscriptionErrorModal(err));
 }
 

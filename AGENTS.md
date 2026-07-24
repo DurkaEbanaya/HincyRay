@@ -6,7 +6,7 @@ Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 a
 
 - `src/main.rs`, `src/bin/hincyray.rs` — thin entrypoints only.
 - `src/profiles.rs` — profile/share-link parsing and subscription loading. Plain HTTP(S) is a subscription URL; HTTP proxy profiles use `mihomo+http(s)://`.
-- `src/benchmark.rs` — shared Mihomo benchmark plus native YouTube and Telegram Quick Test orchestration.
+- `src/benchmark.rs` — shared Mihomo benchmark plus native YouTube, Telegram, and AI Studio Quick Test orchestration.
 - `src/telegram_probe.rs` — serialized Telegram login/session/media probe; secrets and SQLite session stay outside `state.json`.
 - `src/scoring.rs` — shared quality scoring.
 - `src/mihomo_config.rs` — router and benchmark Mihomo YAML generation and protocol builders.
@@ -34,15 +34,17 @@ Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 a
   - never parse, substitute, or expose one contract as the other.
 - Lifecycle canonicalization removes display identity but preserves connection identity. Startup migration converts raw and resolvable current-profile v1 lifecycle values to v2; legacy orphan v1 Trash entries remain restorable.
 - Manual and automatic Dead Servers transitions share the serialized `mutate_dead_server_membership()` boundary. Validate the whole batch before mutation; active profiles cannot be moved; persistence/dataplane failures must roll lifecycle fields back without erasing unrelated state.
+- Routing-rule deletions are desired-state safe: activation failure leaves the deletion persisted and pending apply; additions and edits retain transactional rollback.
 - Automatic/all/subscription scopes exclude dead profiles. Explicit diagnostic requests may include them. Enabled pinned routes preserve intent and use active fallback while their target is dead.
 - Router DNS is always present because firewall rules unconditionally redirect port 53 to Mihomo on 1053. `dns.enabled` is a desktop-Xray concept.
 - DIRECT routes use configured local DNS servers by default so their name resolution does not depend on VPN upstream health.
 - Router geo assets are MetaCubeX `geosite.dat` + `geoip.metadb`; legacy `geoip.dat` and the oversized RKN bypass list are not runtime inputs.
-- Quick Test is sequential. YouTube uses a narrow Innertube direct-format probe with Rust + `curl`; do not add Python/yt-dlp/JS runtime. Telegram uses one private SQLite session and must not be opened by concurrent clients.
+- Quick Test is sequential. YouTube uses a narrow Innertube direct-format probe with Rust + `curl`; AI Studio checks page access and the unsupported-region redirect. Do not add Python/yt-dlp/JS runtime. Telegram uses one private SQLite session and must not be opened by concurrent clients.
 - Redir and TPROXY listeners must stay on separate ports. The ndm hook is the primary firewall-reload mechanism; watchdog reinstall is a safety net.
 - `geoip.metadb` must be present locally and `geo-auto-update: false`; router startup must not depend on blocked GitHub downloads.
 - Mihomo fallback group `proxy` is the canonical upstream-health decider. The daemon reads its state; do not add duplicate periodic upstream probes.
 - Keep request/response bodies bounded and structurally redact secrets. Never place real subscription URLs, tokens, private keys, or credentials in source/docs/tests; use `https://provider.example/sub/<token>`.
+- Subscription loading separates network-path fallback from client/content compatibility. Retry Happ identity only after an HTTP/content rejection; transport failures advance to the next path. Keep compressed and decoded bodies bounded.
 - Guard OS-specific APIs behind platform boundaries.
 
 ## Required gates

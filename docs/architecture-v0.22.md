@@ -13,9 +13,10 @@ profile
   -> temporary Mihomo SOCKS
      -> YouTube visitor bootstrap + Innertube player + 512 KiB media range
      -> Telegram authorized message lookup + one media chunk
+     -> AI Studio page request + regional redirect check
 ```
 
-Results are persisted in `ProfileStats.resource_tests` with contract version 4. The Web UI renders only the current contract, preventing obsolete CDN, unauthenticated MTProto handshake, or failed intermediate extractor experiments from appearing as current `YT`/`TG` status.
+Results are persisted in `ProfileStats.resource_tests` with contract version 5. The Web UI renders only the current contract, preventing obsolete probes from appearing as current `YT`/`TG`/`AI` status.
 
 ### YouTube
 
@@ -39,6 +40,10 @@ This path uses Rust, Mihomo, and `curl`. It deliberately does not embed Python, 
 
 The configured public peer and message ID identify one operator-selected media message. Quick Test resolves that peer, loads exactly that message, and downloads one 256 KiB chunk.
 
+### AI Studio
+
+The daemon opens `aistudio.google.com` through the same temporary profile SOCKS listener with bounded time and response size. Request failures and redirects to Google AI's `available-regions` page are reported as a failed `AI` result.
+
 ## Secret and session boundary
 
 Telegram data is not part of `HincyrayState`:
@@ -60,6 +65,14 @@ The legacy oversized RKN bypass provider and router `geoip.dat` path are removed
 - bounded Always VPN exceptions.
 
 Under `MATCH,proxy`, automatically classified Active domains do not need a redundant Active rule provider because the final match already proxies them. Static Active networks remain explicit because they represent operator-authored routing intent.
+
+Routing-rule deletions persist as desired state even when low memory or an unavailable upstream prevents immediate Mihomo activation. The API reports `applied:false`, `requires_apply:true`, and a bounded `activation_error`; additions and edits retain transactional rollback on failed activation.
+
+## Subscription compatibility pipeline
+
+Subscription compatibility is split into independent stages: network path (`direct`, SOCKS5h, SOCKS5, HTTP), client identity (sing-box then Happ when the server rejects or returns unusable content), bounded HTTP decoding, nested gzip/base64 payload decoding, and profile-format detection. A timeout, DNS, TLS, or connection failure advances to the next network path without retrying the same broken path under another User-Agent. Successful HTTP content still must contain at least one supported profile, so refresh cannot erase a working group with a challenge or maintenance response.
+
+This covers ordinary standards-based and Happ-compatible subscription endpoints. Provider-side encryption, CAPTCHA/browser attestation, account-bound request signatures, and unsupported proxy schemas remain explicit compatibility boundaries rather than being guessed from response text.
 
 ## Live resource evidence
 

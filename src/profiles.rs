@@ -1,11 +1,16 @@
 use std::fmt;
+use std::io::Read;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose};
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
+
+const MAX_SUBSCRIPTION_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SUBSCRIPTION_DECODE_LAYERS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Protocol {
@@ -340,22 +345,42 @@ pub fn load_subscription_detailed_via_proxy_with_hwid(
     proxy: Option<&str>,
     hwid: &HwidConfig,
 ) -> Result<SubscriptionLoadReport, String> {
-    let mut response = fetch_subscription(source, SubscriptionRequestMode::SingBox, proxy, hwid)?;
-    let (mut decoded, mut parsed) = parse_subscription_response(&response);
-
-    if should_retry_as_happ(&parsed) {
-        response = fetch_subscription(source, SubscriptionRequestMode::HappAndroid, proxy, hwid)?;
-        (decoded, parsed) = parse_subscription_response(&response);
+    let mut errors = Vec::new();
+    for mode in [
+        SubscriptionRequestMode::SingBox,
+        SubscriptionRequestMode::HappAndroid,
+    ] {
+        let fetched = match fetch_subscription(source, mode, proxy, hwid) {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                let retry_with_happ = matches!(mode, SubscriptionRequestMode::SingBox)
+                    && error.retry_with_other_client();
+                errors.push(format!("[{}] {}", mode.label(), error.message()));
+                if retry_with_happ {
+                    continue;
+                }
+                return Err(errors.join("; "));
+            }
+        };
+        let (decoded, parsed) = parse_subscription_response(&fetched.text);
+        match require_subscription_profiles(
+            source,
+            fetched.response_bytes,
+            decoded.chars().count(),
+            &parsed,
+        ) {
+            Ok(()) => {
+                return Ok(SubscriptionLoadReport {
+                    profiles: parsed.profiles,
+                    response_bytes: fetched.response_bytes,
+                    decoded_chars: decoded.chars().count(),
+                    unsupported_placeholders: parsed.unsupported_placeholders,
+                });
+            }
+            Err(error) => errors.push(format!("[{}] {error}", mode.label())),
+        }
     }
-
-    require_subscription_profiles(source, response.len(), decoded.chars().count(), &parsed)?;
-
-    Ok(SubscriptionLoadReport {
-        profiles: parsed.profiles,
-        response_bytes: response.len(),
-        decoded_chars: decoded.chars().count(),
-        unsupported_placeholders: parsed.unsupported_placeholders,
-    })
+    Err(errors.join("; "))
 }
 
 /// A successful HTTP exchange is not a successful subscription refresh unless
@@ -379,9 +404,41 @@ fn require_subscription_profiles(
     ))
 }
 
+#[derive(Clone, Copy)]
 enum SubscriptionRequestMode {
     SingBox,
     HappAndroid,
+}
+
+impl SubscriptionRequestMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SingBox => "sing-box",
+            Self::HappAndroid => "happ",
+        }
+    }
+}
+
+struct FetchedSubscription {
+    text: String,
+    response_bytes: usize,
+}
+
+enum SubscriptionFetchError {
+    Transport(String),
+    ClientResponse(String),
+}
+
+impl SubscriptionFetchError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Transport(message) | Self::ClientResponse(message) => message,
+        }
+    }
+
+    fn retry_with_other_client(&self) -> bool {
+        matches!(self, Self::ClientResponse(_))
+    }
 }
 
 fn fetch_subscription(
@@ -389,7 +446,7 @@ fn fetch_subscription(
     mode: SubscriptionRequestMode,
     proxy: Option<&str>,
     hwid: &HwidConfig,
-) -> Result<String, String> {
+) -> Result<FetchedSubscription, SubscriptionFetchError> {
     let user_agent = match mode {
         SubscriptionRequestMode::SingBox => subscription_user_agent().to_owned(),
         SubscriptionRequestMode::HappAndroid => hwid.user_agent(),
@@ -401,12 +458,18 @@ fn fetch_subscription(
     if let Some(proxy_url) = proxy {
         // `Proxy::all` validates the URL before any network I/O, so a
         // malformed proxy surfaces here without touching the network.
-        let proxy = reqwest::Proxy::all(proxy_url)
-            .map_err(|error| format!("{}: proxy {proxy_url}: {error}", source.url))?;
+        let proxy = reqwest::Proxy::all(proxy_url).map_err(|error| {
+            SubscriptionFetchError::Transport(format!("{}: proxy {proxy_url}: {error}", source.url))
+        })?;
         builder = builder.proxy(proxy);
     }
-    let client = builder.build().map_err(|error| error.to_string())?;
-    let mut request = client.get(&source.url);
+    let client = builder
+        .build()
+        .map_err(|error| SubscriptionFetchError::Transport(error.to_string()))?;
+    let mut request = client
+        .get(&source.url)
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip, deflate, identity")
+        .header(reqwest::header::ACCEPT, "text/plain, application/json, */*");
 
     if matches!(mode, SubscriptionRequestMode::HappAndroid) {
         request = request
@@ -419,13 +482,115 @@ fn fetch_subscription(
             .header("X-API-Version", &hwid.api_version);
     }
 
-    request
+    let response = request
         .send()
-        .map_err(|error| classify_http_error(&source.url, &error))?
+        .map_err(|error| {
+            SubscriptionFetchError::Transport(classify_http_error(&source.url, &error))
+        })?
         .error_for_status()
-        .map_err(|error| classify_http_error(&source.url, &error))?
-        .text()
-        .map_err(|error| classify_http_error(&source.url, &error))
+        .map_err(|error| {
+            SubscriptionFetchError::ClientResponse(classify_http_error(&source.url, &error))
+        })?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SUBSCRIPTION_RESPONSE_BYTES)
+    {
+        return Err(SubscriptionFetchError::ClientResponse(format!(
+            "{}: subscription response exceeds {} bytes",
+            source.url, MAX_SUBSCRIPTION_RESPONSE_BYTES
+        )));
+    }
+    let content_encoding = response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_SUBSCRIPTION_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            SubscriptionFetchError::Transport(format!(
+                "{}: read subscription response: {error}",
+                source.url
+            ))
+        })?;
+    if bytes.len() as u64 > MAX_SUBSCRIPTION_RESPONSE_BYTES {
+        return Err(SubscriptionFetchError::ClientResponse(format!(
+            "{}: subscription response exceeds {} bytes",
+            source.url, MAX_SUBSCRIPTION_RESPONSE_BYTES
+        )));
+    }
+    let response_bytes = bytes.len();
+    let bytes = decode_http_content(&bytes, &content_encoding).map_err(|error| {
+        SubscriptionFetchError::ClientResponse(format!(
+            "{}: decode HTTP response: {error}",
+            source.url
+        ))
+    })?;
+    let text = decode_subscription_payload(bytes).map_err(|error| {
+        SubscriptionFetchError::ClientResponse(format!(
+            "{}: decode subscription payload: {error}",
+            source.url
+        ))
+    })?;
+    Ok(FetchedSubscription {
+        text,
+        response_bytes,
+    })
+}
+
+fn decode_http_content(bytes: &[u8], encoding: &str) -> Result<Vec<u8>, String> {
+    match encoding.trim() {
+        "" | "identity" => Ok(bytes.to_vec()),
+        "gzip" | "x-gzip" => read_bounded_decoder(GzDecoder::new(bytes), "gzip"),
+        "deflate" => read_bounded_decoder(ZlibDecoder::new(bytes), "deflate")
+            .or_else(|_| read_bounded_decoder(DeflateDecoder::new(bytes), "deflate")),
+        other => Err(format!("unsupported Content-Encoding {other:?}")),
+    }
+}
+
+fn read_bounded_decoder(mut decoder: impl Read, format: &str) -> Result<Vec<u8>, String> {
+    let mut decoded = Vec::new();
+    decoder
+        .by_ref()
+        .take(MAX_SUBSCRIPTION_RESPONSE_BYTES + 1)
+        .read_to_end(&mut decoded)
+        .map_err(|error| format!("{format}: {error}"))?;
+    if decoded.len() as u64 > MAX_SUBSCRIPTION_RESPONSE_BYTES {
+        return Err(format!(
+            "decoded {format} response exceeds {MAX_SUBSCRIPTION_RESPONSE_BYTES} bytes"
+        ));
+    }
+    Ok(decoded)
+}
+
+fn decode_subscription_payload(mut bytes: Vec<u8>) -> Result<String, String> {
+    for _ in 0..MAX_SUBSCRIPTION_DECODE_LAYERS {
+        if bytes.starts_with(&[0x1f, 0x8b]) {
+            bytes = read_bounded_decoder(GzDecoder::new(bytes.as_slice()), "gzip payload")?;
+            continue;
+        }
+        let text = String::from_utf8(bytes.clone()).map_err(|error| error.to_string())?;
+        let compact = text.trim().replace(['\r', '\n', ' '], "");
+        let decoded = [
+            &general_purpose::STANDARD,
+            &general_purpose::STANDARD_NO_PAD,
+            &general_purpose::URL_SAFE,
+            &general_purpose::URL_SAFE_NO_PAD,
+        ]
+        .into_iter()
+        .find_map(|engine| engine.decode(&compact).ok());
+        let Some(decoded) = decoded.filter(|decoded| {
+            decoded != &bytes
+                && (decoded.starts_with(&[0x1f, 0x8b]) || std::str::from_utf8(decoded).is_ok())
+        }) else {
+            return Ok(text);
+        };
+        bytes = decoded;
+    }
+    String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 
 /// Turn a `reqwest::Error` into a human-readable string that explains
@@ -492,10 +657,6 @@ fn parse_subscription_response(response: &str) -> (String, ParseOutput) {
     }
 
     (decoded, parsed)
-}
-
-fn should_retry_as_happ(parsed: &ParseOutput) -> bool {
-    parsed.profiles.is_empty()
 }
 
 fn subscription_user_agent() -> &'static str {
@@ -1153,6 +1314,107 @@ mod tests {
             },
             worker,
         )
+    }
+
+    #[test]
+    fn decodes_gzip_http_and_nested_base64_subscription_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local subscription listener");
+        let address = listener.local_addr().expect("listener address");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("subscription request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("subscription request");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8(request).expect("HTTP request");
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line
+                        .eq_ignore_ascii_case("accept-encoding: gzip, deflate, identity"))
+            );
+            let profile = "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Compressed";
+            let encoded = base64::engine::general_purpose::STANDARD.encode(profile);
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(encoded.as_bytes()).expect("gzip body");
+            let body = encoder.finish().expect("finish gzip");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("subscription headers");
+            stream.write_all(&body).expect("subscription body");
+        });
+        let source = SubscriptionSource {
+            url: format!("http://{address}/subscription"),
+        };
+
+        let report = load_subscription_detailed_via_proxy(&source, None).expect("load gzip");
+        worker.join().expect("subscription worker");
+        assert_eq!(report.profiles.len(), 1);
+        assert_eq!(report.profiles[0].name, "Compressed");
+    }
+
+    #[test]
+    fn happ_mode_runs_after_sing_box_http_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local subscription listener");
+        let address = listener.local_addr().expect("listener address");
+        let worker = thread::spawn(move || {
+            let (mut sing_box, _) = listener.accept().expect("sing-box request");
+            read_http_request_head(&mut sing_box);
+            sing_box
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("sing-box response");
+
+            let (mut happ, _) = listener.accept().expect("Happ request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = happ.read(&mut chunk).expect("Happ request");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8(request).expect("HTTP request");
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line.to_ascii_lowercase().starts_with("x-hwid:"))
+            );
+            let profile =
+                "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Happ";
+            let body = base64::engine::general_purpose::STANDARD.encode(profile);
+            write!(
+                happ,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("Happ response");
+        });
+        let source = SubscriptionSource {
+            url: format!("http://{address}/subscription"),
+        };
+
+        let report = load_subscription_detailed_via_proxy(&source, None).expect("Happ fallback");
+        worker.join().expect("subscription worker");
+        assert_eq!(report.profiles.len(), 1);
+        assert_eq!(report.profiles[0].name, "Happ");
+    }
+
+    #[test]
+    fn transport_failure_does_not_repeat_with_happ_on_same_path() {
+        let source = SubscriptionSource {
+            url: "http://127.0.0.1:1/subscription".to_owned(),
+        };
+
+        let error =
+            load_subscription_detailed_via_proxy(&source, None).expect_err("closed port must fail");
+        assert!(error.starts_with("[sing-box]"), "{error}");
+        assert!(!error.contains("[happ]"), "{error}");
     }
 
     #[test]

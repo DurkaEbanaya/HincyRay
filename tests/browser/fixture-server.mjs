@@ -143,8 +143,9 @@ const responses = new Map([
   }],
   ['/api/memory-guard', { mihomo: { pid: 100, rss_kb: 1024 }, top_processes: [], warnings: [] }],
   ['/api/stats', { stats: [{ profile_id: profile.id, score: 90, last_latency_ms: 25, resource_tests: [
-    { contract_version: 4, id: 'youtube', name: 'YouTube', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 120 },
-    { contract_version: 4, id: 'telegram', name: 'Telegram', attempts: 1, successes: 0, stable: false, avg_ttfb_ms: 240 },
+    { contract_version: 5, id: 'youtube', name: 'YouTube', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 120 },
+    { contract_version: 5, id: 'telegram', name: 'Telegram', attempts: 1, successes: 0, stable: false, avg_ttfb_ms: 240 },
+    { contract_version: 5, id: 'ai', name: 'AI Studio', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 180 },
   ] }] }],
   ['/api/profiles', { profiles: [profile] }],
   ['/api/routing', routing],

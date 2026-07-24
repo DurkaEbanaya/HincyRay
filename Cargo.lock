@@ -5727,6 +5727,7 @@ dependencies = [
  "base64",
  "eframe",
  "egui_extras",
+ "flate2",
  "getrandom 0.4.3",
  "grammers-client",
  "grammers-session",

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added a bounded AI Studio regional-availability check to Quick Test and bumped persisted service results to contract v5 with `YT`/`TG`/`AI` indicators.
+- Kept routing-rule deletions in desired state when Mihomo validation or activation cannot run, reporting the pending apply instead of restoring the deleted rule.
+- Reworked subscription loading into a bounded transport/content pipeline: direct and proxy paths stay separate, Happ client identity retries HTTP/content incompatibility, gzip/deflate and nested gzip/base64 layers decode before format detection, and transport failures are not redundantly retried with another User-Agent.
+
 ## v0.22.0 - 2026-07-22
 
 - Replaced Quick Test's server-port/CDN smoke checks with real per-profile service validation. YouTube now bootstraps a visitor-bound `ANDROID_VR` Innertube player response and serves a bounded 512 KiB direct video range through the tested profile using only Rust and `curl`; no Python, `yt-dlp`, JavaScript runtime, or TUN path is required.

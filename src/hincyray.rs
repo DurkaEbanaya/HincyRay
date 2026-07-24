@@ -1613,7 +1613,7 @@ fn default_geo_asset_path() -> String {
 /// placeholder, so they remain strings for safe state migration. New UI uses
 /// `domains`/`ips`/`services`; `target` is one of: `direct`, `active`,
 /// `best`, `reject`, or `server:<ref>`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutingRule {
     #[serde(default)]
     pub enabled: bool,
@@ -9310,7 +9310,7 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
     if let Err(error) = validate_router_routing_rules(&rules) {
         return (400, "application/json", json!({"error": error}).to_string());
     }
-    let (previous_state, saved_rules) = {
+    let (previous_state, saved_rules, removes_rules) = {
         let mut inner = lock(&daemon.inner);
         let mut candidate = inner.state.clone();
         sync_server_route_registry(&mut candidate);
@@ -9328,7 +9328,15 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
                 json!({"error": format!("persist state: {error}")}).to_string(),
             );
         }
-        (previous_state, inner.state.routing_rules.clone())
+        let removes_rules = routing_rules_are_strict_deletion(
+            &previous_state.routing_rules,
+            &inner.state.routing_rules,
+        );
+        (
+            previous_state,
+            inner.state.routing_rules.clone(),
+            removes_rules,
+        )
     };
 
     if apply_requested {
@@ -9346,6 +9354,17 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
                 })
                 .to_string(),
             ),
+            Err(error) if removes_rules => (
+                200,
+                "application/json",
+                json!({
+                    "rules": saved_rules,
+                    "applied": false,
+                    "requires_apply": true,
+                    "activation_error": error,
+                })
+                .to_string(),
+            ),
             Err(error) => {
                 let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
                 json_error(500, &format!("{error}; state rollback: {rollback}"))
@@ -9358,6 +9377,20 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         "application/json",
         json!({"rules": saved_rules, "applied": false, "requires_apply": true}).to_string(),
     )
+}
+
+fn routing_rules_are_strict_deletion(previous: &[RoutingRule], next: &[RoutingRule]) -> bool {
+    if next.len() >= previous.len() {
+        return false;
+    }
+    let mut remaining = next.iter();
+    let mut expected = remaining.next();
+    for rule in previous {
+        if expected == Some(rule) {
+            expected = remaining.next();
+        }
+    }
+    expected.is_none()
 }
 
 fn restore_state_after_failed_policy_change(
@@ -22442,6 +22475,74 @@ mod tests {
 
         let inner = lock(&daemon.inner);
         assert!(inner.state.routing_rules.is_empty());
+    }
+
+    #[test]
+    fn routing_rule_deletion_survives_apply_validation_failure() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "Remove me".to_owned(),
+                target: "active".to_owned(),
+                domains: vec!["remove.example".to_owned()],
+                ..Default::default()
+            });
+            inner.state.mihomo_path = "/definitely/missing/mihomo".to_owned();
+            persist_state(&daemon.state_path, &inner.state).expect("persist initial state");
+        }
+
+        let (status, _, body) = handle_routing_rules(r#"{"rules":[],"apply":true}"#, &daemon);
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("response");
+        assert_eq!(response["applied"], false);
+        assert_eq!(response["requires_apply"], true);
+        assert!(response["activation_error"].as_str().is_some());
+        assert!(lock(&daemon.inner).state.routing_rules.is_empty());
+        assert!(
+            load_state(&daemon.state_path)
+                .routing_rules
+                .iter()
+                .all(|rule| rule.name != "Remove me")
+        );
+    }
+
+    #[test]
+    fn routing_rule_deletion_classifier_rejects_mixed_edits() {
+        let first = RoutingRule {
+            name: "First".to_owned(),
+            ..Default::default()
+        };
+        let second = RoutingRule {
+            name: "Second".to_owned(),
+            ..Default::default()
+        };
+        let edited = RoutingRule {
+            name: "Edited".to_owned(),
+            ..Default::default()
+        };
+
+        assert!(routing_rules_are_strict_deletion(
+            &[first.clone(), second.clone()],
+            std::slice::from_ref(&second)
+        ));
+        assert!(!routing_rules_are_strict_deletion(
+            &[first, second],
+            &[edited]
+        ));
+    }
+
+    #[test]
+    fn routing_rule_addition_rolls_back_on_apply_validation_failure() {
+        let (_dir, daemon) = test_daemon();
+        lock(&daemon.inner).state.mihomo_path = "/definitely/missing/mihomo".to_owned();
+        let body = r#"{"rules":[{"enabled":true,"name":"New","target":"active","domains":["new.example"]}],"apply":true}"#;
+
+        let (status, _, response) = handle_routing_rules(body, &daemon);
+        assert_eq!(status, 500, "{response}");
+        assert!(response.contains("state rollback: restored"), "{response}");
+        assert!(lock(&daemon.inner).state.routing_rules.is_empty());
     }
 
     #[test]

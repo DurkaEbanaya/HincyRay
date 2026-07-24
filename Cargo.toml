@@ -28,6 +28,7 @@ argon2 = { version = "0.5.3", default-features = false, features = ["std"] }
 base64 = "0.22"
 eframe = { version = "0.33", default-features = true, optional = true }
 egui_extras = { version = "0.33", optional = true }
+flate2 = "1.1"
 percent-encoding = "2.3"
 getrandom = "0.4.3"
 grammers-client = { version = "0.10.0", default-features = false, features = ["proxy"] }

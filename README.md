@@ -244,6 +244,7 @@ Web UI sharing and audit hardening:
 - **Hysteria2 port hopping**: `mport`/`ports` and `hopInterval`/`hop_interval` query params parsed from share links, emitted as Mihomo `ports` + `hop-interval` fields.
 - **Profile CRUD API**: `POST /api/profiles/add` (parse share link), `POST /api/profiles/delete` (remove by ID, re-index), `POST /api/profiles/update` (rename, toggle block_quic). The current Web UI exposes add/delete and dialog-based rename flows.
 - **Auto-refresh subscriptions**: watchdog Phase 7 refreshes all subscriptions on a configurable interval. Disabled by default. If the active profile is removed during refresh, auto-selects the best available.
+- **Provider-compatible subscription loading**: each network path uses bounded HTTP/content decoding before profile parsing, including gzip/deflate and nested base64 payloads. A Happ-compatible identity is retried for HTTP/content rejection, while DNS/TLS/timeout failures advance to the next direct/SOCKS/HTTP path instead of repeating the same failed transport.
 - **Traffic statistics**: cumulative upload/download byte counters persisted in state. Real-time speed via Mihomo `/traffic` API. `GET /api/traffic`, `GET /api/mihomo-api/traffic`, `GET /api/mihomo-api/memory`.
 - **Connection log**: persisted log of connections seen through the proxy (host, source IP, chain, rule, upload/download). Cap 500 entries. `GET /api/connection-log`.
 - **Speed test API**: `POST /api/mihomo-api/speed-test` downloads a 10MB file through the SOCKS proxy and returns Mbps, elapsed time, and bytes. Default URL: Cloudflare.
@@ -423,7 +424,7 @@ Embedded Fluent/Acrylic panel with RU/EN i18n, light/dark themes, desktop/sideba
 | `GET` | `/api/routing/preview` | Non-mutating desired/applied config hash comparison and apply effects |
 | `POST` | `/api/routing/explain` | Explain routing for a normalized host/IP resource with optional source/port/network context |
 | `POST` | `/api/routing/settings` | Save routing settings; `{"apply":true}` saves + applies atomically |
-| `POST` | `/api/routing/rules` | Save routing rules; `{"rules":[...],"apply":true}` saves + applies atomically |
+| `POST` | `/api/routing/rules` | Save rules; failed apply rolls additions/edits back, while deletions remain saved with `requires_apply:true` |
 | `POST` | `/api/routing/apply` | Regenerate config + restart core + restart firewall |
 | `POST` | `/api/routing/resource-route` | Create/update a rule for observed host/IP resource, apply config, optionally close matching connections |
 | `GET` | `/api/routing-presets` | Built-in routing presets |

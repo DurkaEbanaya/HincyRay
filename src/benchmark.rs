@@ -8,8 +8,8 @@
 //! the router is never left with stray benchmark cores.
 //!
 //! `curl` is invoked for the generic HTTP probes. Quick Test uses a narrow
-//! YouTube Innertube flow and an authorized Telegram session for one bounded
-//! media chunk from each service.
+//! YouTube Innertube flow, an authorized Telegram session, and an AI Studio
+//! region-availability request through each tested profile.
 
 use std::io::Write;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -42,7 +42,7 @@ const DOWNLOAD_MAX_SECS: u64 = 3;
 const SUSTAINED_DOWNLOAD_MAX_SECS: u64 = 15;
 const XRAY_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const QUICK_RESOURCE_CONTRACT_VERSION: u8 = 4;
+const QUICK_RESOURCE_CONTRACT_VERSION: u8 = 5;
 const YOUTUBE_VIDEO_ID: &str = "aqz-KE-bpKQ";
 const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=aqz-KE-bpKQ&hl=en";
 const YOUTUBE_PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
@@ -52,6 +52,9 @@ const YOUTUBE_VR_USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1
 const YOUTUBE_SIGNATURE_TIMESTAMP: u64 = 20653;
 const YOUTUBE_PAGE_MAX_BYTES: u64 = 3 * 1024 * 1024;
 const YOUTUBE_SEGMENT_BYTES: u64 = 512 * 1024;
+const AI_STUDIO_URL: &str = "https://aistudio.google.com/";
+const AI_STUDIO_UNAVAILABLE_URL: &str = "https://ai.google.dev/gemini-api/docs/available-regions";
+const AI_STUDIO_PAGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct QuickProbeConfig {
@@ -370,22 +373,26 @@ fn benchmark_profile(
 }
 
 fn unavailable_quick_resource_results(error: &str) -> Vec<ResourceTestResult> {
-    [("youtube", "YouTube", 1), ("telegram", "Telegram", 1)]
-        .into_iter()
-        .map(|(id, name, attempts)| ResourceTestResult {
-            contract_version: QUICK_RESOURCE_CONTRACT_VERSION,
-            id: id.to_owned(),
-            name: name.to_owned(),
-            attempts,
-            successes: 0,
-            reachable: false,
-            stable: false,
-            avg_ttfb_ms: 0,
-            max_ttfb_ms: 0,
-            avg_download_kbps: 0.0,
-            error: Some(error.to_owned()),
-        })
-        .collect()
+    [
+        ("youtube", "YouTube", 1),
+        ("telegram", "Telegram", 1),
+        ("ai", "AI Studio", 1),
+    ]
+    .into_iter()
+    .map(|(id, name, attempts)| ResourceTestResult {
+        contract_version: QUICK_RESOURCE_CONTRACT_VERSION,
+        id: id.to_owned(),
+        name: name.to_owned(),
+        attempts,
+        successes: 0,
+        reachable: false,
+        stable: false,
+        avg_ttfb_ms: 0,
+        max_ttfb_ms: 0,
+        avg_download_kbps: 0.0,
+        error: Some(error.to_owned()),
+    })
+    .collect()
 }
 
 /// Verify a failover candidate through its real proxy protocol, not merely by
@@ -461,6 +468,7 @@ fn run_quick_resources(
     let tests = vec![
         run_youtube_playback_probe(port),
         run_telegram_media_probe(port, quick_probe),
+        run_ai_studio_probe(port),
     ];
     let samples = tests
         .iter()
@@ -520,6 +528,14 @@ fn run_telegram_media_probe(port: u16, quick_probe: &QuickProbeConfig) -> Resour
         Err(error) => errors.push(error),
     }
     aggregate_quick_resource_probe("telegram", "Telegram", 1, &successes, &errors)
+}
+
+fn run_ai_studio_probe(port: u16) -> ResourceTestResult {
+    let (successes, errors) = match ai_studio_attempt(port) {
+        Ok(attempt) => (vec![attempt], Vec::new()),
+        Err(error) => (Vec::new(), vec![error]),
+    };
+    aggregate_quick_resource_probe("ai", "AI Studio", 1, &successes, &errors)
 }
 
 fn aggregate_quick_resource_probe(
@@ -777,11 +793,99 @@ fn curl_youtube_range(port: u16, media_url: &str) -> Result<QuickResourceAttempt
     })
 }
 
+fn ai_studio_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
+    let headers = NamedTempFile::new().map_err(|error| format!("AI Studio headers: {error}"))?;
+    let page = NamedTempFile::new().map_err(|error| format!("AI Studio page: {error}"))?;
+    let output = Command::new("curl")
+        .arg("--socks5-hostname")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("-L")
+        .arg("--connect-timeout")
+        .arg("5")
+        .arg("--max-time")
+        .arg("20")
+        .arg("--max-filesize")
+        .arg(AI_STUDIO_PAGE_MAX_BYTES.to_string())
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--dump-header")
+        .arg(headers.path())
+        .arg("--output")
+        .arg(page.path())
+        .arg("--write-out")
+        .arg("%{http_code} %{size_download} %{time_starttransfer} %{time_total} %{url_effective}")
+        .arg(AI_STUDIO_URL)
+        .output()
+        .map_err(|error| format!("AI Studio curl: {error}"))?;
+    let metrics = parse_ai_curl_metrics(&output.stdout)?;
+    let redirect_headers = std::fs::read_to_string(headers.path())
+        .map_err(|error| format!("read AI Studio headers: {error}"))?;
+    if ai_studio_region_unavailable(&metrics.final_url)
+        || redirect_headers.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, url)| {
+                name.eq_ignore_ascii_case("location") && ai_studio_region_unavailable(url.trim())
+            })
+        })
+    {
+        return Err("AI Studio redirected to the unsupported-region page".to_owned());
+    }
+    if !output.status.success() || !(200..300).contains(&metrics.base.http_status) {
+        return Err(format!(
+            "AI Studio rc={}, http={}: {}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "?".to_owned(), |code| code.to_string()),
+            metrics.base.http_status,
+            bounded_process_error(&output.stderr)
+        ));
+    }
+    Ok(QuickResourceAttempt {
+        ttfb_ms: seconds_to_millis(metrics.base.ttfb_secs, 0),
+        total_ms: seconds_to_millis(metrics.base.total_secs, 1),
+        bytes: metrics.base.bytes,
+    })
+}
+
+fn ai_studio_region_unavailable(url: &str) -> bool {
+    url.trim()
+        .to_ascii_lowercase()
+        .starts_with(AI_STUDIO_UNAVAILABLE_URL)
+}
+
 struct CurlMetrics {
     http_status: u16,
     bytes: u64,
     ttfb_secs: f64,
     total_secs: f64,
+}
+
+struct AiCurlMetrics {
+    base: CurlMetrics,
+    final_url: String,
+}
+
+fn parse_ai_curl_metrics(output: &[u8]) -> Result<AiCurlMetrics, String> {
+    let raw = String::from_utf8_lossy(output);
+    let mut parts = raw.split_whitespace();
+    let base = parse_curl_metrics(
+        parts
+            .by_ref()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .as_bytes(),
+    )?;
+    let final_url = parts
+        .next()
+        .ok_or_else(|| format!("unexpected AI Studio curl metrics: {raw}"))?;
+    if parts.next().is_some() {
+        return Err(format!("unexpected AI Studio curl metrics: {raw}"));
+    }
+    Ok(AiCurlMetrics {
+        base,
+        final_url: final_url.to_owned(),
+    })
 }
 
 fn parse_curl_metrics(output: &[u8]) -> Result<CurlMetrics, String> {
@@ -1733,7 +1837,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("Mihomo spawn"))
         );
-        assert_eq!(result.resource_tests.len(), 2);
+        assert_eq!(result.resource_tests.len(), 3);
         assert!(result.resource_tests.iter().all(|test| !test.stable));
     }
 
@@ -1760,7 +1864,7 @@ mod tests {
             &["timeout".to_owned()],
         );
 
-        assert_eq!(result.contract_version, 4);
+        assert_eq!(result.contract_version, 5);
         assert!(result.reachable);
         assert!(!result.stable);
         assert_eq!(result.successes, 2);
@@ -1778,6 +1882,19 @@ mod tests {
         assert_eq!(metrics.bytes, 524_288);
         assert_eq!(seconds_to_millis(metrics.ttfb_secs, 0), 561);
         assert_eq!(seconds_to_millis(metrics.total_secs, 1), 826);
+    }
+
+    #[test]
+    fn parses_ai_studio_metrics_and_detects_region_redirect() {
+        let metrics =
+            parse_ai_curl_metrics(b"200 12345 0.250 0.500 https://aistudio.google.com/welcome")
+                .expect("metrics");
+        assert_eq!(metrics.base.http_status, 200);
+        assert_eq!(metrics.final_url, "https://aistudio.google.com/welcome");
+        assert!(ai_studio_region_unavailable(
+            "https://ai.google.dev/gemini-api/docs/available-regions?hl=en"
+        ));
+        assert!(!ai_studio_region_unavailable(&metrics.final_url));
     }
 
     #[test]
