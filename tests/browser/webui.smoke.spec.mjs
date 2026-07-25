@@ -39,6 +39,10 @@ test('profile table shows compact service status and configurable metric columns
   await expect(row.locator('.profile-service-test.bad')).toHaveText('TG');
 
   await page.locator('#profileMetricSettings > button').click();
+  await page.locator('#profileMetricSettings input[data-profile-metric="latency"]').uncheck();
+  await expect(page.locator('#profilesTable thead [data-profile-metric="latency"]')).toBeHidden();
+  await expect(row.locator('.profile-name-cell .profile-service-test')).toHaveText(['YT', 'TG', 'AI']);
+
   const uploadToggle = page.locator('#profileMetricSettings input[data-profile-metric="upload"]');
   await expect(uploadToggle).not.toBeChecked();
   await uploadToggle.check();

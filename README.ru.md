@@ -1,10 +1,10 @@
-# HincyRay v0.22.0
+# HincyRay v0.22.1
 
 [English](README.md) | [Русский](README.ru.md)
 
 ---
 
-HincyRay — лёгкий VPN/proxy-клиент для роутеров Keenetic. Поставляет роутер-демон (`hincyray`), который переиспользует парсер и формулу оценки качества из десктопного инструмента `XrayVpnTest`, и предоставляет встроенную веб-панель в локальной сети роутера.
+HincyRay — лёгкий VPN/proxy-клиент для роутеров Keenetic. Поставляет роутер-демон (`hincyray`), который переиспользует парсер и benchmark engine из десктопного инструмента `XrayVpnTest`, и предоставляет встроенную веб-панель в локальной сети роутера.
 
 Демон использует **Mihomo (Clash.Meta)** как единое прокси-ядро, поддерживая VLESS (Reality/xhttp), VMess, Trojan, Shadowsocks, ShadowsocksR, Snell, HTTP, SOCKS, AnyTLS, Hysteria v1/v2 (port hopping), WireGuard, TUIC, SSH, MASQUE, OpenVPN и Tailscale. Transparent proxying через iptables NAT REDIRECT (TCP) + TPROXY (UDP) — без tun2socks, без TUN-устройства.
 
@@ -42,6 +42,12 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 Демон `ndm` в Keenetic пересоздаёт все iptables chains при изменениях конфигурации, событиях WAN и обновлении DHCP. HincyRay устанавливает hook-скрипт в `/opt/etc/ndm/netfilter.d/hincyray.sh`, который **ndm вызывает сам** после каждой перезагрузки firewall, переустанавливая все правила атомарно. Watchdog каждые 10 секунд — запасная страховка.
 
 ## Возможности
+
+### v0.22.1
+
+v0.22.1 исправляет обрывы transparent-router path, которые выглядели как нерабочий VPN-сервер. DHCP limited broadcast, link-local, loopback и все RFC1918 destinations теперь обходят TCP REDIRECT и UDP TPROXY как в live firewall rules, так и в постоянном ndm hook. Hostname прокси-сервера разрешается через настроенные local DNS, не зависящие от ещё не поднятого proxy; watchdog требует, чтобы живым был сам outbound `proxy-active`, а не только его aggregate fallback group.
+
+Индикаторы Quick Test `YT`/`TG`/`AI` остаются рядом с именем профиля даже при скрытой optional-колонке задержки. Dead Servers получил одиночный/массовый Quick Test, restore-all и атомарную очистку; качество профилей отображается raw latency/jitter/loss/speed без синтетического score.
 
 ### v0.22.0
 
@@ -318,7 +324,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Текущие gates и результаты router deploy v0.22.0 зафиксированы в [`docs/releases/v0.22.0.md`](docs/releases/v0.22.0.md).
+Команда Playwright запускает fixture-backed browser smoke suite. Текущие gates и результаты router deploy v0.22.1 зафиксированы в [`docs/releases/v0.22.1.md`](docs/releases/v0.22.1.md).
 
 ## Установка
 

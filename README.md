@@ -1,4 +1,4 @@
-# HincyRay v0.22.0
+# HincyRay v0.22.1
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,12 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v0.22.1
+
+v0.22.1 fixes transparent-router outages that looked like dead VPN servers. DHCP limited broadcasts, link-local traffic, loopback, and every RFC1918 destination now bypass TCP REDIRECT and UDP TPROXY in both live firewall rules and the persistent ndm hook. Proxy hostnames bootstrap through configured local DNS servers instead of depending on the not-yet-established proxy itself, and the watchdog requires the `proxy-active` outbound—not only its aggregate fallback group—to report alive.
+
+Quick Test service indicators (`YT`/`TG`/`AI`) now remain beside the profile name even when the optional latency column is hidden. Dead Servers also supports single/all Quick Test, restore-all, and atomic clear; profile quality is represented by raw latency/jitter/loss/speed rather than a synthetic score.
 
 ### v0.22.0
 
@@ -350,7 +356,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v0.22.0 gate and router deployment results are recorded in [`docs/releases/v0.22.0.md`](docs/releases/v0.22.0.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v0.22.1 gate and router deployment results are recorded in [`docs/releases/v0.22.1.md`](docs/releases/v0.22.1.md).
 
 ## Installation
 

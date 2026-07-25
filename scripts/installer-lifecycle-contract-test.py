@@ -79,7 +79,7 @@ def main() -> None:
             'register_runtime_tree',
             'acquire_transaction_lock',
             'release_transaction_lock',
-            'VERSION="0.22.0"',
+            'VERSION="0.22.1"',
             'HINCYRAY_GITHUB_TOKEN',
             'github_get() {',
             'api.github.com/repos/DurkaEbanaya/HincyRay/releases/tags/v${VERSION}',

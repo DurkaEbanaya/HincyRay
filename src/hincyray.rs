@@ -2481,45 +2481,14 @@ fn install_firewall_rules(
         .status();
 
     // Bypass rules: don't re-intercept DNAT'd traffic (port forwards),
-    // bypass private LAN and multicast.
+    // bypass local networks, link-local traffic, and broadcasts.
     let _ = Command::new("sh")
         .arg("-c")
         .arg(format!(
             "iptables -t nat -A HINCYRAY -m conntrack --ctstate DNAT {comment} -j RETURN"
         ))
         .status();
-    let _ = Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-A",
-            "HINCYRAY",
-            "-d",
-            "192.168.0.0/16",
-            "-m",
-            "comment",
-            "--comment",
-            "hincyray",
-            "-j",
-            "RETURN",
-        ])
-        .status();
-    let _ = Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-A",
-            "HINCYRAY",
-            "-d",
-            "224.0.0.0/4",
-            "-m",
-            "comment",
-            "--comment",
-            "hincyray",
-            "-j",
-            "RETURN",
-        ])
-        .status();
+    append_firewall_bypass_rules("nat", "HINCYRAY");
 
     // REDIRECT TCP to the dokodemo-door port.
     let _ = Command::new("iptables")
@@ -2704,38 +2673,7 @@ fn install_firewall_rules(
                 "iptables -t mangle -A HINCYRAY_UDP -m conntrack --ctstate DNAT {comment} -j RETURN"
             ))
             .status();
-        let _ = Command::new("iptables")
-            .args([
-                "-t",
-                "mangle",
-                "-A",
-                "HINCYRAY_UDP",
-                "-d",
-                "192.168.0.0/16",
-                "-m",
-                "comment",
-                "--comment",
-                "hincyray",
-                "-j",
-                "RETURN",
-            ])
-            .status();
-        let _ = Command::new("iptables")
-            .args([
-                "-t",
-                "mangle",
-                "-A",
-                "HINCYRAY_UDP",
-                "-d",
-                "224.0.0.0/4",
-                "-m",
-                "comment",
-                "--comment",
-                "hincyray",
-                "-j",
-                "RETURN",
-            ])
-            .status();
+        append_firewall_bypass_rules("mangle", "HINCYRAY_UDP");
 
         // TPROXY: first mark packets with an existing transparent socket,
         // then TPROXY new packets.
@@ -2830,6 +2768,37 @@ fn install_firewall_rules(
     // source-based fallback if connmark is unavailable).
 
     Ok(())
+}
+
+const FIREWALL_BYPASS_CIDRS: &[&str] = &[
+    "10.0.0.0/8",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/4",
+    "255.255.255.255/32",
+];
+
+fn append_firewall_bypass_rules(table: &str, chain: &str) {
+    for cidr in FIREWALL_BYPASS_CIDRS {
+        let _ = Command::new("iptables")
+            .args([
+                "-t",
+                table,
+                "-A",
+                chain,
+                "-d",
+                cidr,
+                "-m",
+                "comment",
+                "--comment",
+                "hincyray",
+                "-j",
+                "RETURN",
+            ])
+            .status();
+    }
 }
 
 /// Remove all iptables rules tagged "hincyray".
@@ -2927,6 +2896,8 @@ fn generate_ndm_hook_script(
 ) -> String {
     let port_str = redirect_port.to_string();
     let tproxy_port_str = (redirect_port + 1).to_string();
+    let nat_bypass = firewall_bypass_script("nat", "HINCYRAY");
+    let udp_bypass = firewall_bypass_script("mangle", "HINCYRAY_UDP");
     let tproxy_section = if tproxy_available {
         format!(
             r##"# ── mangle table: UDP TPROXY ──
@@ -2935,8 +2906,7 @@ insmod /lib/modules/$(uname -r)/xt_socket.ko 2>/dev/null
 iptables -t mangle -N HINCYRAY_UDP 2>/dev/null
 iptables -t mangle -F HINCYRAY_UDP
 iptables -t mangle -A HINCYRAY_UDP -m conntrack --ctstate DNAT -m comment --comment hincyray -j RETURN
-iptables -t mangle -A HINCYRAY_UDP -d 192.168.0.0/16 -m comment --comment hincyray -j RETURN
-iptables -t mangle -A HINCYRAY_UDP -d 224.0.0.0/4 -m comment --comment hincyray -j RETURN
+{udp_bypass}
 iptables -t mangle -A HINCYRAY_UDP -p udp -m socket --transparent -m comment --comment hincyray -j MARK --set-mark 0x111
 iptables -t mangle -A HINCYRAY_UDP -p udp -m comment --comment hincyray -j TPROXY --on-ip 127.0.0.1 --on-port {tproxy_port} --tproxy-mark 0x111
 iptables -t mangle -D PREROUTING -m connmark --mark {mark} -p udp -m comment --comment hincyray -j HINCYRAY_UDP 2>/dev/null
@@ -2949,7 +2919,8 @@ ip route flush table 111 2>/dev/null
 ip route add local default dev lo table 111 2>/dev/null
 "##,
             tproxy_port = tproxy_port_str,
-            mark = mark
+            mark = mark,
+            udp_bypass = udp_bypass,
         )
     } else {
         String::new()
@@ -2972,8 +2943,7 @@ DNS_DST="127.0.0.1:1053"
 iptables -t nat -N HINCYRAY 2>/dev/null
 iptables -t nat -F HINCYRAY
 iptables -t nat -A HINCYRAY -m conntrack --ctstate DNAT -m comment --comment hincyray -j RETURN
-iptables -t nat -A HINCYRAY -d 192.168.0.0/16 -m comment --comment hincyray -j RETURN
-iptables -t nat -A HINCYRAY -d 224.0.0.0/4 -m comment --comment hincyray -j RETURN
+{nat_bypass}
 iptables -t nat -A HINCYRAY -p tcp -m comment --comment hincyray -j REDIRECT --to-ports $PORT
 iptables -t nat -D PREROUTING -m connmark --mark $MARK -p tcp -m comment --comment hincyray -j HINCYRAY 2>/dev/null
 iptables -t nat -A PREROUTING -m connmark --mark $MARK -p tcp -m comment --comment hincyray -j HINCYRAY
@@ -2988,8 +2958,21 @@ iptables -t nat -I PREROUTING 2 -m connmark --mark $MARK -p tcp --dport 53 -m co
 "##,
         mark = mark,
         port = port_str,
+        nat_bypass = nat_bypass,
         tproxy = tproxy_section,
     )
+}
+
+fn firewall_bypass_script(table: &str, chain: &str) -> String {
+    FIREWALL_BYPASS_CIDRS
+        .iter()
+        .map(|cidr| {
+            format!(
+                "iptables -t {table} -A {chain} -d {cidr} -m comment --comment hincyray -j RETURN"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Write the ndm hook script to `/opt/etc/ndm/netfilter.d/hincyray.sh`
@@ -16719,25 +16702,27 @@ fn start_watchdog(
                     // detect that as a proxy failure.
                     let group_state =
                         mihomo_api_get_json(addr, ec_secret.as_deref(), "/proxies/proxy");
-                    let healthy = group_state.as_ref().is_ok_and(|v| {
-                        let alive = v.get("alive").and_then(Value::as_bool).unwrap_or(false);
-                        let now = v.get("now").and_then(Value::as_str).unwrap_or("");
-                        alive && now == PROXY_ACTIVE_NAME
-                    });
+                    let active_state =
+                        mihomo_api_get_json(addr, ec_secret.as_deref(), "/proxies/proxy-active");
+                    let healthy = group_state
+                        .as_ref()
+                        .ok()
+                        .zip(active_state.as_ref().ok())
+                        .is_some_and(|(group, active)| {
+                            fallback_routes_through_live_active(group, active)
+                        });
                     // Read the last known latency from proxy-active history
                     // for logging purposes. This does not trigger a new
                     // upstream request — `history` is populated by the
                     // fallback group's own delay test.
                     let latency_ms: Option<u64> = if healthy {
-                        mihomo_api_get_json(addr, ec_secret.as_deref(), "/proxies/proxy-active")
-                            .ok()
-                            .and_then(|v| {
-                                v.get("history")
-                                    .and_then(Value::as_array)
-                                    .and_then(|h| h.last())
-                                    .and_then(|last| last.get("delay"))
-                                    .and_then(Value::as_u64)
-                            })
+                        active_state.as_ref().ok().and_then(|v| {
+                            v.get("history")
+                                .and_then(Value::as_array)
+                                .and_then(|h| h.last())
+                                .and_then(|last| last.get("delay"))
+                                .and_then(Value::as_u64)
+                        })
                     } else {
                         None
                     };
@@ -16770,7 +16755,15 @@ fn start_watchdog(
                                             .get("alive")
                                             .and_then(Value::as_bool)
                                             .unwrap_or(false);
-                                        format!("now={now} alive={alive}")
+                                        let active_alive = active_state
+                                            .as_ref()
+                                            .ok()
+                                            .and_then(|value| value.get("alive"))
+                                            .and_then(Value::as_bool)
+                                            .unwrap_or(false);
+                                        format!(
+                                            "now={now} alive={alive} active_alive={active_alive}"
+                                        )
                                     }
                                     Err(error) => error.to_string(),
                                 };
@@ -17344,6 +17337,12 @@ fn start_watchdog(
             bench_was_running = bench_running;
         }
     });
+}
+
+fn fallback_routes_through_live_active(group: &Value, active: &Value) -> bool {
+    group.get("alive").and_then(Value::as_bool) == Some(true)
+        && group.get("now").and_then(Value::as_str) == Some(PROXY_ACTIVE_NAME)
+        && active.get("alive").and_then(Value::as_bool) == Some(true)
 }
 
 fn maintenance_due(settings: &MaintenanceSettings, now: u64) -> bool {
@@ -22751,6 +22750,43 @@ mod tests {
             "https://evil.example",
             Some("192.168.1.1:8088")
         ));
+    }
+
+    #[test]
+    fn fallback_health_requires_the_active_outbound_itself_to_be_alive() {
+        let group = json!({"alive": true, "now": "proxy-active"});
+        assert!(fallback_routes_through_live_active(
+            &group,
+            &json!({"alive": true})
+        ));
+        assert!(!fallback_routes_through_live_active(
+            &group,
+            &json!({"alive": false})
+        ));
+        assert!(!fallback_routes_through_live_active(
+            &json!({"alive": true, "now": "DIRECT"}),
+            &json!({"alive": true})
+        ));
+    }
+
+    #[test]
+    fn ndm_hook_bypasses_dhcp_broadcast_and_local_networks_before_tproxy() {
+        let script = generate_ndm_hook_script("0xffffaaa", 10810, "192.168.2.0/24", true);
+        for cidr in FIREWALL_BYPASS_CIDRS {
+            let nat_rule = format!("iptables -t nat -A HINCYRAY -d {cidr}");
+            let udp_rule = format!("iptables -t mangle -A HINCYRAY_UDP -d {cidr}");
+            assert!(script.contains(&nat_rule), "missing NAT bypass for {cidr}");
+            assert!(script.contains(&udp_rule), "missing UDP bypass for {cidr}");
+            assert_eq!(script.matches(&nat_rule).count(), 1);
+            assert_eq!(script.matches(&udp_rule).count(), 1);
+        }
+        let broadcast = script
+            .find("iptables -t mangle -A HINCYRAY_UDP -d 255.255.255.255/32")
+            .expect("DHCP broadcast bypass");
+        let tproxy = script
+            .find("iptables -t mangle -A HINCYRAY_UDP -p udp -m comment")
+            .expect("TPROXY rule");
+        assert!(broadcast < tproxy, "broadcast bypass must precede TPROXY");
     }
 
     #[test]

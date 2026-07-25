@@ -1811,8 +1811,13 @@ fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeat
     if features.dns_respect_rules {
         dns_config["respect-rules"] = json!(true);
     }
-    if !features.dns_proxy_server_nameserver.is_empty() {
-        dns_config["proxy-server-nameserver"] = json!(features.dns_proxy_server_nameserver);
+    let proxy_server_nameservers = if features.dns_proxy_server_nameserver.is_empty() {
+        &dns.local_servers
+    } else {
+        &features.dns_proxy_server_nameserver
+    };
+    if !proxy_server_nameservers.is_empty() {
+        dns_config["proxy-server-nameserver"] = json!(proxy_server_nameservers);
     }
     let direct_nameservers = if features.dns_direct_nameserver.is_empty() {
         &dns.local_servers
@@ -4565,6 +4570,19 @@ mod tests {
         let mut features = default_features();
         features.dns_proxy_server_nameserver = vec!["223.5.5.5".to_owned()];
         let config = build_test_router_config(&features);
+        let dns = config.get("dns").expect("dns");
+        assert_eq!(
+            dns.get("proxy-server-nameserver")
+                .and_then(Value::as_array)
+                .expect("proxy-server-nameserver")[0]
+                .as_str(),
+            Some("223.5.5.5")
+        );
+    }
+
+    #[test]
+    fn dns_uses_local_servers_to_bootstrap_proxy_hostnames_by_default() {
+        let config = build_test_router_config(&default_features());
         let dns = config.get("dns").expect("dns");
         assert_eq!(
             dns.get("proxy-server-nameserver")
