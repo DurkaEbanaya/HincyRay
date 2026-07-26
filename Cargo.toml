@@ -1,6 +1,6 @@
 [package]
 name = "xray-vpn-test"
-version = "0.22.1"
+version = "1.0.0"
 edition = "2024"
 authors = ["lain"]
 description = "Keenetic-native Mihomo router daemon with policy routing, diagnostics, and VPN quality automation"

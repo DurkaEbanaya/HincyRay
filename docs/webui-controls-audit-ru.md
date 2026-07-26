@@ -4,7 +4,7 @@
 
 Актуализация: 2026-07-22
 
-Версия документации: v0.22.1
+Версия документации: v1.0.0
 
 Фокус: Web UI роутерного демона `hincyray`, файл `src/webui/index.html`, backend `src/hincyray.rs`.
 
@@ -30,7 +30,7 @@
 - Профильная таблица показывает версионированные `YT`/`TG` результаты Quick Test; gear menu сохраняет набор видимых metric columns в `localStorage`.
 - Telegram media probe имеет отдельные request-code/confirm/status/delete controls. API hash, телефон, login code и 2FA password очищаются после отправки и не сохраняются в browser storage.
 
-Базовый контракт описан в [`architecture-v0.21.md`](architecture-v0.21.md), изменения Quick Test/Telegram/routing — в [`architecture-v0.22.md`](architecture-v0.22.md). Текущие gates и live deploy зафиксированы в [`releases/v0.22.1.md`](releases/v0.22.1.md).
+Базовый контракт описан в [`architecture-v0.21.md`](architecture-v0.21.md), изменения Quick Test/Telegram/routing — в [`architecture-v0.22.md`](architecture-v0.22.md). Текущие gates и live deploy зафиксированы в [`releases/v1.0.0.md`](releases/v1.0.0.md).
 
 ## 1. Важная модель: не WiFi сам по себе, а политика Keenetic
 

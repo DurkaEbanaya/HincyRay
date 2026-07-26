@@ -1,4 +1,4 @@
-# HincyRay v0.22.1
+# HincyRay v1.0.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,12 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v1.0.0
+
+v1.0.0 is the first stable public release. It promotes the hardened Keenetic/Mihomo runtime developed through v0.22.1 and ships a production Fluent/Acrylic Web UI with a restored HincyRay mark, responsive desktop/tablet profile grids, mobile navigation, bounded API-backed views, and visible progress feedback for long-running tests and apply/download operations.
+
+The stable release includes transactional core/firewall activation, persistent ndm firewall recovery, TCP REDIRECT + UDP TPROXY, canonical routing and lifecycle identities, Dead Servers, Deep Bench, real Quick Test checks for YouTube/Telegram/AI Studio, secure Web UI sessions, structurally redacted diagnostics, managed GeoBase, backups, and a public release installer path. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
 
 ### v0.22.1
 
@@ -212,7 +218,7 @@ Web UI sharing and audit hardening:
 
 ### v0.15.1
 
-- **Fluent/Acrylic Web UI**: new embedded web panel (`src/webui/index.html`) compiled via `include_str!`. 7 navigation groups, 24 sidebar items, 16 Mihomo Features sub-sections, custom Acrylic dropdowns, RU/EN i18n (~180 pairs), light/dark theme with brightness slider, tooltips, login overlay, confirm modal, toast notifications, responsive bottom-nav for mobile, real `fetch()` API helper with Bearer-token auth, production data loaders for all 87 daemon endpoints, data-URI logo (no external asset dependency).
+- **Fluent/Acrylic Web UI**: embedded web panel (`src/webui/index.html`) compiled via `include_str!`, with desktop/tablet/mobile navigation, custom Acrylic controls, RU/EN i18n, light/dark theme, tooltips, login overlay, dialogs, toasts, adaptive profile grids, long-operation feedback, real `fetch()` API access with Bearer auth, and an inline HincyRay mark (no external asset dependency).
 - **EC streaming fix**: `first_stream_json()` parses the first JSON snapshot from Mihomo infinite-stream endpoints (`/traffic`, `/memory`), succeeding even when `curl --max-time` exits with code 28 (timeout on infinite stream).
 - **Optional EC endpoints**: `/api/mihomo-api/configs/geo` and `/api/mihomo-api/rules/disable` now return `{"supported":false}` (200) when Mihomo EC responds 405, instead of 502 transport error.
 - **UI flicker fix**: `updateStatusUI` split into `updateStatusCards` (core/profile/version cards) and `updateRoutingForm` (routing form fields) — prevents `loadRouting()` from overwriting status cards with partial data.
@@ -356,7 +362,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v0.22.1 gate and router deployment results are recorded in [`docs/releases/v0.22.1.md`](docs/releases/v0.22.1.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.0.0 gate and router deployment results are recorded in [`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
 
 ## Installation
 
@@ -368,7 +374,7 @@ sh scripts/hincyray-install.sh
 
 The installer checks for kernel modules, creates the ndm hook directory, installs the binary, init script, and default state. Staging → backup → atomic `mv` → verify → commit/rollback.
 
-The repository is private. Copy the release binary to `/tmp/hincyray` (or set `HINCYRAY_BIN_PATH`) before running the installer. Alternatively, set `HINCYRAY_GITHUB_TOKEN` to a token with read access; the installer resolves the exact `hincyray` asset through the authenticated GitHub Releases API and never places the token in a URL or log message.
+For the public release, the installer downloads the exact `hincyray` asset from GitHub Releases when no local binary is present. Offline installation remains available by copying the binary to `/tmp/hincyray` or setting `HINCYRAY_BIN_PATH`.
 
 See [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md) for manual installation.
 
@@ -378,7 +384,7 @@ See [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md) for m
 http://<router-ip>:8088/
 ```
 
-Embedded Fluent/Acrylic panel with RU/EN i18n, light/dark themes, desktop/sidebar, tablet, and mobile navigation. Tables become labelled cards on narrow screens. Profile rename uses an in-page dialog, connection search matches exact rendered flag-plus-host labels, and the Bearer token is held in `sessionStorage`. Status, profiles, benchmark, import, subscriptions, routing, firewall, DNS, diagnostics, backups, HWID, system monitoring, Mihomo management, traffic, connections, and logs remain available without an external CDN or frontend build step. Lightweight status and system heartbeats are used instead of periodically refreshing the full dashboard.
+Embedded Fluent/Acrylic panel with RU/EN i18n, light/dark themes, desktop/sidebar, tablet, and mobile navigation. Profiles fill desktop and tablet width with an adaptive multi-column layout; mobile stays single-column. Long-running tests, downloads, and apply operations expose a moving activity indicator. Profile rename uses an in-page dialog, connection search matches exact rendered flag-plus-host labels, and the Bearer token is held in `sessionStorage`. Status, profiles, benchmark, import, subscriptions, routing, firewall, DNS, diagnostics, backups, HWID, system monitoring, Mihomo management, traffic, connections, and logs remain available without an external CDN or frontend build step. Lightweight status and system heartbeats are used instead of periodically refreshing the full dashboard.
 
 ### Environment overrides
 

@@ -29,6 +29,8 @@ test('page boots without JavaScript errors', async ({ page }) => {
   await page.waitForTimeout(100);
 
   expect(errors).toEqual([]);
+  await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.0.0');
 });
 
 test('profile table shows compact service status and configurable metric columns', async ({ page }) => {
@@ -93,10 +95,42 @@ test('profile group shows provider title and announcement from subscription meta
     };
   });
   expect(Math.abs(alignment.announcementLeft - alignment.tableLeft)).toBeLessThanOrEqual(1);
-  expect(Math.abs(alignment.announcementWidth - alignment.tableWidth)).toBeLessThanOrEqual(1);
+  expect(Math.abs(alignment.announcementWidth - alignment.wrapperWidth)).toBeLessThanOrEqual(1);
   expect(alignment.groupHeaderAlign).toBe('left');
-  expect(alignment.tableWidth).toBeLessThan(alignment.wrapperWidth);
+  expect(alignment.tableWidth).toBe(alignment.wrapperWidth);
   await expect(announcement).toHaveCSS('text-align', 'left');
+});
+
+test('profiles use the available desktop width and long-operation scanner moves', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const layout = await page.locator('#profilesTable').evaluate(table => {
+    const wrapper = table.parentElement;
+    const group = table.querySelector('.profile-group-row');
+    const deleteButton = group.querySelector('[title="Удалить подписку?"]');
+    return {
+      columns: getComputedStyle(table.tBodies[0]).gridTemplateColumns.split(' ').length,
+      tableWidth: table.getBoundingClientRect().width,
+      wrapperWidth: wrapper.getBoundingClientRect().width,
+      groupRight: group.getBoundingClientRect().right,
+      deleteRight: deleteButton.getBoundingClientRect().right,
+    };
+  });
+  expect(layout.columns).toBeGreaterThan(1);
+  expect(Math.abs(layout.tableWidth - layout.wrapperWidth)).toBeLessThanOrEqual(1);
+  expect(layout.groupRight - layout.deleteRight).toBeGreaterThanOrEqual(2);
+
+  await page.setViewportSize({ width: 800, height: 900 });
+  expect(await page.locator('#profilesBody').evaluate(body => getComputedStyle(body).gridTemplateColumns.split(' ').length)).toBeGreaterThan(1);
+
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await page.evaluate(() => beginLongOperation('/test-operation', 'Тестовая операция'));
+  const scanner = page.locator('#longOperationScanner');
+  const start = await scanner.evaluate(element => element.style.left);
+  await page.waitForTimeout(120);
+  const moved = await scanner.evaluate(element => element.style.left);
+  expect(moved).not.toBe(start);
+  await page.evaluate(() => endLongOperation('/test-operation'));
 });
 
 test('Dead Servers supports single and bulk diagnostics, restore, and clear', async ({ page }) => {

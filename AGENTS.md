@@ -1,4 +1,4 @@
-# HincyRay v0.22.1 (`xray-vpn-test`)
+# HincyRay v1.0.0 (`xray-vpn-test`)
 
 Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 and the feature-gated `xray-vpn-test` desktop diagnostics app. Router mode uses Mihomo with iptables NAT REDIRECT (TCP 10810) and mangle TPROXY (UDP 10811); there is no TUN/tun2socks path.
 
@@ -118,12 +118,12 @@ Use this repeatable live-update sequence; do not improvise a different installer
 5. Poll bounded `/api/health` and `/api/safe-mode` until the expected version, `core_status=running`, and `firewall_status=running`; only then disarm the trap and remove the staged file.
 6. Verify active profile, fallback group, routing/firewall, the changed live behavior, and bounded router E2E. Keep the rollback directory and report its path.
 
-Release artifact SHA256: `9a84e4469c00e5c20c49cfca086fa3720d6d203bdf3f5209ba0e0357a0173603`. Live verification and release evidence are recorded in `docs/releases/v0.22.1.md`.
+Release artifact SHA256: `ec5f82780613fc7091d53bae727af5a299856b6117ac556e6c76be07c79ddbd4`. Live verification and release evidence are recorded in `docs/releases/v1.0.0.md`.
 
 ## Release
 
 - `Cargo.toml`, first-party `Cargo.lock`, README EN/RU, CHANGELOG, installer download version, installer contract, and `docs/releases/vX.Y.Z.md` must agree.
-- The GitHub repository is private. Installer downloads must use a local `HINCYRAY_BIN_PATH` or authenticated API resolution with `HINCYRAY_GITHUB_TOKEN`; never assume a public `releases/download` URL or expose the token in URLs/logs.
+- The GitHub repository is public. Installer downloads use the exact versioned `releases/download` asset; local `HINCYRAY_BIN_PATH` remains the offline path.
 - Inspect status/diff/log and stage only intended files. Never stage user-owned scratch documents or secrets.
 - GitHub Release tag must target the pushed release commit and attach the hash-verified aarch64 `hincyray` artifact.
 - Detailed history belongs in `CHANGELOG.md` and `docs/releases/`, not this file.

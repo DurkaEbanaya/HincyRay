@@ -1,4 +1,4 @@
-# HincyRay v0.22.1
+# HincyRay v1.0.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,12 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 Демон `ndm` в Keenetic пересоздаёт все iptables chains при изменениях конфигурации, событиях WAN и обновлении DHCP. HincyRay устанавливает hook-скрипт в `/opt/etc/ndm/netfilter.d/hincyray.sh`, который **ndm вызывает сам** после каждой перезагрузки firewall, переустанавливая все правила атомарно. Watchdog каждые 10 секунд — запасная страховка.
 
 ## Возможности
+
+### v1.0.0
+
+v1.0.0 — первый стабильный публичный релиз. Он закрепляет hardened runtime Keenetic/Mihomo, сформированный к v0.22.1, и поставляет production Fluent/Acrylic Web UI с восстановленным знаком HincyRay, адаптивной многоколоночной раскладкой профилей на ПК и планшетах, мобильной навигацией, bounded API-backed представлениями и видимым прогрессом длительных тестов, применений и загрузок.
+
+В стабильный релиз входят transactional activation ядра/firewall, восстановление правил через постоянный ndm hook, TCP REDIRECT + UDP TPROXY, раздельные canonical identity routing/lifecycle, Dead Servers, Deep Bench, реальные Quick Test проверки YouTube/Telegram/AI Studio, защищённые Web UI sessions, структурная редакция diagnostics, managed GeoBase, backup и публичный путь установки из GitHub Release. Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
 
 ### v0.22.1
 
@@ -180,7 +186,7 @@ Hotfix: страница «Система» теперь явно показыв
 
 ### v0.15.1
 
-- **Fluent/Acrylic веб-панель**: новая встроенная веб-панель (`src/webui/index.html`), встраивается через `include_str!`. 7 групп навигации, 24 пункта сайдбара, 16 подсекций Mihomo Features, кастомные Acrylic-дропдауны, RU/EN i18n (~180 пар), светлая/тёмная тема со слайдером яркости, тултипы, login-оверлей, confirm-модалка, toast-уведомления, адаптивная нижняя навигация для мобильных, real `fetch()` API-хелпер с Bearer-авторизацией, production data-лоадеры для всех 87 эндпоинтов демона, data-URI лого (без внешних ассетов).
+- **Fluent/Acrylic веб-панель**: встроенная через `include_str!` панель `src/webui/index.html` с desktop/tablet/mobile навигацией, Acrylic controls, RU/EN i18n, светлой/тёмной темой, подсказками, login overlay, диалогами, toast, адаптивной сеткой профилей, индикаторами длительных операций, real `fetch()` API с Bearer auth и inline-знаком HincyRay без внешних ассетов.
 - **Фикс EC-стриминга**: `first_stream_json()` парсит первый JSON-снапшот из бесконечных стрим-эндпоинтов Mihomo (`/traffic`, `/memory`), успешен даже когда `curl --max-time` завершается с кодом 28 (таймаут на бесконечном стриме).
 - **Опциональные EC-эндпоинты**: `/api/mihomo-api/configs/geo` и `/api/mihomo-api/rules/disable` теперь возвращают `{"supported":false}` (200) при ответе 405 от Mihomo EC, вместо 502 транспортной ошибки.
 - **Фикс мерцания UI**: `updateStatusUI` разделён на `updateStatusCards` (карточки ядра/профиля/версии) и `updateRoutingForm` (поля формы роутинга) — предотвращает перезапись карточек частичными данными при `loadRouting()`.
@@ -324,7 +330,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Текущие gates и результаты router deploy v0.22.1 зафиксированы в [`docs/releases/v0.22.1.md`](docs/releases/v0.22.1.md).
+Команда Playwright запускает fixture-backed browser smoke suite. Текущие gates и результаты router deploy v1.0.0 зафиксированы в [`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
 
 ## Установка
 
@@ -336,7 +342,7 @@ sh scripts/hincyray-install.sh
 
 Установщик проверяет kernel modules, создаёт директорию ndm hook, устанавливает бинарник, init-скрипт и состояние по умолчанию. Staging → backup → atomic `mv` → verify → commit/rollback.
 
-Репозиторий приватный. Перед запуском установщика скопируйте release-бинарник в `/tmp/hincyray` (или задайте `HINCYRAY_BIN_PATH`). Альтернатива — `HINCYRAY_GITHUB_TOKEN` с правом чтения: установщик структурно находит точный asset `hincyray` через authenticated GitHub Releases API и не помещает token в URL или log message.
+Для публичного релиза установщик скачивает точный asset `hincyray` из GitHub Releases, если локальный бинарник отсутствует. Для offline-установки по-прежнему можно скопировать бинарник в `/tmp/hincyray` или задать `HINCYRAY_BIN_PATH`.
 
 См. [`docs/hincyray-entware-install.md`](docs/hincyray-entware-install.md) для ручной установки.
 
@@ -346,7 +352,7 @@ sh scripts/hincyray-install.sh
 http://<ip-роутера>:8088/
 ```
 
-Встроенная Fluent/Acrylic-панель с RU/EN i18n, светлой/тёмной темой и навигацией для desktop, tablet и mobile. На узких экранах таблицы превращаются в подписанные карточки. Переименование профиля выполняется в диалоге, поиск соединений учитывает точную видимую строку флаг+host, Bearer token хранится в `sessionStorage`. Статус, профили, benchmark, импорт, подписки, routing, firewall, DNS, диагностика, backup, HWID, системный мониторинг, управление Mihomo, трафик, соединения и логи доступны без внешнего CDN и frontend build step. Вместо периодического полного refresh используются лёгкие heartbeat статуса и системы.
+Встроенная Fluent/Acrylic-панель с RU/EN i18n, светлой/тёмной темой и навигацией для desktop, tablet и mobile. Профили занимают доступную ширину на ПК и планшетах в адаптивной многоколоночной раскладке; mobile остаётся одноколоночным. Длительные тесты, загрузки и apply-операции показывают движущийся индикатор активности. Переименование профиля выполняется в диалоге, поиск соединений учитывает точную видимую строку флаг+host, Bearer token хранится в `sessionStorage`. Статус, профили, benchmark, импорт, подписки, routing, firewall, DNS, диагностика, backup, HWID, системный мониторинг, управление Mihomo, трафик, соединения и логи доступны без внешнего CDN и frontend build step. Вместо периодического полного refresh используются лёгкие heartbeat статуса и системы.
 
 ### Переменные окружения
 
