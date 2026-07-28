@@ -749,6 +749,24 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .experimental-card[open]>summary::before{transform:rotate(90deg)}
 .experimental-body{padding:0 16px 16px}
 .experimental-body>.feature-card{border-top:1px solid var(--border);padding:16px 0}
+.parovozik-consist{margin:12px 0;border:1px solid var(--border);background:var(--bg)}
+.parovozik-consist>summary{padding:11px 13px;cursor:pointer;list-style:none;font-weight:600;border-bottom:1px solid transparent}
+.parovozik-consist>summary::-webkit-details-marker{display:none}
+.parovozik-consist[open]>summary{border-bottom-color:var(--border)}
+.parovozik-consist>summary::before{content:'›';display:inline-block;margin-right:7px;transition:transform .15s ease}
+.parovozik-consist[open]>summary::before{transform:rotate(90deg)}
+.parovozik-wagons{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;padding:14px}
+.parovozik-subscription{min-width:0}
+.parovozik-subscription-title{margin:0 0 5px;padding-bottom:5px;border-bottom:1px solid var(--border);font-size:var(--fs-sm);font-weight:700;color:var(--muted);overflow-wrap:anywhere}
+.parovozik-subscription-grid{display:flex;flex-direction:column}
+.parovozik-wagon{display:grid;grid-template-columns:18px minmax(0,1fr);gap:7px;align-items:start;min-width:0;padding:5px 3px;cursor:pointer;line-height:1.3;border-bottom:1px solid color-mix(in srgb,var(--border) 55%,transparent)}
+.parovozik-wagon:hover{background:var(--accent-soft)}
+.parovozik-wagon input{margin:2px 0 0}
+.parovozik-wagon-name{min-width:0;overflow-wrap:anywhere}
+.parovozik-locomotive{cursor:default;color:var(--accent);font-weight:600}
+.parovozik-locomotive:hover{background:transparent}
+.parovozik-consist-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:0 14px 14px}
+@media(max-width:640px){.parovozik-wagons{grid-template-columns:1fr}}
 .geobase-source-fields{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(180px,1fr) minmax(240px,2fr);gap:var(--gap-sm);align-items:end}
 .geobase-runtime{display:none;margin:12px 0;padding:10px 12px;border-left:3px solid var(--accent);background:var(--accent-soft)}
 .geobase-runtime.error{border-left-color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,var(--surface))}
@@ -902,7 +920,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   <nav class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="sidebar-brand" style="border-radius: 0px;">
       <svg class="brand-icon" viewBox="0 0 1024 1024" role="img" aria-label="HincyRay"><defs><radialGradient id="brand-bg" cx="50%" cy="46%" r="62%"><stop stop-color="#172b3d"/><stop offset=".55" stop-color="#0b1018"/><stop offset="1" stop-color="#05070b"/></radialGradient><linearGradient id="brand-phone" x1="250" y1="100" x2="760" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#3b424d"/><stop offset=".45" stop-color="#151a21"/><stop offset="1" stop-color="#050608"/></linearGradient><linearGradient id="brand-screen" x1="310" y1="150" x2="690" y2="850" gradientUnits="userSpaceOnUse"><stop stop-color="#1f3146"/><stop offset="1" stop-color="#070a0f"/></linearGradient></defs><rect width="1024" height="1024" rx="220" fill="url(#brand-bg)"/><path d="M130 740 40 820M190 820 95 930M845 170l115-92M820 790l130 92M93 276l112 52" stroke="#0078d7" stroke-width="18" stroke-linecap="round" opacity=".65"/><g transform="rotate(-8 512 512)"><rect x="290" y="92" width="444" height="840" rx="78" fill="url(#brand-phone)" stroke="#737b87" stroke-width="14"/><rect x="328" y="138" width="368" height="748" rx="48" fill="url(#brand-screen)" stroke="#0e1620" stroke-width="10"/><circle cx="512" cy="176" r="16" fill="#080b10" stroke="#4d5663" stroke-width="5"/><path d="M510 132 455 292l68-30-42 172 106-238-72 34z" fill="#f4d03f" stroke="#fff2a4" stroke-width="8"/><path d="M496 432 365 536l112 8-74 204 214-260-102 14 75-134z" fill="#ff453a" stroke="#ffb2ab" stroke-width="9"/><path d="M520 398 660 496l-92 22 70 188-198-238 92 18z" fill="#60cdff" stroke="#b8efff" stroke-width="8"/><path d="M445 308 340 248M444 309l-96 102M521 264l118-98M514 436l-160 44M514 437l120 152M477 546l-112 188M566 515l104 166" stroke="#d8e6f3" stroke-width="10" stroke-linecap="round" opacity=".8"/><path d="M336 610 238 660l87 36-142 98 238-62-62-42 98-38zM664 300l150-50-72 102 160 10-228 68 38-78z" fill="#1f8fff" opacity=".88"/><text x="512" y="760" text-anchor="middle" font-family="Arial Black,Arial,sans-serif" font-size="76" fill="#f2f6fb" stroke="#05070b" stroke-width="7" paint-order="stroke">POCO</text></g></svg>
-      <div><div class="logo">HincyRay</div><div class="version">v1.0.0</div></div>
+      <div><div class="logo">HincyRay</div><div class="version">v1.1.0</div></div>
     </div>
     <div class="brightness-row">
       <svg class="brightness-icon" onclick="toggleTheme()" title="Переключить тему" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9L14 6M5.9 14l-1.1 1.1"></path></svg>
@@ -1346,6 +1364,21 @@ https://sub.example.com/…"></textarea>
                   <div class="form-group" style="flex:1"><label>Авто-исключения VPN (по одному на строку)</label><textarea id="rAutoVpnExceptions" class="mono" rows="4" placeholder="auto-learned.example"></textarea></div>
                 </div>
                 <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить</button>
+              </div>
+              <div class="feature-card">
+                <h4>🚂 Паровозик</h4>
+                <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Включить экспериментальную direct-first классификацию</label><label class="toggle"><input type="checkbox" id="rParovozikEnabled"><span class="slider"></span></label></div>
+                <div style="font-size:var(--fs-sm);color:var(--muted);margin:8px 0">Только для сайтов, отсутствующих во включённых GeoBase: сначала DIRECT, после подтверждённой ошибки — текущее VPN и выбранные резервные серверы. GeoBase всегда имеет приоритет.</div>
+                <details class="parovozik-consist" id="rParovozikConsist" open>
+                  <summary>Состав вагонов · <span id="rParovozikCount">0 / 5</span></summary>
+                  <div class="parovozik-wagons" id="rParovozikWagons"></div>
+                  <div class="parovozik-consist-actions"><button class="btn btn-accent" type="button" onclick="saveParovozikConsist()">Сохранить состав вагонов</button><span class="hint">Текущее VPN — локомотив и добавляется автоматически.</span></div>
+                </details>
+                <div class="form-row">
+                  <div class="form-group" style="flex:1"><label>Паровозик Direct</label><textarea id="rParovozikDirect" class="mono" rows="4" readonly></textarea></div>
+                  <div class="form-group" style="flex:1"><label>Паровозик VPN</label><textarea id="rParovozikVpn" class="mono" rows="4" readonly></textarea></div>
+                </div>
+                <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить и применить</button>
               </div>
               <div class="feature-card" id="geobaseConstructor">
                 <h4>GeoBase Constructor</h4>
@@ -2277,9 +2310,9 @@ const MOCK = {
     split_routing: { enabled: true, auto_switch: false, block_quic_global: false, rule_source: "metacubex-lite", vpn_subnet: "192.168.2.0/24", redirect_port: 10810, policy_name: "HincyRay", geo_asset_path: "/opt/share/mihomo", quic_mode: "block", tproxy_available: true, port_mode: "all", proxy_ports: "80,443,8080", bypass_ports: "22,53" }
   },
   profiles: [
-    { id:0, name:"🇩🇪 Frankfurt · VLESS Reality", protocol:"VLESS", transport:"tcp", address:"de-1.example.net", port:443, active:true, group:null, block_quic:false, favorite:true, last_latency_ms:150, last_jitter_ms:5, last_download_mbps:45.5, last_upload_mbps:12.3, last_loss_percent:0, ewma_latency_ms:154, ewma_download_mbps:44.8, consecutive_failures:0, cooldown_until_unix:null, success_count:10, failure_count:2, resource_tests:[{contract_version:5,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:182},{contract_version:5,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:141},{contract_version:5,id:'ai',name:'AI',stable:true,successes:3,attempts:3,avg_ttfb_ms:271}] },
-    { id:1, name:"🇳🇱 Amsterdam • Streaming", protocol:"VMess", transport:"ws", address:"nl-ams.example.net", port:443, active:false, group:"Europe Premium", block_quic:false, favorite:false, last_latency_ms:210, last_jitter_ms:12, last_download_mbps:32.1, last_upload_mbps:8.5, last_loss_percent:1.5, ewma_latency_ms:218, ewma_download_mbps:31.4, consecutive_failures:1, cooldown_until_unix:null, success_count:8, failure_count:3, resource_tests:[{contract_version:5,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:238},{contract_version:5,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:202},{contract_version:5,id:'ai',name:'AI',stable:false,successes:1,attempts:3,avg_ttfb_ms:0}] },
-    { id:2, name:"🇯🇵 Tokyo — AI / low jitter", protocol:"Trojan", transport:"grpc", address:"jp-tyo.example.net", port:443, active:false, group:"Asia", block_quic:true, favorite:false, last_latency_ms:180, last_jitter_ms:8, last_download_mbps:38.7, last_upload_mbps:10.1, last_loss_percent:0, ewma_latency_ms:176, ewma_download_mbps:39.2, consecutive_failures:0, cooldown_until_unix:null, success_count:9, failure_count:1, resource_tests:[{contract_version:5,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:207},{contract_version:5,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:174},{contract_version:5,id:'ai',name:'AI',stable:true,successes:3,attempts:3,avg_ttfb_ms:233}] },
+    { id:0, name:"🇩🇪 Frankfurt · VLESS Reality", protocol:"VLESS", transport:"tcp", address:"de-1.example.net", port:443, active:true, group:null, block_quic:false, favorite:true, last_latency_ms:150, last_jitter_ms:5, last_download_mbps:45.5, last_upload_mbps:12.3, last_loss_percent:0, ewma_latency_ms:154, ewma_download_mbps:44.8, consecutive_failures:0, cooldown_until_unix:null, success_count:10, failure_count:2, resource_tests:[{contract_version:6,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:182},{contract_version:6,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:141},{contract_version:6,id:'ai',name:'AI',stable:true,successes:3,attempts:3,avg_ttfb_ms:271}] },
+    { id:1, name:"🇳🇱 Amsterdam • Streaming", protocol:"VMess", transport:"ws", address:"nl-ams.example.net", port:443, active:false, group:"Europe Premium", block_quic:false, favorite:false, last_latency_ms:210, last_jitter_ms:12, last_download_mbps:32.1, last_upload_mbps:8.5, last_loss_percent:1.5, ewma_latency_ms:218, ewma_download_mbps:31.4, consecutive_failures:1, cooldown_until_unix:null, success_count:8, failure_count:3, resource_tests:[{contract_version:6,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:238},{contract_version:6,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:202},{contract_version:6,id:'ai',name:'AI',stable:false,successes:1,attempts:3,avg_ttfb_ms:0}] },
+    { id:2, name:"🇯🇵 Tokyo — AI / low jitter", protocol:"Trojan", transport:"grpc", address:"jp-tyo.example.net", port:443, active:false, group:"Asia", block_quic:true, favorite:false, last_latency_ms:180, last_jitter_ms:8, last_download_mbps:38.7, last_upload_mbps:10.1, last_loss_percent:0, ewma_latency_ms:176, ewma_download_mbps:39.2, consecutive_failures:0, cooldown_until_unix:null, success_count:9, failure_count:1, resource_tests:[{contract_version:6,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:207},{contract_version:6,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:174},{contract_version:6,id:'ai',name:'AI',stable:true,successes:3,attempts:3,avg_ttfb_ms:233}] },
     { id:3, name:"Server-4", protocol:"VLESS", transport:"tcp", address:"13.14.15.16", port:443, active:false, group:null, block_quic:false, favorite:true, last_latency_ms:95, last_jitter_ms:3, last_download_mbps:62.3, last_upload_mbps:18.7, last_loss_percent:0, ewma_latency_ms:99, ewma_download_mbps:60.9, consecutive_failures:0, cooldown_until_unix:null, success_count:15, failure_count:0 },
     { id:4, name:"Server-5", protocol:"Shadowsocks", transport:"tcp", address:"17.18.19.20", port:8388, active:false, group:"Group-B", block_quic:false, favorite:false, last_latency_ms:320, last_jitter_ms:25, last_download_mbps:15.0, last_upload_mbps:3.2, last_loss_percent:5, ewma_latency_ms:335, ewma_download_mbps:14.1, consecutive_failures:4, cooldown_until_unix:1719903700, success_count:4, failure_count:8 },
     { id:5, name:"🇫🇮 Helsinki · WireGuard", protocol:"WireGuard", transport:"udp", address:"fi-hel.example.net", port:51820, active:false, group:"Europe Premium", block_quic:false, favorite:true, last_latency_ms:128, last_jitter_ms:4, last_download_mbps:58.2, last_upload_mbps:16.1, last_loss_percent:0, ewma_latency_ms:131, ewma_download_mbps:57.4, consecutive_failures:0, cooldown_until_unix:null, success_count:17, failure_count:1 },
@@ -3476,7 +3509,7 @@ function profileMetricStyle(metric) {
 }
 
 function profileServiceTestsHtml(resourceTests) {
-  const tests = Array.isArray(resourceTests) ? resourceTests.filter(test => test.contract_version === 5) : [];
+  const tests = Array.isArray(resourceTests) ? resourceTests.filter(test => test.contract_version === 6) : [];
   if (!tests.length) return '';
   return `<div class="profile-service-tests">${[['youtube','YT'],['telegram','TG'],['ai','AI']].map(([id,label]) => {
     const result = tests.find(test => test.id === id);
@@ -4253,6 +4286,10 @@ function renderRoutingRules(data) {
     const net = r.network || 'any';
     const target = routingTargetPresentation(r.target);
     const targetBadge = r.target==='reject' || target.stale?'danger':r.target==='direct'?'success':'info';
+    if (r.kind === 'managed-parovozik') {
+      const managedTarget = r.target === 'direct' ? 'DIRECT' : 'parovozik-vpn';
+      return `<tr class="managed-routing-rule"><td><span class="badge">🚂 managed</span></td><td><strong>${htmlEscape(r.name)}</strong></td><td class="mono" style="font-size:12px">${htmlEscape(entriesShort)}</td><td><span class="badge badge-${targetBadge}">${managedTarget}</span></td><td>—</td><td>any</td><td>—</td></tr>`;
+    }
 
     // Target cell: <select> if editing, otherwise clickable span
     let targetCell;
@@ -6026,12 +6063,68 @@ function saveRoutingSettings() {
     ru_direct_exceptions: (document.getElementById('rRuDirectExceptions')?.value || '').split('\n').map(s=>s.trim()).filter(Boolean),
     auto_vpn_learning_enabled: document.getElementById('rAutoVpnLearning')?.checked === true,
     auto_vpn_exceptions: (document.getElementById('rAutoVpnExceptions')?.value || '').split('\n').map(s=>s.trim()).filter(Boolean),
+    parovozik_enabled: document.getElementById('rParovozikEnabled')?.checked === true,
+    parovozik_server_refs: [...parovozikSelectedRefs],
     match_target: sr.match_target || 'proxy',
   };
   body.apply = true;
   api('POST','/api/routing/settings',body).then(() => {
     showToast('success', t('Настройки маршрутизации сохранены и применены'));
     refreshDashboard();
+  }).catch(()=>{});
+}
+
+const parovozikSelectedRefs = new Set();
+let parovozikConsistDirty = false;
+
+function toggleParovozikWagon(serverRef) {
+  if (!serverRef) return;
+  if (parovozikSelectedRefs.has(serverRef)) parovozikSelectedRefs.delete(serverRef);
+  else if (parovozikSelectedRefs.size < 5) parovozikSelectedRefs.add(serverRef);
+  else return showToast('warning','Можно выбрать не более 5 вагонов');
+  parovozikConsistDirty = true;
+  renderParovozikServers([...parovozikSelectedRefs]);
+}
+
+function renderParovozikServers(selectedRefs) {
+  const selected = new Set(Array.isArray(selectedRefs) ? selectedRefs : []);
+  const servers = (MOCK.routing_servers || []).filter(server => !server.active && !server.dead && server.ref);
+  const availableRefs = new Set(servers.map(server => server.ref));
+  parovozikSelectedRefs.clear();
+  [...selected].filter(serverRef => availableRefs.has(serverRef)).slice(0,5).forEach(serverRef => parovozikSelectedRefs.add(serverRef));
+  const container = document.getElementById('rParovozikWagons');
+  if (!container) return;
+  const active = (MOCK.routing_servers || []).find(server => server.active);
+  const locomotive = active ? `<div class="parovozik-subscription"><div class="parovozik-subscription-title">Локомотив</div><div class="parovozik-subscription-grid"><div class="parovozik-wagon parovozik-locomotive"><span>🚂</span><span class="parovozik-wagon-name">${htmlEscape(active.name || t('Текущий активный VPN'))}</span></div></div></div>` : '';
+  const groups = new Map();
+  servers.forEach(server => {
+    const key = server.group || '';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(server);
+  });
+  const grouped = [...groups.entries()].map(([group, items]) => {
+    const subscription = subscriptionForGroup(group);
+    const title = subscription?.title || shortGroupName(group || t('Без группы'));
+    const cards = items.map(server => {
+      const checked = parovozikSelectedRefs.has(server.ref);
+      const disabled = !checked && parovozikSelectedRefs.size >= 5;
+      return `<label class="parovozik-wagon">
+        <input type="checkbox" data-parovozik-ref="${attrEscape(server.ref)}" ${checked?'checked':''} ${disabled?'disabled':''} onchange="toggleParovozikWagon(this.dataset.parovozikRef)">
+        <span class="parovozik-wagon-name">${htmlEscape(server.name || `#${server.id}`)}</span>
+      </label>`;
+    }).join('');
+    return `<div class="parovozik-subscription"><div class="parovozik-subscription-title">${htmlEscape(title)}</div><div class="parovozik-subscription-grid">${cards}</div></div>`;
+  }).join('');
+  container.innerHTML = locomotive + grouped;
+  if (!active && !servers.length) container.innerHTML = '<div class="hint">Серверов нет.</div>';
+  safeSet('rParovozikCount', `${parovozikSelectedRefs.size} / 5`);
+}
+
+function saveParovozikConsist() {
+  api('POST','/api/routing/settings',{parovozik_server_refs:[...parovozikSelectedRefs],apply:true}).then(result => {
+    parovozikConsistDirty = false;
+    if (result.settings) updateRoutingForm(result.settings);
+    showToast('success','Состав вагонов сохранён');
   }).catch(()=>{});
 }
 
@@ -6331,6 +6424,10 @@ function updateRoutingForm(sr) {
   safeValue('rRuDirectExceptions', Array.isArray(sr.ru_direct_exceptions) ? sr.ru_direct_exceptions.join('\n') : (sr.ru_direct_exceptions || ''));
   syncAutoVpnLearningToggles(sr.auto_vpn_learning_enabled === true);
   safeValue('rAutoVpnExceptions', Array.isArray(sr.auto_vpn_exceptions) ? sr.auto_vpn_exceptions.join('\n') : (sr.auto_vpn_exceptions || ''));
+  safeChecked('rParovozikEnabled', sr.parovozik_enabled === true);
+  safeValue('rParovozikDirect', Array.isArray(sr.parovozik_direct_domains) ? sr.parovozik_direct_domains.join('\n') : '');
+  safeValue('rParovozikVpn', Array.isArray(sr.parovozik_vpn_domains) ? sr.parovozik_vpn_domains.join('\n') : '');
+  if (!parovozikConsistDirty) renderParovozikServers(sr.parovozik_server_refs);
   updatePortModeFields();
   // Sync all custom selects with the freshly-loaded values.
   refreshCustomSelects();
@@ -6484,6 +6581,7 @@ function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>
 function loadRouting() { return api('GET','/api/routing').then(d => {
   MOCK.routing_rules = d.rules || d.routing_rules || [];
   MOCK.routing_servers = Array.isArray(d.servers) ? d.servers : [];
+  renderParovozikServers(parovozikConsistDirty ? [...parovozikSelectedRefs] : MOCK.split_routing?.parovozik_server_refs);
   MOCK.managed_routing_rules = d.managed_rules || [];
   MOCK.geobase_requires_apply = d.geobase_requires_apply === true;
   MOCK.split_routing = d.settings || d.split_routing || MOCK.split_routing;

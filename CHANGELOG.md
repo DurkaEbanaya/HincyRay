@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v1.1.0 - 2026-07-28
+
+- Added the disabled-by-default experimental «Паровозик»: domains absent from enabled applied GeoBases are tried DIRECT first, verified DIRECT failures are immediately tested through the current VPN plus up to five selected live server routes, and learned results are exposed as separate managed `Паровозик Direct` / `Паровозик VPN` rules below GeoBase precedence.
+- Added a compact subscription-column consist selector that excludes Dead Servers, displays no endpoint secrets or technical connection fields, and preserves unsaved selections across periodic status refreshes.
+- Replaced the AI Studio Quick Test request/redirect heuristic with the bounded `vernette/ipregion` method: read Google's exit-region code through the tested profile, resolve its country name, and match it against Google's published AI Studio/Gemini region list. The legacy direct AI Studio probe remains compiled but disabled for rollback; the authorized Telegram media probe remains active because ipregion has no Telegram check.
+- Removed the superseded browser-extension experiment and its extension-only routing/CORS API surface.
 
 ## v1.0.0 - 2026-07-26
 

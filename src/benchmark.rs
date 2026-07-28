@@ -8,8 +8,8 @@
 //! the router is never left with stray benchmark cores.
 //!
 //! `curl` is invoked for the generic HTTP probes. Quick Test uses a narrow
-//! YouTube Innertube flow, an authorized Telegram session, and an AI Studio
-//! region-availability request through each tested profile.
+//! YouTube Innertube flow, an authorized Telegram session, and an ipregion-style
+//! Google region lookup for AI Studio availability through each tested profile.
 
 use std::io::Write;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -41,7 +41,7 @@ const DOWNLOAD_MAX_SECS: u64 = 3;
 const SUSTAINED_DOWNLOAD_MAX_SECS: u64 = 15;
 const XRAY_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const QUICK_RESOURCE_CONTRACT_VERSION: u8 = 5;
+const QUICK_RESOURCE_CONTRACT_VERSION: u8 = 6;
 const YOUTUBE_VIDEO_ID: &str = "aqz-KE-bpKQ";
 const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=aqz-KE-bpKQ&hl=en";
 const YOUTUBE_PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
@@ -55,6 +55,15 @@ const AI_STUDIO_URL: &str = "https://aistudio.google.com/prompts/new_chat";
 const AI_STUDIO_UNAVAILABLE_URL: &str = "https://ai.google.dev/gemini-api/docs/available-regions";
 const AI_STUDIO_SIGN_IN_URL: &str = "https://accounts.google.com/";
 const AI_STUDIO_PAGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const IPREGION_GOOGLE_URL: &str =
+    "https://accounts.google.com/v3/signin/identifier?flowName=GlifSetupAndroid";
+const IPREGION_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
+const IPREGION_COUNTRY_URL: &str = "https://www.apicountries.com/alpha/";
+const IPREGION_GEMINI_REGIONS_URL: &str =
+    "https://ai.google.dev/gemini-api/docs/available-regions.md.txt";
+const IPREGION_GOOGLE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const IPREGION_RESPONSE_MAX_BYTES: u64 = 512 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct QuickProbeConfig {
@@ -517,11 +526,127 @@ fn run_telegram_media_probe(port: u16, quick_probe: &QuickProbeConfig) -> Resour
 }
 
 fn run_ai_studio_probe(port: u16) -> ResourceTestResult {
-    let (successes, errors) = match ai_studio_attempt(port) {
+    let (successes, errors) = match ipregion_ai_studio_attempt(port) {
         Ok(attempt) => (vec![attempt], Vec::new()),
         Err(error) => (Vec::new(), vec![error]),
     };
     aggregate_quick_resource_probe("ai", "AI Studio", 1, &successes, &errors)
+}
+
+fn ipregion_ai_studio_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
+    // Based on vernette/ipregion's Google + Gemini Supported lookups.
+    let (google_page, google_metrics) = curl_bounded_text_via_socks(
+        port,
+        IPREGION_GOOGLE_URL,
+        IPREGION_GOOGLE_MAX_BYTES,
+        "ipregion Google",
+    )?;
+    let country_code = google_region_code(&google_page)
+        .ok_or_else(|| "ipregion Google response has no region".to_owned())?;
+    let (country_json, country_metrics) = curl_bounded_text_via_socks(
+        port,
+        &format!("{IPREGION_COUNTRY_URL}{country_code}"),
+        IPREGION_RESPONSE_MAX_BYTES,
+        "ipregion country",
+    )?;
+    let country_name = serde_json::from_str::<serde_json::Value>(&country_json)
+        .map_err(|error| format!("parse ipregion country response: {error}"))?
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "ipregion country response has no name".to_owned())?
+        .trim()
+        .to_owned();
+    let (regions, regions_metrics) = curl_bounded_text_via_socks(
+        port,
+        IPREGION_GEMINI_REGIONS_URL,
+        IPREGION_RESPONSE_MAX_BYTES,
+        "ipregion Gemini regions",
+    )?;
+    if !gemini_region_supported(&regions, &country_code, &country_name) {
+        return Err(format!(
+            "AI Studio is unavailable in Google region {country_code} ({country_name})"
+        ));
+    }
+    Ok(QuickResourceAttempt {
+        ttfb_ms: seconds_to_millis(google_metrics.ttfb_secs, 0),
+        total_ms: [&google_metrics, &country_metrics, &regions_metrics]
+            .iter()
+            .map(|metrics| seconds_to_millis(metrics.total_secs, 1))
+            .sum(),
+        bytes: google_metrics.bytes + country_metrics.bytes + regions_metrics.bytes,
+    })
+}
+
+fn curl_bounded_text_via_socks(
+    port: u16,
+    url: &str,
+    max_bytes: u64,
+    label: &str,
+) -> Result<(String, CurlMetrics), String> {
+    let response = NamedTempFile::new().map_err(|error| format!("{label} response: {error}"))?;
+    let output = Command::new("curl")
+        .arg("--socks5-hostname")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("-L")
+        .arg("--connect-timeout")
+        .arg("5")
+        .arg("--max-time")
+        .arg("20")
+        .arg("--max-filesize")
+        .arg(max_bytes.to_string())
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--user-agent")
+        .arg(IPREGION_USER_AGENT)
+        .arg("--output")
+        .arg(response.path())
+        .arg("--write-out")
+        .arg("%{http_code} %{size_download} %{time_starttransfer} %{time_total}")
+        .arg(url)
+        .output()
+        .map_err(|error| format!("{label} curl: {error}"))?;
+    let metrics = parse_curl_metrics(&output.stdout)?;
+    if !output.status.success() || !(200..300).contains(&metrics.http_status) {
+        return Err(format!(
+            "{label} rc={}, http={}: {}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "?".to_owned(), |code| code.to_string()),
+            metrics.http_status,
+            bounded_process_error(&output.stderr)
+        ));
+    }
+    let text = std::fs::read_to_string(response.path())
+        .map_err(|error| format!("read {label} response: {error}"))?;
+    Ok((text, metrics))
+}
+
+fn google_region_code(page: &str) -> Option<String> {
+    let marker = "name=\"region\" value=\"";
+    let value = page.get(page.find(marker)? + marker.len()..)?;
+    let code = value.get(..value.find('"')?)?;
+    (code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_alphabetic()))
+        .then(|| code.to_ascii_uppercase())
+}
+
+fn gemini_region_supported(regions: &str, country_code: &str, country_name: &str) -> bool {
+    let documented_name = match country_code {
+        "BS" => "The Bahamas",
+        "CV" => "Cabo Verde",
+        "CI" => "Côte d'Ivoire",
+        "CZ" => "Czech Republic",
+        "GM" => "The Gambia",
+        "KR" => "South Korea",
+        "TR" => "Türkiye",
+        "US" => "United States",
+        _ => country_name,
+    };
+    regions.lines().any(|line| {
+        line.strip_prefix("- ")
+            .is_some_and(|name| name == documented_name)
+    })
 }
 
 fn aggregate_quick_resource_probe(
@@ -779,7 +904,8 @@ fn curl_youtube_range(port: u16, media_url: &str) -> Result<QuickResourceAttempt
     })
 }
 
-fn ai_studio_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
+#[allow(dead_code)]
+fn legacy_ai_studio_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
     let headers = NamedTempFile::new().map_err(|error| format!("AI Studio headers: {error}"))?;
     let page = NamedTempFile::new().map_err(|error| format!("AI Studio page: {error}"))?;
     let output = Command::new("curl")
@@ -839,12 +965,14 @@ fn ai_studio_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
     })
 }
 
+#[allow(dead_code)]
 fn ai_studio_region_unavailable(url: &str) -> bool {
     url.trim()
         .to_ascii_lowercase()
         .starts_with(AI_STUDIO_UNAVAILABLE_URL)
 }
 
+#[allow(dead_code)]
 fn ai_studio_sign_in_required(url: &str) -> bool {
     url.trim()
         .to_ascii_lowercase()
@@ -1804,7 +1932,7 @@ mod tests {
             &["timeout".to_owned()],
         );
 
-        assert_eq!(result.contract_version, 5);
+        assert_eq!(result.contract_version, 6);
         assert!(result.reachable);
         assert!(!result.stable);
         assert_eq!(result.successes, 2);
@@ -1839,6 +1967,27 @@ mod tests {
             "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Faistudio.google.com"
         ));
         assert!(!ai_studio_sign_in_required(&metrics.final_url));
+    }
+
+    #[test]
+    fn parses_ipregion_google_region_and_gemini_support() {
+        assert_eq!(
+            google_region_code(r#"<input name="region" value="nl">"#).as_deref(),
+            Some("NL")
+        );
+        assert_eq!(
+            google_region_code(r#"<input name="region" value="RUS">"#),
+            None
+        );
+        let regions = "# Available regions\n\n- Netherlands\n- Türkiye\n- United States\n";
+        assert!(gemini_region_supported(regions, "NL", "Netherlands"));
+        assert!(gemini_region_supported(regions, "TR", "Turkey"));
+        assert!(gemini_region_supported(
+            regions,
+            "US",
+            "United States of America"
+        ));
+        assert!(!gemini_region_supported(regions, "RU", "Russia"));
     }
 
     #[test]

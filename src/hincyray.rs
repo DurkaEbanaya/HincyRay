@@ -65,8 +65,8 @@ use crate::hincyray_security::{
 };
 use crate::hincyray_webui::index_html;
 use crate::mihomo_config::{
-    DIRECT_NAME, MihomoFeatures, PROXY_ACTIVE_NAME, PROXY_NAME, PinnedServerRoute, REJECT_NAME,
-    build_mihomo_config, build_mihomo_router_config,
+    DIRECT_NAME, MihomoFeatures, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME, PROXY_NAME,
+    PinnedServerRoute, REJECT_NAME, build_mihomo_config, build_mihomo_router_config,
 };
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionMetadata, SubscriptionSource,
@@ -87,6 +87,8 @@ const MAX_HISTORY_SAMPLES: usize = 1000;
 const MAX_CONNECTION_LOG: usize = 500;
 const MAX_AUTO_VPN_EXCEPTIONS: usize = 200;
 const MAX_AUTO_VPN_PENDING_DOMAINS: usize = 200;
+const MAX_PAROVOZIK_DOMAINS: usize = 500;
+const MAX_PAROVOZIK_SERVERS: usize = 5;
 const AUTO_VPN_PROBE_INTERVAL_TICKS: u64 = 3; // 30 seconds
 const AUTO_VPN_RECHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const AUTO_VPN_PROBE_CONTRACT_VERSION: u8 = 1;
@@ -1506,6 +1508,19 @@ pub struct SplitRoutingSettings {
     /// Persisted migration marker for auto-VPN probe semantics.
     #[serde(default)]
     pub auto_vpn_probe_contract_version: u8,
+    /// Experimental direct-first classifier for hosts absent from enabled
+    /// managed GeoBases. Disabled by default.
+    #[serde(default)]
+    pub parovozik_enabled: bool,
+    #[serde(default)]
+    pub parovozik_direct_domains: Vec<String>,
+    #[serde(default)]
+    pub parovozik_vpn_domains: Vec<String>,
+    /// Stable routing refs tried after the current active VPN, max five.
+    #[serde(default)]
+    pub parovozik_server_refs: Vec<String>,
+    #[serde(default)]
+    pub parovozik_last_checked_unix: HashMap<String, u64>,
     /// v0.16: Controls the final MATCH rule target.
     /// `"proxy"` = everything through VPN, `"direct"` = everything direct.
     /// Empty string (old state) is migrated in `load_state()`.
@@ -1536,6 +1551,11 @@ impl Default for SplitRoutingSettings {
             auto_vpn_last_checked_unix: HashMap::new(),
             auto_vpn_learning_enabled: false,
             auto_vpn_probe_contract_version: AUTO_VPN_PROBE_CONTRACT_VERSION,
+            parovozik_enabled: false,
+            parovozik_direct_domains: Vec::new(),
+            parovozik_vpn_domains: Vec::new(),
+            parovozik_server_refs: Vec::new(),
+            parovozik_last_checked_unix: HashMap::new(),
             match_target: String::new(),
         }
     }
@@ -1620,6 +1640,7 @@ enum RoutingTarget {
     Direct,
     Active,
     Reject,
+    Parovozik,
     Server(String),
     LegacyProfile(usize),
 }
@@ -1631,6 +1652,7 @@ impl RoutingTarget {
             "" | "active" | "best" => Ok(Self::Active),
             "direct" => Ok(Self::Direct),
             "reject" => Ok(Self::Reject),
+            "parovozik" => Ok(Self::Parovozik),
             _ if value.starts_with("server:") => {
                 let server_ref = &value[7..];
                 if valid_routing_server_ref(server_ref) {
@@ -1862,6 +1884,7 @@ fn sync_server_route_registry(state: &mut HincyrayState) {
             RoutingTarget::Server(server_ref) => Some(server_ref),
             _ => None,
         })
+        .chain(state.split_routing.parovozik_server_refs.iter().cloned())
         .collect();
     state.server_route_registry.retain(|entry| {
         current.contains(&entry.canonical_raw) || referenced.contains(&entry.server_ref)
@@ -3332,6 +3355,30 @@ fn compact_state_for_persist(state: &mut HincyrayState) {
     {
         report.entries.truncate(MAX_REFRESH_REPORT_ENTRIES);
     }
+    state.split_routing.parovozik_direct_domains =
+        normalize_parovozik_domains(&state.split_routing.parovozik_direct_domains);
+    state.split_routing.parovozik_vpn_domains =
+        normalize_parovozik_domains(&state.split_routing.parovozik_vpn_domains);
+    state
+        .split_routing
+        .parovozik_server_refs
+        .truncate(MAX_PAROVOZIK_SERVERS);
+    if state.split_routing.parovozik_last_checked_unix.len() > MAX_PAROVOZIK_DOMAINS * 2 {
+        let mut checked: Vec<(String, u64)> = state
+            .split_routing
+            .parovozik_last_checked_unix
+            .iter()
+            .map(|(domain, timestamp)| (domain.clone(), *timestamp))
+            .collect();
+        checked.sort_by_key(|(_, timestamp)| *timestamp);
+        let remove_count = checked.len() - MAX_PAROVOZIK_DOMAINS * 2;
+        for (domain, _) in checked.into_iter().take(remove_count) {
+            state
+                .split_routing
+                .parovozik_last_checked_unix
+                .remove(&domain);
+        }
+    }
 }
 
 fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String> {
@@ -3565,6 +3612,28 @@ fn build_routing_context<'a>(
     // ("QUIC Block"). active_block_quic only reflects per-profile QUIC
     // capability, which is a system-level automatic rule.
     let active_block_quic = active_profile.block_quic;
+    let mut parovozik_vpn_outbounds = Vec::new();
+    if state.split_routing.parovozik_enabled {
+        let active_canonical = canonical_profile_raw(active_profile);
+        for server_ref in state
+            .split_routing
+            .parovozik_server_refs
+            .iter()
+            .take(MAX_PAROVOZIK_SERVERS)
+        {
+            let is_active = state.server_route_registry.iter().any(|entry| {
+                entry.server_ref == *server_ref && entry.canonical_raw == active_canonical
+            });
+            if is_active {
+                continue;
+            }
+            let target = format!("server:{server_ref}");
+            let (group, _) = resolve_target(state, active_profile, &target, &mut pinned_routes)?;
+            if group != PROXY_ACTIVE_NAME && !parovozik_vpn_outbounds.contains(&group) {
+                parovozik_vpn_outbounds.push(group);
+            }
+        }
+    }
     let extra = RouterExtra {
         dns: Some(state.dns_settings.clone()),
         port_mode: state.split_routing.port_mode.clone(),
@@ -3578,6 +3647,22 @@ fn build_routing_context<'a>(
         ru_direct_mode: state.split_routing.ru_direct_mode.clone(),
         ru_direct_exceptions: normalize_route_items(&state.split_routing.ru_direct_exceptions),
         auto_vpn_exceptions: normalize_route_items(&state.split_routing.auto_vpn_exceptions),
+        parovozik_direct_domains: if state.split_routing.parovozik_enabled {
+            normalize_route_items(&state.split_routing.parovozik_direct_domains)
+        } else {
+            Vec::new()
+        },
+        parovozik_vpn_domains: if state.split_routing.parovozik_enabled {
+            normalize_route_items(&state.split_routing.parovozik_vpn_domains)
+        } else {
+            Vec::new()
+        },
+        parovozik_vpn_target: if state.split_routing.parovozik_enabled {
+            PAROVOZIK_PROXY_GROUP.to_owned()
+        } else {
+            String::new()
+        },
+        parovozik_vpn_outbounds,
         match_target: state.split_routing.match_target.clone(),
         mihomo_home: geo_dir_from_state(state),
         geobase_rule_providers: geobase_rule_providers.to_vec(),
@@ -3600,6 +3685,7 @@ fn resolve_target<'a>(
     match RoutingTarget::parse(value)? {
         RoutingTarget::Direct => Ok((DIRECT_NAME.to_owned(), None)),
         RoutingTarget::Reject => Ok((REJECT_NAME.to_owned(), None)),
+        RoutingTarget::Parovozik => Ok((PAROVOZIK_PROXY_GROUP.to_owned(), Some(active))),
         RoutingTarget::Active => Ok((PROXY_NAME.to_owned(), Some(active))),
         RoutingTarget::LegacyProfile(_) => Err(format!("unmigrated legacy target {value:?}")),
         RoutingTarget::Server(server_ref) => {
@@ -3675,6 +3761,31 @@ fn validate_routing_targets(
             }
             _ => {}
         }
+    }
+    for server_ref in state
+        .split_routing
+        .parovozik_server_refs
+        .iter()
+        .take(MAX_PAROVOZIK_SERVERS)
+    {
+        let entry = state
+            .server_route_registry
+            .iter()
+            .find(|entry| entry.server_ref == *server_ref)
+            .ok_or_else(|| format!("unknown Parovozik server ref {server_ref}"))?;
+        if state
+            .profiles
+            .iter()
+            .all(|profile| canonical_profile_raw(profile) != entry.canonical_raw)
+        {
+            return Err(format!("Parovozik server ref {server_ref} is stale"));
+        }
+        refs.insert(server_ref.clone());
+    }
+    if state.split_routing.parovozik_server_refs.len() > MAX_PAROVOZIK_SERVERS {
+        return Err(format!(
+            "Паровозик поддерживает не более {MAX_PAROVOZIK_SERVERS} дополнительных серверов"
+        ));
     }
     if refs.len() > MAX_PINNED_SERVERS {
         return Err(format!(
@@ -3928,6 +4039,55 @@ fn prune_auto_vpn_metadata(split: &mut SplitRoutingSettings) {
     }
 }
 
+fn normalize_parovozik_domains(items: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| normalize_auto_vpn_domain(item))
+        .filter(|domain| seen.insert(domain.clone()))
+        .take(MAX_PAROVOZIK_DOMAINS)
+        .collect()
+}
+
+fn normalize_parovozik_server_refs(
+    state: &HincyrayState,
+    values: &[String],
+) -> Result<Vec<String>, String> {
+    if values.len() > MAX_PAROVOZIK_SERVERS {
+        return Err(format!(
+            "Паровозик поддерживает не более {MAX_PAROVOZIK_SERVERS} дополнительных серверов"
+        ));
+    }
+    let mut refs = Vec::new();
+    for value in values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        let server_ref = value.strip_prefix("server:").unwrap_or(value);
+        if !state
+            .server_route_registry
+            .iter()
+            .any(|entry| entry.server_ref == server_ref)
+        {
+            return Err(format!("unknown Parovozik server ref {server_ref}"));
+        }
+        if state.profiles.iter().any(|profile| {
+            state.server_route_registry.iter().any(|entry| {
+                entry.server_ref == server_ref
+                    && entry.canonical_raw == canonical_profile_raw(profile)
+                    && profile_is_dead(state, profile)
+            })
+        }) {
+            return Err(format!("Parovozik server ref {server_ref} is dead"));
+        }
+        if !refs.iter().any(|existing| existing == server_ref) {
+            refs.push(server_ref.to_owned());
+        }
+    }
+    Ok(refs)
+}
+
 fn normalize_route_network(network: &str) -> Option<String> {
     match network.trim().to_ascii_lowercase().as_str() {
         "" | "any" | "all" | "*" | "tcp,udp" | "udp,tcp" => None,
@@ -4163,6 +4323,15 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
     let method = parts[0];
     let raw_path = parts[1];
     let (path, _query) = split_query(raw_path);
+    if method == "OPTIONS" {
+        write_response(
+            &mut stream,
+            403,
+            "application/json",
+            &json!({"error": "cross-origin preflight rejected"}).to_string(),
+        )?;
+        return Ok(());
+    }
     let body_limit = request_body_limit(method, path);
     let content_length = content_length.unwrap_or(0);
     if content_length > body_limit {
@@ -8506,7 +8675,8 @@ fn managed_geobase_routing_rules(
 
 fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
     let (settings, rules, conflicts, servers) = {
-        let inner = lock(&daemon.inner);
+        let mut inner = lock(&daemon.inner);
+        sync_server_route_registry(&mut inner.state);
         let active_canonical = inner
             .state
             .active_profile_id
@@ -8531,6 +8701,7 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
                     "address": profile.address,
                     "group": profile.group,
                     "active": active_canonical.as_deref() == Some(canonical.as_str()),
+                    "dead": profile_is_dead(&inner.state, profile),
                 }))
             })
             .collect();
@@ -8541,6 +8712,23 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
             servers,
         )
     };
+    let mut rules = rules;
+    rules.push(RoutingRule {
+        enabled: settings.parovozik_enabled,
+        name: "Паровозик Direct".to_owned(),
+        target: "direct".to_owned(),
+        domains: settings.parovozik_direct_domains.clone(),
+        kind: "managed-parovozik".to_owned(),
+        ..RoutingRule::default()
+    });
+    rules.push(RoutingRule {
+        enabled: settings.parovozik_enabled,
+        name: "Паровозик VPN".to_owned(),
+        target: "parovozik".to_owned(),
+        domains: settings.parovozik_vpn_domains.clone(),
+        kind: "managed-parovozik".to_owned(),
+        ..RoutingRule::default()
+    });
     let manifest = match daemon.geobase_store().load_manifest() {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -9248,6 +9436,41 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
             inner.state.split_routing.auto_vpn_exceptions = dedup_limited_domains(items);
             prune_auto_vpn_metadata(&mut inner.state.split_routing);
         }
+        if let Some(v) = value.get("parovozik_enabled").and_then(Value::as_bool) {
+            inner.state.split_routing.parovozik_enabled = v;
+        }
+        if let Some(v) = value
+            .get("parovozik_direct_domains")
+            .and_then(Value::as_array)
+        {
+            let items: Vec<String> = v
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect();
+            inner.state.split_routing.parovozik_direct_domains =
+                normalize_parovozik_domains(&items);
+        }
+        if let Some(v) = value.get("parovozik_vpn_domains").and_then(Value::as_array) {
+            let items: Vec<String> = v
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect();
+            inner.state.split_routing.parovozik_vpn_domains = normalize_parovozik_domains(&items);
+        }
+        if let Some(v) = value.get("parovozik_server_refs").and_then(Value::as_array) {
+            let items: Vec<String> = v
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect();
+            let mut candidate = inner.state.clone();
+            sync_server_route_registry(&mut candidate);
+            let refs = match normalize_parovozik_server_refs(&candidate, &items) {
+                Ok(refs) => refs,
+                Err(error) => return json_error(400, &error),
+            };
+            inner.state.server_route_registry = candidate.server_route_registry;
+            inner.state.split_routing.parovozik_server_refs = refs;
+        }
         if let Some(v) = value.get("match_target").and_then(Value::as_str) {
             let target = v.trim().to_ascii_lowercase();
             // Validate: when no routing rules exist, can't set to "direct"
@@ -9319,6 +9542,7 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
             json!({"error": "expected rules array"}).to_string(),
         );
     };
+    rules.retain(|rule| rule.kind != "managed-parovozik");
     for rule in &mut rules {
         rule.name = rule.name.trim().to_owned();
         rule.kind = rule.kind.trim().to_owned();
@@ -9671,6 +9895,11 @@ fn handle_routing_reset(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         s.auto_vpn_exceptions = Vec::new();
         s.auto_vpn_last_checked_unix.clear();
         s.auto_vpn_learning_enabled = false;
+        s.parovozik_enabled = false;
+        s.parovozik_direct_domains.clear();
+        s.parovozik_vpn_domains.clear();
+        s.parovozik_server_refs.clear();
+        s.parovozik_last_checked_unix.clear();
         s.match_target = "proxy".to_owned();
         s.port_mode = PortMode::AllowList;
         s.proxy_ports = vec!["80".to_owned(), "443".to_owned()];
@@ -12806,6 +13035,22 @@ fn auto_vpn_candidate_from_mihomo_log_payload(payload: &str) -> Option<AutoVpnCa
     })
 }
 
+fn parovozik_candidate_from_mihomo_log_payload(payload: &str) -> Option<AutoVpnCandidate> {
+    let (target, error) = payload.split_once(" error:")?;
+    let direct_attempt = payload.contains("dial DIRECT")
+        || payload.contains("dial tcp")
+        || payload.contains("connect error");
+    if !direct_attempt || error.trim().is_empty() {
+        return None;
+    }
+    let target = target.rsplit(" --> ").next()?.trim();
+    let domain = normalize_auto_vpn_domain(target)?;
+    let port = target
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok());
+    Some(AutoVpnCandidate { domain, port })
+}
+
 #[derive(Debug, Default)]
 struct MihomoLogCursor {
     identity: Option<(u64, u64)>,
@@ -12823,7 +13068,11 @@ impl MihomoLogCursor {
         }
     }
 
-    fn read_new_domains(&mut self, path: &Path) -> Result<Vec<AutoVpnCandidate>, String> {
+    fn read_new_domains(
+        &mut self,
+        path: &Path,
+        parovozik_enabled: bool,
+    ) -> Result<Vec<AutoVpnCandidate>, String> {
         let mut file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let metadata = file
             .metadata()
@@ -12855,8 +13104,9 @@ impl MihomoLogCursor {
         };
         let complete_len = last_newline + 1;
         self.offset = self.offset.saturating_add(complete_len as u64);
-        Ok(auto_vpn_log_candidate_domains_from_text(
+        Ok(log_candidate_domains_from_text(
             &String::from_utf8_lossy(&bytes[..complete_len]),
+            parovozik_enabled,
         ))
     }
 }
@@ -12872,11 +13122,21 @@ fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
     (metadata.len(), 0)
 }
 
+#[cfg(test)]
 fn auto_vpn_log_candidate_domains_from_text(text: &str) -> Vec<AutoVpnCandidate> {
+    log_candidate_domains_from_text(text, false)
+}
+
+fn log_candidate_domains_from_text(text: &str, parovozik_enabled: bool) -> Vec<AutoVpnCandidate> {
     let mut seen = HashSet::new();
     let mut domains = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let Some(candidate) = auto_vpn_candidate_from_mihomo_log_payload(line) else {
+        let candidate = if parovozik_enabled {
+            parovozik_candidate_from_mihomo_log_payload(line)
+        } else {
+            auto_vpn_candidate_from_mihomo_log_payload(line)
+        };
+        let Some(candidate) = candidate else {
             continue;
         };
         if seen.insert(candidate.clone()) {
@@ -12973,6 +13233,200 @@ fn auto_vpn_candidate_domains(
     }
 
     candidates
+}
+
+fn domain_matches_geobase_artifact(domain: &str, bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok_and(|text| {
+        text.lines().any(|line| {
+            let entry = line.trim().trim_start_matches("+.");
+            !entry.is_empty() && (domain == entry || domain.ends_with(&format!(".{entry}")))
+        })
+    })
+}
+
+fn domain_is_in_applied_geobase(daemon: &Daemon, domain: &str) -> Result<bool, String> {
+    let manifest = daemon
+        .geobase_store()
+        .load_manifest()
+        .map_err(|error| format!("GeoBase manifest: {error}"))?;
+    for base in manifest
+        .applied_bases
+        .iter()
+        .filter(|base| base.enabled && base.status == GeoBaseStatus::Ready)
+    {
+        for metadata in [
+            &base.lists.active,
+            &base.lists.direct,
+            &base.lists.unresolved,
+        ] {
+            let bytes = fs::read(daemon.geobase_store_root.join(&metadata.file))
+                .map_err(|error| format!("GeoBase artifact {}: {error}", metadata.file))?;
+            if domain_matches_geobase_artifact(domain, &bytes) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn parovozik_candidate_domains(
+    state: &HincyrayState,
+    now: u64,
+    observed_direct_failures: &[AutoVpnCandidate],
+) -> Vec<AutoVpnCandidate> {
+    let known: HashSet<&str> = state
+        .split_routing
+        .parovozik_direct_domains
+        .iter()
+        .chain(state.split_routing.parovozik_vpn_domains.iter())
+        .map(String::as_str)
+        .collect();
+    let manual_rule_match = |domain: &str| {
+        state
+            .routing_rules
+            .iter()
+            .filter(|rule| rule.enabled)
+            .any(|rule| trace_domain_match(rule, domain).exact)
+    };
+    observed_direct_failures
+        .iter()
+        .filter(|candidate| !known.contains(candidate.domain.as_str()))
+        .filter(|candidate| !manual_rule_match(&candidate.domain))
+        .filter(|candidate| {
+            now.saturating_sub(
+                state
+                    .split_routing
+                    .parovozik_last_checked_unix
+                    .get(&candidate.domain)
+                    .copied()
+                    .unwrap_or(0),
+            ) >= AUTO_VPN_RECHECK_INTERVAL_SECS
+        })
+        .take(3)
+        .cloned()
+        .collect()
+}
+
+fn parovozik_probe_targets(state: &HincyrayState) -> Vec<String> {
+    let mut targets = vec![PROXY_ACTIVE_NAME.to_owned()];
+    for server_ref in state
+        .split_routing
+        .parovozik_server_refs
+        .iter()
+        .take(MAX_PAROVOZIK_SERVERS)
+    {
+        let usable = state.server_route_registry.iter().any(|entry| {
+            entry.server_ref == *server_ref
+                && state.profiles.iter().any(|profile| {
+                    canonical_profile_raw(profile) == entry.canonical_raw
+                        && !profile_is_dead(state, profile)
+                })
+        });
+        if usable && server_ref.len() > 7 {
+            targets.push(format!("srv-route-{}", &server_ref[7..]));
+        }
+    }
+    targets
+}
+
+fn run_parovozik(
+    daemon: &Daemon,
+    ec_addr: Option<&str>,
+    ec_secret: Option<&str>,
+    observed_direct_failures: &[AutoVpnCandidate],
+) -> bool {
+    let Some(ec_addr) = ec_addr else {
+        return false;
+    };
+    let now = unix_now();
+    let (candidates, targets) = {
+        let inner = lock(&daemon.inner);
+        if !inner.state.split_routing.parovozik_enabled {
+            return true;
+        }
+        (
+            parovozik_candidate_domains(&inner.state, now, observed_direct_failures),
+            parovozik_probe_targets(&inner.state),
+        )
+    };
+    if candidates.is_empty() {
+        return true;
+    }
+    let Ok(direct_client) = direct_http_client(Duration::from_secs(5)) else {
+        return false;
+    };
+    let mut classified = Vec::new();
+    for candidate in candidates {
+        match domain_is_in_applied_geobase(daemon, &candidate.domain) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("hincyray: Паровозик GeoBase lookup failed: {error}");
+                return false;
+            }
+        }
+        let target = if probe_domain_reachable(&direct_client, &candidate) {
+            Some("direct")
+        } else if targets.iter().any(|target| {
+            auto_vpn_probe_urls(&candidate)
+                .iter()
+                .any(|url| mihomo_api_delay(ec_addr, ec_secret, target, url, 8000).is_ok())
+        }) {
+            Some("vpn")
+        } else {
+            None
+        };
+        classified.push((candidate.domain, target));
+    }
+    if classified.is_empty() {
+        return true;
+    }
+
+    let previous_state = lock(&daemon.inner).state.clone();
+    let changed = {
+        let mut inner = lock(&daemon.inner);
+        if !inner.state.split_routing.parovozik_enabled {
+            return true;
+        }
+        let mut changed = false;
+        for (domain, target) in classified {
+            inner
+                .state
+                .split_routing
+                .parovozik_last_checked_unix
+                .insert(domain.clone(), now);
+            let list = match target {
+                Some("direct") => Some(&mut inner.state.split_routing.parovozik_direct_domains),
+                Some("vpn") => Some(&mut inner.state.split_routing.parovozik_vpn_domains),
+                _ => None,
+            };
+            if let Some(list) = list
+                && !list.contains(&domain)
+            {
+                eprintln!("hincyray: Паровозик classified {domain} as {target:?}");
+                list.push(domain);
+                changed = true;
+            }
+        }
+        inner.state.split_routing.parovozik_direct_domains =
+            normalize_parovozik_domains(&inner.state.split_routing.parovozik_direct_domains);
+        inner.state.split_routing.parovozik_vpn_domains =
+            normalize_parovozik_domains(&inner.state.split_routing.parovozik_vpn_domains);
+        if changed && let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            inner.state = previous_state.clone();
+            eprintln!("hincyray: Паровозик persist failed: {error}");
+            return false;
+        }
+        changed
+    };
+    if changed
+        && let Err(error) = activate_current_config(daemon, false, true, GeoBaseProjection::Desired)
+    {
+        let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
+        eprintln!("hincyray: Паровозик apply failed: {error}; state rollback: {rollback}");
+        return false;
+    }
+    true
 }
 
 fn run_auto_vpn_learning(
@@ -16514,6 +16968,7 @@ fn start_watchdog(
                 last_auto_refresh,
                 maintenance,
                 auto_vpn_learning_enabled,
+                parovozik_enabled,
                 deep_bench_running,
                 deep_bench_due_now,
             ) = {
@@ -16550,6 +17005,7 @@ fn start_watchdog(
                     inner.state.last_auto_refresh_unix,
                     inner.state.maintenance.clone(),
                     inner.state.split_routing.auto_vpn_learning_enabled,
+                    inner.state.split_routing.parovozik_enabled,
                     inner.deep_bench_active,
                     deep_bench_due(&inner.state.deep_bench, unix_now()),
                 )
@@ -17193,8 +17649,8 @@ fn start_watchdog(
             // to Mihomo's local log instead; the cursor handles rotation and
             // truncation, while the bounded queue bridges 10s reads to 30s
             // probe cycles.
-            if core_running && split_enabled && auto_vpn_learning_enabled {
-                match mihomo_log_cursor.read_new_domains(&mihomo_log_path) {
+            if core_running && split_enabled && (auto_vpn_learning_enabled || parovozik_enabled) {
+                match mihomo_log_cursor.read_new_domains(&mihomo_log_path, parovozik_enabled) {
                     Ok(domains) => {
                         for candidate in domains {
                             if !pending_auto_vpn_domains
@@ -17217,13 +17673,21 @@ fn start_watchdog(
 
             if core_running
                 && split_enabled
-                && auto_vpn_learning_enabled
+                && (auto_vpn_learning_enabled || parovozik_enabled)
                 && watchdog_tick.is_multiple_of(AUTO_VPN_PROBE_INTERVAL_TICKS)
             {
                 let batch: Vec<AutoVpnCandidate> =
                     pending_auto_vpn_domains.iter().take(3).cloned().collect();
-                if run_auto_vpn_learning(&daemon, ec_addr.as_deref(), ec_secret.as_deref(), &batch)
-                {
+                let parovozik_ok = !parovozik_enabled
+                    || run_parovozik(&daemon, ec_addr.as_deref(), ec_secret.as_deref(), &batch);
+                let auto_vpn_ok = !auto_vpn_learning_enabled
+                    || run_auto_vpn_learning(
+                        &daemon,
+                        ec_addr.as_deref(),
+                        ec_secret.as_deref(),
+                        &batch,
+                    );
+                if parovozik_ok && auto_vpn_ok {
                     pending_auto_vpn_domains.drain(..batch.len());
                 }
             }
@@ -18061,6 +18525,7 @@ fn write_response(
 fn status_text(code: u16) -> &'static str {
     match code {
         200 => "OK",
+        204 => "No Content",
         202 => "Accepted",
         400 => "Bad Request",
         403 => "Forbidden",
@@ -19549,6 +20014,28 @@ mod tests {
         assert_eq!(inner.state.split_routing.rule_source, "blackmatrix7");
         assert_eq!(inner.state.routing_rules.len(), 1);
         assert_eq!(inner.state.routing_rules[0].services, vec!["instagram"]);
+    }
+
+    #[test]
+    fn parovozik_settings_are_disabled_by_default_and_project_two_managed_rules() {
+        let (_dir, daemon) = test_daemon();
+        assert!(!lock(&daemon.inner).state.split_routing.parovozik_enabled);
+        let (status, _, body) = handle_routing_get(&daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("routing response");
+        let rules = response["rules"].as_array().expect("rules");
+        let parovozik: Vec<&Value> = rules
+            .iter()
+            .filter(|rule| rule["kind"] == "managed-parovozik")
+            .collect();
+        assert_eq!(parovozik.len(), 2);
+        assert!(parovozik.iter().all(|rule| rule["enabled"] == false));
+        assert!(
+            parovozik
+                .iter()
+                .any(|rule| rule["name"] == "Паровозик Direct")
+        );
+        assert!(parovozik.iter().any(|rule| rule["name"] == "Паровозик VPN"));
     }
 
     #[test]
@@ -22243,11 +22730,7 @@ mod tests {
             "vless://11111111-1111-1111-1111-111111111111@example.com:443#Active",
             &daemon,
         );
-        {
-            let mut inner = lock(&daemon.inner);
-            inner.state.active_profile_id = Some(0);
-            inner.state.split_routing.enabled = true;
-        }
+        lock(&daemon.inner).state.active_profile_id = Some(0);
         let (status, _, body) =
             handle_routing_preset_apply(r#"{"preset":"ru-ip-direct"}"#, &daemon);
         assert_eq!(status, 200);
@@ -22750,6 +23233,17 @@ mod tests {
             "https://evil.example",
             Some("192.168.1.1:8088")
         ));
+    }
+
+    #[test]
+    fn cross_origin_preflight_is_rejected() {
+        let (_dir, daemon) = test_daemon();
+        let rejected = http_request(
+            daemon,
+            "OPTIONS /api/routing/rules HTTP/1.1\r\nHost: 192.168.1.1:8088\r\nOrigin: https://evil.example\r\n\r\n",
+        );
+        assert!(rejected.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(!rejected.contains("Access-Control-Allow-Origin"));
     }
 
     #[test]
@@ -23875,6 +24369,22 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
     }
 
     #[test]
+    fn parovozik_log_parser_accepts_unmatched_direct_dial_failures() {
+        assert_eq!(
+            parovozik_candidate_from_mihomo_log_payload(
+                "[TCP] dial tcp (match Match/) 192.168.2.100:45542 --> New.Example:443 error: i/o timeout"
+            ),
+            Some(auto_candidate("new.example", Some(443)))
+        );
+        assert_eq!(
+            parovozik_candidate_from_mihomo_log_payload(
+                "[TCP] dial proxy-active 192.168.2.100:1 --> ignored.example:443 error: failed"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn auto_vpn_probe_urls_preserve_observed_port() {
         assert_eq!(
             auto_vpn_probe_urls(&auto_candidate("rutube.ru", Some(8443))),
@@ -23883,6 +24393,56 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
                 "http://rutube.ru:8443/".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn parovozik_candidates_exclude_known_domains_and_are_disabled_by_default() {
+        let mut state = HincyrayState::default();
+        assert!(!state.split_routing.parovozik_enabled);
+        state
+            .split_routing
+            .parovozik_direct_domains
+            .push("known.example".to_owned());
+        let candidates = parovozik_candidate_domains(
+            &state,
+            AUTO_VPN_RECHECK_INTERVAL_SECS + 1,
+            &[
+                auto_candidate("known.example", Some(443)),
+                auto_candidate("new.example", Some(443)),
+            ],
+        );
+        assert_eq!(candidates, vec![auto_candidate("new.example", Some(443))]);
+    }
+
+    #[test]
+    fn parovozik_geobase_match_supports_exact_and_suffix_entries() {
+        let bytes = b"exact.example\n+.suffix.example\n";
+        assert!(domain_matches_geobase_artifact("exact.example", bytes));
+        assert!(domain_matches_geobase_artifact("cdn.suffix.example", bytes));
+        assert!(!domain_matches_geobase_artifact("unknown.example", bytes));
+    }
+
+    #[test]
+    fn parovozik_settings_accept_at_most_five_stable_server_refs() {
+        let mut state = HincyrayState::default();
+        for index in 0..6 {
+            state.profiles.push(sample_profile(
+                index,
+                &format!("Server {index}"),
+                &format!("server-{index}.example"),
+            ));
+        }
+        sync_server_route_registry(&mut state);
+        let refs: Vec<String> = state
+            .server_route_registry
+            .iter()
+            .map(|entry| entry.server_ref.clone())
+            .collect();
+        assert_eq!(
+            normalize_parovozik_server_refs(&state, &refs[..5]).expect("five refs"),
+            refs[..5]
+        );
+        assert!(normalize_parovozik_server_refs(&state, &refs).is_err());
     }
 
     #[test]
@@ -23908,18 +24468,20 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         file.flush().expect("flush records");
 
         assert_eq!(
-            cursor.read_new_domains(&path).expect("read append"),
+            cursor.read_new_domains(&path, false).expect("read append"),
             vec![auto_candidate("first.example", Some(443))]
         );
         writeln!(file).expect("complete partial record");
         file.flush().expect("flush completed record");
         assert_eq!(
-            cursor.read_new_domains(&path).expect("read completed line"),
+            cursor
+                .read_new_domains(&path, false)
+                .expect("read completed line"),
             vec![auto_candidate("second.example", Some(443))]
         );
         assert!(
             cursor
-                .read_new_domains(&path)
+                .read_new_domains(&path, false)
                 .expect("read no append")
                 .is_empty()
         );
@@ -23938,7 +24500,9 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         )
         .expect("new log");
         assert_eq!(
-            cursor.read_new_domains(&path).expect("read rotated log"),
+            cursor
+                .read_new_domains(&path, false)
+                .expect("read rotated log"),
             vec![auto_candidate("rotated.example", Some(443))]
         );
     }
@@ -23954,7 +24518,9 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         )
         .expect("created log");
         assert_eq!(
-            cursor.read_new_domains(&path).expect("read created log"),
+            cursor
+                .read_new_domains(&path, false)
+                .expect("read created log"),
             vec![auto_candidate("created.example", Some(8443))]
         );
     }

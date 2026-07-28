@@ -755,6 +755,7 @@ pub const PROXY_NAME: &str = "proxy";
 pub const PROXY_ACTIVE_NAME: &str = "proxy-active";
 pub const DIRECT_NAME: &str = "DIRECT";
 pub const REJECT_NAME: &str = "REJECT";
+pub const PAROVOZIK_PROXY_GROUP: &str = "parovozik-vpn";
 pub const REDIR_LISTENER: &str = "redir-in";
 pub const TPROXY_LISTENER: &str = "tproxy-in";
 
@@ -1585,6 +1586,28 @@ pub fn build_mihomo_router_config(
         }
     }
 
+    // Experimental Parovozik is deliberately below GeoBase providers. Its
+    // learned decisions therefore cannot override managed GeoBase intent.
+    for domain in extra
+        .parovozik_vpn_domains
+        .iter()
+        .map(|domain| domain.trim())
+        .filter(|domain| !domain.is_empty())
+    {
+        rules.push(format!(
+            "DOMAIN-SUFFIX,{domain},{}",
+            extra.parovozik_vpn_target
+        ));
+    }
+    for domain in extra
+        .parovozik_direct_domains
+        .iter()
+        .map(|domain| domain.trim())
+        .filter(|domain| !domain.is_empty())
+    {
+        rules.push(format!("DOMAIN-SUFFIX,{domain},{}", DIRECT_NAME));
+    }
+
     // v0.16: RU Direct — route Russian domains direct before port-mode
     // fallbacks and MATCH,proxy.  Exceptions (go through VPN) are emitted
     // first so they take precedence over the broad direct rules.
@@ -1707,6 +1730,19 @@ pub fn build_mihomo_router_config(
             "timeout": 3000,
         })
     }));
+    if !extra.parovozik_vpn_target.is_empty() {
+        let proxies: Vec<String> = std::iter::once(PROXY_ACTIVE_NAME.to_owned())
+            .chain(extra.parovozik_vpn_outbounds.iter().cloned())
+            .collect();
+        groups.push(json!({
+            "name": PAROVOZIK_PROXY_GROUP,
+            "type": "fallback",
+            "proxies": proxies,
+            "url": FALLBACK_HEALTH_URL,
+            "interval": 10,
+            "timeout": 3000,
+        }));
+    }
 
     // Proxy providers — Mihomo fetches subscriptions itself.
     if !features.proxy_providers.is_empty() {
@@ -3513,11 +3549,11 @@ fn apply_grpc_advanced(grpc_opts: &mut Value, url: &Url) {
 mod tests {
     use super::{
         ExternalControllerConfig, FALLBACK_HEALTH_URL, FallbackFilter, LoadBalanceStrategy,
-        MihomoFeatures, NtpConfig, PROXY_ACTIVE_NAME, PROXY_NAME, PerProxyDefaults,
-        PinnedServerRoute, ProxyGroupConfig, ProxyGroupType, ProxyProviderConfig, REDIR_LISTENER,
-        RuleProviderConfig, SmuxConfig, SubRuleConfig, TPROXY_LISTENER, TunnelConfig,
-        build_anytls_proxy, build_http_proxy, build_hysteria_proxy, build_hysteria2_proxy,
-        build_masque_proxy, build_mihomo_bench_config, build_mihomo_config,
+        MihomoFeatures, NtpConfig, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME, PROXY_NAME,
+        PerProxyDefaults, PinnedServerRoute, ProxyGroupConfig, ProxyGroupType, ProxyProviderConfig,
+        REDIR_LISTENER, RuleProviderConfig, SmuxConfig, SubRuleConfig, TPROXY_LISTENER,
+        TunnelConfig, build_anytls_proxy, build_http_proxy, build_hysteria_proxy,
+        build_hysteria2_proxy, build_masque_proxy, build_mihomo_bench_config, build_mihomo_config,
         build_mihomo_router_config, build_openvpn_proxy, build_shadowsocks_proxy,
         build_shadowsocksr_proxy, build_snell_proxy, build_socks_proxy, build_ssh_proxy,
         build_tailscale_proxy, build_trojan_proxy, build_tuic_proxy, build_vless_proxy,
@@ -6833,6 +6869,52 @@ mod tests {
                 "DST-PORT,443,proxy",
                 "MATCH,proxy",
             ]
+        );
+    }
+
+    #[test]
+    fn parovozik_rules_follow_geobase_and_use_fallback_group() {
+        let extra = RouterExtra {
+            geobase_rule_providers: vec![managed_provider(
+                "managed-direct",
+                "/opt/etc/hincyray/geobase/direct.txt",
+                GeoBaseRuleBehavior::Domain,
+                GeoBaseRuleTarget::Direct,
+            )],
+            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
+            parovozik_direct_domains: vec!["direct.example".to_owned()],
+            parovozik_vpn_domains: vec!["vpn.example".to_owned()],
+            parovozik_vpn_target: PAROVOZIK_PROXY_GROUP.to_owned(),
+            parovozik_vpn_outbounds: vec!["srv-route-test".to_owned()],
+            ..RouterExtra::default()
+        };
+        let yaml = build_router_with_extra(&extra, &[], false, &MihomoFeatures::default())
+            .expect("router config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("config");
+        let rules = config["rules"].as_array().expect("rules");
+        let geobase = rules
+            .iter()
+            .position(|rule| rule == "RULE-SET,managed-direct,DIRECT")
+            .expect("GeoBase rule");
+        let vpn = rules
+            .iter()
+            .position(|rule| rule == "DOMAIN-SUFFIX,vpn.example,parovozik-vpn")
+            .expect("Parovozik VPN rule");
+        let direct = rules
+            .iter()
+            .position(|rule| rule == "DOMAIN-SUFFIX,direct.example,DIRECT")
+            .expect("Parovozik Direct rule");
+        assert!(geobase < vpn && vpn < direct);
+        let group = config["proxy-groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .find(|group| group["name"] == PAROVOZIK_PROXY_GROUP)
+            .expect("Parovozik group");
+        assert_eq!(group["type"], "fallback");
+        assert_eq!(
+            group["proxies"],
+            json!([PROXY_ACTIVE_NAME, "srv-route-test"])
         );
     }
 

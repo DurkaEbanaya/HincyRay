@@ -1,4 +1,4 @@
-# HincyRay v1.0.0
+# HincyRay v1.1.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -43,11 +43,17 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 
 ## Возможности
 
+### v1.1.0
+
+v1.1.0 добавляет выключенный по умолчанию **Паровозик** — direct-first классификатор для доменов, отсутствующих во включённых применённых GeoBase. Результаты хранятся отдельно в `Паровозик Direct` и `Паровозик VPN`, а после текущего VPN можно выбрать до пяти живых резервных серверов. Компактный список разбит на колонки подписок, исключает Dead Servers и не теряет несохранённый выбор при обновлении статуса.
+
+Quick Test теперь определяет доступность AI Studio bounded-методом региона из [`vernette/ipregion`](https://github.com/vernette/ipregion). Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.1.0.md`](docs/releases/v1.1.0.md).
+
 ### v1.0.0
 
 v1.0.0 — первый стабильный публичный релиз. Он закрепляет hardened runtime Keenetic/Mihomo, сформированный к v0.22.1, и поставляет production Fluent/Acrylic Web UI с восстановленным знаком HincyRay, адаптивной многоколоночной раскладкой профилей на ПК и планшетах, мобильной навигацией, bounded API-backed представлениями и видимым прогрессом длительных тестов, применений и загрузок.
 
-В стабильный релиз входят transactional activation ядра/firewall, восстановление правил через постоянный ndm hook, TCP REDIRECT + UDP TPROXY, раздельные canonical identity routing/lifecycle, Dead Servers, Deep Bench, реальные Quick Test проверки YouTube/Telegram/AI Studio, защищённые Web UI sessions, структурная редакция diagnostics, managed GeoBase, backup и публичный путь установки из GitHub Release. Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
+В стабильный релиз входят transactional activation ядра/firewall, восстановление правил через постоянный ndm hook, TCP REDIRECT + UDP TPROXY, раздельные canonical identity routing/lifecycle, Dead Servers, Deep Bench, реальные Quick Test проверки YouTube/Telegram/AI Studio, защищённые Web UI sessions, структурная редакция diagnostics, managed GeoBase, backup и публичный путь установки из GitHub Release. Доступность AI Studio определяется bounded Google-region методом из [`vernette/ipregion`](https://github.com/vernette/ipregion); для Telegram сохранён authorized media probe, потому что ipregion не содержит Telegram-проверки. Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
 
 ### v0.22.1
 
@@ -330,7 +336,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Текущие gates и результаты router deploy v1.0.0 зафиксированы в [`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
+Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.1.0 зафиксированы в [`docs/releases/v1.1.0.md`](docs/releases/v1.1.0.md).
 
 ## Установка
 

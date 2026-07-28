@@ -30,7 +30,7 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.0.0');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.1.0');
 });
 
 test('profile table shows compact service status and configurable metric columns', async ({ page }) => {
@@ -343,6 +343,17 @@ test('routing rule add and apply are posted through the API contract', async ({ 
   );
   await page.getByRole('button', { name: '⬆ Применить' }).click();
   expect((await applyPost).postDataJSON()).toBeNull();
+});
+
+test('unsaved Parovozik selection survives status refresh', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'routing');
+  const wagon = page.locator('[data-parovozik-ref="srv-v1-wagon"]');
+  await page.evaluate(() => window.toggleParovozikWagon('srv-v1-wagon'));
+  await expect(wagon).toBeChecked();
+  await page.evaluate(() => window.refreshStatus());
+  await page.waitForTimeout(100);
+  await expect(wagon).toBeChecked();
 });
 
 test('DNS save persists settings and applies routing', async ({ page }) => {

@@ -1,4 +1,4 @@
-# HincyRay v1.0.0 (`xray-vpn-test`)
+# HincyRay v1.1.0 (`xray-vpn-test`)
 
 Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 and the feature-gated `xray-vpn-test` desktop diagnostics app. Router mode uses Mihomo with iptables NAT REDIRECT (TCP 10810) and mangle TPROXY (UDP 10811); there is no TUN/tun2socks path.
 
@@ -38,7 +38,7 @@ Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 a
 - Router DNS is always present because firewall rules unconditionally redirect port 53 to Mihomo on 1053. `dns.enabled` is a desktop-Xray concept.
 - DIRECT routes use configured local DNS servers by default so their name resolution does not depend on VPN upstream health.
 - Router geo assets are MetaCubeX `geosite.dat` + `geoip.metadb`; legacy `geoip.dat` and the oversized RKN bypass list are not runtime inputs.
-- Quick Test is sequential. YouTube uses a narrow Innertube direct-format probe with Rust + `curl`; AI Studio checks a protected route and fails on unsupported-region or sign-in redirects because anonymous `/welcome` is not proof of access. Do not add Python/yt-dlp/JS runtime. Telegram uses one private SQLite session and must not be opened by concurrent clients.
+- Quick Test is sequential. YouTube uses a narrow Innertube direct-format probe with Rust + `curl`; AI Studio uses the bounded ipregion Google-region + published-region-list method. The legacy direct AI Studio request remains disabled. Do not add Python/yt-dlp/JS runtime. Telegram uses one private SQLite session and must not be opened by concurrent clients; ipregion has no Telegram check.
 - Redir and TPROXY listeners must stay on separate ports. The ndm hook is the primary firewall-reload mechanism; watchdog reinstall is a safety net.
 - `geoip.metadb` must be present locally and `geo-auto-update: false`; router startup must not depend on blocked GitHub downloads.
 - Mihomo fallback group `proxy` is the canonical upstream-health decider. The daemon reads its state; do not add duplicate periodic upstream probes.
@@ -118,7 +118,7 @@ Use this repeatable live-update sequence; do not improvise a different installer
 5. Poll bounded `/api/health` and `/api/safe-mode` until the expected version, `core_status=running`, and `firewall_status=running`; only then disarm the trap and remove the staged file.
 6. Verify active profile, fallback group, routing/firewall, the changed live behavior, and bounded router E2E. Keep the rollback directory and report its path.
 
-Release artifact SHA256: `ec5f82780613fc7091d53bae727af5a299856b6117ac556e6c76be07c79ddbd4`. Live verification and release evidence are recorded in `docs/releases/v1.0.0.md`.
+Release artifact SHA256: `66dd7c18d15396c110c9984811f4065d88c722faf7d0feb362391e45b401604e`. Live verification and release evidence are recorded in `docs/releases/v1.1.0.md`.
 
 ## Release
 

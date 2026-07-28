@@ -1,4 +1,4 @@
-# HincyRay v1.0.0
+# HincyRay v1.1.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -43,11 +43,17 @@ Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN eve
 
 ## Features
 
+### v1.1.0
+
+v1.1.0 adds the disabled-by-default **Паровозик** direct-first classifier. It only considers domains absent from enabled applied GeoBases, keeps learned `Паровозик Direct` and `Паровозик VPN` lists separate from user and GeoBase rules, and can try the current VPN followed by up to five selected live server routes. Its compact subscription-column UI excludes Dead Servers and preserves unsaved selections across status refreshes.
+
+Quick Test now determines AI Studio availability with the bounded [`vernette/ipregion`](https://github.com/vernette/ipregion) region method. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.1.0.md`](docs/releases/v1.1.0.md).
+
 ### v1.0.0
 
 v1.0.0 is the first stable public release. It promotes the hardened Keenetic/Mihomo runtime developed through v0.22.1 and ships a production Fluent/Acrylic Web UI with a restored HincyRay mark, responsive desktop/tablet profile grids, mobile navigation, bounded API-backed views, and visible progress feedback for long-running tests and apply/download operations.
 
-The stable release includes transactional core/firewall activation, persistent ndm firewall recovery, TCP REDIRECT + UDP TPROXY, canonical routing and lifecycle identities, Dead Servers, Deep Bench, real Quick Test checks for YouTube/Telegram/AI Studio, secure Web UI sessions, structurally redacted diagnostics, managed GeoBase, backups, and a public release installer path. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
+The stable release includes transactional core/firewall activation, persistent ndm firewall recovery, TCP REDIRECT + UDP TPROXY, canonical routing and lifecycle identities, Dead Servers, Deep Bench, real Quick Test checks for YouTube/Telegram/AI Studio, secure Web UI sessions, structurally redacted diagnostics, managed GeoBase, backups, and a public release installer path. AI Studio availability follows the bounded Google-region method from [`vernette/ipregion`](https://github.com/vernette/ipregion); Telegram retains its authorized media probe because ipregion does not expose a Telegram check. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
 
 ### v0.22.1
 
@@ -362,7 +368,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.0.0 gate and router deployment results are recorded in [`docs/releases/v1.0.0.md`](docs/releases/v1.0.0.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.1.0 release evidence is recorded in [`docs/releases/v1.1.0.md`](docs/releases/v1.1.0.md).
 
 ## Installation
 

@@ -155,6 +155,12 @@ pub struct RouterExtra {
     pub ru_direct_exceptions: Vec<String>,
     /// High-priority VPN exceptions emitted before broad RU Direct rules.
     pub auto_vpn_exceptions: Vec<String>,
+    /// Experimental Parovozik lists are emitted after GeoBase providers so
+    /// managed GeoBase decisions always keep precedence.
+    pub parovozik_direct_domains: Vec<String>,
+    pub parovozik_vpn_domains: Vec<String>,
+    pub parovozik_vpn_target: String,
+    pub parovozik_vpn_outbounds: Vec<String>,
     /// v0.16: MATCH rule target — `"proxy"` (default) or `"direct"`.
     /// Controls the final fallback rule: `MATCH,proxy` or `MATCH,direct`.
     pub match_target: String,
