@@ -53,8 +53,8 @@ use crate::hincyray_api::{
 use crate::hincyray_mihomo_api::{controller_dial_address, first_stream_json};
 use crate::hincyray_mihomo_api::{
     mihomo_api_delay, mihomo_api_delete, mihomo_api_get, mihomo_api_get_json,
-    mihomo_api_get_response, mihomo_api_post, mihomo_api_post_response, mihomo_api_stream_get,
-    mihomo_api_stream_get_json, mihomo_controller,
+    mihomo_api_get_response, mihomo_api_post, mihomo_api_post_response, mihomo_api_put,
+    mihomo_api_stream_get, mihomo_api_stream_get_json, mihomo_controller,
 };
 use crate::hincyray_routing::{RoutingResource, RoutingResourceKind, normalize_routing_resource};
 #[cfg(test)]
@@ -85,6 +85,7 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_GEOBASE_ANALYZE_BODY_BYTES: usize = 9 * 1024 * 1024;
 const MAX_HISTORY_SAMPLES: usize = 1000;
 const MAX_CONNECTION_LOG: usize = 500;
+const MAX_STALE_PROFILE_STATS: usize = 256;
 const MAX_AUTO_VPN_EXCEPTIONS: usize = 200;
 const MAX_AUTO_VPN_PENDING_DOMAINS: usize = 200;
 const MAX_PAROVOZIK_DOMAINS: usize = 500;
@@ -95,11 +96,17 @@ const AUTO_VPN_PROBE_CONTRACT_VERSION: u8 = 1;
 const MAX_BACKUPS: usize = 20;
 const MAX_UNDO_STACK: usize = 10;
 const MAX_REFRESH_REPORT_ENTRIES: usize = 100;
-const MIHOMO_VALIDATE_TIMEOUT: Duration = Duration::from_secs(8);
+const MIHOMO_VALIDATE_TIMEOUT: Duration = Duration::from_secs(15);
+const MIHOMO_VALIDATE_MEMORY_LIMIT: &str = "64MiB";
+const MIHOMO_VALIDATE_GOGC: &str = "20";
 const COMMAND_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024;
 const GEOBASE_JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const GEOBASE_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const GEOBASE_DNS_TIMEOUT: Duration = Duration::from_secs(3);
+const PAROVOZIK_DIRECT_PROVIDER: &str = "parovozik-direct";
+const PAROVOZIK_VPN_PROVIDER: &str = "parovozik-vpn-rules";
+const PAROVOZIK_DIRECT_FILE: &str = "parovozik-direct.txt";
+const PAROVOZIK_VPN_FILE: &str = "parovozik-vpn.txt";
 
 /// Global shutdown flag set by the SIGTERM/SIGINT handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -141,6 +148,9 @@ pub fn run() -> Result<(), String> {
     // inbounds are included when split routing is enabled.
     {
         let mut inner = lock(&daemon.inner);
+        if let Err(error) = write_parovozik_provider_files(&inner.state) {
+            eprintln!("hincyray: startup Parovozik providers failed: {error}");
+        }
         if let Err(error) = regenerate_config(&inner.state, &daemon) {
             eprintln!("hincyray: startup config regeneration failed: {error}");
         }
@@ -2174,6 +2184,9 @@ struct FirewallManager {
     active: bool,
     tproxy_available: bool,
     policy_mark: Option<String>,
+    redirect_port: Option<u16>,
+    vpn_subnet: Option<String>,
+    policy_name: Option<String>,
 }
 
 impl FirewallManager {
@@ -2182,6 +2195,9 @@ impl FirewallManager {
             active: false,
             tproxy_available: false,
             policy_mark: None,
+            redirect_port: None,
+            vpn_subnet: None,
+            policy_name: None,
         }
     }
 
@@ -2273,6 +2289,9 @@ impl FirewallManager {
         let _ = fs::write("/tmp/hincyray_ready", b"1");
 
         self.active = true;
+        self.redirect_port = Some(redirect_port);
+        self.vpn_subnet = Some(vpn_subnet.to_owned());
+        self.policy_name = Some(policy_name.to_owned());
         eprintln!(
             "hincyray: firewall started (mark={mark}, tproxy={}, port={redirect_port})",
             self.tproxy_available
@@ -2297,6 +2316,9 @@ impl FirewallManager {
 
         self.active = false;
         self.policy_mark = None;
+        self.redirect_port = None;
+        self.vpn_subnet = None;
+        self.policy_name = None;
         eprintln!("hincyray: firewall stopped, iptables rules cleaned");
         Ok(())
     }
@@ -3256,11 +3278,13 @@ fn load_state_with_hasher(
     let dead_servers_changed = migrate_legacy_dead_server_refs(&mut state);
     let deep_bench_filter_changed = migrate_legacy_deep_bench_filter_refs(&mut state);
     let active_dead_membership_changed = reconcile_active_dead_server_membership(&mut state);
+    let stale_profile_stats_changed = prune_stale_profile_stats(&mut state);
     let mut migration_changed = routing_identity_changed
         || auth_migration.changed()
         || dead_servers_changed
         || deep_bench_filter_changed
-        || active_dead_membership_changed;
+        || active_dead_membership_changed
+        || stale_profile_stats_changed;
     if let AuthMigration::Disabled(error) = auth_migration {
         eprintln!("hincyray: failed to migrate Web UI password: {error}");
     }
@@ -3381,6 +3405,33 @@ fn compact_state_for_persist(state: &mut HincyrayState) {
     }
 }
 
+fn prune_stale_profile_stats(state: &mut HincyrayState) -> bool {
+    let current: HashSet<String> = state
+        .profiles
+        .iter()
+        .map(|profile| profile.raw.clone())
+        .collect();
+    let mut stale: Vec<&ProfileStats> = state
+        .stats
+        .iter()
+        .filter(|stat| !current.contains(&stat.profile_raw))
+        .collect();
+    if stale.len() <= MAX_STALE_PROFILE_STATS {
+        return false;
+    }
+    stale.sort_unstable_by_key(|stat| std::cmp::Reverse(stat.last_checked_unix));
+    let keep: HashSet<String> = stale
+        .into_iter()
+        .take(MAX_STALE_PROFILE_STATS)
+        .map(|stat| stat.profile_raw.clone())
+        .collect();
+    let before = state.stats.len();
+    state
+        .stats
+        .retain(|stat| current.contains(&stat.profile_raw) || keep.contains(&stat.profile_raw));
+    state.stats.len() != before
+}
+
 fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String> {
     if let Some(parent) = state_path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -3488,6 +3539,8 @@ fn build_daemon_config(
 
     // Split routing: build the full router config.
     validate_routing_targets(state, &state.routing_rules, &state.device_routes)?;
+    let mut managed_providers = geobase_rule_providers.to_vec();
+    managed_providers.extend(parovozik_rule_providers(state)?);
     let (extra_profiles, mut pinned_routes, mut routes, active_block_quic, extra) =
         build_routing_context(
             state,
@@ -3495,7 +3548,7 @@ fn build_daemon_config(
             if state.safe_mode_enabled {
                 &[]
             } else {
-                geobase_rule_providers
+                &managed_providers
             },
         )?;
 
@@ -3625,6 +3678,16 @@ fn build_routing_context<'a>(
                 entry.server_ref == *server_ref && entry.canonical_raw == active_canonical
             });
             if is_active {
+                continue;
+            }
+            let usable = state.server_route_registry.iter().any(|entry| {
+                entry.server_ref == *server_ref
+                    && state.profiles.iter().any(|profile| {
+                        canonical_profile_raw(profile) == entry.canonical_raw
+                            && !profile_is_dead(state, profile)
+                    })
+            });
+            if !usable {
                 continue;
             }
             let target = format!("server:{server_ref}");
@@ -3768,17 +3831,22 @@ fn validate_routing_targets(
         .iter()
         .take(MAX_PAROVOZIK_SERVERS)
     {
-        let entry = state
+        let Some(entry) = state
             .server_route_registry
             .iter()
             .find(|entry| entry.server_ref == *server_ref)
-            .ok_or_else(|| format!("unknown Parovozik server ref {server_ref}"))?;
-        if state
+        else {
+            continue;
+        };
+        let Some(profile) = state
             .profiles
             .iter()
-            .all(|profile| canonical_profile_raw(profile) != entry.canonical_raw)
-        {
-            return Err(format!("Parovozik server ref {server_ref} is stale"));
+            .find(|profile| canonical_profile_raw(profile) == entry.canonical_raw)
+        else {
+            continue;
+        };
+        if profile_is_dead(state, profile) {
+            continue;
         }
         refs.insert(server_ref.clone());
     }
@@ -3933,6 +4001,88 @@ fn geo_dir_from_state(state: &HincyrayState) -> Option<String> {
     } else {
         p.parent().map(|p| p.to_string_lossy().into_owned())
     }
+}
+
+fn parovozik_provider_paths(state: &HincyrayState) -> Result<(PathBuf, PathBuf), String> {
+    let home = geo_dir_from_state(state)
+        .map(PathBuf::from)
+        .ok_or_else(|| "Mihomo home is required for Parovozik providers".to_owned())?;
+    Ok((
+        home.join(PAROVOZIK_DIRECT_FILE),
+        home.join(PAROVOZIK_VPN_FILE),
+    ))
+}
+
+fn parovozik_rule_providers(state: &HincyrayState) -> Result<Vec<GeoBaseRuleProvider>, String> {
+    if !state.split_routing.parovozik_enabled {
+        return Ok(Vec::new());
+    }
+    let (direct, vpn) = parovozik_provider_paths(state)?;
+    Ok(vec![
+        GeoBaseRuleProvider {
+            enabled: true,
+            name: PAROVOZIK_DIRECT_PROVIDER.to_owned(),
+            path: direct.to_string_lossy().into_owned(),
+            behavior: GeoBaseRuleBehavior::Domain,
+            target: GeoBaseRuleTarget::ParovozikDirect,
+        },
+        GeoBaseRuleProvider {
+            enabled: true,
+            name: PAROVOZIK_VPN_PROVIDER.to_owned(),
+            path: vpn.to_string_lossy().into_owned(),
+            behavior: GeoBaseRuleBehavior::Domain,
+            target: GeoBaseRuleTarget::ParovozikVpn,
+        },
+    ])
+}
+
+fn parovozik_provider_bytes(domains: &[String]) -> Vec<u8> {
+    let domains = normalize_parovozik_domains(domains);
+    if domains.is_empty() {
+        b"# empty\n".to_vec()
+    } else {
+        format!("{}\n", domains.join("\n")).into_bytes()
+    }
+}
+
+fn write_parovozik_provider_files(state: &HincyrayState) -> Result<(), String> {
+    if !state.split_routing.parovozik_enabled {
+        return Ok(());
+    }
+    let (direct_path, vpn_path) = parovozik_provider_paths(state)?;
+    atomic_write_config(
+        &direct_path,
+        &parovozik_provider_bytes(&state.split_routing.parovozik_direct_domains),
+    )?;
+    atomic_write_config(
+        &vpn_path,
+        &parovozik_provider_bytes(&state.split_routing.parovozik_vpn_domains),
+    )
+}
+
+fn hot_update_parovozik_providers(
+    state: &HincyrayState,
+    direct_changed: bool,
+    vpn_changed: bool,
+) -> Result<(), String> {
+    write_parovozik_provider_files(state)?;
+    let (addr, secret) = mihomo_controller(&state.mihomo_features).ok_or_else(|| {
+        "Mihomo External Controller is required for Parovozik hot update".to_owned()
+    })?;
+    for provider in [
+        direct_changed.then_some(PAROVOZIK_DIRECT_PROVIDER),
+        vpn_changed.then_some(PAROVOZIK_VPN_PROVIDER),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let path = format!(
+            "/providers/rules/{}",
+            utf8_percent_encode(provider, NON_ALPHANUMERIC)
+        );
+        mihomo_api_put(&addr, secret.as_deref(), &path, None)?;
+    }
+    Ok(())
 }
 
 fn normalize_route_items(items: &[String]) -> Vec<String> {
@@ -5449,7 +5599,11 @@ fn validate_mihomo_config_yaml_with_timeout(
         return json!({"ok": false, "supported": true, "stage": "write-temp", "error": error.to_string()});
     }
     let mut cmd = Command::new(binary_path);
-    cmd.arg("-t").arg("-f").arg(&temp_path);
+    cmd.env("GOMEMLIMIT", MIHOMO_VALIDATE_MEMORY_LIMIT)
+        .env("GOGC", MIHOMO_VALIDATE_GOGC)
+        .arg("-t")
+        .arg("-f")
+        .arg(&temp_path);
     if let Some(dir) = geo_dir.filter(|d| !d.is_empty()) {
         cmd.arg("-d").arg(dir);
     }
@@ -5874,6 +6028,19 @@ fn wait_for_core_readiness(
     }
 }
 
+fn hot_reload_mihomo_config(
+    controller: &(String, Option<String>),
+    config_path: &Path,
+) -> Result<(), String> {
+    let body = json!({"path": config_path.to_string_lossy()}).to_string();
+    mihomo_api_put(
+        &controller.0,
+        controller.1.as_deref(),
+        "/configs?force=true",
+        Some(&body),
+    )
+}
+
 fn restore_previous_activation(
     daemon: &Daemon,
     previous_config: Option<&[u8]>,
@@ -5901,19 +6068,38 @@ fn restore_previous_activation(
     let core_result = {
         let mut inner = lock(&daemon.inner);
         if previous_running && previous_config.is_some() {
-            inner.core.restart(
-                &state.mihomo_path,
-                &daemon.mihomo_config_path,
-                geo_dir.as_deref(),
-            )
+            let controller = mihomo_controller(&state.mihomo_features);
+            if inner.core.is_running()
+                && let Some(controller) = controller.as_ref()
+            {
+                hot_reload_mihomo_config(controller, &daemon.mihomo_config_path)
+            } else {
+                inner.core.restart(
+                    &state.mihomo_path,
+                    &daemon.mihomo_config_path,
+                    geo_dir.as_deref(),
+                )
+            }
         } else {
             inner.core.stop()
         }
     };
     let firewall_result = {
         let mut inner = lock(&daemon.inner);
-        let _ = inner.firewall.stop(&state.split_routing.vpn_subnet);
-        if firewall_was_running && state.split_routing.enabled {
+        let expected_running = firewall_was_running && state.split_routing.enabled;
+        let contract_matches = inner.firewall.active == expected_running
+            && (!expected_running
+                || (inner.firewall.redirect_port == Some(state.split_routing.redirect_port)
+                    && inner.firewall.vpn_subnet.as_deref()
+                        == Some(state.split_routing.vpn_subnet.as_str())
+                    && inner.firewall.policy_name.as_deref()
+                        == Some(state.split_routing.policy_name.as_str())
+                    && inner.firewall.policy_mark.as_deref()
+                        == state.split_routing.policy_mark.as_deref()));
+        if contract_matches {
+            Ok(())
+        } else if expected_running {
+            let _ = inner.firewall.stop(&state.split_routing.vpn_subnet);
             inner.firewall.start(
                 state.split_routing.redirect_port,
                 &state.split_routing.vpn_subnet,
@@ -5921,6 +6107,7 @@ fn restore_previous_activation(
                 state.split_routing.policy_mark.as_deref(),
             )
         } else {
+            let _ = inner.firewall.stop(&state.split_routing.vpn_subnet);
             Ok(())
         }
     };
@@ -5983,6 +6170,7 @@ fn activate_current_config_locked(
         )
     };
     let (mut config_yaml, generation, activated_bases) = config_plan(&state, daemon, projection)?;
+    write_parovozik_provider_files(&state)?;
     let geo_dir = geo_dir_from_state(&state);
     let validation =
         validate_mihomo_config_yaml(&state.mihomo_path, &config_yaml, geo_dir.as_deref());
@@ -6003,7 +6191,9 @@ fn activate_current_config_locked(
     let controller = mihomo_controller(&state.mihomo_features);
     let activation = (|| -> Result<(String, String), String> {
         if should_run {
-            {
+            if previous_running && let Some(controller) = controller.as_ref() {
+                hot_reload_mihomo_config(controller, &daemon.mihomo_config_path)?;
+            } else {
                 let mut inner = lock(&daemon.inner);
                 inner.core.restart(
                     &state.mihomo_path,
@@ -6016,23 +6206,38 @@ fn activate_current_config_locked(
 
         let firewall_status = if configure_firewall {
             let mut final_state = state.clone();
-            {
+            let firewall_contract_changed = {
+                let inner = lock(&daemon.inner);
+                !inner.firewall.active
+                    || inner.firewall.redirect_port != Some(state.split_routing.redirect_port)
+                    || inner.firewall.vpn_subnet.as_deref()
+                        != Some(state.split_routing.vpn_subnet.as_str())
+                    || inner.firewall.policy_name.as_deref()
+                        != Some(state.split_routing.policy_name.as_str())
+                    || inner.firewall.policy_mark.as_deref()
+                        != state.split_routing.policy_mark.as_deref()
+                    || state.split_routing.tproxy_available != inner.firewall.tproxy_available
+            };
+            if state.split_routing.enabled && firewall_contract_changed {
                 let mut inner = lock(&daemon.inner);
                 let _ = inner.firewall.stop(&state.split_routing.vpn_subnet);
-                if state.split_routing.enabled {
-                    inner.firewall.start(
-                        state.split_routing.redirect_port,
-                        &state.split_routing.vpn_subnet,
-                        &state.split_routing.policy_name,
-                        state.split_routing.policy_mark.as_deref(),
-                    )?;
-                    final_state.split_routing.policy_mark = inner.firewall.policy_mark.clone();
-                    final_state.split_routing.tproxy_available = inner.firewall.tproxy_available;
-                    inner.state.split_routing.policy_mark =
-                        final_state.split_routing.policy_mark.clone();
-                    inner.state.split_routing.tproxy_available =
-                        final_state.split_routing.tproxy_available;
-                    inner.dirty = true;
+                inner.firewall.start(
+                    state.split_routing.redirect_port,
+                    &state.split_routing.vpn_subnet,
+                    &state.split_routing.policy_name,
+                    state.split_routing.policy_mark.as_deref(),
+                )?;
+                final_state.split_routing.policy_mark = inner.firewall.policy_mark.clone();
+                final_state.split_routing.tproxy_available = inner.firewall.tproxy_available;
+                inner.state.split_routing.policy_mark =
+                    final_state.split_routing.policy_mark.clone();
+                inner.state.split_routing.tproxy_available =
+                    final_state.split_routing.tproxy_available;
+                inner.dirty = true;
+            } else if !state.split_routing.enabled {
+                let mut inner = lock(&daemon.inner);
+                if inner.firewall.active {
+                    let _ = inner.firewall.stop(&state.split_routing.vpn_subnet);
                 }
             }
             if final_state.split_routing.enabled
@@ -6058,7 +6263,9 @@ fn activate_current_config_locked(
                 }
                 atomic_write_config(&daemon.mihomo_config_path, config_yaml.as_bytes())?;
                 if should_run {
-                    {
+                    if previous_running && let Some(controller) = controller.as_ref() {
+                        hot_reload_mihomo_config(controller, &daemon.mihomo_config_path)?;
+                    } else {
                         let mut inner = lock(&daemon.inner);
                         inner.core.restart(
                             &final_state.mihomo_path,
@@ -6616,6 +6823,7 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
         let excess = inner.state.metrics_history.len() - MAX_HISTORY_SAMPLES;
         inner.state.metrics_history.drain(0..excess);
     }
+    prune_stale_profile_stats(&mut inner.state);
 
     let _ = persist_state(&daemon.state_path, &inner.state);
 }
@@ -6983,6 +7191,7 @@ fn handle_profile_delete(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
 
     // Remove the profile.
     inner.state.profiles.retain(|p| p.id != id);
+    prune_stale_profile_stats(&mut inner.state);
 
     // Re-index remaining profiles.
     for (i, p) in inner.state.profiles.iter_mut().enumerate() {
@@ -7920,13 +8129,7 @@ fn handle_trash_purge_gone(daemon: &Daemon) -> (u16, &'static str, String) {
 }
 
 fn json_error(code: u16, msg: &str) -> (u16, &'static str, String) {
-    // Leak the message into 'static — small, error-path only, daemon lifetime.
-    let leaked: &'static str = Box::leak(msg.to_owned().into_boxed_str());
-    (
-        code,
-        "application/json",
-        json!({"error": leaked}).to_string(),
-    )
+    (code, "application/json", json!({"error": msg}).to_string())
 }
 
 /// Replace all profiles belonging to subscription `url` with `fresh`.
@@ -7982,6 +8185,7 @@ fn replace_subscription_profiles(
         .as_ref()
         .and_then(|raw| state.profiles.iter().find(|p| &p.raw == raw))
         .map(|p| p.id);
+    prune_stale_profile_stats(state);
 
     Ok(added)
 }
@@ -8014,6 +8218,7 @@ fn purge_subscription(state: &mut HincyrayState, url: &str) -> bool {
         .map(|p| p.id);
     let removed_active = new_active.is_none();
     state.active_profile_id = new_active;
+    prune_stale_profile_stats(state);
     removed_active
 }
 
@@ -8043,6 +8248,7 @@ fn purge_profile_group(state: &mut HincyrayState, group: &str) -> (usize, bool) 
         .map(|p| p.id);
     let removed_active = active_raw.is_some() && new_active.is_none();
     state.active_profile_id = new_active;
+    prune_stale_profile_stats(state);
 
     (removed, removed_active)
 }
@@ -13383,12 +13589,14 @@ fn run_parovozik(
     }
 
     let previous_state = lock(&daemon.inner).state.clone();
-    let changed = {
+    let (changed, direct_changed, vpn_changed, updated_state) = {
         let mut inner = lock(&daemon.inner);
         if !inner.state.split_routing.parovozik_enabled {
             return true;
         }
         let mut changed = false;
+        let mut direct_changed = false;
+        let mut vpn_changed = false;
         for (domain, target) in classified {
             inner
                 .state
@@ -13406,6 +13614,8 @@ fn run_parovozik(
                 eprintln!("hincyray: Паровозик classified {domain} as {target:?}");
                 list.push(domain);
                 changed = true;
+                direct_changed |= target == Some("direct");
+                vpn_changed |= target == Some("vpn");
             }
         }
         inner.state.split_routing.parovozik_direct_domains =
@@ -13417,14 +13627,25 @@ fn run_parovozik(
             eprintln!("hincyray: Паровозик persist failed: {error}");
             return false;
         }
-        changed
+        (changed, direct_changed, vpn_changed, inner.state.clone())
     };
-    if changed
-        && let Err(error) = activate_current_config(daemon, false, true, GeoBaseProjection::Desired)
-    {
-        let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
-        eprintln!("hincyray: Паровозик apply failed: {error}; state rollback: {rollback}");
-        return false;
+    if changed {
+        if let Err(error) =
+            hot_update_parovozik_providers(&updated_state, direct_changed, vpn_changed)
+        {
+            let rollback = restore_state_after_failed_policy_change(daemon, previous_state.clone());
+            let provider_rollback =
+                hot_update_parovozik_providers(&previous_state, direct_changed, vpn_changed)
+                    .map_or_else(
+                        |error| format!("failed ({error})"),
+                        |()| "restored".to_owned(),
+                    );
+            eprintln!(
+                "hincyray: Паровозик hot update failed: {error}; state rollback: {rollback}; provider rollback: {provider_rollback}"
+            );
+            return false;
+        }
+        eprintln!("hincyray: Паровозик providers updated without core/firewall restart");
     }
     true
 }
@@ -14632,6 +14853,7 @@ fn apply_substore_lite(state: &mut HincyrayState) -> Value {
         });
     }
 
+    prune_stale_profile_stats(state);
     sort_profiles_for_substore(&mut state.profiles, &state.stats, &settings.sort_by);
     json!({"renamed": renamed, "filtered": filtered, "deduplicated": deduped, "sort_by": settings.sort_by})
 }
@@ -16826,11 +17048,8 @@ impl ActiveProfileApplyError {
 /// Apply a new active profile to every layer that observes it: in-memory
 /// state, generated Mihomo config, running Mihomo process, and persisted state.
 ///
-/// Mihomo does not hot-reload its config, so writing the file without
-/// restarting the core creates a split-brain state where the API reports one
-/// active profile while the SOCKS/transparent proxy still uses the old
-/// outbound. Keep all profile-switching entrypoints behind this helper so that
-/// "active profile" has one system-wide meaning.
+/// Keep all profile-switching entrypoints behind this helper so that the
+/// persisted profile and Mihomo's live configuration change together.
 fn apply_active_profile(
     inner: &mut MutexGuard<DaemonInner>,
     daemon: &Daemon,
@@ -16865,12 +17084,18 @@ fn apply_active_profile(
 
     let config_path = daemon.mihomo_config_path.clone();
     let binary_path = inner.state.mihomo_path.clone();
+    let controller = mihomo_controller(&inner.state.mihomo_features);
+    let core_running = inner.core.is_running();
 
     let apply_result = atomic_write_config(&config_path, config_yaml.as_bytes())
         .and_then(|()| {
-            inner
-                .core
-                .restart(&binary_path, &config_path, geo_dir.as_deref())
+            if core_running && let Some(controller) = controller.as_ref() {
+                hot_reload_mihomo_config(controller, &config_path)
+            } else {
+                inner
+                    .core
+                    .restart(&binary_path, &config_path, geo_dir.as_deref())
+            }
         })
         .and_then(|()| persist_state(&daemon.state_path, &inner.state).map_err(|e| e.to_string()));
 
@@ -16884,11 +17109,14 @@ fn apply_active_profile(
                     return Err(ActiveProfileApplyError::Runtime(error));
                 }
             };
-            if let Err(rollback_error) =
+            let rollback_result = if core_running && let Some(controller) = controller.as_ref() {
+                hot_reload_mihomo_config(controller, &rollback_path)
+            } else {
                 inner
                     .core
                     .restart(&rollback_binary, &rollback_path, geo_dir.as_deref())
-            {
+            };
+            if let Err(rollback_error) = rollback_result {
                 eprintln!(
                     "hincyray: rollback after active profile switch failure failed: {rollback_error}"
                 );
@@ -20039,6 +20267,76 @@ mod tests {
     }
 
     #[test]
+    fn parovozik_provider_files_are_bounded_normalized_and_atomic() {
+        let (dir, daemon) = test_daemon();
+        let mut state = lock(&daemon.inner).state.clone();
+        state.split_routing.geo_asset_path = dir.path().to_string_lossy().into_owned();
+        state.split_routing.parovozik_enabled = true;
+        state.split_routing.parovozik_direct_domains =
+            vec![" Example.COM ".to_owned(), "example.com".to_owned()];
+        state.split_routing.parovozik_vpn_domains = vec!["vpn.example".to_owned()];
+
+        write_parovozik_provider_files(&state).expect("provider files");
+        let (direct, vpn) = parovozik_provider_paths(&state).expect("paths");
+        assert_eq!(fs::read_to_string(direct).expect("direct"), "example.com\n");
+        assert_eq!(fs::read_to_string(vpn).expect("vpn"), "vpn.example\n");
+
+        state.split_routing.parovozik_direct_domains.clear();
+        write_parovozik_provider_files(&state).expect("empty provider");
+        let (direct, _) = parovozik_provider_paths(&state).expect("paths");
+        assert_eq!(fs::read_to_string(direct).expect("direct"), "# empty\n");
+    }
+
+    #[test]
+    fn parovozik_config_uses_hot_update_rule_providers() {
+        let (dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active",
+            &daemon,
+        );
+        let state = {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            inner.state.split_routing.parovozik_enabled = true;
+            inner.state.split_routing.geo_asset_path = dir.path().to_string_lossy().into_owned();
+            inner.state.clone()
+        };
+        write_parovozik_provider_files(&state).expect("provider files");
+        let yaml = build_daemon_config(&state, &[]).expect("config");
+        assert!(yaml.contains("RULE-SET,parovozik-direct,DIRECT"));
+        assert!(yaml.contains("RULE-SET,parovozik-vpn-rules,parovozik-vpn"));
+        assert!(!yaml.contains("DOMAIN-SUFFIX,example.com,parovozik-vpn"));
+    }
+
+    #[test]
+    fn stale_parovozik_refs_do_not_block_profile_switch_config() {
+        let (dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@one.example:443?security=tls#One\n\
+             vless://22222222-2222-2222-2222-222222222222@two.example:443?security=tls#Two",
+            &daemon,
+        );
+        let mut state = lock(&daemon.inner).state.clone();
+        state.active_profile_id = Some(1);
+        state.split_routing.enabled = true;
+        state.split_routing.parovozik_enabled = true;
+        state.split_routing.geo_asset_path = dir.path().to_string_lossy().into_owned();
+        sync_server_route_registry(&mut state);
+        let stale_ref = "srv-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        state
+            .split_routing
+            .parovozik_server_refs
+            .push(stale_ref.to_owned());
+        state.server_route_registry.push(ServerRouteRegistryEntry {
+            server_ref: stale_ref.to_owned(),
+            canonical_raw: "missing-profile".to_owned(),
+        });
+
+        build_daemon_config(&state, &[]).expect("stale Parovozik ref must be ignored");
+    }
+
+    #[test]
     fn profile_block_quic_toggle_persists_and_affects_config() {
         let (_dir, daemon) = test_daemon();
         handle_import(
@@ -21315,6 +21613,46 @@ mod tests {
     }
 
     #[test]
+    fn stale_profile_stats_are_bounded_by_recency() {
+        let live_raw = "vless://live@example.com";
+        let mut state = HincyrayState {
+            profiles: vec![make_profile(0, "Live", live_raw, None)],
+            stats: (0..(MAX_STALE_PROFILE_STATS + 5))
+                .map(|index| ProfileStats {
+                    profile_raw: format!("vless://stale-{index}@example.com"),
+                    last_checked_unix: index as u64,
+                    ..Default::default()
+                })
+                .chain(std::iter::once(ProfileStats {
+                    profile_raw: live_raw.to_owned(),
+                    last_checked_unix: 0,
+                    ..Default::default()
+                }))
+                .collect(),
+            ..Default::default()
+        };
+
+        assert!(prune_stale_profile_stats(&mut state));
+        assert_eq!(state.stats.len(), MAX_STALE_PROFILE_STATS + 1);
+        assert!(state.stats.iter().any(|stat| stat.profile_raw == live_raw));
+        assert!(
+            !state.stats.iter().any(|stat| stat.last_checked_unix == 0
+                && stat.profile_raw.starts_with("vless://stale-"))
+        );
+        assert!(!prune_stale_profile_stats(&mut state));
+    }
+
+    #[test]
+    fn json_error_does_not_require_static_message() {
+        let message = format!("dynamic error {}", 42);
+        let (_, _, body) = json_error(400, &message);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("error JSON")["error"],
+            message
+        );
+    }
+
+    #[test]
     fn undo_restore_restores_previous_state() {
         let (_dir, daemon) = test_daemon();
         {
@@ -21424,6 +21762,28 @@ mod tests {
         assert_eq!(result["ok"], json!(false));
         assert_eq!(result["supported"], json!(false));
         assert_eq!(result["exit_code"], json!(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mihomo_validator_bounds_go_runtime_memory() {
+        let dir = TempDir::new().expect("temp dir");
+        let script_path = dir.path().join("environment-mihomo.sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\n[ \"$GOMEMLIMIT\" = \"64MiB\" ] && [ \"$GOGC\" = \"20\" ]\n",
+        )
+        .expect("write script");
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let result = validate_mihomo_config_yaml_with_timeout(
+            script_path.to_str().expect("utf-8 path"),
+            "mixed-port: 10809\n",
+            None,
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(result["ok"], json!(true));
     }
 
     // ── Subscription replace / delete tests ───────────────────────────

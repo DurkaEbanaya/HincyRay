@@ -1564,8 +1564,13 @@ pub fn build_mihomo_router_config(
         rules.push(format!("DOMAIN-SUFFIX,{domain},{}", PROXY_NAME));
     }
 
-    // GeoBase ACTIVE providers must take precedence over broad DIRECT sets.
-    for target in [GeoBaseRuleTarget::Active, GeoBaseRuleTarget::Direct] {
+    // GeoBase providers keep precedence over hot-updated Parovozik providers.
+    for target in [
+        GeoBaseRuleTarget::Active,
+        GeoBaseRuleTarget::Direct,
+        GeoBaseRuleTarget::ParovozikVpn,
+        GeoBaseRuleTarget::ParovozikDirect,
+    ] {
         for provider in extra
             .geobase_rule_providers
             .iter()
@@ -1581,31 +1586,11 @@ pub fn build_mihomo_router_config(
                 // flaps or dies.
                 GeoBaseRuleTarget::Active => PROXY_NAME,
                 GeoBaseRuleTarget::Direct => DIRECT_NAME,
+                GeoBaseRuleTarget::ParovozikDirect => DIRECT_NAME,
+                GeoBaseRuleTarget::ParovozikVpn => PAROVOZIK_PROXY_GROUP,
             };
             rules.push(format!("RULE-SET,{},{}", provider.name, target_name));
         }
-    }
-
-    // Experimental Parovozik is deliberately below GeoBase providers. Its
-    // learned decisions therefore cannot override managed GeoBase intent.
-    for domain in extra
-        .parovozik_vpn_domains
-        .iter()
-        .map(|domain| domain.trim())
-        .filter(|domain| !domain.is_empty())
-    {
-        rules.push(format!(
-            "DOMAIN-SUFFIX,{domain},{}",
-            extra.parovozik_vpn_target
-        ));
-    }
-    for domain in extra
-        .parovozik_direct_domains
-        .iter()
-        .map(|domain| domain.trim())
-        .filter(|domain| !domain.is_empty())
-    {
-        rules.push(format!("DOMAIN-SUFFIX,{domain},{}", DIRECT_NAME));
     }
 
     // v0.16: RU Direct — route Russian domains direct before port-mode
@@ -6873,17 +6858,29 @@ mod tests {
     }
 
     #[test]
-    fn parovozik_rules_follow_geobase_and_use_fallback_group() {
+    fn parovozik_provider_rules_follow_geobase_and_use_fallback_group() {
         let extra = RouterExtra {
-            geobase_rule_providers: vec![managed_provider(
-                "managed-direct",
-                "/opt/etc/hincyray/geobase/direct.txt",
-                GeoBaseRuleBehavior::Domain,
-                GeoBaseRuleTarget::Direct,
-            )],
+            geobase_rule_providers: vec![
+                managed_provider(
+                    "managed-direct",
+                    "/opt/etc/hincyray/geobase/direct.txt",
+                    GeoBaseRuleBehavior::Domain,
+                    GeoBaseRuleTarget::Direct,
+                ),
+                managed_provider(
+                    "parovozik-vpn-rules",
+                    "/opt/etc/hincyray/parovozik-vpn.txt",
+                    GeoBaseRuleBehavior::Domain,
+                    GeoBaseRuleTarget::ParovozikVpn,
+                ),
+                managed_provider(
+                    "parovozik-direct",
+                    "/opt/etc/hincyray/parovozik-direct.txt",
+                    GeoBaseRuleBehavior::Domain,
+                    GeoBaseRuleTarget::ParovozikDirect,
+                ),
+            ],
             mihomo_home: Some("/opt/etc/hincyray".to_owned()),
-            parovozik_direct_domains: vec!["direct.example".to_owned()],
-            parovozik_vpn_domains: vec!["vpn.example".to_owned()],
             parovozik_vpn_target: PAROVOZIK_PROXY_GROUP.to_owned(),
             parovozik_vpn_outbounds: vec!["srv-route-test".to_owned()],
             ..RouterExtra::default()
@@ -6898,11 +6895,11 @@ mod tests {
             .expect("GeoBase rule");
         let vpn = rules
             .iter()
-            .position(|rule| rule == "DOMAIN-SUFFIX,vpn.example,parovozik-vpn")
+            .position(|rule| rule == "RULE-SET,parovozik-vpn-rules,parovozik-vpn")
             .expect("Parovozik VPN rule");
         let direct = rules
             .iter()
-            .position(|rule| rule == "DOMAIN-SUFFIX,direct.example,DIRECT")
+            .position(|rule| rule == "RULE-SET,parovozik-direct,DIRECT")
             .expect("Parovozik Direct rule");
         assert!(geobase < vpn && vpn < direct);
         let group = config["proxy-groups"]

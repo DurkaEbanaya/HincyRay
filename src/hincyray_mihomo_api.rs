@@ -135,6 +135,36 @@ pub fn mihomo_api_post_response(
     Ok((status, response))
 }
 
+pub fn mihomo_api_put(
+    addr: &str,
+    secret: Option<&str>,
+    path: &str,
+    body: Option<&str>,
+) -> Result<(), String> {
+    let url = format!("http://{addr}{path}");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.put(&url);
+    if let Some(s) = secret
+        && !s.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {s}"));
+    }
+    if let Some(body) = body {
+        req = req
+            .header("Content-Type", "application/json")
+            .body(body.to_owned());
+    }
+    let resp = req.send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("Mihomo API {path}: HTTP {}", resp.status()));
+    }
+    Ok(())
+}
+
 /// Like `mihomo_api_get` but for streaming endpoints (`/traffic`, `/memory`).
 /// Uses `curl --max-time` because reqwest's blocking API would wait for the
 /// endless stream rather than returning the first JSON snapshot.

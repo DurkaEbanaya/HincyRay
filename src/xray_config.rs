@@ -103,6 +103,8 @@ pub enum GeoBaseRuleBehavior {
 pub enum GeoBaseRuleTarget {
     Active,
     Direct,
+    ParovozikDirect,
+    ParovozikVpn,
 }
 
 /// A locally managed rule provider consumed by Mihomo router mode.
