@@ -30,26 +30,21 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.1.0');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.2.0');
 });
 
 test('profile table shows compact service status and configurable metric columns', async ({ page }) => {
   await openFixture(page);
   await navigateTo(page, 'profiles');
   const row = page.locator('#profilesBody tr').filter({ hasText: 'Fixture Profile' });
-  await expect(row.locator('.profile-service-test')).toHaveText(['YT', 'TG', 'AI']);
+  await expect(row.locator('.profile-service-test')).toHaveText(['P 25', 'YT', 'TG', 'AI']);
   await expect(row.locator('.profile-service-test.bad')).toHaveText('TG');
 
   await page.locator('#profileMetricSettings > button').click();
   await page.locator('#profileMetricSettings input[data-profile-metric="latency"]').uncheck();
   await expect(page.locator('#profilesTable thead [data-profile-metric="latency"]')).toBeHidden();
-  await expect(row.locator('.profile-name-cell .profile-service-test')).toHaveText(['YT', 'TG', 'AI']);
-
-  const uploadToggle = page.locator('#profileMetricSettings input[data-profile-metric="upload"]');
-  await expect(uploadToggle).not.toBeChecked();
-  await uploadToggle.check();
-  await expect(page.locator('#profilesTable thead [data-profile-metric="upload"]')).toBeVisible();
-  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('hr_profile_metrics') || '[]').includes('upload'))).toBe(true);
+  await expect(row.locator('.profile-name-cell .profile-service-test')).toHaveText(['P 25', 'YT', 'TG', 'AI']);
+  await expect(page.locator('#profileMetricSettings input[data-profile-metric="upload"]')).toHaveCount(0);
 });
 
 test('profile technical columns are optional and row actions stay beside the name', async ({ page }) => {
@@ -61,7 +56,7 @@ test('profile technical columns are optional and row actions stay beside the nam
   await expect(page.locator('#profilesTable thead [data-profile-metric="transport"]')).toBeHidden();
   await expect(page.locator('#profilesTable thead [data-profile-metric="address"]')).toBeHidden();
   await expect(row.locator('.profile-name-cell .profile-row-actions')).toContainText('Активен');
-  await expect(row.locator('.profile-name-cell').getByTitle('Тест сервера')).toBeVisible();
+  await expect(row.locator('.profile-name-cell').getByTitle('Quick Test')).toBeVisible();
   await expect(row.locator('.profile-name-cell').getByTitle('Переименовать')).toBeVisible();
   await expect(row.locator('.profile-name-cell').getByTitle('Удалить')).toBeVisible();
   const starCell = row.locator('td').first();
@@ -131,6 +126,34 @@ test('profiles use the available desktop width and long-operation scanner moves'
   const moved = await scanner.evaluate(element => element.style.left);
   expect(moved).not.toBe(start);
   await page.evaluate(() => endLongOperation('/test-operation'));
+});
+
+test('profile quick and global full tests send bounded concurrency', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  await page.getByText('Настройки тестирования').click();
+  await page.locator('#benchConcurrency').selectOption('6');
+
+  const fullRequest = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/bench/start'
+  );
+  await page.locator('#benchFullAll').click();
+  expect((await fullRequest).postDataJSON()).toEqual(expect.objectContaining({
+    method: 'full',
+    concurrency: 6,
+    test_download: false,
+    test_upload: false,
+  }));
+
+  await page.evaluate(() => api('POST','/api/bench/stop',{}));
+  const quickRequest = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/bench/start'
+  );
+  await page.locator('#profilesBody [title="Quick Test"]').first().click();
+  expect((await quickRequest).postDataJSON()).toEqual(expect.objectContaining({
+    method: 'quick',
+    concurrency: 6,
+  }));
 });
 
 test('Dead Servers supports single and bulk diagnostics, restore, and clear', async ({ page }) => {

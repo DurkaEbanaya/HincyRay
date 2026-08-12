@@ -1428,6 +1428,8 @@ pub struct ProfileStats {
     pub last_checked_unix: u64,
     #[serde(default)]
     pub resource_tests: Vec<ResourceTestResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_service_test_success: Option<bool>,
     #[serde(default)]
     pub ewma_latency_ms: f32,
     #[serde(default)]
@@ -6423,7 +6425,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             "application/json",
             json!({
                 "error": "unknown method",
-                "supported": ["tcp", "head", "get", "quick"],
+                "supported": ["tcp", "head", "get", "quick", "full"],
             })
             .to_string(),
         );
@@ -6454,6 +6456,13 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         .get("test_upload")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let concurrency = match value.get("concurrency") {
+        None => 1,
+        Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            Some(value @ 1..=6) => value,
+            _ => return json_error(400, "concurrency must be an integer from 1 to 6"),
+        },
+    };
 
     // Decide benchmark scope under the state lock. Subscription membership is
     // resolved by the daemon so browser filtering/collapse/reindexing cannot
@@ -6522,12 +6531,13 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
     let on_result = Box::new(move |result: BenchResult| {
         apply_bench_result(&daemon_for_callback, result);
     });
-    let quick_probe = (method == BenchMethod::Quick).then(|| QuickProbeConfig {
-        telegram_session_path: telegram_session_path(&daemon.state_path)
-            .to_string_lossy()
-            .into_owned(),
-        telegram: load_telegram_config(&telegram_config_path(&daemon.state_path)).ok(),
-    });
+    let quick_probe =
+        matches!(method, BenchMethod::Quick | BenchMethod::Full).then(|| QuickProbeConfig {
+            telegram_session_path: telegram_session_path(&daemon.state_path)
+                .to_string_lossy()
+                .into_owned(),
+            telegram: load_telegram_config(&telegram_config_path(&daemon.state_path)).ok(),
+        });
 
     let handle = run_bench(
         profiles,
@@ -6539,6 +6549,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         quick_probe,
         test_download,
         test_upload,
+        concurrency,
         Arc::clone(&job),
         Arc::clone(&cancel),
         on_result,
@@ -6777,8 +6788,12 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
 
     {
         let stats_entry = &mut inner.state.stats[stats_idx];
-        if result.method == "quick" {
+        if matches!(result.method.as_str(), "quick" | "full") {
             stats_entry.resource_tests = result.resource_tests.clone();
+            stats_entry.last_service_test_success = Some(result.success);
+            stats_entry.last_checked_unix = now;
+            let _ = persist_state(&daemon.state_path, &inner.state);
+            return;
         }
         if result.success {
             stats_entry.last_latency_ms = result.latency_ms;
@@ -6862,6 +6877,7 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
                 "last_error": stat.and_then(|s| s.last_error.clone()),
                 "last_checked": stat.map(|s| s.last_checked_unix).unwrap_or(0),
                 "resource_tests": stat.map(|s| s.resource_tests.clone()).unwrap_or_default(),
+                "last_service_test_success": stat.and_then(|s| s.last_service_test_success),
                 "ewma_latency_ms": stat.filter(|s| s.has_ewma).map(|s| s.ewma_latency_ms),
                 "ewma_download_mbps": stat.filter(|s| s.has_download).map(|s| s.ewma_download_mbps),
                 "consecutive_failures": stat.map(|s| s.consecutive_failures).unwrap_or(0),
@@ -17008,6 +17024,7 @@ fn start_auto_benchmark(daemon: &Daemon) {
         None,
         false,
         false,
+        1,
         Arc::clone(&job),
         Arc::clone(&cancel),
         on_result,
@@ -18276,7 +18293,7 @@ fn run_deep_bench(
         cancel_requested: false,
         results: Vec::new(),
     }));
-    let on_result: Box<dyn Fn(crate::benchmark::BenchResult) + Send> = Box::new(|_| {});
+    let on_result: Box<dyn Fn(crate::benchmark::BenchResult) + Send + Sync> = Box::new(|_| {});
     // Update status to Phase A.
     {
         let mut inner = lock(&daemon.inner);
@@ -18299,6 +18316,7 @@ fn run_deep_bench(
         None,
         /* test_download */ true,
         /* test_upload */ false,
+        /* concurrency */ 1,
         job.clone(),
         cancel.clone(),
         on_result,
@@ -20881,6 +20899,17 @@ mod tests {
     }
 
     #[test]
+    fn bench_start_rejects_concurrency_outside_one_to_six() {
+        let (_dir, daemon) = test_daemon();
+        for value in [0, 7] {
+            let body = format!(r#"{{"method":"full","concurrency":{value}}}"#);
+            let (status, _, response) = dispatch("POST", "/api/bench/start", &body, &daemon);
+            assert_eq!(status, 400);
+            assert!(response.contains("concurrency must be an integer from 1 to 6"));
+        }
+    }
+
+    #[test]
     fn benchmark_empty_mihomo_path_uses_path_lookup() {
         assert_eq!(benchmark_mihomo_path(""), "mihomo");
         assert_eq!(benchmark_mihomo_path("  "), "mihomo");
@@ -21113,7 +21142,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_bench_result_updates_stats_and_history() {
+    fn service_bench_updates_diagnostics_without_affecting_health_history() {
         let (_dir, daemon) = test_daemon();
         handle_import(
             "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
@@ -21156,16 +21185,15 @@ mod tests {
         assert_eq!(inner.state.stats.len(), 1);
         let stat = &inner.state.stats[0];
         assert_eq!(stat.profile_raw, raw);
-        assert_eq!(stat.last_latency_ms, 80);
-        assert_eq!(stat.last_download_mbps, 25.0);
-        assert_eq!(stat.last_upload_mbps, 8.0);
-        assert!(stat.has_download);
-        assert!(stat.has_upload);
+        assert!(!stat.has_latency);
+        assert!(!stat.has_download);
+        assert!(!stat.has_upload);
         assert_eq!(stat.resource_tests.len(), 1);
         assert_eq!(stat.resource_tests[0].id, "youtube");
-        assert_eq!(stat.success_count, 1);
+        assert_eq!(stat.last_service_test_success, Some(true));
+        assert_eq!(stat.success_count, 0);
         assert_eq!(stat.failure_count, 0);
-        assert_eq!(inner.state.metrics_history.len(), 1);
+        assert!(inner.state.metrics_history.is_empty());
         drop(inner);
 
         // A failure outcome increments failure_count and stores last_error.
@@ -21189,10 +21217,10 @@ mod tests {
         apply_bench_result(&daemon, failure);
         let inner = lock(&daemon.inner);
         let stat = &inner.state.stats[0];
-        assert_eq!(stat.success_count, 1);
+        assert_eq!(stat.success_count, 0);
         assert_eq!(stat.failure_count, 1);
         assert_eq!(stat.last_error.as_deref(), Some("tcp connect failed"));
-        assert_eq!(inner.state.metrics_history.len(), 2);
+        assert_eq!(inner.state.metrics_history.len(), 1);
     }
 
     #[test]

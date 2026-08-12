@@ -153,7 +153,10 @@ const responses = new Map([
     model: 'Fixture Router',
   }],
   ['/api/memory-guard', { mihomo: { pid: 100, rss_kb: 1024 }, top_processes: [], warnings: [] }],
-  ['/api/stats', { stats: [{ profile_id: profile.id, last_latency_ms: 25, resource_tests: [
+  ['/api/stats', { stats: [{ profile_id: profile.id, last_latency_ms: 25, last_service_test_success: false, resource_tests: [
+    { contract_version: 6, id: 'ping_icmp', name: 'ICMP ping', attempts: 1, successes: 1, reachable: true, stable: true, avg_ttfb_ms: 22 },
+    { contract_version: 6, id: 'ping_tcp', name: 'TCP ping', attempts: 1, successes: 1, reachable: true, stable: true, avg_ttfb_ms: 25 },
+    { contract_version: 6, id: 'ping_proxy', name: 'Proxy HTTPS ping', attempts: 1, successes: 1, reachable: true, stable: true, avg_ttfb_ms: 28 },
     { contract_version: 6, id: 'youtube', name: 'YouTube', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 120 },
     { contract_version: 6, id: 'telegram', name: 'Telegram', attempts: 1, successes: 0, stable: false, avg_ttfb_ms: 240 },
     { contract_version: 6, id: 'ai', name: 'AI Studio', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 180 },

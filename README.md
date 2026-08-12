@@ -1,4 +1,4 @@
-# HincyRay v1.1.0
+# HincyRay v1.2.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,12 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v1.2.0
+
+v1.2.0 replaces the legacy speed-oriented profile benchmark UI with explicit Quick and Full service tests. Both modes record ICMP, direct TCP, and end-to-end proxy HTTPS ping diagnostics plus YouTube, Telegram, and AI Studio availability. Quick Test stops a profile at the first failed stage; Full Test records every stage independently. Server-level concurrency is configurable from 1 to 6, while the shared Telegram session and anonymous YouTube boundary remain serialized.
+
+The YouTube probe now carries its visitor cookies and matching client identity through the bounded media-range request, avoiding false CDN `403` results, and uses a realistic connect budget. Subscription compatibility also rejects unusable unspecified-address sentinels before the existing Happ fallback. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.2.0.md`](docs/releases/v1.2.0.md).
 
 ### v1.1.0
 
@@ -368,7 +374,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.1.0 release evidence is recorded in [`docs/releases/v1.1.0.md`](docs/releases/v1.1.0.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.2.0 release evidence is recorded in [`docs/releases/v1.2.0.md`](docs/releases/v1.2.0.md).
 
 ## Installation
 

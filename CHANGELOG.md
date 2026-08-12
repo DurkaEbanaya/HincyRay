@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.2.0 - 2026-08-12
+
+- Replaced the profile speed-test controls with explicit Quick and Full service diagnostics. Quick Test applies an any-of ICMP/direct-TCP/proxy-HTTPS ping gate and then checks YouTube, Telegram, and AI Studio in fail-fast order; Full Test records every stage independently.
+- Added bounded server concurrency from 1 to 6, persisted ping/YT/TG/AI indicators, and result sorting by complete outcome, successful checks, then ping. Diagnostic service failures no longer alter health counters, cooldown, failover, or auto-selection history.
+- Fixed widespread false-red YouTube results by serializing the anonymous YouTube boundary, extending its connect budget, and carrying the Innertube visitor cookies and matching client identity into the bounded direct-media request.
+- Made benchmark Mihomo use the writable temporary config directory instead of resolving its home under `/.config/mihomo` on the router.
+- Restored Happ-compatible subscription imports when a provider first returns a syntactically valid but unusable `0.0.0.0:1` sentinel profile.
+- Added a tested operational guide for locking Foxconn T99W175 / Cinterion MV31-W LTE B3 as PCC while retaining B1+B7 carrier aggregation on Keenetic.
+
 ## v1.1.0 - 2026-07-28
 
 - Added the disabled-by-default experimental «Паровозик»: domains absent from enabled applied GeoBases are tried DIRECT first, verified DIRECT failures are immediately tested through the current VPN plus up to five selected live server routes, and learned results are exposed as separate managed `Паровозик Direct` / `Паровозик VPN` rules below GeoBase precedence.

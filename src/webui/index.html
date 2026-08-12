@@ -710,6 +710,7 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .profile-service-test{display:inline-flex;align-items:center;justify-content:center;min-width:22px;padding:0 3px;border:1px solid currentColor;border-radius:3px;font-size:9px;font-weight:700;line-height:14px}
 .profile-service-test.ok{color:var(--success);background:color-mix(in srgb,var(--success) 12%,transparent)}
 .profile-service-test.bad{color:var(--danger);background:color-mix(in srgb,var(--danger) 12%,transparent)}
+.profile-service-test.skipped{color:var(--muted);background:var(--fg-soft)}
 .profile-name-cell{min-width:230px;max-width:360px;white-space:normal!important}
 .profile-name{font-weight:500;overflow-wrap:anywhere}
 .profile-row-actions{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:5px}
@@ -920,7 +921,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   <nav class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="sidebar-brand" style="border-radius: 0px;">
       <svg class="brand-icon" viewBox="0 0 1024 1024" role="img" aria-label="HincyRay"><defs><radialGradient id="brand-bg" cx="50%" cy="46%" r="62%"><stop stop-color="#172b3d"/><stop offset=".55" stop-color="#0b1018"/><stop offset="1" stop-color="#05070b"/></radialGradient><linearGradient id="brand-phone" x1="250" y1="100" x2="760" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#3b424d"/><stop offset=".45" stop-color="#151a21"/><stop offset="1" stop-color="#050608"/></linearGradient><linearGradient id="brand-screen" x1="310" y1="150" x2="690" y2="850" gradientUnits="userSpaceOnUse"><stop stop-color="#1f3146"/><stop offset="1" stop-color="#070a0f"/></linearGradient></defs><rect width="1024" height="1024" rx="220" fill="url(#brand-bg)"/><path d="M130 740 40 820M190 820 95 930M845 170l115-92M820 790l130 92M93 276l112 52" stroke="#0078d7" stroke-width="18" stroke-linecap="round" opacity=".65"/><g transform="rotate(-8 512 512)"><rect x="290" y="92" width="444" height="840" rx="78" fill="url(#brand-phone)" stroke="#737b87" stroke-width="14"/><rect x="328" y="138" width="368" height="748" rx="48" fill="url(#brand-screen)" stroke="#0e1620" stroke-width="10"/><circle cx="512" cy="176" r="16" fill="#080b10" stroke="#4d5663" stroke-width="5"/><path d="M510 132 455 292l68-30-42 172 106-238-72 34z" fill="#f4d03f" stroke="#fff2a4" stroke-width="8"/><path d="M496 432 365 536l112 8-74 204 214-260-102 14 75-134z" fill="#ff453a" stroke="#ffb2ab" stroke-width="9"/><path d="M520 398 660 496l-92 22 70 188-198-238 92 18z" fill="#60cdff" stroke="#b8efff" stroke-width="8"/><path d="M445 308 340 248M444 309l-96 102M521 264l118-98M514 436l-160 44M514 437l120 152M477 546l-112 188M566 515l104 166" stroke="#d8e6f3" stroke-width="10" stroke-linecap="round" opacity=".8"/><path d="M336 610 238 660l87 36-142 98 238-62-62-42 98-38zM664 300l150-50-72 102 160 10-228 68 38-78z" fill="#1f8fff" opacity=".88"/><text x="512" y="760" text-anchor="middle" font-family="Arial Black,Arial,sans-serif" font-size="76" fill="#f2f6fb" stroke="#05070b" stroke-width="7" paint-order="stroke">POCO</text></g></svg>
-      <div><div class="logo">HincyRay</div><div class="version">v1.1.0</div></div>
+      <div><div class="logo">HincyRay</div><div class="version">v1.2.0</div></div>
     </div>
     <div class="brightness-row">
       <svg class="brightness-icon" onclick="toggleTheme()" title="Переключить тему" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9L14 6M5.9 14l-1.1 1.1"></path></svg>
@@ -1159,24 +1160,12 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
           <details id="testPanel" style="margin-bottom:16px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
             <summary style="cursor:pointer;font-weight:600;padding:10px 14px;background:var(--surface-2);user-select:none">Настройки тестирования</summary>
             <div style="padding:12px 14px">
-              <div style="font-size:var(--fs-sm);color:var(--muted);margin-bottom:10px">Выберите метрики для тестирования и метод. Тест запускается кнопкой ⚡ у группы или сервера.</div>
-              <div class="form-row" style="align-items:flex-start;flex-wrap:wrap;gap:16px;margin-bottom:12px">
-                <div style="display:flex;flex-direction:column;gap:8px;min-width:180px">
-                  <div style="font-weight:600;font-size:var(--fs-sm);margin-bottom:2px">Метрики</div>
-                  <div style="display:flex;align-items:center;gap:8px"><label class="toggle"><input type="checkbox" id="metricLatency" checked><span class="slider"></span></label><span>Задержка</span></div>
-                  <div style="display:flex;align-items:center;gap:8px"><label class="toggle"><input type="checkbox" id="metricDownload" checked><span class="slider"></span></label><span>Закачка</span></div>
-                  <div style="display:flex;align-items:center;gap:8px"><label class="toggle"><input type="checkbox" id="metricUpload"><span class="slider"></span></label><span>Отдача</span></div>
-                  <div style="display:flex;align-items:center;gap:8px"><label class="toggle"><input type="checkbox" id="metricEwma" checked><span class="slider"></span></label><span>EWMA</span></div>
-                  <div style="display:flex;align-items:center;gap:8px"><label class="toggle"><input type="checkbox" id="metricJitter" checked><span class="slider"></span></label><span>Джиттер</span></div>
+              <div style="font-size:var(--fs-sm);color:var(--muted);margin-bottom:10px">⚡ у сервера или подписки запускает Quick Test. Full Test проверяет ping, YouTube, Telegram и AI независимо для всех серверов.</div>
+              <div class="form-row" style="align-items:flex-end;flex-wrap:wrap;gap:16px;margin-bottom:12px">
+                <div class="form-group" style="margin:0;min-width:180px"><label>Параллельных серверов</label>
+                  <select id="benchConcurrency" onchange="saveBenchConcurrency(this.value)"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option></select>
                 </div>
-                <div style="display:flex;flex-direction:column;gap:8px;flex:1;min-width:250px">
-                  <div class="form-group" style="margin:0"><label>Метод</label>
-                    <select id="benchMethod"><option value="tcp">TCP ping</option><option value="head">HTTP HEAD</option><option value="get">HTTP GET</option></select>
-                  </div>
-                  <div class="form-group" style="margin:0;flex:1"><label>Probe URL</label><input id="benchProbe" placeholder="https://www.gstatic.com/generate_204"></div>
-                  <div class="form-group" style="margin:0;flex:1"><label>Download URL</label><input id="benchDL" placeholder="https://speed.cloudflare.com/__down?bytes=10485760"></div>
-                  <div class="form-group" style="margin:0;flex:1"><label>Upload URL</label><input id="benchUL" placeholder="https://speed.cloudflare.com/__up"></div>
-                </div>
+                <button class="btn btn-accent" id="benchFullAll" onclick="fullBenchAll()">⚡ Full Test всех серверов</button>
               </div>
               <div id="benchSummary" style="margin-top:12px;display:none" class="cards">
                 <div class="card"><div class="card-label">Прошло</div><div class="card-value success" id="benchPassed">0</div></div>
@@ -1215,7 +1204,8 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
           <div class="form-row">
             <select id="profileSort" style="width:auto" onchange="sortProfiles(this.value)">
               <option value="import">Порядок импорта</option>
-              <option value="latency">По задержке ↑</option>
+              <option value="results">По результатам</option>
+              <option value="latency">По ping ↑</option>
               <option value="name">По имени А-Я</option>
             </select>
             <input type="text" placeholder="Поиск профиля…" id="profileSearch" oninput="filterProfiles(this.value)" style="flex:1;min-width:200px">
@@ -1228,10 +1218,6 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
                 <label><input type="checkbox" data-profile-metric="transport" onchange="setProfileMetricVisible(this.dataset.profileMetric,this.checked)"> Транспорт</label>
                 <label><input type="checkbox" data-profile-metric="address" onchange="setProfileMetricVisible(this.dataset.profileMetric,this.checked)"> Адрес</label>
                 <label><input type="checkbox" data-profile-metric="latency" onchange="setProfileMetricVisible(this.dataset.profileMetric,this.checked)"> Задержка</label>
-                <label><input type="checkbox" data-profile-metric="download" onchange="setProfileMetricVisible(this.dataset.profileMetric,this.checked)"> Скорость</label>
-                <label><input type="checkbox" data-profile-metric="upload" onchange="setProfileMetricVisible(this.dataset.profileMetric,this.checked)"> Отдача</label>
-                <label><input type="checkbox" data-profile-metric="ewma" onchange="setProfileMetricVisible(this.dataset.profileMetric,this.checked)"> EWMA</label>
-                <label><input type="checkbox" data-profile-metric="jitter" onchange="setProfileMetricVisible(this.dataset.profileMetric,this.checked)"> Джиттер</label>
                 <label><input type="checkbox" data-profile-metric="loss" onchange="setProfileMetricVisible(this.dataset.profileMetric,this.checked)"> Потери</label>
                 <label><input type="checkbox" data-profile-metric="errors" onchange="setProfileMetricVisible(this.dataset.profileMetric,this.checked)"> Ошибки</label>
                 <label><input type="checkbox" data-profile-metric="cooldown" onchange="setProfileMetricVisible(this.dataset.profileMetric,this.checked)"> Cooldown</label>
@@ -1250,7 +1236,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
             <table class="tbl tbl-compact" id="profilesTable">
               <thead>
                 <tr>
-                  <th>★</th><th data-profile-metric="id" onclick="sortByColumn(1)" style="cursor:pointer">ID</th><th onclick="sortByColumn(2)" style="cursor:pointer">Имя</th><th data-profile-metric="protocol" onclick="sortByColumn(3)" style="cursor:pointer">Протокол</th><th data-profile-metric="latency" onclick="sortByColumn(4)" style="cursor:pointer">Задержка</th><th data-profile-metric="download" onclick="sortByColumn(5)" style="cursor:pointer">Скорость</th><th data-profile-metric="upload" onclick="sortByColumn(6)" style="cursor:pointer">Отдача</th><th data-profile-metric="ewma" onclick="sortByColumn(7)" style="cursor:pointer">История</th><th data-profile-metric="jitter" onclick="sortByColumn(8)" style="cursor:pointer">Джиттер</th><th data-profile-metric="loss" onclick="sortByColumn(9)" style="cursor:pointer">Потери</th><th data-profile-metric="errors" onclick="sortByColumn(10)" style="cursor:pointer">Ошибки</th><th data-profile-metric="cooldown" onclick="sortByColumn(11)" style="cursor:pointer">Cooldown</th><th data-profile-metric="transport" onclick="sortByColumn(12)" style="cursor:pointer">Транспорт</th><th data-profile-metric="address" onclick="sortByColumn(13)" style="cursor:pointer">Адрес</th>
+                  <th>★</th><th data-profile-metric="id" onclick="sortByColumn(1)" style="cursor:pointer">ID</th><th onclick="sortByColumn(2)" style="cursor:pointer">Имя</th><th data-profile-metric="protocol" onclick="sortByColumn(3)" style="cursor:pointer">Протокол</th><th data-profile-metric="latency" onclick="sortByColumn(4)" style="cursor:pointer">Ping</th><th data-profile-metric="loss" onclick="sortByColumn(5)" style="cursor:pointer">Потери</th><th data-profile-metric="errors" onclick="sortByColumn(6)" style="cursor:pointer">Ошибки</th><th data-profile-metric="cooldown" onclick="sortByColumn(7)" style="cursor:pointer">Cooldown</th><th data-profile-metric="transport" onclick="sortByColumn(8)" style="cursor:pointer">Транспорт</th><th data-profile-metric="address" onclick="sortByColumn(9)" style="cursor:pointer">Адрес</th>
                 </tr>
               </thead>
               <tbody id="profilesBody"></tbody>
@@ -1263,7 +1249,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
             <table class="tbl tbl-compact" id="favoritesTable">
               <thead>
                 <tr>
-                  <th>★</th><th data-profile-metric="id" onclick="sortByColumn(1)" style="cursor:pointer">ID</th><th onclick="sortByColumn(2)" style="cursor:pointer">Имя</th><th data-profile-metric="protocol" onclick="sortByColumn(3)" style="cursor:pointer">Протокол</th><th data-profile-metric="latency" onclick="sortByColumn(4)" style="cursor:pointer">Задержка</th><th data-profile-metric="download" onclick="sortByColumn(5)" style="cursor:pointer">Скорость</th><th data-profile-metric="upload" onclick="sortByColumn(6)" style="cursor:pointer">Отдача</th><th data-profile-metric="ewma" onclick="sortByColumn(7)" style="cursor:pointer">История</th><th data-profile-metric="jitter" onclick="sortByColumn(8)" style="cursor:pointer">Джиттер</th><th data-profile-metric="loss" onclick="sortByColumn(9)" style="cursor:pointer">Потери</th><th data-profile-metric="errors" onclick="sortByColumn(10)" style="cursor:pointer">Ошибки</th><th data-profile-metric="cooldown" onclick="sortByColumn(11)" style="cursor:pointer">Cooldown</th><th data-profile-metric="transport" onclick="sortByColumn(12)" style="cursor:pointer">Транспорт</th><th data-profile-metric="address" onclick="sortByColumn(13)" style="cursor:pointer">Адрес</th>
+                  <th>★</th><th data-profile-metric="id" onclick="sortByColumn(1)" style="cursor:pointer">ID</th><th onclick="sortByColumn(2)" style="cursor:pointer">Имя</th><th data-profile-metric="protocol" onclick="sortByColumn(3)" style="cursor:pointer">Протокол</th><th data-profile-metric="latency" onclick="sortByColumn(4)" style="cursor:pointer">Ping</th><th data-profile-metric="loss" onclick="sortByColumn(5)" style="cursor:pointer">Потери</th><th data-profile-metric="errors" onclick="sortByColumn(6)" style="cursor:pointer">Ошибки</th><th data-profile-metric="cooldown" onclick="sortByColumn(7)" style="cursor:pointer">Cooldown</th><th data-profile-metric="transport" onclick="sortByColumn(8)" style="cursor:pointer">Транспорт</th><th data-profile-metric="address" onclick="sortByColumn(9)" style="cursor:pointer">Адрес</th>
                 </tr>
               </thead>
               <tbody id="favoritesBody"></tbody>
@@ -2415,9 +2401,9 @@ function previewApi(method, path, body) {
   if (path === '/api/mihomo-api/connections/device-traffic') return Promise.resolve({devices:{}});
   if (path === '/api/bench/start') {
     const ids = body?.profile_ids || MOCK.profiles.filter(profile => !profile.active).map(profile => profile.id);
-    previewBenchStatus = {state:'running',running:true,method:body?.method || 'tcp',quick:body?.method === 'quick',completed:0,total:ids.length,current_profile:'Подготовка проверки'};
+    previewBenchStatus = {state:'running',running:true,method:body?.method || 'quick',quick:body?.method === 'quick',completed:0,total:ids.length,current_profile:'Подготовка проверки'};
     setTimeout(() => { previewBenchStatus = {...previewBenchStatus,completed:Math.max(1,Math.floor(previewBenchStatus.total / 2)),current_profile:'🇫🇮 Helsinki · WireGuard'}; }, 900);
-    setTimeout(() => { previewBenchStatus = {state:'completed',running:false,method:body?.method || 'tcp',quick:body?.method === 'quick',completed:ids.length,total:ids.length,current_profile:'Проверка завершена',results:ids.map(id => ({profile_id:id,success:true,latency_ms:128}))}; }, 5200);
+    setTimeout(() => { previewBenchStatus = {state:'completed',running:false,method:body?.method || 'quick',quick:body?.method === 'quick',completed:ids.length,total:ids.length,current_profile:'Проверка завершена',results:ids.map(id => ({profile_id:id,success:true,latency_ms:128}))}; }, 5200);
     return Promise.resolve({started:true});
   }
   if (path === '/api/bench/stop') { previewBenchStatus = {...previewBenchStatus,state:'stopped',running:false}; return Promise.resolve({stopped:true}); }
@@ -3475,8 +3461,8 @@ function saveCollapsedGroups() {
 const collapsedGroups = loadCollapsedGroups();
 const DEAD_SERVERS_GROUP_KEY = 'virtual:dead-servers';
 const selectedServerRefs = new Set();
-const PROFILE_METRICS = ['id','protocol','latency','download','upload','ewma','jitter','loss','errors','cooldown','transport','address'];
-const DEFAULT_PROFILE_METRICS = ['latency','download','ewma','jitter','loss','errors'];
+const PROFILE_METRICS = ['id','protocol','latency','loss','errors','cooldown','transport','address'];
+const DEFAULT_PROFILE_METRICS = ['latency','loss','errors'];
 
 function loadVisibleProfileMetrics() {
   try {
@@ -3511,12 +3497,18 @@ function profileMetricStyle(metric) {
 function profileServiceTestsHtml(resourceTests) {
   const tests = Array.isArray(resourceTests) ? resourceTests.filter(test => test.contract_version === 6) : [];
   if (!tests.length) return '';
-  return `<div class="profile-service-tests">${[['youtube','YT'],['telegram','TG'],['ai','AI']].map(([id,label]) => {
+  const pingTests = tests.filter(test => String(test.id || '').startsWith('ping_'));
+  const pingOk = pingTests.some(test => test.reachable === true);
+  const pingMs = pingTests.filter(test => test.reachable && test.avg_ttfb_ms > 0).map(test => Number(test.avg_ttfb_ms));
+  const pingTitle = pingTests.map(test => `${test.name}: ${test.reachable ? `${test.avg_ttfb_ms || '—'} ms` : (test.error || 'failed')}`).join(' · ');
+  const ping = pingTests.length ? `<span class="profile-service-test ${pingOk?'ok':'bad'}" title="${attrEscape(pingTitle)}">P${pingMs.length ? ` ${Math.round(pingMs.reduce((sum,value)=>sum+value,0)/pingMs.length)}` : ''}</span>` : '';
+  return `<div class="profile-service-tests">${ping}${[['youtube','YT'],['telegram','TG'],['ai','AI']].map(([id,label]) => {
     const result = tests.find(test => test.id === id);
     if (!result) return '';
     const ok = result.stable === true;
-    const title = `${result.name || label}: ${result.successes || 0}/${result.attempts || 0}${result.avg_ttfb_ms ? `, ${result.avg_ttfb_ms} ms` : ''}`;
-    return `<span class="profile-service-test ${ok?'ok':'bad'}" title="${attrEscape(title)}">${label}</span>`;
+    const skipped = Number(result.attempts || 0) === 0;
+    const title = `${result.name || label}: ${skipped ? (result.error || 'skipped') : `${result.successes || 0}/${result.attempts || 0}${result.avg_ttfb_ms ? `, ${result.avg_ttfb_ms} ms` : ''}${result.error ? `, ${result.error}` : ''}`}`;
+    return `<span class="profile-service-test ${skipped?'skipped':ok?'ok':'bad'}" title="${attrEscape(title)}">${label}</span>`;
   }).join('')}</div>`;
 }
 
@@ -3570,8 +3562,7 @@ let profileSortState = { key: null, dir: 'asc' };
 // Map column index → sort key. Must match thead order.
 const PROFILE_SORT_KEYS = [
   null, 'id', 'name', 'protocol',
-  'last_latency_ms', 'last_download_mbps', 'last_upload_mbps', 'ewma_latency_ms',
-  'last_jitter_ms', 'last_loss_percent', 'consecutive_failures',
+  'last_latency_ms', 'last_loss_percent', 'consecutive_failures',
   'cooldown_until_unix', 'transport', 'address'
 ];
 
@@ -3589,8 +3580,26 @@ function getSortValue(p, key) {
   return { missing, value: missing ? null : value };
 }
 
+function profileSuccessfulChecks(profile) {
+  const tests = Array.isArray(profile.resource_tests) ? profile.resource_tests.filter(test => test.contract_version === 6) : [];
+  const pingPassed = tests.some(test => String(test.id || '').startsWith('ping_') && test.reachable === true) ? 1 : 0;
+  return pingPassed + ['youtube','telegram','ai'].filter(id => tests.some(test => test.id === id && test.stable === true)).length;
+}
+
 function applyProfileSort(data) {
   if (!profileSortState.key) return data;
+  if (profileSortState.key === 'results') {
+    return data.map((profile, index) => ({profile, index})).sort((a, b) => {
+      const passA = a.profile.last_service_test_success === true ? 2 : a.profile.last_service_test_success === false ? 1 : 0;
+      const passB = b.profile.last_service_test_success === true ? 2 : b.profile.last_service_test_success === false ? 1 : 0;
+      if (passA !== passB) return passB - passA;
+      const checks = profileSuccessfulChecks(b.profile) - profileSuccessfulChecks(a.profile);
+      if (checks) return checks;
+      const pingA = profilePingMs(a.profile);
+      const pingB = profilePingMs(b.profile);
+      return pingA - pingB || a.index - b.index;
+    }).map(item => item.profile);
+  }
   const dir = profileSortState.dir === 'asc' ? 1 : -1;
   return data.map((profile, index) => ({profile, index})).sort((a, b) => {
     const va = getSortValue(a.profile, profileSortState.key);
@@ -3605,6 +3614,14 @@ function applyProfileSort(data) {
     }
     return compared ? compared * dir : a.index - b.index;
   }).map(item => item.profile);
+}
+
+function profilePingMs(profile) {
+  const pings = (Array.isArray(profile.resource_tests) ? profile.resource_tests : [])
+    .filter(test => test.contract_version === 6 && String(test.id || '').startsWith('ping_') && test.reachable === true && Number(test.avg_ttfb_ms) > 0)
+    .map(test => Number(test.avg_ttfb_ms));
+  if (pings.length) return Math.round(pings.reduce((sum,value)=>sum+value,0)/pings.length);
+  return Number(profile.last_latency_ms) || Number.MAX_SAFE_INTEGER;
 }
 
 function sortByColumn(colIdx) {
@@ -3743,12 +3760,12 @@ function renderProfileGroup(descriptor) {
   const selectable = items.filter(profile => !profile.active && profile.server_ref);
   const groupChecked = selectable.length > 0 && selectable.every(profile => selectedServerRefs.has(profile.server_ref));
   const groupLabel = dead ? t('Дохлые серверы') : (sub?.title || shortGroupName(source || t('Без группы')));
-  const header = `<tr class="profile-group-row" data-profile-group="${groupAttr}"><td colspan="14" style="font-weight:600">
+  const header = `<tr class="profile-group-row" data-profile-group="${groupAttr}"><td colspan="10" style="font-weight:600">
     <button class="btn btn-sm" onclick="toggleProfileGroup(${groupJs})">${arrow}</button>
     <input class="profile-group-select" type="checkbox" ${groupChecked?'checked':''} ${selectable.length?'':'disabled'} onchange="toggleProfileGroupSelection(${groupJs},this.checked)" aria-label="${attrEscape(t('Выбрать группу'))}">
     <span>${htmlEscape(groupLabel)}</span> <span class="badge badge-info">${items.length}</span> ${groupActions}
   </td></tr>`;
-  const announcement = sub?.announcement ? `<tr class="subscription-announcement-row" data-profile-row="${groupAttr}" style="display:${display}"><td colspan="14"><div class="subscription-announcement"><div class="subscription-announcement-icon">ⓘ</div><div><div class="subscription-announcement-label">${t('От автора подписки')}</div><div class="subscription-announcement-text">${htmlEscape(sub.announcement)}</div></div></div></td></tr>` : '';
+  const announcement = sub?.announcement ? `<tr class="subscription-announcement-row" data-profile-row="${groupAttr}" style="display:${display}"><td colspan="10"><div class="subscription-announcement"><div class="subscription-announcement-icon">ⓘ</div><div><div class="subscription-announcement-label">${t('От автора подписки')}</div><div class="subscription-announcement-text">${htmlEscape(sub.announcement)}</div></div></div></td></tr>` : '';
   return header + announcement + items.map(profile => renderProfileRow(profile, key, display)).join('');
 }
 
@@ -3758,13 +3775,9 @@ function renderProfileRow(p, groupKey, display) {
   return `<tr data-profile-row="${attrEscape(groupKey)}" class="${p.dead?'dead-server-row':''}" style="display:${display};${p.active?'background:var(--accent-soft)':''}">
     <td><span class="star ${p.favorite?'on':''}" onclick="toggleFav(${p.id})" title="${t('Избранное')}">★</span></td>
     <td data-profile-metric="id" class="mono" style="${profileMetricStyle('id')};color:var(--muted)">${p.id}</td>
-    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><div class="profile-name">${htmlEscape(p.name)}</div>${provenance}${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions"><input class="profile-select" type="checkbox" data-server-ref="${attrEscape(p.server_ref || '')}" ${selectedServerRefs.has(p.server_ref)?'checked':''} ${disabled?'disabled':''} onchange="toggleServerSelection(this.dataset.serverRef,this.checked)" aria-label="${attrEscape(t('Выбрать сервер'))}">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="${t('Тест сервера')}">⚡</button><button class="btn-icon btn-sm" onclick="editProfileName(${p.id})" title="${t('Переименовать')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
+    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><div class="profile-name">${htmlEscape(p.name)}</div>${provenance}${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions"><input class="profile-select" type="checkbox" data-server-ref="${attrEscape(p.server_ref || '')}" ${selectedServerRefs.has(p.server_ref)?'checked':''} ${disabled?'disabled':''} onchange="toggleServerSelection(this.dataset.serverRef,this.checked)" aria-label="${attrEscape(t('Выбрать сервер'))}">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="Quick Test">⚡</button><button class="btn-icon btn-sm" onclick="editProfileName(${p.id})" title="${t('Переименовать')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
     <td data-profile-metric="protocol" data-label="${attrEscape(t('Протокол'))}" style="${profileMetricStyle('protocol')}"><span class="badge badge-info" style="font-size:10px">${htmlEscape(p.protocol)}</span></td>
     <td data-profile-metric="latency" data-label="${attrEscape(t('Задержка'))}" class="mono" style="${profileMetricStyle('latency')}">${p.last_latency_ms != null ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
-    <td data-profile-metric="download" data-label="${attrEscape(t('Скорость'))}" class="mono" style="${profileMetricStyle('download')}">${p.last_download_mbps != null ? p.last_download_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
-    <td data-profile-metric="upload" data-label="${attrEscape(t('Отдача'))}" class="mono" style="${profileMetricStyle('upload')}">${p.last_upload_mbps != null ? p.last_upload_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
-    <td data-profile-metric="ewma" data-label="${attrEscape(t('История'))}" class="mono" style="${profileMetricStyle('ewma')};font-size:11px;line-height:1.35">${p.ewma_latency_ms != null ? p.ewma_latency_ms.toFixed(0)+'ms' : '—'}<br><span style="color:var(--muted)">${p.ewma_download_mbps != null ? p.ewma_download_mbps.toFixed(1)+'Mb' : '—'}</span></td>
-    <td data-profile-metric="jitter" data-label="${attrEscape(t('Джиттер'))}" class="mono" style="${profileMetricStyle('jitter')}">${p.last_jitter_ms ?? '—'}</td>
     <td data-profile-metric="loss" data-label="${attrEscape(t('Потери'))}" class="mono" style="${profileMetricStyle('loss')}">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
     <td data-profile-metric="errors" data-label="${attrEscape(t('Ошибки'))}" class="mono" style="${profileMetricStyle('errors')};color:${(p.consecutive_failures ?? p.failure_count ?? 0)>3?'var(--danger)':'var(--fg)'}">${p.consecutive_failures ?? p.failure_count ?? 0}</td>
     <td data-profile-metric="cooldown" data-label="Cooldown" class="mono" style="${profileMetricStyle('cooldown')};font-size:11px">${p.cooldown_until_unix ? formatTime(p.cooldown_until_unix) : '—'}</td>
@@ -3813,20 +3826,16 @@ function renderFavorites(data) {
   if (!body) return;
   const favorites = applyProfileSort(data.filter(p => p.favorite));
   if (!favorites.length) {
-    body.innerHTML = `<tr><td colspan="14" style="color:var(--muted);text-align:center;padding:12px">${t('Нет избранных профилей')}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="10" style="color:var(--muted);text-align:center;padding:12px">${t('Нет избранных профилей')}</td></tr>`;
     applyProfileMetricVisibility();
     return;
   }
   body.innerHTML = favorites.map(p => `<tr style="${p.active?'background:var(--accent-soft)':''}">
     <td><span class="star on" onclick="toggleFav(${p.id})" title="${t('Избранное')}">★</span></td>
     <td data-profile-metric="id" class="mono" style="${profileMetricStyle('id')};color:var(--muted)">${p.id}</td>
-    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><div class="profile-name">${htmlEscape(p.name)}</div>${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="${t('Тест сервера')}">⚡</button><button class="btn-icon btn-sm" onclick="editProfileName(${p.id})" title="${t('Переименовать')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
+    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><div class="profile-name">${htmlEscape(p.name)}</div>${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="Quick Test">⚡</button><button class="btn-icon btn-sm" onclick="editProfileName(${p.id})" title="${t('Переименовать')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
     <td data-profile-metric="protocol" style="${profileMetricStyle('protocol')}"><span class="badge badge-info" style="font-size:10px">${htmlEscape(p.protocol)}</span></td>
     <td data-profile-metric="latency" class="mono" style="${profileMetricStyle('latency')}">${p.last_latency_ms != null ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
-    <td data-profile-metric="download" class="mono" style="${profileMetricStyle('download')}">${p.last_download_mbps != null ? p.last_download_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
-    <td data-profile-metric="upload" class="mono" style="${profileMetricStyle('upload')}">${p.last_upload_mbps != null ? p.last_upload_mbps.toFixed(1)+'<span style="font-size:9px;color:var(--muted);margin-left:2px">Mb</span>' : '—'}</td>
-    <td data-profile-metric="ewma" class="mono" style="${profileMetricStyle('ewma')};font-size:11px;line-height:1.35">${p.ewma_latency_ms != null ? p.ewma_latency_ms.toFixed(0)+'ms' : '—'}<br><span style="color:var(--muted)">${p.ewma_download_mbps != null ? p.ewma_download_mbps.toFixed(1)+'Mb' : '—'}</span></td>
-    <td data-profile-metric="jitter" class="mono" style="${profileMetricStyle('jitter')}">${p.last_jitter_ms ?? '—'}</td>
     <td data-profile-metric="loss" class="mono" style="${profileMetricStyle('loss')}">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
     <td data-profile-metric="errors" class="mono" style="${profileMetricStyle('errors')};color:${(p.consecutive_failures ?? p.failure_count ?? 0)>3?'var(--danger)':'var(--fg)'}">${p.consecutive_failures ?? p.failure_count ?? 0}</td>
     <td data-profile-metric="cooldown" class="mono" style="${profileMetricStyle('cooldown')};font-size:11px">${p.cooldown_until_unix ? formatTime(p.cooldown_until_unix) : '—'}</td>
@@ -3840,6 +3849,9 @@ function sortProfiles(mode) {
   const map = { 'latency': 4, 'name': 2 };
   if (mode === 'import') {
     profileSortState = { key: null, dir: 'asc' };
+    renderProfiles(MOCK.profiles);
+  } else if (mode === 'results') {
+    profileSortState = { key:'results', dir:'desc' };
     renderProfiles(MOCK.profiles);
   } else if (map[mode] != null) {
     sortByColumn(map[mode]);
@@ -5391,7 +5403,7 @@ function updateBenchStatus(data) {
   const kittEl = document.getElementById('benchKitt');
   const stopEl = document.getElementById('benchStop');
   if (progressEl) progressEl.style.display = running || done ? 'block' : 'none';
-  setKittRunning(running && (data.method === 'quick' || data.quick === true));
+  setKittRunning(running && (data.method === 'quick' || data.method === 'full' || data.quick === true));
   if (stopEl) stopEl.style.display = running ? 'inline-flex' : 'none';
   const barEl = document.getElementById('benchBar');
   if (barEl) barEl.style.width = pct + '%';
@@ -5445,28 +5457,29 @@ function mergeBenchResultsIntoProfiles(results) {
       p.last_error = r.download_error || r.upload_error || null;
     }
     if (Array.isArray(r.resource_tests) && r.resource_tests.length) p.resource_tests = r.resource_tests;
+    if (r.method === 'quick' || r.method === 'full') p.last_service_test_success = r.success === true;
     changed = true;
   }
   if (changed) renderProfiles(MOCK.profiles);
 }
 function pollBenchStatus() { api('GET','/api/bench/status').then(updateBenchStatus).catch(()=>{}); }
 
-/// Read which metrics are enabled in the test settings panel.
-/// Controls which fields get updated when merging bench results.
-function metricToggles() {
-  return {
-    latency: document.getElementById('metricLatency')?.checked ?? true,
-    download: document.getElementById('metricDownload')?.checked ?? true,
-    upload: document.getElementById('metricUpload')?.checked ?? false,
-    ewma: document.getElementById('metricEwma')?.checked ?? true,
-    jitter: document.getElementById('metricJitter')?.checked ?? true,
-  };
+function benchConcurrency() {
+  const value = Number(document.getElementById('benchConcurrency')?.value || localStorage.getItem('hr_bench_concurrency') || 1);
+  return Math.min(6, Math.max(1, Number.isInteger(value) ? value : 1));
+}
+function saveBenchConcurrency(value) {
+  try { localStorage.setItem('hr_bench_concurrency', String(Math.min(6, Math.max(1, Number(value) || 1)))); } catch (_) {}
+}
+function initBenchConcurrency() {
+  const input = document.getElementById('benchConcurrency');
+  if (input) input.value = String(benchConcurrency());
 }
 
 /// Benchmark a single profile by id. Uses the method/probe/download settings
 /// from the test settings panel (falls back to defaults if not present).
 function benchOne(id) {
-  startBenchWithIds([id]);
+  startBenchWithIds([id], 'quick');
 }
 
 function quickBenchSelected() {
@@ -5478,27 +5491,28 @@ function quickBenchSelected() {
 /// Benchmark all profiles in a group/subscription.
 function benchGroup(ids) {
   if (!ids || !ids.length) return;
-  startBenchWithIds(ids);
+  startBenchWithIds(ids, 'quick');
 }
 
 function benchSubscription(subscriptionUrl) {
   if (!subscriptionUrl) return;
-  startBenchScope({subscription_url:subscriptionUrl}, true);
+  startBenchScope({subscription_url:subscriptionUrl, method:'quick'}, true);
 }
 
-function startBenchWithIds(ids) {
-  startBenchScope({profile_ids:ids}, ids.length > 1);
+function fullBenchAll() {
+  startBenchScope({method:'full'}, true);
+}
+
+function startBenchWithIds(ids, method) {
+  startBenchScope({profile_ids:ids, method:method || 'quick'}, ids.length > 1);
 }
 
 function startBenchScope(scope, isGroup) {
-  const tog = metricToggles();
   const body = Object.assign({
-    method: document.getElementById('benchMethod')?.value || 'tcp',
-    probe_url: document.getElementById('benchProbe')?.value || '',
-    download_url: document.getElementById('benchDL')?.value || '',
-    upload_url: document.getElementById('benchUL')?.value || '',
-    test_download: tog.download,
-    test_upload: tog.upload,
+    method: 'quick',
+    concurrency: benchConcurrency(),
+    test_download: false,
+    test_upload: false,
   }, scope);
   // Track whether this is a group test (for summary bar visibility).
   window.benchIsGroup = isGroup;
@@ -6229,9 +6243,7 @@ const TOOLTIPS = {
   'sHttp': 'Адрес HTTP прокси-сервера Mihomo',
   'sVersion': 'Текущая версия бинарника Mihomo',
   // Benchmark
-  'benchMethod': 'Метод тестирования: TCP ping — быстро, HTTP HEAD — проверка прокси, HTTP GET — точный throughput',
-  'benchProbe': 'URL для health-check запросов через прокси',
-  'benchDL': 'URL файла для скачивания при measurement скорости',
+  'benchConcurrency': 'Сколько серверов проверять одновременно: от 1 до 6',
   // Split Routing
   'splitEnabled': 'Включить прозрачное проксирование для WiFi-сегмента HincyRay-VPN (192.168.2.0/24). Трафик этого сегмента автоматически направляется через Mihomo без настройки клиентов',
   'rAutoSwitch': 'Автоматически переключаться на следующий лучший профиль при 3 подряд проваленных health-check',
@@ -6380,6 +6392,7 @@ function normalizeProfiles(statsData, profilesData) {
         last_loss_percent: st.last_loss_percent ?? null,
         success_count: st.success_count || 0,
         failure_count: st.failure_count || 0,
+        last_service_test_success: st.last_service_test_success ?? null,
         ewma_latency_ms: st.ewma_latency_ms ?? null,
         ewma_download_mbps: st.ewma_download_mbps ?? null,
         consecutive_failures: st.consecutive_failures || 0,
@@ -7168,6 +7181,7 @@ function purgeGoneTrash() {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
+  initBenchConcurrency();
   // Init weekday chips click handlers.
   initDbWeekdayChips();
   // Lazy-load data when user navigates to deep-bench or trash.

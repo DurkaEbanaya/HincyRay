@@ -11,12 +11,13 @@
 //! YouTube Innertube flow, an authorized Telegram session, and an ipregion-style
 //! Google region lookup for AI Studio availability through each tested profile.
 
+use std::collections::VecDeque;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -51,6 +52,7 @@ const YOUTUBE_VR_USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1
 const YOUTUBE_SIGNATURE_TIMESTAMP: u64 = 20653;
 const YOUTUBE_PAGE_MAX_BYTES: u64 = 3 * 1024 * 1024;
 const YOUTUBE_SEGMENT_BYTES: u64 = 512 * 1024;
+const YOUTUBE_CONNECT_TIMEOUT_SECS: u64 = 10;
 const AI_STUDIO_URL: &str = "https://aistudio.google.com/prompts/new_chat";
 const AI_STUDIO_UNAVAILABLE_URL: &str = "https://ai.google.dev/gemini-api/docs/available-regions";
 const AI_STUDIO_SIGN_IN_URL: &str = "https://accounts.google.com/";
@@ -79,6 +81,7 @@ pub enum BenchMethod {
     Head,
     Get,
     Quick,
+    Full,
 }
 
 impl BenchMethod {
@@ -88,6 +91,7 @@ impl BenchMethod {
             "head" => Some(Self::Head),
             "get" => Some(Self::Get),
             "quick" => Some(Self::Quick),
+            "full" => Some(Self::Full),
             _ => None,
         }
     }
@@ -98,6 +102,7 @@ impl BenchMethod {
             Self::Head => "head",
             Self::Get => "get",
             Self::Quick => "quick",
+            Self::Full => "full",
         }
     }
 }
@@ -180,9 +185,10 @@ pub fn run_bench(
     quick_probe: Option<QuickProbeConfig>,
     test_download: bool,
     test_upload: bool,
+    concurrency: usize,
     job: SharedJob,
     cancel: Arc<AtomicBool>,
-    on_result: Box<dyn Fn(BenchResult) + Send + 'static>,
+    on_result: Box<dyn Fn(BenchResult) + Send + Sync + 'static>,
 ) -> thread::JoinHandle<()> {
     {
         let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -196,37 +202,65 @@ pub fn run_bench(
     }
 
     thread::spawn(move || {
-        for profile in &profiles {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            {
-                let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-                state.current_profile_id = Some(profile.id);
-                state.current_profile_name = Some(profile.name.clone());
-                state.last_updated = unix_now();
-            }
+        let queue = Arc::new(Mutex::new(VecDeque::from(profiles)));
+        let on_result: Arc<dyn Fn(BenchResult) + Send + Sync> = Arc::from(on_result);
+        let worker_count = concurrency.clamp(1, 6).min(
+            queue
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .len()
+                .max(1),
+        );
 
-            let result = benchmark_profile(
-                profile,
-                method,
-                &probe_url,
-                &download_url,
-                &upload_url,
-                &core_path,
-                quick_probe.as_ref(),
-                test_download,
-                test_upload,
-            );
+        thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let queue = Arc::clone(&queue);
+                let job = Arc::clone(&job);
+                let cancel = Arc::clone(&cancel);
+                let on_result = Arc::clone(&on_result);
+                let quick_probe = quick_probe.clone();
+                let probe_url = &probe_url;
+                let download_url = &download_url;
+                let upload_url = &upload_url;
+                let core_path = &core_path;
+                scope.spawn(move || {
+                    loop {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let profile = queue
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .pop_front();
+                        let Some(profile) = profile else { break };
+                        {
+                            let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
+                            state.current_profile_id = Some(profile.id);
+                            state.current_profile_name = Some(profile.name.clone());
+                            state.last_updated = unix_now();
+                        }
 
-            on_result(result.clone());
-            {
-                let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-                state.results.push(result);
-                state.completed += 1;
-                state.last_updated = unix_now();
+                        let result = benchmark_profile(
+                            &profile,
+                            method,
+                            probe_url,
+                            download_url,
+                            upload_url,
+                            core_path,
+                            quick_probe.as_ref(),
+                            test_download,
+                            test_upload,
+                        );
+
+                        on_result(result.clone());
+                        let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
+                        state.results.push(result);
+                        state.completed += 1;
+                        state.last_updated = unix_now();
+                    }
+                });
             }
-        }
+        });
 
         {
             let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -273,11 +307,13 @@ fn benchmark_profile(
     let mut resource_tests = Vec::new();
     let latency_outcome = match method {
         BenchMethod::Tcp => run_tcp(profile),
-        BenchMethod::Quick => {
-            run_quick_resources(profile, core_path, quick_probe).map(|(metrics, tests)| {
-                resource_tests = tests;
-                metrics
-            })
+        BenchMethod::Quick | BenchMethod::Full => {
+            run_service_resources(profile, method, probe_url, core_path, quick_probe).map(
+                |(metrics, tests)| {
+                    resource_tests = tests;
+                    metrics
+                },
+            )
         }
         BenchMethod::Head | BenchMethod::Get => {
             run_via_temp_mihomo(profile, method, probe_url, core_path)
@@ -287,7 +323,8 @@ fn benchmark_profile(
     // Step 2: Speed metrics are independent of the selected latency method.
     // Always execute every requested speed stage through a temporary Mihomo
     // instance; GET must not silently skip upload or bypass request flags.
-    let need_speed = method != BenchMethod::Quick && (test_download || test_upload);
+    let need_speed =
+        !matches!(method, BenchMethod::Quick | BenchMethod::Full) && (test_download || test_upload);
 
     let speed_metrics = if need_speed {
         run_speed_via_mihomo(
@@ -316,12 +353,7 @@ fn benchmark_profile(
                 .as_ref()
                 .and_then(|result| result.as_ref().ok())
                 .copied();
-            let resource_error = resource_tests
-                .iter()
-                .filter(|test| !test.stable)
-                .map(|test| format!("{} {}/{}", test.name, test.successes, test.attempts))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let resource_error = service_resource_error(&resource_tests);
             let resources_passed = resource_error.is_empty();
             BenchResult {
                 latency_ms: metrics.latency_ms,
@@ -339,8 +371,8 @@ fn benchmark_profile(
             }
         }
         Err(error) => {
-            let resource_tests = if method == BenchMethod::Quick {
-                unavailable_quick_resource_results(&error)
+            let resource_tests = if matches!(method, BenchMethod::Quick | BenchMethod::Full) {
+                unavailable_service_resource_results(&error)
             } else {
                 Vec::new()
             };
@@ -368,8 +400,11 @@ fn benchmark_profile(
     }
 }
 
-fn unavailable_quick_resource_results(error: &str) -> Vec<ResourceTestResult> {
+fn unavailable_service_resource_results(error: &str) -> Vec<ResourceTestResult> {
     [
+        ("ping_icmp", "ICMP ping", 1),
+        ("ping_tcp", "TCP ping", 1),
+        ("ping_proxy", "Proxy HTTPS ping", 1),
         ("youtube", "YouTube", 1),
         ("telegram", "Telegram", 1),
         ("ai", "AI Studio", 1),
@@ -452,45 +487,256 @@ fn run_tcp(profile: &Profile) -> Result<Metrics, String> {
     })
 }
 
-fn run_quick_resources(
+fn run_service_resources(
     profile: &Profile,
+    method: BenchMethod,
+    probe_url: &str,
     mihomo_path: &str,
     quick_probe: Option<&QuickProbeConfig>,
 ) -> Result<(Metrics, Vec<ResourceTestResult>), String> {
-    let (port, _guard) = spawn_bench_mihomo_with_path(profile, mihomo_path)?;
-    let quick_probe =
-        quick_probe.ok_or_else(|| "Quick Test service probes are not configured".to_owned())?;
-    let tests = vec![
-        run_youtube_playback_probe(port),
-        run_telegram_media_probe(port, quick_probe),
-        run_ai_studio_probe(port),
-    ];
+    let mut tests = vec![run_icmp_ping_probe(profile), run_tcp_ping_probe(profile)];
+    let runtime = spawn_bench_mihomo_with_path(profile, mihomo_path);
+    match runtime.as_ref() {
+        Ok((port, _guard)) => tests.push(run_proxy_ping_probe(*port, probe_url)),
+        Err(error) => tests.push(failed_resource_result(
+            "ping_proxy",
+            "Proxy HTTPS ping",
+            error,
+        )),
+    };
+    let ping_passed = tests.iter().any(|test| test.reachable);
+    if method == BenchMethod::Quick && !ping_passed {
+        tests.extend(skipped_service_results("skipped after ping gate failed"));
+    } else if let Ok((port, _guard)) = runtime.as_ref() {
+        let youtube = run_youtube_playback_probe(*port);
+        let youtube_passed = youtube.stable;
+        tests.push(youtube);
+        if method == BenchMethod::Quick && !youtube_passed {
+            tests.extend(skipped_service_results_from(
+                "telegram",
+                "skipped after YouTube failed",
+            ));
+        } else {
+            let telegram = run_telegram_media_probe(*port, quick_probe);
+            let telegram_passed = telegram.stable;
+            tests.push(telegram);
+            if method == BenchMethod::Quick && !telegram_passed {
+                tests.extend(skipped_service_results_from(
+                    "ai",
+                    "skipped after Telegram failed",
+                ));
+            } else {
+                tests.push(run_ai_studio_probe(*port));
+            }
+        }
+    } else {
+        let error = runtime.as_ref().err().expect("failed Mihomo runtime");
+        if method == BenchMethod::Quick {
+            tests.push(failed_resource_result("youtube", "YouTube", error));
+            tests.extend(skipped_service_results_from(
+                "telegram",
+                "skipped after YouTube proxy setup failed",
+            ));
+        } else {
+            tests.extend(unavailable_proxy_service_results(error));
+        }
+    }
+
+    Ok((ping_metrics(&tests), tests))
+}
+
+fn ping_metrics(tests: &[ResourceTestResult]) -> Metrics {
     let samples = tests
         .iter()
-        .flat_map(|test| [test.avg_ttfb_ms, test.max_ttfb_ms])
+        .filter(|test| test.id.starts_with("ping_"))
+        .map(|test| test.avg_ttfb_ms)
         .filter(|sample| *sample > 0)
         .map(|sample| Duration::from_millis(u64::from(sample)))
         .collect::<Vec<_>>();
-    let attempts = tests.iter().map(|test| test.attempts).sum::<u32>();
+    let attempts = tests
+        .iter()
+        .filter(|test| test.id.starts_with("ping_"))
+        .map(|test| test.attempts)
+        .sum::<u32>();
     let failures = tests
         .iter()
+        .filter(|test| test.id.starts_with("ping_"))
         .map(|test| test.attempts.saturating_sub(test.successes))
         .sum::<u32>();
-    Ok((
-        Metrics {
-            latency_ms: average_ms(&samples),
-            jitter_ms: jitter_ms(&samples),
-            loss_percent: if attempts == 0 {
-                100.0
-            } else {
-                failures as f32 * 100.0 / attempts as f32
-            },
+    Metrics {
+        latency_ms: average_ms(&samples),
+        jitter_ms: jitter_ms(&samples),
+        loss_percent: if attempts == 0 {
+            100.0
+        } else {
+            failures as f32 * 100.0 / attempts as f32
         },
-        tests,
-    ))
+    }
+}
+
+fn run_icmp_ping_probe(profile: &Profile) -> ResourceTestResult {
+    if profile.address.trim().is_empty() {
+        return failed_resource_result("ping_icmp", "ICMP ping", "profile has empty address");
+    }
+    let started = Instant::now();
+    let output = Command::new("ping")
+        .args(["-c", "1", "-W", "2", profile.address.as_str()])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            successful_resource_result("ping_icmp", "ICMP ping", started.elapsed())
+        }
+        Ok(output) => failed_resource_result(
+            "ping_icmp",
+            "ICMP ping",
+            &format!("ping failed: {}", bounded_process_error(&output.stderr)),
+        ),
+        Err(error) => {
+            failed_resource_result("ping_icmp", "ICMP ping", &format!("ping spawn: {error}"))
+        }
+    }
+}
+
+fn run_tcp_ping_probe(profile: &Profile) -> ResourceTestResult {
+    let port = profile.port.unwrap_or(443);
+    let (latencies, failures) = tcp_probe(&profile.address, port, 1);
+    match latencies.first() {
+        Some(latency) => successful_resource_result("ping_tcp", "TCP ping", *latency),
+        None => failed_resource_result(
+            "ping_tcp",
+            "TCP ping",
+            &format!("tcp connect {}:{port} failed {failures}/1", profile.address),
+        ),
+    }
+}
+
+fn run_proxy_ping_probe(port: u16, probe_url: &str) -> ResourceTestResult {
+    match curl_probe(port, probe_url, BenchMethod::Head) {
+        Ok(latency) => successful_resource_result("ping_proxy", "Proxy HTTPS ping", latency),
+        Err(error) => failed_resource_result("ping_proxy", "Proxy HTTPS ping", &error),
+    }
+}
+
+fn successful_resource_result(id: &str, name: &str, latency: Duration) -> ResourceTestResult {
+    let latency_ms = latency.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+    ResourceTestResult {
+        contract_version: QUICK_RESOURCE_CONTRACT_VERSION,
+        id: id.to_owned(),
+        name: name.to_owned(),
+        attempts: 1,
+        successes: 1,
+        reachable: true,
+        stable: true,
+        avg_ttfb_ms: latency_ms,
+        max_ttfb_ms: latency_ms,
+        avg_download_kbps: 0.0,
+        error: None,
+    }
+}
+
+fn failed_resource_result(id: &str, name: &str, error: &str) -> ResourceTestResult {
+    ResourceTestResult {
+        contract_version: QUICK_RESOURCE_CONTRACT_VERSION,
+        id: id.to_owned(),
+        name: name.to_owned(),
+        attempts: 1,
+        successes: 0,
+        reachable: false,
+        stable: false,
+        avg_ttfb_ms: 0,
+        max_ttfb_ms: 0,
+        avg_download_kbps: 0.0,
+        error: Some(error.to_owned()),
+    }
+}
+
+fn skipped_resource_result(id: &str, name: &str, error: &str) -> ResourceTestResult {
+    ResourceTestResult {
+        attempts: 0,
+        ..failed_resource_result(id, name, error)
+    }
+}
+
+fn skipped_service_results(error: &str) -> Vec<ResourceTestResult> {
+    [
+        ("youtube", "YouTube"),
+        ("telegram", "Telegram"),
+        ("ai", "AI Studio"),
+    ]
+    .into_iter()
+    .map(|(id, name)| skipped_resource_result(id, name, error))
+    .collect()
+}
+
+fn skipped_service_results_from(id: &str, error: &str) -> Vec<ResourceTestResult> {
+    let start = match id {
+        "telegram" => 1,
+        "ai" => 2,
+        _ => 0,
+    };
+    skipped_service_results(error)
+        .into_iter()
+        .skip(start)
+        .collect()
+}
+
+fn unavailable_proxy_service_results(error: &str) -> Vec<ResourceTestResult> {
+    [
+        ("youtube", "YouTube"),
+        ("telegram", "Telegram"),
+        ("ai", "AI Studio"),
+    ]
+    .into_iter()
+    .map(|(id, name)| failed_resource_result(id, name, error))
+    .collect()
+}
+
+fn service_resource_error(tests: &[ResourceTestResult]) -> String {
+    if tests.is_empty() {
+        return String::new();
+    }
+    let ping_passed = tests
+        .iter()
+        .filter(|test| test.id.starts_with("ping_"))
+        .any(|test| test.reachable);
+    let mut failures = Vec::new();
+    if !ping_passed {
+        let errors = tests
+            .iter()
+            .filter(|test| test.id.starts_with("ping_"))
+            .filter_map(|test| test.error.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        failures.push(format!("Ping failed: {errors}"));
+    }
+    failures.extend(
+        tests
+            .iter()
+            .filter(|test| !test.id.starts_with("ping_") && !test.stable)
+            .map(|test| {
+                format!(
+                    "{} {}/{}{}",
+                    test.name,
+                    test.successes,
+                    test.attempts,
+                    test.error
+                        .as_deref()
+                        .map_or_else(String::new, |error| format!(": {error}"))
+                )
+            }),
+    );
+    failures.join(", ")
 }
 
 fn run_youtube_playback_probe(port: u16) -> ResourceTestResult {
+    // Concurrent anonymous Innertube bootstraps from one router IP trigger
+    // throttling and TLS resets. Keep the user-selected profile concurrency,
+    // but serialize this narrow external-service boundary.
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let mut successes = Vec::new();
     let mut errors = Vec::new();
     for _ in 0..1 {
@@ -502,21 +748,28 @@ fn run_youtube_playback_probe(port: u16) -> ResourceTestResult {
     aggregate_quick_resource_probe("youtube", "YouTube", 1, &successes, &errors)
 }
 
-fn run_telegram_media_probe(port: u16, quick_probe: &QuickProbeConfig) -> ResourceTestResult {
+fn run_telegram_media_probe(
+    port: u16,
+    quick_probe: Option<&QuickProbeConfig>,
+) -> ResourceTestResult {
     let mut successes = Vec::new();
     let mut errors = Vec::new();
     let result = quick_probe
-        .telegram
-        .as_ref()
         .ok_or_else(|| "Telegram probe is not configured".to_owned())
-        .and_then(|config| {
-            probe_media(Path::new(&quick_probe.telegram_session_path), config, port).map(|result| {
-                QuickResourceAttempt {
-                    ttfb_ms: result.elapsed_ms,
-                    total_ms: result.elapsed_ms.max(1),
-                    bytes: result.bytes,
-                }
-            })
+        .and_then(|quick_probe| {
+            quick_probe
+                .telegram
+                .as_ref()
+                .ok_or_else(|| "Telegram probe is not configured".to_owned())
+                .and_then(|config| {
+                    probe_media(Path::new(&quick_probe.telegram_session_path), config, port).map(
+                        |result| QuickResourceAttempt {
+                            ttfb_ms: result.elapsed_ms,
+                            total_ms: result.elapsed_ms.max(1),
+                            bytes: result.bytes,
+                        },
+                    )
+                })
         });
     match result {
         Ok(attempt) => successes.push(attempt),
@@ -701,7 +954,7 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
         .arg(format!("127.0.0.1:{port}"))
         .arg("-L")
         .arg("--connect-timeout")
-        .arg("5")
+        .arg(YOUTUBE_CONNECT_TIMEOUT_SECS.to_string())
         .arg("--max-time")
         .arg("20")
         .arg("--max-filesize")
@@ -762,7 +1015,7 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
         .arg("--socks5-hostname")
         .arg(format!("127.0.0.1:{port}"))
         .arg("--connect-timeout")
-        .arg("5")
+        .arg(YOUTUBE_CONNECT_TIMEOUT_SECS.to_string())
         .arg("--max-time")
         .arg("20")
         .arg("--silent")
@@ -818,7 +1071,7 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
     }
     let media_url = youtube_direct_media_url(&player)
         .ok_or_else(|| "YouTube player returned no direct video format".to_owned())?;
-    curl_youtube_range(port, media_url)
+    curl_youtube_range(port, media_url, cookie_file.path())
 }
 
 fn embedded_json_string(source: &str, key: &str) -> Option<String> {
@@ -859,7 +1112,11 @@ fn youtube_direct_media_url(player: &serde_json::Value) -> Option<&str> {
         })
 }
 
-fn curl_youtube_range(port: u16, media_url: &str) -> Result<QuickResourceAttempt, String> {
+fn curl_youtube_range(
+    port: u16,
+    media_url: &str,
+    cookie_file: &Path,
+) -> Result<QuickResourceAttempt, String> {
     let output_file =
         NamedTempFile::new().map_err(|error| format!("temp YouTube media: {error}"))?;
     let output = Command::new("curl")
@@ -867,7 +1124,7 @@ fn curl_youtube_range(port: u16, media_url: &str) -> Result<QuickResourceAttempt
         .arg(format!("127.0.0.1:{port}"))
         .arg("-L")
         .arg("--connect-timeout")
-        .arg("5")
+        .arg(YOUTUBE_CONNECT_TIMEOUT_SECS.to_string())
         .arg("--max-time")
         .arg("30")
         .arg("--range")
@@ -876,6 +1133,10 @@ fn curl_youtube_range(port: u16, media_url: &str) -> Result<QuickResourceAttempt
         .arg(YOUTUBE_SEGMENT_BYTES.to_string())
         .arg("--silent")
         .arg("--show-error")
+        .arg("--user-agent")
+        .arg(YOUTUBE_VR_USER_AGENT)
+        .arg("--cookie")
+        .arg(cookie_file)
         .arg("--output")
         .arg(output_file.path())
         .arg("--write-out")
@@ -1244,9 +1505,19 @@ fn spawn_mihomo_with_combined_log(
     Command::new(mihomo_path)
         .arg("-f")
         .arg(config_path)
+        .arg("-d")
+        .arg(benchmark_mihomo_home(config_path))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
+}
+
+fn benchmark_mihomo_home(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_owned()
 }
 
 fn combined_process_log_files(
@@ -1831,6 +2102,18 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_mihomo_home_uses_temp_config_directory() {
+        assert_eq!(
+            benchmark_mihomo_home(Path::new("/tmp/bench/config.yaml")),
+            Path::new("/tmp/bench")
+        );
+        assert_eq!(
+            benchmark_mihomo_home(Path::new("config.yaml")),
+            Path::new(".")
+        );
+    }
+
+    #[test]
     fn failover_verification_rejects_partial_protocol_availability() {
         let result = BenchResult {
             profile_id: 7,
@@ -1866,7 +2149,46 @@ mod tests {
         assert_eq!(BenchMethod::parse_method("Head"), Some(BenchMethod::Head));
         assert_eq!(BenchMethod::parse_method("get"), Some(BenchMethod::Get));
         assert_eq!(BenchMethod::parse_method("QUICK"), Some(BenchMethod::Quick));
+        assert_eq!(BenchMethod::parse_method("FULL"), Some(BenchMethod::Full));
         assert_eq!(BenchMethod::parse_method("quic"), None);
+    }
+
+    #[test]
+    fn youtube_connect_budget_exceeds_the_generic_probe_timeout() {
+        assert_eq!(YOUTUBE_CONNECT_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn service_result_requires_any_ping_and_all_service_checks() {
+        let mut tests = vec![
+            failed_resource_result("ping_icmp", "ICMP ping", "blocked"),
+            successful_resource_result("ping_tcp", "TCP ping", Duration::from_millis(20)),
+            failed_resource_result("ping_proxy", "Proxy HTTPS ping", "timeout"),
+        ];
+        for (id, name) in [
+            ("youtube", "YouTube"),
+            ("telegram", "Telegram"),
+            ("ai", "AI Studio"),
+        ] {
+            tests.push(successful_resource_result(
+                id,
+                name,
+                Duration::from_millis(30),
+            ));
+        }
+        assert!(service_resource_error(&tests).is_empty());
+
+        tests[4] = failed_resource_result("telegram", "Telegram", "timeout");
+        assert!(service_resource_error(&tests).contains("Telegram"));
+    }
+
+    #[test]
+    fn quick_skipped_checks_are_not_reported_as_attempted() {
+        let tests = skipped_service_results_from("telegram", "YouTube failed");
+        assert_eq!(tests.len(), 2);
+        assert!(tests.iter().all(|test| test.attempts == 0));
+        assert_eq!(tests[0].id, "telegram");
+        assert_eq!(tests[1].id, "ai");
     }
 
     #[test]
@@ -1905,8 +2227,20 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("Mihomo spawn"))
         );
-        assert_eq!(result.resource_tests.len(), 3);
-        assert!(result.resource_tests.iter().all(|test| !test.stable));
+        assert_eq!(result.resource_tests.len(), 6);
+        assert!(
+            result
+                .resource_tests
+                .iter()
+                .any(|test| test.id == "ping_proxy")
+        );
+        assert!(
+            result
+                .resource_tests
+                .iter()
+                .filter(|test| !test.id.starts_with("ping_"))
+                .all(|test| !test.stable)
+        );
     }
 
     #[test]
@@ -2169,6 +2503,7 @@ mod tests {
             None,
             false,
             false,
+            1,
             Arc::clone(&job),
             cancel,
             on_result,
@@ -2219,6 +2554,7 @@ mod tests {
             None,
             false,
             false,
+            1,
             Arc::clone(&job),
             Arc::new(AtomicBool::new(false)),
             Box::new(move |result| {

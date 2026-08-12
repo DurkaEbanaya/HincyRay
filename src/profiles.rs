@@ -371,7 +371,8 @@ pub fn load_subscription_detailed_via_proxy_with_hwid(
                 return Err(errors.join("; "));
             }
         };
-        let (decoded, parsed) = parse_subscription_response(&fetched.text);
+        let (decoded, mut parsed) = parse_subscription_response(&fetched.text);
+        parsed.profiles.retain(subscription_profile_is_usable);
         match require_subscription_profiles(
             source,
             fetched.response_bytes,
@@ -391,6 +392,18 @@ pub fn load_subscription_detailed_via_proxy_with_hwid(
         }
     }
     Err(errors.join("; "))
+}
+
+/// Providers sometimes return syntactically valid share links as client-
+/// compatibility sentinels. An unspecified IP can never be a remote proxy
+/// endpoint, so accepting it would suppress the Happ fallback and turn a valid
+/// subscription into a fake server such as `0.0.0.0:1`.
+fn subscription_profile_is_usable(profile: &Profile) -> bool {
+    profile
+        .address
+        .parse::<std::net::IpAddr>()
+        .map(|address| !address.is_unspecified())
+        .unwrap_or(true)
 }
 
 /// A successful HTTP exchange is not a successful subscription refresh unless
@@ -1502,6 +1515,55 @@ mod tests {
         worker.join().expect("subscription worker");
         assert_eq!(report.profiles.len(), 1);
         assert_eq!(report.profiles[0].name, "Happ");
+    }
+
+    #[test]
+    fn happ_mode_replaces_unusable_sing_box_sentinel() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local subscription listener");
+        let address = listener.local_addr().expect("listener address");
+        let worker = thread::spawn(move || {
+            let (mut sing_box, _) = listener.accept().expect("sing-box request");
+            read_http_request_head(&mut sing_box);
+            let sentinel =
+                "vless://11111111-1111-1111-1111-111111111111@0.0.0.0:1#Subscription%20expired";
+            let sentinel = base64::engine::general_purpose::STANDARD.encode(sentinel);
+            write!(
+                sing_box,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sentinel}",
+                sentinel.len()
+            )
+            .expect("sing-box sentinel response");
+
+            let (mut happ, _) = listener.accept().expect("Happ request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = happ.read(&mut chunk).expect("Happ request");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8(request).expect("Happ request");
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line.to_ascii_lowercase().starts_with("x-hwid:"))
+            );
+            let body = r#"[{"remarks":"Happ real server","outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"vpn.example.com","port":443,"users":[{"id":"22222222-2222-2222-2222-222222222222"}]}]},"streamSettings":{"network":"tcp","security":"tls"}}]}]"#;
+            write!(
+                happ,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("Happ response");
+        });
+        let source = SubscriptionSource {
+            url: format!("http://{address}/subscription"),
+        };
+
+        let report = load_subscription_detailed_via_proxy(&source, None).expect("Happ fallback");
+        worker.join().expect("subscription worker");
+        assert_eq!(report.profiles.len(), 1);
+        assert_eq!(report.profiles[0].name, "Happ real server");
+        assert_eq!(report.profiles[0].address, "vpn.example.com");
     }
 
     #[test]
