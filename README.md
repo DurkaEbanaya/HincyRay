@@ -1,4 +1,4 @@
-# HincyRay v1.2.0
+# HincyRay v1.2.1
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,10 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v1.2.1
+
+v1.2.1 makes the built-in Mihomo updater safe on memory-constrained Keenetic routers. Core releases are now decompressed directly into the staged file instead of being buffered in HincyRay memory, while the existing binary verification, backup, restart, and rollback flow remains intact. Subscription wrappers whose query value is another URL are also preserved as one source instead of being split at the nested scheme. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.2.1.md`](docs/releases/v1.2.1.md).
 
 ### v1.2.0
 
@@ -374,7 +378,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.2.0 release evidence is recorded in [`docs/releases/v1.2.0.md`](docs/releases/v1.2.0.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.2.1 release evidence is recorded in [`docs/releases/v1.2.1.md`](docs/releases/v1.2.1.md).
 
 ## Installation
 

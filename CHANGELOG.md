@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.1 - 2026-08-15
+
+- Fixed the built-in Mihomo updater exhausting router memory while decompressing a core release. `gunzip` now streams directly into the staged binary instead of buffering the complete decompressed executable in the HincyRay process.
+- Preserved updater verification, binary backup, core restart, and rollback behavior while cleaning partial staged output on decompression failures.
+- Fixed subscription wrappers with an unescaped URL query value, such as `https://provider.example/happlink?link=https://provider.example/sub/<token>`, being split into two invalid subscription candidates.
+
 ## v1.2.0 - 2026-08-12
 
 - Replaced the profile speed-test controls with explicit Quick and Full service diagnostics. Quick Test applies an any-of ICMP/direct-TCP/proxy-HTTPS ping gate and then checks YouTube, Telegram, and AI Studio in fail-fast order; Full Test records every stage independently.

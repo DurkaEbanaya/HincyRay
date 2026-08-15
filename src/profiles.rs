@@ -763,7 +763,7 @@ fn extract_candidates(input: &str) -> Vec<String> {
 }
 
 fn extract_line_candidates(line: &str) -> Vec<String> {
-    let starts: Vec<usize> = line
+    let raw_starts: Vec<usize> = line
         .match_indices("://")
         .filter_map(|(separator, _)| {
             let bytes = line.as_bytes();
@@ -777,6 +777,21 @@ fn extract_line_candidates(line: &str) -> Vec<String> {
             (start < separator).then_some(start)
         })
         .collect();
+    let mut starts = Vec::with_capacity(raw_starts.len());
+    for start in raw_starts {
+        let Some(current) = starts.last().copied() else {
+            starts.push(start);
+            continue;
+        };
+        let current_value = &line[current..start];
+        let nested_query_url = (current_value.starts_with("http://")
+            || current_value.starts_with("https://"))
+            && current_value.contains('?')
+            && line.as_bytes().get(start.wrapping_sub(1)) == Some(&b'=');
+        if !nested_query_url {
+            starts.push(start);
+        }
+    }
 
     starts
         .iter()
@@ -1587,6 +1602,35 @@ https://provider.example/sub/token-b}"#;
 
         let output = parse_input(input);
 
+        assert_eq!(output.subscriptions.len(), 2);
+        assert_eq!(
+            output.subscriptions[0].url,
+            "https://provider.example/sub/token-a"
+        );
+        assert_eq!(
+            output.subscriptions[1].url,
+            "https://provider.example/sub/token-b"
+        );
+    }
+
+    #[test]
+    fn preserves_nested_subscription_url_in_query_value() {
+        let wrapper = "https://provider.example/happlink?link=https://provider.example/sub/token";
+
+        let output = parse_input(wrapper);
+
+        assert_eq!(output.candidates, 1);
+        assert_eq!(output.subscriptions.len(), 1);
+        assert_eq!(output.subscriptions[0].url, wrapper);
+    }
+
+    #[test]
+    fn still_splits_separate_subscription_urls_on_one_line() {
+        let output = parse_input(
+            "https://provider.example/sub/token-a https://provider.example/sub/token-b",
+        );
+
+        assert_eq!(output.candidates, 2);
         assert_eq!(output.subscriptions.len(), 2);
         assert_eq!(
             output.subscriptions[0].url,

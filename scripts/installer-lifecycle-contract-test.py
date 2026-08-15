@@ -79,7 +79,7 @@ def main() -> None:
             'register_runtime_tree',
             'acquire_transaction_lock',
             'release_transaction_lock',
-            'VERSION="1.2.0"',
+            'VERSION="1.2.1"',
             'public_get() {',
             'releases/download/v${VERSION}/hincyray',
             'raw.githubusercontent.com/DurkaEbanaya/HincyRay/v${VERSION}/scripts/wifi-segment-setup.sh',

@@ -50,7 +50,7 @@ REQUIRED_MARKERS = [
     "/api/telegram-probe/request-code",
     "/api/telegram-probe/confirm",
     "/api/telegram-probe/delete",
-    "v1.2.0",
+    "v1.2.1",
     "/api/memory-guard",
     "/api/subscriptions/refresh-report",
     "/api/undo",

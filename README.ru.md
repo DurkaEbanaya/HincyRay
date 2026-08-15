@@ -1,4 +1,4 @@
-# HincyRay v1.2.0
+# HincyRay v1.2.1
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,10 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 Демон `ndm` в Keenetic пересоздаёт все iptables chains при изменениях конфигурации, событиях WAN и обновлении DHCP. HincyRay устанавливает hook-скрипт в `/opt/etc/ndm/netfilter.d/hincyray.sh`, который **ndm вызывает сам** после каждой перезагрузки firewall, переустанавливая все правила атомарно. Watchdog каждые 10 секунд — запасная страховка.
 
 ## Возможности
+
+### v1.2.1
+
+v1.2.1 делает встроенное обновление Mihomo безопасным для Keenetic с ограниченной памятью. Теперь релиз ядра распаковывается напрямую в staged-файл, а не буферизуется целиком в памяти HincyRay; существующие проверка бинарника, резервная копия, перезапуск и rollback сохранены. Обёртки подписок, у которых значением query-параметра является другой URL, теперь сохраняются как один источник, а не разрезаются на вложенной схеме. Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.2.1.md`](docs/releases/v1.2.1.md).
 
 ### v1.2.0
 
@@ -342,7 +346,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.2.0 зафиксированы в [`docs/releases/v1.2.0.md`](docs/releases/v1.2.0.md).
+Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.2.1 зафиксированы в [`docs/releases/v1.2.1.md`](docs/releases/v1.2.1.md).
 
 ## Установка
 

@@ -16884,6 +16884,22 @@ fn check_latest_mihomo_release(socks_port: u16) -> Result<MihomoRelease, String>
     })
 }
 
+fn gunzip_to_file(gzip_path: &Path, output_path: &Path) -> Result<(), String> {
+    let output_file =
+        fs::File::create(output_path).map_err(|e| format!("create decompressed binary: {e}"))?;
+    let output = Command::new("gunzip")
+        .arg("-c")
+        .arg(gzip_path)
+        .stdout(Stdio::from(output_file))
+        .output()
+        .map_err(|e| format!("gunzip spawn: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gunzip failed: {stderr}"));
+    }
+    Ok(())
+}
+
 /// Download, decompress, verify, back up, and replace the Mihomo
 /// binary. The caller is responsible for restarting the core after
 /// this function returns successfully.
@@ -16927,22 +16943,11 @@ fn download_and_install_mihomo(
     }
 
     // 2. Decompress
-    let gz_output = Command::new("gunzip")
-        .args(["-c", tmp_gz])
-        .output()
-        .map_err(|e| {
-            let _ = fs::remove_file(tmp_gz);
-            format!("gunzip spawn: {e}")
-        })?;
-    if !gz_output.status.success() {
+    if let Err(error) = gunzip_to_file(Path::new(tmp_gz), Path::new(tmp_bin)) {
         let _ = fs::remove_file(tmp_gz);
-        let stderr = String::from_utf8_lossy(&gz_output.stderr);
-        return Err(format!("gunzip failed: {stderr}"));
+        let _ = fs::remove_file(tmp_bin);
+        return Err(error);
     }
-    fs::write(tmp_bin, &gz_output.stdout).map_err(|e| {
-        let _ = fs::remove_file(tmp_gz);
-        format!("write decompressed binary: {e}")
-    })?;
 
     // 3. Make executable
     let _ = fs::remove_file(tmp_gz);
@@ -22699,6 +22704,23 @@ mod tests {
         // Different number of parts
         assert!(is_newer_version("v1.19", "v1.19.1"));
         assert!(!is_newer_version("v1.19.1", "v1.19"));
+    }
+
+    #[test]
+    fn gunzip_to_file_streams_decompressed_output() {
+        use flate2::{Compression, write::GzEncoder};
+
+        let dir = TempDir::new().expect("temp dir");
+        let gzip_path = dir.path().join("mihomo.gz");
+        let output_path = dir.path().join("mihomo");
+        let expected = vec![0x5a; 2 * 1024 * 1024];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&expected).expect("compress fixture");
+        fs::write(&gzip_path, encoder.finish().expect("finish gzip")).expect("write gzip");
+
+        gunzip_to_file(&gzip_path, &output_path).expect("stream gunzip");
+
+        assert_eq!(fs::read(output_path).expect("read output"), expected);
     }
 
     #[test]
