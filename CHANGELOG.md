@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.2 - 2026-08-16
+
+- Restored the benchmark concurrency control as a native accessible selector with the supported 1–6 range instead of a custom menu clipped by its settings panel.
+- Made Quick and Full Test run the same serialized YouTube playback probe whenever the temporary Mihomo runtime starts; unrelated ping failures no longer fabricate a skipped YouTube result.
+- Added one bounded retry for transient DNS/connect/TLS/reset/timeout and HTTP `408`/`425`/`429`/`5xx` failures, explicit bounded HTTP-status validation for bootstrap/player responses, and a 2 MiB player-response limit.
+- Made YouTube media verification try up to three distinct direct video formats, including a progressive fallback. This avoids false `403` results observed live for `itag 160` while other formats delivered the requested media range through the same profile.
+- After a successful active-profile transaction, close existing Mihomo connections so manual and automatic server switches force applications to reconnect through the newly selected upstream instead of retaining the old exit IP.
+
 ## v1.2.1 - 2026-08-15
 
 - Fixed the built-in Mihomo updater exhausting router memory while decompressing a core release. `gunzip` now streams directly into the staged binary instead of buffering the complete decompressed executable in the HincyRay process.

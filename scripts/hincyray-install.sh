@@ -27,7 +27,7 @@
 
 set -eu
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 GITHUB="https://github.com/DurkaEbanaya/HincyRay"
 ENTWARE="${HINCYRAY_ENTWARE:-/opt}"
 HINCYRAY_DIR="${ENTWARE}/etc/hincyray"

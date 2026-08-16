@@ -1,4 +1,4 @@
-# HincyRay v1.2.1
+# HincyRay v1.2.2
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,12 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 Демон `ndm` в Keenetic пересоздаёт все iptables chains при изменениях конфигурации, событиях WAN и обновлении DHCP. HincyRay устанавливает hook-скрипт в `/opt/etc/ndm/netfilter.d/hincyray.sh`, который **ndm вызывает сам** после каждой перезагрузки firewall, переустанавливая все правила атомарно. Watchdog каждые 10 секунд — запасная страховка.
 
 ## Возможности
+
+### v1.2.2
+
+v1.2.2 приводит YouTube-диагностику Quick и Full Test к одной bounded-политике воспроизведения, один раз повторяет временные сетевые сбои и пробует несколько прямых media formats, чтобы не считать сервер нерабочим из-за проблемного low-resolution CDN URL. Quick Test теперь действительно запускает YouTube-проверку при успешном старте временного Mihomo, а не выводит результат YouTube из несвязанных ping-диагностик.
+
+Поле параллелизма снова является нативным доступным селектором 1–6. После успешной смены активного профиля HincyRay закрывает существующие соединения Mihomo, поэтому приложения переподключаются через новый сервер и не сохраняют прежний выходной IP. Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.2.2.md`](docs/releases/v1.2.2.md).
 
 ### v1.2.1
 
@@ -346,7 +352,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.2.1 зафиксированы в [`docs/releases/v1.2.1.md`](docs/releases/v1.2.1.md).
+Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.2.2 зафиксированы в [`docs/releases/v1.2.2.md`](docs/releases/v1.2.2.md).
 
 ## Установка
 

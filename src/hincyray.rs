@@ -17093,6 +17093,7 @@ fn apply_active_profile(
         ));
     }
     let previous_profile_id = inner.state.active_profile_id;
+    let active_profile_changed = previous_profile_id != Some(profile_id);
     let geo_dir = geo_dir_from_state(&inner.state);
 
     inner.state.active_profile_id = Some(profile_id);
@@ -17145,6 +17146,19 @@ fn apply_active_profile(
             }
         }
         return Err(ActiveProfileApplyError::Runtime(error));
+    }
+
+    // A successful Mihomo hot reload affects only new connections. Drop the
+    // old ones after the transaction commits so clients reconnect through the
+    // newly selected profile instead of retaining the previous exit address.
+    if active_profile_changed
+        && core_running
+        && let Some((addr, secret)) = controller.as_ref()
+        && let Err(error) = mihomo_api_delete(addr, secret.as_deref(), "/connections")
+    {
+        eprintln!(
+            "hincyray: active profile switched, but closing old Mihomo connections failed: {error}"
+        );
     }
 
     Ok(())
@@ -20557,6 +20571,77 @@ mod tests {
         );
         let (status, _, _) = handle_set_active(r#"{"id":0}"#, &daemon);
         assert_eq!(status, 200);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_profile_hot_reload_closes_existing_mihomo_connections() {
+        let (dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@one.example:443?security=tls#One\n\
+             vless://22222222-2222-2222-2222-222222222222@two.example:443?security=tls#Two",
+            &daemon,
+        );
+        let script = dir.path().join("fake-mihomo.sh");
+        fs::write(&script, b"#!/bin/sh\nsleep 30\n").expect("fake Mihomo");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("external controller");
+        let controller_address = listener.local_addr().expect("controller address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&requests);
+        let controller = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("controller request");
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).expect("request header");
+                    request.push(byte[0]);
+                }
+                let text = String::from_utf8_lossy(&request);
+                let request_line = text.lines().next().expect("request line").to_owned();
+                observed
+                    .lock()
+                    .expect("observed requests")
+                    .push(request_line);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("controller response");
+            }
+        });
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.mihomo_path = script.to_string_lossy().into_owned();
+            inner.state.mihomo_features.external_controller.enabled = true;
+            inner.state.mihomo_features.external_controller.address =
+                controller_address.to_string();
+            atomic_write_config(&daemon.mihomo_config_path, b"old config").expect("old config");
+            inner
+                .core
+                .start(
+                    script.to_str().expect("script path"),
+                    &daemon.mihomo_config_path,
+                    None,
+                )
+                .expect("running fake Mihomo");
+        }
+
+        let (status, _, _) = handle_set_active(r#"{"profile_id":1}"#, &daemon);
+        assert_eq!(status, 200);
+        controller.join().expect("controller thread");
+        assert_eq!(
+            *requests.lock().expect("observed requests"),
+            [
+                "PUT /configs?force=true HTTP/1.1",
+                "DELETE /connections HTTP/1.1"
+            ]
+        );
+        assert_eq!(lock(&daemon.inner).state.active_profile_id, Some(1));
+        assert_eq!(load_state(&daemon.state_path).active_profile_id, Some(1));
+        let _ = lock(&daemon.inner).core.stop();
     }
 
     #[test]

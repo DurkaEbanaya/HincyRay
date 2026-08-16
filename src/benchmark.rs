@@ -51,8 +51,10 @@ const YOUTUBE_WEB_USER_AGENT: &str =
 const YOUTUBE_VR_USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 const YOUTUBE_SIGNATURE_TIMESTAMP: u64 = 20653;
 const YOUTUBE_PAGE_MAX_BYTES: u64 = 3 * 1024 * 1024;
+const YOUTUBE_PLAYER_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const YOUTUBE_SEGMENT_BYTES: u64 = 512 * 1024;
 const YOUTUBE_CONNECT_TIMEOUT_SECS: u64 = 10;
+const YOUTUBE_ATTEMPTS: u32 = 2;
 const AI_STUDIO_URL: &str = "https://aistudio.google.com/prompts/new_chat";
 const AI_STUDIO_UNAVAILABLE_URL: &str = "https://ai.google.dev/gemini-api/docs/available-regions";
 const AI_STUDIO_SIGN_IN_URL: &str = "https://accounts.google.com/";
@@ -504,10 +506,7 @@ fn run_service_resources(
             error,
         )),
     };
-    let ping_passed = tests.iter().any(|test| test.reachable);
-    if method == BenchMethod::Quick && !ping_passed {
-        tests.extend(skipped_service_results("skipped after ping gate failed"));
-    } else if let Ok((port, _guard)) = runtime.as_ref() {
+    if let Ok((port, _guard)) = runtime.as_ref() {
         let youtube = run_youtube_playback_probe(*port);
         let youtube_passed = youtube.stable;
         tests.push(youtube);
@@ -739,13 +738,45 @@ fn run_youtube_playback_probe(port: u16) -> ResourceTestResult {
         .unwrap_or_else(|poison| poison.into_inner());
     let mut successes = Vec::new();
     let mut errors = Vec::new();
-    for _ in 0..1 {
+    for attempt in 0..YOUTUBE_ATTEMPTS {
         match youtube_playback_attempt(port) {
-            Ok(attempt) => successes.push(attempt),
-            Err(error) => errors.push(error),
+            Ok(success) => {
+                successes.push(success);
+                break;
+            }
+            Err(error) => {
+                let retry = attempt + 1 < YOUTUBE_ATTEMPTS && youtube_error_is_transient(&error);
+                errors.push(error);
+                if !retry {
+                    break;
+                }
+            }
         }
     }
-    aggregate_quick_resource_probe("youtube", "YouTube", 1, &successes, &errors)
+    aggregate_quick_resource_probe(
+        "youtube",
+        "YouTube",
+        successes.len() as u32 + errors.len() as u32,
+        &successes,
+        &errors,
+        true,
+    )
+}
+
+fn youtube_error_is_transient(error: &str) -> bool {
+    let transient_curl = [5, 6, 7, 28, 35, 52, 55, 56].iter().any(|code| {
+        error.contains(&format!("rc={code}:")) || error.contains(&format!("rc={code},"))
+    });
+    let transient_http = error
+        .split("http=")
+        .skip(1)
+        .filter_map(|status| status.split(|ch: char| !ch.is_ascii_digit()).next())
+        .filter_map(|status| status.parse::<u16>().ok())
+        .any(|status| matches!(status, 408 | 425 | 429) || status >= 500);
+    transient_curl
+        || transient_http
+        || error.contains("returned no visitor data")
+        || error.contains("parse YouTube player response")
 }
 
 fn run_telegram_media_probe(
@@ -775,7 +806,7 @@ fn run_telegram_media_probe(
         Ok(attempt) => successes.push(attempt),
         Err(error) => errors.push(error),
     }
-    aggregate_quick_resource_probe("telegram", "Telegram", 1, &successes, &errors)
+    aggregate_quick_resource_probe("telegram", "Telegram", 1, &successes, &errors, false)
 }
 
 fn run_ai_studio_probe(port: u16) -> ResourceTestResult {
@@ -783,7 +814,7 @@ fn run_ai_studio_probe(port: u16) -> ResourceTestResult {
         Ok(attempt) => (vec![attempt], Vec::new()),
         Err(error) => (Vec::new(), vec![error]),
     };
-    aggregate_quick_resource_probe("ai", "AI Studio", 1, &successes, &errors)
+    aggregate_quick_resource_probe("ai", "AI Studio", 1, &successes, &errors, false)
 }
 
 fn ipregion_ai_studio_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
@@ -908,6 +939,7 @@ fn aggregate_quick_resource_probe(
     attempts: u32,
     successes: &[QuickResourceAttempt],
     errors: &[String],
+    any_success_is_stable: bool,
 ) -> ResourceTestResult {
     let success_count = successes.len() as u32;
     let avg_ttfb_ms = successes
@@ -937,7 +969,7 @@ fn aggregate_quick_resource_probe(
         attempts,
         successes: success_count,
         reachable: success_count > 0,
-        stable: success_count == attempts,
+        stable: success_count > 0 && (any_success_is_stable || success_count == attempts),
         avg_ttfb_ms,
         max_ttfb_ms,
         avg_download_kbps,
@@ -967,6 +999,8 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
         .arg(cookie_file.path())
         .arg("--output")
         .arg(watch_file.path())
+        .arg("--write-out")
+        .arg("%{http_code}")
         .arg(YOUTUBE_WATCH_URL)
         .output()
         .map_err(|error| format!("YouTube bootstrap curl: {error}"))?;
@@ -979,6 +1013,10 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
                 .map_or_else(|| "?".to_owned(), |code| code.to_string()),
             bounded_process_error(&watch.stderr)
         ));
+    }
+    let watch_status = parse_http_status(&watch.stdout, "YouTube bootstrap")?;
+    if !(200..300).contains(&watch_status) {
+        return Err(format!("YouTube bootstrap http={watch_status}"));
     }
     let watch_page = std::fs::read_to_string(watch_file.path())
         .map_err(|error| format!("read YouTube bootstrap: {error}"))?;
@@ -1018,6 +1056,8 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
         .arg(YOUTUBE_CONNECT_TIMEOUT_SECS.to_string())
         .arg("--max-time")
         .arg("20")
+        .arg("--max-filesize")
+        .arg(YOUTUBE_PLAYER_MAX_BYTES.to_string())
         .arg("--silent")
         .arg("--show-error")
         .arg("--cookie")
@@ -1040,6 +1080,8 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
         .arg(player_body)
         .arg("--output")
         .arg(player_file.path())
+        .arg("--write-out")
+        .arg("%{http_code}")
         .arg(YOUTUBE_PLAYER_URL)
         .output()
         .map_err(|error| format!("YouTube player curl: {error}"))?;
@@ -1052,6 +1094,10 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
                 .map_or_else(|| "?".to_owned(), |code| code.to_string()),
             bounded_process_error(&player.stderr)
         ));
+    }
+    let player_status = parse_http_status(&player.stdout, "YouTube player")?;
+    if !(200..300).contains(&player_status) {
+        return Err(format!("YouTube player http={player_status}"));
     }
     let player: serde_json::Value = serde_json::from_reader(
         std::fs::File::open(player_file.path())
@@ -1069,9 +1115,26 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
             .unwrap_or("no reason");
         return Err(format!("YouTube player {status}: {reason}"));
     }
-    let media_url = youtube_direct_media_url(&player)
-        .ok_or_else(|| "YouTube player returned no direct video format".to_owned())?;
-    curl_youtube_range(port, media_url, cookie_file.path())
+    let media_urls = youtube_direct_media_urls(&player);
+    if media_urls.is_empty() {
+        return Err("YouTube player returned no direct video format".to_owned());
+    }
+    let mut errors = Vec::new();
+    for media_url in media_urls {
+        match curl_youtube_range(port, media_url, cookie_file.path()) {
+            Ok(attempt) => return Ok(attempt),
+            Err(error) => errors.push(error),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+fn parse_http_status(output: &[u8], stage: &str) -> Result<u16, String> {
+    std::str::from_utf8(output)
+        .ok()
+        .map(str::trim)
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| format!("{stage} returned invalid HTTP status"))
 }
 
 fn embedded_json_string(source: &str, key: &str) -> Option<String> {
@@ -1093,22 +1156,55 @@ fn embedded_json_u64(source: &str, key: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-fn youtube_direct_media_url(player: &serde_json::Value) -> Option<&str> {
-    let adaptive = player
-        .pointer("/streamingData/adaptiveFormats")?
-        .as_array()?;
-    adaptive
-        .iter()
-        .find(|format| format.get("itag").and_then(serde_json::Value::as_u64) == Some(160))
-        .and_then(|format| format.get("url"))
+fn youtube_direct_media_urls(player: &serde_json::Value) -> Vec<&str> {
+    let mut urls = player
+        .pointer("/streamingData/adaptiveFormats")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(youtube_format_direct_video_url)
+        .collect::<Vec<_>>();
+    urls.sort_by_key(|format| std::cmp::Reverse(format.1.unwrap_or(0)));
+    let mut candidates = Vec::new();
+    for url in urls.into_iter().map(|format| format.2) {
+        push_unique_youtube_url(&mut candidates, url);
+        if candidates.len() == 2 {
+            break;
+        }
+    }
+    if let Some(formats) = player
+        .pointer("/streamingData/formats")
+        .and_then(serde_json::Value::as_array)
+        && let Some(url) = formats
+            .iter()
+            .filter_map(youtube_format_direct_video_url)
+            .max_by_key(|format| format.1.unwrap_or(0))
+            .map(|format| format.2)
+    {
+        push_unique_youtube_url(&mut candidates, url);
+    }
+    candidates
+}
+
+fn push_unique_youtube_url<'a>(urls: &mut Vec<&'a str>, candidate: &'a str) {
+    if !urls.contains(&candidate) {
+        urls.push(candidate);
+    }
+}
+
+fn youtube_format_direct_video_url(
+    format: &serde_json::Value,
+) -> Option<(Option<u64>, Option<u64>, &str)> {
+    format
+        .get("mimeType")
         .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            adaptive.iter().find_map(|format| {
-                let mime = format.get("mimeType")?.as_str()?;
-                mime.starts_with("video/")
-                    .then(|| format.get("url")?.as_str())
-                    .flatten()
-            })
+        .filter(|mime| mime.starts_with("video/"))
+        .and_then(|_| {
+            Some((
+                format.get("itag").and_then(serde_json::Value::as_u64),
+                format.get("bitrate").and_then(serde_json::Value::as_u64),
+                format.get("url")?.as_str()?,
+            ))
         })
 }
 
@@ -2154,8 +2250,64 @@ mod tests {
     }
 
     #[test]
-    fn youtube_connect_budget_exceeds_the_generic_probe_timeout() {
+    fn youtube_probe_has_bounded_retry_and_response_budgets() {
         assert_eq!(YOUTUBE_CONNECT_TIMEOUT_SECS, 10);
+        assert_eq!(YOUTUBE_ATTEMPTS, 2);
+        assert_eq!(YOUTUBE_PLAYER_MAX_BYTES, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn youtube_retries_only_transient_failures() {
+        for error in [
+            "YouTube bootstrap rc=28: timeout",
+            "YouTube bootstrap rc=35: TLS reset",
+            "curl rc=28, http=000, bytes=0",
+            "YouTube bootstrap http=429",
+            "YouTube player http=503",
+            "curl rc=0, http=403, bytes=0; curl rc=0, http=503, bytes=0",
+            "YouTube bootstrap returned no visitor data",
+            "parse YouTube player response: EOF",
+        ] {
+            assert!(youtube_error_is_transient(error), "{error}");
+        }
+        for error in [
+            "YouTube player LOGIN_REQUIRED: Sign in to confirm you’re not a bot",
+            "YouTube player returned no direct video format",
+            "curl rc=0, http=403, bytes=0",
+        ] {
+            assert!(!youtube_error_is_transient(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn youtube_retry_passes_after_one_verified_playback() {
+        let success = QuickResourceAttempt {
+            ttfb_ms: 120,
+            total_ms: 300,
+            bytes: YOUTUBE_SEGMENT_BYTES,
+        };
+        let result = aggregate_quick_resource_probe(
+            "youtube",
+            "YouTube",
+            2,
+            &[success],
+            &["YouTube bootstrap rc=28: timeout".to_owned()],
+            true,
+        );
+        assert!(result.reachable);
+        assert!(result.stable);
+        assert_eq!(result.successes, 1);
+        assert_eq!(result.attempts, 2);
+    }
+
+    #[test]
+    fn parses_youtube_http_status() {
+        assert_eq!(
+            parse_http_status(b"200", "YouTube").expect("valid HTTP status"),
+            200
+        );
+        assert!(parse_http_status(b"", "YouTube").is_err());
+        assert!(parse_http_status(b"not-a-status", "YouTube").is_err());
     }
 
     #[test]
@@ -2264,6 +2416,7 @@ mod tests {
             3,
             &attempts,
             &["timeout".to_owned()],
+            false,
         );
 
         assert_eq!(result.contract_version, 6);
@@ -2339,8 +2492,55 @@ mod tests {
             ]}
         });
         assert_eq!(
-            youtube_direct_media_url(&player),
-            Some("https://video.example/")
+            youtube_direct_media_urls(&player),
+            vec!["https://video.example/"]
+        );
+
+        let progressive = serde_json::json!({
+            "streamingData": {
+                "adaptiveFormats": [
+                    {"itag": 251, "mimeType": "audio/webm", "url": "https://audio.example/"}
+                ],
+                "formats": [
+                    {"itag": 18, "mimeType": "video/mp4", "url": "https://progressive.example/"}
+                ]
+            }
+        });
+        assert_eq!(
+            youtube_direct_media_urls(&progressive),
+            vec!["https://progressive.example/"]
+        );
+
+        let alternatives = serde_json::json!({
+            "streamingData": {"adaptiveFormats": [
+                {"itag": 160, "bitrate": 100000, "mimeType": "video/mp4", "url": "https://low.example/"},
+                {"itag": 315, "bitrate": 12000000, "mimeType": "video/webm", "url": "https://high.example/"}
+            ]}
+        });
+        assert_eq!(
+            youtube_direct_media_urls(&alternatives),
+            vec!["https://high.example/", "https://low.example/"]
+        );
+
+        let bounded_fallback = serde_json::json!({
+            "streamingData": {
+                "adaptiveFormats": [
+                    {"itag": 315, "bitrate": 12000000, "mimeType": "video/webm", "url": "https://high.example/"},
+                    {"itag": 401, "bitrate": 8000000, "mimeType": "video/webm", "url": "https://medium.example/"},
+                    {"itag": 160, "bitrate": 100000, "mimeType": "video/mp4", "url": "https://low.example/"}
+                ],
+                "formats": [
+                    {"itag": 18, "bitrate": 500000, "mimeType": "video/mp4", "url": "https://progressive.example/"}
+                ]
+            }
+        });
+        assert_eq!(
+            youtube_direct_media_urls(&bounded_fallback),
+            vec![
+                "https://high.example/",
+                "https://medium.example/",
+                "https://progressive.example/"
+            ]
         );
     }
 

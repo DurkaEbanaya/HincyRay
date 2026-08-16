@@ -30,7 +30,7 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.2.1');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.2.2');
 });
 
 test('profile table shows compact service status and configurable metric columns', async ({ page }) => {
@@ -132,6 +132,12 @@ test('profile quick and global full tests send bounded concurrency', async ({ pa
   await openFixture(page);
   await navigateTo(page, 'profiles');
   await page.getByText('Настройки тестирования').click();
+  await expect(page.locator('label[for="benchConcurrency"]')).toHaveText('Параллельных серверов');
+  expect(await page.locator('#benchConcurrency').evaluate(select => ({
+    native: select.dataset.nativeSelect,
+    enhanced: select.dataset.customSelectEnhanced || null,
+    wrapped: select.parentElement?.classList.contains('custom-select') || false,
+  }))).toEqual({ native: '1', enhanced: null, wrapped: false });
   await page.locator('#benchConcurrency').selectOption('6');
 
   const fullRequest = page.waitForRequest(request =>

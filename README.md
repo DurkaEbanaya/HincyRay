@@ -1,4 +1,4 @@
-# HincyRay v1.2.1
+# HincyRay v1.2.2
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,12 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v1.2.2
+
+v1.2.2 makes Quick and Full YouTube diagnostics use the same bounded playback policy, retries transient network failures once, and tries multiple direct media formats so a broken low-resolution CDN URL does not produce a false failure. Quick Test now performs the actual YouTube check whenever its temporary Mihomo runtime starts instead of deriving a YouTube result from unrelated ping diagnostics.
+
+The benchmark concurrency field is a native accessible 1–6 selector again. After a successful active-profile switch, HincyRay closes existing Mihomo connections so applications reconnect through the new server rather than retaining the previous exit IP. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.2.2.md`](docs/releases/v1.2.2.md).
 
 ### v1.2.1
 
@@ -378,7 +384,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.2.1 release evidence is recorded in [`docs/releases/v1.2.1.md`](docs/releases/v1.2.1.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.2.2 release evidence is recorded in [`docs/releases/v1.2.2.md`](docs/releases/v1.2.2.md).
 
 ## Installation
 
