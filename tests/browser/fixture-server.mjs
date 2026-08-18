@@ -11,6 +11,7 @@ const port = Number(process.env.PLAYWRIGHT_FIXTURE_PORT || 4173);
 const fixtureSubscriptionUrl = 'https://provider.example/sub/fixture-token';
 const profile = {
   id: 101,
+  server_ref: 'srv-v2-fixture-subscription',
   name: 'Fixture Profile',
   protocol: 'VLESS',
   transport: 'tcp',
@@ -19,9 +20,142 @@ const profile = {
   active: true,
   favorite: false,
   group: fixtureSubscriptionUrl,
-  raw: 'vless://fixture@example.invalid:443',
+  dead: false,
+  block_quic: false,
 };
+const manualProfile = {
+  id: 102,
+  server_ref: 'srv-v2-fixture-manual',
+  name: 'Fixture Manual',
+  protocol: 'VLESS',
+  transport: 'ws',
+  address: '192.0.2.44',
+  port: 8443,
+  active: false,
+  favorite: false,
+  group: null,
+  dead: false,
+  block_quic: true,
+};
+const profileDiagnosticSecretCanary = 'PROFILE-DIAGNOSTIC-SECRET-CANARY';
+let profileDiagnostic = { active: null, completed: null, statusPolls: 0 };
+
+function diagnosticStatus(session, state = 'running') {
+  if (!session) return null;
+  return {
+    session_id: session.session_id,
+    state,
+    profile_id: profile.id,
+    profile_name: profile.name,
+    server_ref: profile.server_ref,
+    started_at_unix: session.started_at_unix,
+    deadline_unix: session.deadline_unix,
+    completed_at_unix: state === 'running' ? null : session.started_at_unix + 8,
+    finalization_reason: state === 'running' ? null : session.finalization_reason || 'stopped',
+    connection_count: state === 'running' ? profileDiagnostic.statusPolls + 1 : 3,
+    event_count: state === 'running' ? profileDiagnostic.statusPolls : 2,
+  };
+}
+
+function diagnosticReport(session) {
+  const markdown = `# Profile diagnostic: ${profile.name}\n\n- Session: ${session.session_id}\n- Profile ID: ${profile.id}\n- Source IP: ${session.source_ip}\n- Connections: 3\n- Events: 2\n- Errors: 1\n\n## Finding\nFixture TLS timeout while watching YouTube.\n`;
+  return {
+    session_id: session.session_id,
+    purpose: 'active profile traffic diagnostics',
+    state: 'completed',
+    started_at_unix: session.started_at_unix,
+    ended_at_unix: session.started_at_unix + 8,
+    requested_duration_seconds: session.duration_seconds,
+    observed_duration_seconds: 8,
+    finalization_reason: session.finalization_reason || 'stopped',
+    source_ip: session.source_ip,
+    profile: {
+      id: profile.id,
+      server_ref: profile.server_ref,
+      name: profile.name,
+      protocol: profile.protocol,
+      transport: profile.transport,
+      address: profile.address,
+      port: profile.port,
+    },
+    environment_start: {
+      hincyray_version: 'fixture', mihomo_version: 'fixture', core_generation: 1,
+      core_status: 'running', firewall_status: 'running', socks_port: 10808,
+      mixed_port: 10809, redirect_port: 10810, tproxy_port: 10811, dns_port: 1053,
+      memory: { hincyray_rss_kb: 1024, mihomo_rss_kb: 2048, system_available_kb: 262144 },
+    },
+    environment_end: {
+      hincyray_version: 'fixture', mihomo_version: 'fixture', core_generation: 1,
+      core_status: 'running', firewall_status: 'running', socks_port: 10808,
+      mixed_port: 10809, redirect_port: 10810, tproxy_port: 10811, dns_port: 1053,
+      memory: { hincyray_rss_kb: 1030, mihomo_rss_kb: 2050, system_available_kb: 262000 },
+    },
+    summary: {
+      connections: 3, open_connections: 1, closed_connections: 2,
+      upload_bytes: 1024, download_bytes: 8192, events: 2, poll_errors: 0,
+      dropped_connections: 1, dropped_events: 0, failure_classifications: { tls_timeout: 1 },
+    },
+    connections: [{
+      id: 'connection-1', domain: 'youtube.example', destination_ip: '203.0.113.30',
+      destination_port: 443, network: 'tcp', rule: 'MATCH', rule_payload: '',
+      chains: ['proxy-active', profile.name], upload_bytes: 1024, download_bytes: 8192,
+      first_seen_unix: session.started_at_unix, last_seen_unix: session.started_at_unix + 5,
+      open: false, source_ip: session.source_ip,
+    }],
+    events: [{ timestamp_unix: session.started_at_unix + 4, severity: 'error', message: 'TLS timeout', classification: 'tls_timeout' }],
+    latest_stats: null,
+    config_summary: 'Active profile only; secrets structurally redacted.',
+    redaction_note: 'Keys and subscription URLs are not collected.',
+    markdown,
+  };
+}
+const initialProfileNames = new Map([[profile.id, profile.name], [manualProfile.id, manualProfile.name]]);
+const initialProfileRaws = new Map([
+  [profile.id, 'vless://subscription-secret@fixture.proxy.test:443?security=reality&type=tcp#Fixture'],
+  [manualProfile.id, 'vless://manual-key@192.0.2.44:8443?encryption=none&security=tls&type=ws&host=hidden.example&path=%2Fsecret#Fixture-Manual'],
+]);
+const profileDetails = new Map([
+  [profile.id, { ...profile, raw: initialProfileRaws.get(profile.id), subscription_managed: true }],
+  [manualProfile.id, { ...manualProfile, raw: initialProfileRaws.get(manualProfile.id), subscription_managed: false }],
+]);
 const deadServerRef = 'srv-v2-fixture-dead';
+let mihomoFeatures = {
+  parameters: {
+    unified_delay: true,
+    store_selected: true,
+    keep_alive_interval: 30,
+    keep_alive_idle: 120,
+    disable_keep_alive: false,
+    tcp_concurrent: true,
+    per_proxy: { tfo: false, mptcp: false, ip_version: 'dual' },
+    dns: {
+      prefer_h3: false,
+      respect_rules: true,
+      default_nameserver: ['1.1.1.1'],
+      nameserver_policy: { 'geosite:private': ['192.168.1.1'] },
+      proxy_server_nameserver_policy: { 'provider.example': ['1.0.0.1'] },
+      direct_nameserver_follow_policy: true,
+      fake_ip_filter_mode: 'blacklist',
+      fake_ip_filter: ['*.lan', '*.local'],
+      fake_ip_ttl: 60,
+    },
+    sniffer: {
+      force_domain: ['+.netflix.com'],
+      skip_domain: ['+.apple.com'],
+      skip_src_address: ['192.168.0.0/16'],
+      skip_dst_address: ['127.0.0.1/8'],
+    },
+    tunnels: [{ network: ['tcp'], address: '127.0.0.1:8080', target: 'fixture.test:80', proxy: null }],
+    hosts: { 'local.test': '127.0.0.1' },
+    experimental: { quic_go_disable_gso: false, quic_go_disable_ecn: true },
+  },
+  runtime: {
+    geodata_loader: 'memconservative',
+    store_fake_ip: true,
+    udp: true,
+    external_controller: { enabled: true, address: '127.0.0.1:9090', connected: true },
+  },
+};
 
 const canonicalConnection = {
       id: 'canonical-chatgpt',
@@ -137,7 +271,7 @@ const responses = new Map([
     core_status: 'running',
     active_profile_name: profile.name,
     active_profile_protocol: profile.protocol,
-    profile_count: 1,
+    profile_count: 2,
     listen_host: '127.0.0.1',
     socks_port: 10808,
     http_port: 10809,
@@ -161,7 +295,7 @@ const responses = new Map([
     { contract_version: 6, id: 'telegram', name: 'Telegram', attempts: 1, successes: 0, stable: false, avg_ttfb_ms: 240 },
     { contract_version: 6, id: 'ai', name: 'AI Studio', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 180 },
   ] }] }],
-  ['/api/profiles', { profiles: [profile] }],
+  ['/api/profiles', { profiles: [profile, manualProfile] }],
   ['/api/routing', routing],
   ['/api/routing/connection-context', { servers: routing.servers }],
   ['/api/routing/preview', { requires_apply: true, core_restart: true, firewall_reload: true, desired_config_sha256: 'desired', applied_config_sha256: 'applied', changes: ['fixture change'], warnings: [] }],
@@ -184,6 +318,7 @@ const responses = new Map([
   ['/api/mihomo-api/proxies', { proxies: {} }],
   ['/api/mihomo-api/memory', { inuse: 1024 }],
   ['/api/dns', { dns: { enabled: true, query_strategy: 'UseIPv4', remote_servers: [], local_servers: [] }, sniffer_override_destination: true }],
+  ['/api/mihomo-features', mihomoFeatures],
   ['/api/hwid', { hwid: {} }],
   ['/api/auth-settings', { enabled: false, username: 'admin' }],
   ['/api/update/status', { current_version: 'fixture', auto_update_enabled: false }],
@@ -243,6 +378,24 @@ const server = http.createServer(async (request, response) => {
 
   if (request.method === 'POST' && url.pathname === '/__fixture/reset') {
     requests.length = 0;
+    for (const item of [profile, manualProfile]) {
+      item.name = initialProfileNames.get(item.id);
+      profileDetails.get(item.id).name = item.name;
+      profileDetails.get(item.id).raw = initialProfileRaws.get(item.id);
+    }
+    responses.set('/api/bench/status', { running: false, results: [] });
+    profileDiagnostic = { active: null, completed: null, statusPolls: 0 };
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/__fixture/bench-status') {
+    try {
+      responses.set('/api/bench/status', await readJson(request));
+    } catch {
+      sendJson(response, 400, { error: 'fixture expected valid JSON' });
+      return;
+    }
     sendJson(response, 200, { ok: true });
     return;
   }
@@ -259,6 +412,81 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === 'POST' && url.pathname === '/api/routing/resource-route') {
       sendJson(response, 200, { ok: true, closed_connections: 1 });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/profile-diagnostics/start') {
+      if (body?.profile_id !== profile.id || ![60, 120, 180, 300].includes(body?.duration_seconds) || !body?.source_ip) {
+        sendJson(response, 400, { error: 'fixture expected the active profile, source IP, and a bounded duration' });
+        return;
+      }
+      const startedAt = Math.floor(Date.now() / 1000);
+      profileDiagnostic = {
+        active: {
+          session_id: 'diag-fixture-session',
+          started_at_unix: startedAt,
+          deadline_unix: startedAt + body.duration_seconds,
+          duration_seconds: body.duration_seconds,
+          source_ip: body.source_ip || null,
+        },
+        completed: null,
+        statusPolls: 0,
+      };
+      sendJson(response, 200, { session: diagnosticStatus(profileDiagnostic.active) });
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/api/profile-diagnostics/status') {
+      if (profileDiagnostic.active) {
+        profileDiagnostic.statusPolls += 1;
+        if (profileDiagnostic.statusPolls >= 4) {
+          profileDiagnostic.active.finalization_reason = 'duration_elapsed';
+          profileDiagnostic.completed = profileDiagnostic.active;
+          profileDiagnostic.active = null;
+        }
+      }
+      sendJson(response, 200, {
+        active: diagnosticStatus(profileDiagnostic.active),
+        completed: diagnosticStatus(profileDiagnostic.completed, 'completed'),
+        completed_ttl_seconds: 300,
+      });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/profile-diagnostics/stop') {
+      if (!profileDiagnostic.active || body?.session_id !== profileDiagnostic.active.session_id) {
+        sendJson(response, 409, { error: 'fixture diagnostic session mismatch' });
+        return;
+      }
+      profileDiagnostic.active.finalization_reason = 'stopped';
+      profileDiagnostic.completed = profileDiagnostic.active;
+      profileDiagnostic.active = null;
+      sendJson(response, 200, { report: diagnosticReport(profileDiagnostic.completed) });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/profile-diagnostics/report') {
+      if (!profileDiagnostic.completed) {
+        sendJson(response, 404, { error: 'fixture has no completed diagnostic report' });
+        return;
+      }
+      if (body?.session_id !== profileDiagnostic.completed.session_id) {
+        sendJson(response, 409, { error: 'fixture diagnostic report mismatch' });
+        return;
+      }
+      const report = diagnosticReport(profileDiagnostic.completed);
+      if (JSON.stringify(report).includes(profileDiagnosticSecretCanary)) {
+        sendJson(response, 500, { error: 'fixture leaked diagnostic secret canary' });
+        return;
+      }
+      sendJson(response, 200, { report });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/profile-diagnostics/discard') {
+      const sessionId = profileDiagnostic.active?.session_id || profileDiagnostic.completed?.session_id || null;
+      if (body?.session_id && body.session_id !== sessionId) {
+        sendJson(response, 409, { error: 'fixture diagnostic discard mismatch' });
+        return;
+      }
+      const discarded = !!sessionId;
+      profileDiagnostic = { active: null, completed: null, statusPolls: 0 };
+      sendJson(response, 200, { discarded, session_id: sessionId });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/auth/login') {
@@ -289,8 +517,28 @@ const server = http.createServer(async (request, response) => {
       sendJson(response, 200, { ok: true });
       return;
     }
+    if (request.method === 'POST' && url.pathname === '/api/mihomo-features') {
+      if (!body || Object.keys(body).join(',') !== 'parameters') {
+        sendJson(response, 400, { error: 'fixture expected reduced Mihomo parameters envelope' });
+        return;
+      }
+      mihomoFeatures = { parameters: body.parameters, runtime: mihomoFeatures.runtime };
+      responses.set('/api/mihomo-features', mihomoFeatures);
+      sendJson(response, 200, mihomoFeatures);
+      return;
+    }
     if (request.method === 'POST' && url.pathname === '/api/profiles/import') {
       sendJson(response, 200, { imported: 1 });
+      return;
+    }
+    if (request.method === 'GET' && /^\/api\/profiles\/\d+$/.test(url.pathname)) {
+      const id = Number(url.pathname.split('/').at(-1));
+      const detail = profileDetails.get(id);
+      if (!detail) {
+        sendJson(response, 404, { error: 'profile not found' });
+        return;
+      }
+      sendJson(response, 200, { profile: detail });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/mihomo-api/connections/page') {
@@ -328,7 +576,37 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/profiles/update') {
-      sendJson(response, 200, { ok: true });
+      const allowedKeys = body && Object.keys(body).every(key => ['profile_id', 'expected_server_ref', 'name', 'raw', 'block_quic'].includes(key));
+      const detail = profileDetails.get(body?.profile_id);
+      if (!allowedKeys || !detail || body.expected_server_ref !== detail.server_ref || JSON.stringify(body).length > 66_000) {
+        sendJson(response, 400, { error: 'fixture rejected unbounded or unstable profile update payload' });
+        return;
+      }
+      if (!String(body.name || '').trim() || (!detail.subscription_managed && !String(body.raw || '').trim())) {
+        sendJson(response, 400, { error: 'fixture expected nonempty profile fields' });
+        return;
+      }
+      if (detail.subscription_managed && Object.hasOwn(body, 'raw')) {
+        sendJson(response, 400, { error: 'fixture forbids subscription raw updates' });
+        return;
+      }
+      if (body.name === 'Fixture rejected name') {
+        sendJson(response, 409, { error: 'fixture rejected profile update' });
+        return;
+      }
+      detail.name = body.name;
+      if (Object.hasOwn(body, 'raw')) detail.raw = body.raw;
+      const listProfile = body.profile_id === profile.id ? profile : manualProfile;
+      listProfile.name = detail.name;
+      sendJson(response, 200, { profile: { ...detail, raw: undefined }, dataplane_applied: false });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/profiles/revalidate-ungrouped') {
+      if (body && Object.keys(body).length) {
+        sendJson(response, 400, { error: 'fixture expected an empty revalidation payload' });
+        return;
+      }
+      sendJson(response, 200, { checked: 1, updated: 1, unchanged: 0, dataplane_applied: false, errors: [] });
       return;
     }
     sendJson(response, 200, responses.get(url.pathname) ?? {});

@@ -1,4 +1,4 @@
-# HincyRay v1.2.2
+# HincyRay v1.3.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,16 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v1.3.0
+
+v1.3.0 adds an on-demand **Profile Logger** for reproducing unstable browsing and streaming through the active server. A bounded 1–5 minute session records only new connections from the explicitly selected LAN client IP, profile-relevant warning/error events, routing chains, traffic counters, memory/runtime context, the latest service diagnostics, and a structurally redacted configuration summary. The resulting bounded Markdown report is written for direct use in an AI support conversation and excludes share links, subscription URLs, authentication data, and keys.
+
+Profiles now have a secure on-demand editor for the display name and complete manual share link, with parsed protocol, transport, address, port, lifecycle, and subscription provenance. Subscription-managed links remain read-only. The `No group` projection can locally reparse and validate all manual profiles as one atomic batch.
+
+The Mihomo Parameters page was reduced to router-relevant runtime status and validated Expert controls. Unsupported or parallel configuration surfaces were removed, External Controller became a fixed loopback invariant, and parameter changes now validate, apply, persist, or roll back as one transaction.
+
+This release also fixes orphan Mihomo split-brain processes and verifies that the tracked child owns every required listener, bounds and streamlines connection-table polling, supports Happ/Xray XHTTP `extra` options including header-based `GET` packet uplinks on Mihomo v1.19.29, and makes the benchmark concurrency selector persist and visibly run up to six workers. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.3.0.md`](docs/releases/v1.3.0.md).
 
 ### v1.2.2
 
@@ -384,7 +394,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.2.2 release evidence is recorded in [`docs/releases/v1.2.2.md`](docs/releases/v1.2.2.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.0 release evidence is recorded in [`docs/releases/v1.3.0.md`](docs/releases/v1.3.0.md).
 
 ## Installation
 

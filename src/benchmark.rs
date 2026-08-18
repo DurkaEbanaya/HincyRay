@@ -164,12 +164,31 @@ pub struct BenchJob {
     pub completed: usize,
     pub current_profile_id: Option<usize>,
     pub current_profile_name: Option<String>,
+    pub active_profiles: Vec<ActiveBenchProfile>,
     pub last_updated: u64,
     pub cancel_requested: bool,
     pub results: Vec<BenchResult>,
+    pub(crate) worker_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ActiveBenchProfile {
+    pub id: usize,
+    pub name: String,
 }
 
 pub type SharedJob = Arc<Mutex<BenchJob>>;
+
+pub fn new_bench_job(method: BenchMethod, total: usize, concurrency: usize) -> SharedJob {
+    Arc::new(Mutex::new(BenchJob {
+        running: true,
+        method: Some(method),
+        total,
+        last_updated: unix_now(),
+        worker_count: benchmark_worker_count(concurrency, total),
+        ..BenchJob::default()
+    }))
+}
 
 /// Spawn the benchmark worker thread. Returns immediately; the caller
 /// keeps the `SharedJob` for status reads and the `AtomicBool` to
@@ -187,91 +206,105 @@ pub fn run_bench(
     quick_probe: Option<QuickProbeConfig>,
     test_download: bool,
     test_upload: bool,
-    concurrency: usize,
     job: SharedJob,
     cancel: Arc<AtomicBool>,
     on_result: Box<dyn Fn(BenchResult) + Send + Sync + 'static>,
-) -> thread::JoinHandle<()> {
-    {
-        let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-        *state = BenchJob {
-            running: true,
-            method: Some(method),
-            total: profiles.len(),
-            last_updated: unix_now(),
-            ..BenchJob::default()
-        };
-    }
-
-    thread::spawn(move || {
-        let queue = Arc::new(Mutex::new(VecDeque::from(profiles)));
-        let on_result: Arc<dyn Fn(BenchResult) + Send + Sync> = Arc::from(on_result);
-        let worker_count = concurrency.clamp(1, 6).min(
-            queue
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name("hincyray-benchmark".to_owned())
+        .spawn(move || {
+            let queue = Arc::new(Mutex::new(VecDeque::from(profiles)));
+            let on_result: Arc<dyn Fn(BenchResult) + Send + Sync> = Arc::from(on_result);
+            let worker_count = job
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .len()
-                .max(1),
-        );
+                .worker_count;
 
-        thread::scope(|scope| {
-            for _ in 0..worker_count {
-                let queue = Arc::clone(&queue);
-                let job = Arc::clone(&job);
-                let cancel = Arc::clone(&cancel);
-                let on_result = Arc::clone(&on_result);
-                let quick_probe = quick_probe.clone();
-                let probe_url = &probe_url;
-                let download_url = &download_url;
-                let upload_url = &upload_url;
-                let core_path = &core_path;
-                scope.spawn(move || {
-                    loop {
-                        if cancel.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let profile = queue
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner())
-                            .pop_front();
-                        let Some(profile) = profile else { break };
-                        {
+            thread::scope(|scope| {
+                for _ in 0..worker_count {
+                    let queue = Arc::clone(&queue);
+                    let job = Arc::clone(&job);
+                    let cancel = Arc::clone(&cancel);
+                    let on_result = Arc::clone(&on_result);
+                    let quick_probe = quick_probe.clone();
+                    let probe_url = &probe_url;
+                    let download_url = &download_url;
+                    let upload_url = &upload_url;
+                    let core_path = &core_path;
+                    scope.spawn(move || {
+                        loop {
+                            if cancel.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let profile = queue
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .pop_front();
+                            let Some(profile) = profile else { break };
+                            {
+                                let mut state =
+                                    job.lock().unwrap_or_else(|poison| poison.into_inner());
+                                state.current_profile_id = Some(profile.id);
+                                state.current_profile_name = Some(profile.name.clone());
+                                if state.active_profiles.len() < 6 {
+                                    state.active_profiles.push(ActiveBenchProfile {
+                                        id: profile.id,
+                                        name: profile.name.clone(),
+                                    });
+                                }
+                                state.last_updated = unix_now();
+                            }
+
+                            let result = benchmark_profile(
+                                &profile,
+                                method,
+                                probe_url,
+                                download_url,
+                                upload_url,
+                                core_path,
+                                quick_probe.as_ref(),
+                                test_download,
+                                test_upload,
+                            );
+
+                            on_result(result.clone());
                             let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-                            state.current_profile_id = Some(profile.id);
-                            state.current_profile_name = Some(profile.name.clone());
+                            state
+                                .active_profiles
+                                .retain(|active| active.id != profile.id);
+                            if let Some((id, name)) = state
+                                .active_profiles
+                                .last()
+                                .map(|active| (active.id, active.name.clone()))
+                            {
+                                state.current_profile_id = Some(id);
+                                state.current_profile_name = Some(name);
+                            } else {
+                                state.current_profile_id = None;
+                                state.current_profile_name = None;
+                            }
+                            state.results.push(result);
+                            state.completed += 1;
                             state.last_updated = unix_now();
                         }
+                    });
+                }
+            });
 
-                        let result = benchmark_profile(
-                            &profile,
-                            method,
-                            probe_url,
-                            download_url,
-                            upload_url,
-                            core_path,
-                            quick_probe.as_ref(),
-                            test_download,
-                            test_upload,
-                        );
-
-                        on_result(result.clone());
-                        let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-                        state.results.push(result);
-                        state.completed += 1;
-                        state.last_updated = unix_now();
-                    }
-                });
+            {
+                let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
+                state.running = false;
+                state.current_profile_id = None;
+                state.current_profile_name = None;
+                state.active_profiles.clear();
+                state.last_updated = unix_now();
             }
-        });
+        })
+        .map_err(|error| format!("spawn benchmark worker: {error}"))
+}
 
-        {
-            let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-            state.running = false;
-            state.current_profile_id = None;
-            state.current_profile_name = None;
-            state.last_updated = unix_now();
-        }
-    })
+fn benchmark_worker_count(concurrency: usize, profile_count: usize) -> usize {
+    concurrency.clamp(1, 6).min(profile_count.max(1))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2682,7 +2715,7 @@ mod tests {
 
     #[test]
     fn run_bench_marks_running_and_completes_for_empty_input() {
-        let job: SharedJob = Arc::new(Mutex::new(BenchJob::default()));
+        let job = new_bench_job(BenchMethod::Tcp, 0, 1);
         let cancel = Arc::new(AtomicBool::new(false));
         let collected: Arc<Mutex<Vec<BenchResult>>> = Arc::new(Mutex::new(Vec::new()));
         let collected_for_closure = Arc::clone(&collected);
@@ -2703,11 +2736,11 @@ mod tests {
             None,
             false,
             false,
-            1,
             Arc::clone(&job),
             cancel,
             on_result,
-        );
+        )
+        .expect("spawn bench worker");
         {
             let state = job.lock().unwrap_or_else(|p| p.into_inner());
             assert_eq!(state.total, 0);
@@ -2729,6 +2762,13 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_concurrency_four_creates_four_profile_workers() {
+        assert_eq!(benchmark_worker_count(4, 8), 4);
+        assert_eq!(benchmark_worker_count(4, 2), 2);
+        assert_eq!(benchmark_worker_count(9, 8), 6);
+    }
+
+    #[test]
     fn quick_bench_passes_configured_mihomo_path() {
         let profile = Profile {
             id: 10,
@@ -2741,7 +2781,7 @@ mod tests {
             block_quic: false,
             group: None,
         };
-        let job: SharedJob = Arc::new(Mutex::new(BenchJob::default()));
+        let job = new_bench_job(BenchMethod::Quick, 1, 1);
         let collected = Arc::new(Mutex::new(Vec::new()));
         let collected_for_callback = Arc::clone(&collected);
         let handle = run_bench(
@@ -2754,7 +2794,6 @@ mod tests {
             None,
             false,
             false,
-            1,
             Arc::clone(&job),
             Arc::new(AtomicBool::new(false)),
             Box::new(move |result| {
@@ -2763,7 +2802,8 @@ mod tests {
                     .unwrap_or_else(|poison| poison.into_inner())
                     .push(result);
             }),
-        );
+        )
+        .expect("spawn quick benchmark worker");
 
         handle.join().expect("quick benchmark worker");
         let results = collected

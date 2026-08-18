@@ -466,6 +466,16 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .modal p{color:var(--muted);margin:0 0 20px;font-size:var(--fs-body)}
 .modal-actions{display:flex;gap:var(--gap-sm);justify-content:flex-end}
 .modal-wide{max-width:680px;max-height:80vh;overflow-y:auto}
+.profile-editor{width:min(760px,calc(100vw - 24px));max-width:760px;max-height:calc(100vh - 24px);overflow-y:auto}
+.profile-editor-status{min-height:22px;margin:0 0 12px!important;color:var(--muted)}
+.profile-editor-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0 18px}
+.profile-editor-fact{padding:9px 10px;border:1px solid var(--border);background:var(--surface-2);min-width:0}
+.profile-editor-fact span{display:block;margin-bottom:3px;color:var(--muted);font-size:10px;text-transform:uppercase}
+.profile-editor-fact strong{display:block;overflow-wrap:anywhere;font:12px/1.4 var(--font-mono)}
+.profile-secret-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:7px}
+.profile-secret-mask:not(.revealed){-webkit-text-security:disc;color:var(--muted)}
+.profile-secret-mask:not(.revealed)::selection{background:transparent;color:transparent}
+.profile-editor-explanation{margin:7px 0 0!important;font-size:12px!important;color:var(--muted)!important}
 .result-table{width:100%;border-collapse:collapse;font-size:13px}
 .result-table td{padding:6px 10px;border-bottom:1px solid var(--border)}
 .result-table td:first-child{color:var(--muted);white-space:nowrap;width:40%}
@@ -500,6 +510,8 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .profile-select,.profile-group-select{width:16px;height:16px;vertical-align:middle;accent-color:var(--accent)}
 .profile-select{margin:0 7px 0 0}.profile-group-select{margin:0 7px 0 4px}
 .profile-provenance{font-size:10px;color:var(--muted);margin-top:2px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.profile-name-edit{display:block;max-width:100%;padding:0;border:0;background:none;color:inherit;font:inherit;text-align:left;cursor:pointer;overflow-wrap:anywhere}
+.profile-name-edit:hover,.profile-name-edit:focus-visible{color:var(--accent);text-decoration:underline;text-underline-offset:3px}
 .profiles-table-wrap .subscription-announcement-row td{position:static!important;left:auto!important;width:auto!important;min-width:0;max-width:none;padding:0 0 8px!important;text-align:left!important;white-space:normal!important;background:transparent!important}
 .subscription-announcement{display:grid;grid-template-columns:auto 1fr;gap:10px;margin:0;padding:11px 13px;border:1px solid color-mix(in srgb,var(--accent) 28%,var(--border));border-radius:0;background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 9%,var(--surface)),var(--surface));box-sizing:border-box}
 .subscription-announcement-icon{color:var(--accent);font-size:16px;line-height:1.3}
@@ -715,6 +727,13 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .profile-name{font-weight:500;overflow-wrap:anywhere}
 .profile-row-actions{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:5px}
 .profile-row-actions .btn,.profile-row-actions .btn-icon{min-height:25px}
+.profile-logger-grid{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(260px,.8fr);gap:16px;align-items:start}
+.profile-logger-panel{border:1px solid var(--border);background:var(--surface1);padding:16px}
+.profile-logger-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--border);border:1px solid var(--border);margin-top:14px}
+.profile-logger-stat{background:var(--surface);padding:12px;min-width:0}
+.profile-logger-stat strong{display:block;font-family:var(--mono);font-size:20px;overflow:hidden;text-overflow:ellipsis}
+.profile-logger-report{width:100%;min-height:320px;resize:vertical;white-space:pre-wrap}
+@media(max-width:800px){.profile-logger-grid{grid-template-columns:1fr}.profile-logger-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(min-width:641px){
   .profile-grid-wrap{overflow:visible}
   .profile-grid-wrap>#profilesTable{display:block;width:100%;max-width:none}
@@ -845,6 +864,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
 @keyframes v2-spin{to{transform:rotate(360deg)}}@keyframes v2-shimmer{to{transform:translateX(100%)}}
 @media(max-width:1024px){.context-heading{min-width:170px}.main-content{padding:18px 20px 72px}}
 @media(max-width:640px){.sub-tabs{min-height:52px;padding:0 8px}.context-heading{display:none}.main-content{padding:14px 12px 78px}.section-header h2{font-size:22px}.cards{grid-template-columns:1fr}.card{border-right:0;border-bottom:1px solid var(--border)}.feature-grid{grid-template-columns:1fr}.bottom-nav-item{min-height:52px}.sidebar.open{box-shadow:var(--shadow-md)}.btn,.custom-select-trigger,.nav-group-header,.nav-sub-item,.sub-tab{min-height:44px}.routing-visual-commandbar{align-items:stretch}.routing-visual-actions{width:100%}.routing-visual-actions .btn{flex:1}.modal{min-width:0;width:calc(100vw - 24px);max-height:calc(100vh - 24px);overflow:auto}.login-box{width:calc(100vw - 24px);padding:24px}table.responsive-cards tr{border-radius:0;box-shadow:none;background:transparent}}
+@media(max-width:640px){.profile-editor-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.profile-secret-tools .btn{flex:1}.profile-editor .modal-actions{position:sticky;bottom:-28px;margin:18px -28px -28px;padding:12px 28px;background:var(--surface);border-top:1px solid var(--border)}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}.reveal-wave,.skeleton::after{display:none}}
 @media(forced-colors:active){.sidebar,.sub-tabs,.bottom-nav,.dead-server-bulk{background:Canvas;backdrop-filter:none}.nav-sub-item.active,.sub-tab.active{outline:2px solid Highlight}.nav-group-header::before,.nav-sub-item::before,.tbl tbody tr::after{display:none}.v2-reveal-hot{background-image:none!important;outline:1px solid Highlight}}
 </style>
@@ -887,7 +907,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   </div>
 </div>
 
-<div id="formDialog" class="modal-backdrop" style="display:none" data-testid="profile-rename-modal">
+<div id="formDialog" class="modal-backdrop" style="display:none">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="formDialogTitle">
     <h3 id="formDialogTitle">Изменить значение</h3>
     <div class="form-group"><label id="formDialogLabel" for="formDialogInput">Значение</label><input id="formDialogInput" autocomplete="off"></div>
@@ -895,6 +915,41 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
       <button class="btn" onclick="closeFormDialog()">Отмена</button>
       <button class="btn btn-accent" id="formDialogSubmit" onclick="submitFormDialog()">Сохранить</button>
     </div>
+  </div>
+</div>
+
+<div id="profileEditorModal" class="modal-backdrop" style="display:none" data-testid="profile-editor-modal">
+  <div class="modal profile-editor" role="dialog" aria-modal="true" aria-labelledby="profileEditorTitle" aria-describedby="profileEditorStatus">
+    <h3 id="profileEditorTitle">Редактировать профиль</h3>
+    <p id="profileEditorStatus" class="profile-editor-status" role="status" aria-live="polite">Загрузка профиля…</p>
+    <form id="profileEditorForm" onsubmit="event.preventDefault();saveProfileEditor()">
+      <fieldset id="profileEditorFields" disabled>
+        <div class="form-group"><label for="profileEditorName">Имя</label><input id="profileEditorName" maxlength="256" autocomplete="off" required></div>
+        <div class="profile-editor-grid" aria-label="Разобранные параметры профиля">
+          <div class="profile-editor-fact"><span>Протокол</span><strong id="profileEditorProtocol">—</strong></div>
+          <div class="profile-editor-fact"><span>Транспорт</span><strong id="profileEditorTransport">—</strong></div>
+          <div class="profile-editor-fact"><span>Адрес</span><strong id="profileEditorAddress">—</strong></div>
+          <div class="profile-editor-fact"><span>Порт</span><strong id="profileEditorPort">—</strong></div>
+          <div class="profile-editor-fact"><span>Группа</span><strong id="profileEditorGroup">—</strong></div>
+          <div class="profile-editor-fact"><span>Активен</span><strong id="profileEditorActive">—</strong></div>
+          <div class="profile-editor-fact"><span>Дохлый сервер</span><strong id="profileEditorDead">—</strong></div>
+          <div class="profile-editor-fact"><span>Block QUIC</span><strong id="profileEditorBlockQuic">—</strong></div>
+        </div>
+        <div class="form-group">
+          <label for="profileEditorRaw">Полная share-ссылка</label>
+          <textarea id="profileEditorRaw" class="mono profile-secret-mask" rows="6" maxlength="65536" autocomplete="off" autocapitalize="off" spellcheck="false" required></textarea>
+          <div class="profile-secret-tools">
+            <button class="btn btn-sm" id="profileEditorReveal" type="button" aria-pressed="false" onclick="toggleProfileRawVisibility()">Показать секрет</button>
+            <button class="btn btn-sm" id="profileEditorCopy" type="button" onclick="copyProfileRaw()">Копировать ссылку</button>
+          </div>
+          <p id="profileEditorManagedNote" class="profile-editor-explanation" hidden>Ссылка управляется подпиской и доступна только для просмотра. Имя можно изменить.</p>
+        </div>
+      </fieldset>
+      <div class="modal-actions">
+        <button class="btn" type="button" onclick="closeProfileEditor()">Отмена</button>
+        <button class="btn btn-accent" id="profileEditorSave" type="submit" disabled>Сохранить</button>
+      </div>
+    </form>
   </div>
 </div>
 
@@ -921,7 +976,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   <nav class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="sidebar-brand" style="border-radius: 0px;">
       <svg class="brand-icon" viewBox="0 0 1024 1024" role="img" aria-label="HincyRay"><defs><radialGradient id="brand-bg" cx="50%" cy="46%" r="62%"><stop stop-color="#172b3d"/><stop offset=".55" stop-color="#0b1018"/><stop offset="1" stop-color="#05070b"/></radialGradient><linearGradient id="brand-phone" x1="250" y1="100" x2="760" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#3b424d"/><stop offset=".45" stop-color="#151a21"/><stop offset="1" stop-color="#050608"/></linearGradient><linearGradient id="brand-screen" x1="310" y1="150" x2="690" y2="850" gradientUnits="userSpaceOnUse"><stop stop-color="#1f3146"/><stop offset="1" stop-color="#070a0f"/></linearGradient></defs><rect width="1024" height="1024" rx="220" fill="url(#brand-bg)"/><path d="M130 740 40 820M190 820 95 930M845 170l115-92M820 790l130 92M93 276l112 52" stroke="#0078d7" stroke-width="18" stroke-linecap="round" opacity=".65"/><g transform="rotate(-8 512 512)"><rect x="290" y="92" width="444" height="840" rx="78" fill="url(#brand-phone)" stroke="#737b87" stroke-width="14"/><rect x="328" y="138" width="368" height="748" rx="48" fill="url(#brand-screen)" stroke="#0e1620" stroke-width="10"/><circle cx="512" cy="176" r="16" fill="#080b10" stroke="#4d5663" stroke-width="5"/><path d="M510 132 455 292l68-30-42 172 106-238-72 34z" fill="#f4d03f" stroke="#fff2a4" stroke-width="8"/><path d="M496 432 365 536l112 8-74 204 214-260-102 14 75-134z" fill="#ff453a" stroke="#ffb2ab" stroke-width="9"/><path d="M520 398 660 496l-92 22 70 188-198-238 92 18z" fill="#60cdff" stroke="#b8efff" stroke-width="8"/><path d="M445 308 340 248M444 309l-96 102M521 264l118-98M514 436l-160 44M514 437l120 152M477 546l-112 188M566 515l104 166" stroke="#d8e6f3" stroke-width="10" stroke-linecap="round" opacity=".8"/><path d="M336 610 238 660l87 36-142 98 238-62-62-42 98-38zM664 300l150-50-72 102 160 10-228 68 38-78z" fill="#1f8fff" opacity=".88"/><text x="512" y="760" text-anchor="middle" font-family="Arial Black,Arial,sans-serif" font-size="76" fill="#f2f6fb" stroke="#05070b" stroke-width="7" paint-order="stroke">POCO</text></g></svg>
-      <div><div class="logo">HincyRay</div><div class="version">v1.2.2</div></div>
+      <div><div class="logo">HincyRay</div><div class="version">v1.3.0</div></div>
     </div>
     <div class="brightness-row">
       <svg class="brightness-icon" onclick="toggleTheme()" title="Переключить тему" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9L14 6M5.9 14l-1.1 1.1"></path></svg>
@@ -1006,6 +1061,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
           <div class="nav-sub-item" data-section="trace" onclick="navTo('trace')"><span class="nav-label">Трассировка</span></div>
           <div class="nav-sub-item" data-section="unlock" onclick="navTo('unlock')"><span class="nav-label">Разблокировка</span></div>
           <div class="nav-sub-item" data-section="diag-network" onclick="navTo('diag-network')"><span class="nav-label">DNS / UDP / QUIC</span></div>
+          <div class="nav-sub-item" data-section="profile-logger" onclick="navTo('profile-logger')"><span class="nav-label">Логгер профиля</span></div>
           <div class="nav-sub-item" data-section="deep-bench" onclick="navTo('deep-bench')"><span class="nav-label">Отложенное тестирование</span></div>
           <div class="nav-sub-item" data-section="trash" onclick="navTo('trash')"><span class="nav-label">Мусор</span></div>
         </div>
@@ -1030,7 +1086,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
         <div id="globalSearchResults" style="display:none;position:absolute;left:12px;right:12px;top:48px;z-index:20;background:var(--surface1);border:1px solid var(--border);box-shadow:var(--shadow);max-height:280px;overflow:auto"></div>
         <div id="benchProgress" style="display:none;margin:10px 0 0;padding:10px 0 2px;border-top:1px solid var(--border)" aria-live="polite">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:var(--fs-sm);color:var(--muted)">
-            <span id="benchCurrent" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span>
+            <span id="benchCurrent" data-title-ru="Активные серверы текущего теста" data-title-en="Servers active in the current test" title="Активные серверы текущего теста" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span>
             <span style="display:flex;align-items:center;white-space:nowrap"><span id="benchCounter">0/0</span> <button class="btn btn-danger btn-sm" id="benchStop" onclick="apiAction('POST','/api/bench/stop',null,'Бенчмарк остановлен')" style="display:none;margin-left:8px">■ Остановить</button></span>
           </div>
           <div class="progress" style="margin-top:6px"><div class="progress-fill accent" id="benchBar" style="width:0%"></div></div>
@@ -1160,12 +1216,13 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
           <details id="testPanel" style="margin-bottom:16px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
             <summary style="cursor:pointer;font-weight:600;padding:10px 14px;background:var(--surface-2);user-select:none">Настройки тестирования</summary>
             <div style="padding:12px 14px">
-              <div style="font-size:var(--fs-sm);color:var(--muted);margin-bottom:10px">⚡ у сервера или подписки запускает Quick Test. Full Test проверяет ping, YouTube, Telegram и AI независимо для всех серверов.</div>
+              <p id="benchSemanticsHelp" style="font-size:var(--fs-sm);color:var(--muted);margin:0 0 10px">⚡ в строке проверяет только один сервер. ⚡ у группы/подписки, выбранная область и Full Test используют до настроенного числа параллельных серверов.</p>
               <div class="form-row" style="align-items:flex-end;flex-wrap:wrap;gap:16px;margin-bottom:12px">
-                <div class="form-group" style="margin:0;min-width:180px"><label for="benchConcurrency">Параллельных серверов</label>
-                  <select id="benchConcurrency" data-native-select="1" onchange="saveBenchConcurrency(this.value)"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option></select>
+                <div class="form-group" style="margin:0;min-width:240px"><label for="benchConcurrency" id="benchConcurrencyLabel" data-title-ru="Максимум одновременно проверяемых серверов для групповых, выбранных и Full тестов" data-title-en="Maximum servers tested at once by group, selected-scope, and Full tests" title="Максимум одновременно проверяемых серверов для групповых, выбранных и Full тестов">Параллельных серверов</label>
+                  <select id="benchConcurrency" data-native-select="1" data-title-ru="От 1 до 6; строковый тест всегда проверяет один сервер" data-title-en="From 1 to 6; a row test always checks one server" title="От 1 до 6; строковый тест всегда проверяет один сервер" onchange="saveBenchConcurrency(this.value)"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option></select>
+                  <span id="benchConcurrencyHelp" style="font-size:var(--fs-xs);color:var(--muted)">Для группы, выбранной области и Full Test; строка ⚡ всегда одна.</span>
                 </div>
-                <button class="btn btn-accent" id="benchFullAll" onclick="fullBenchAll()">⚡ Full Test всех серверов</button>
+                <button class="btn btn-accent" id="benchFullAll" data-bench-scope="global" data-title-ru="Full Test всех серверов, до выбранного числа параллельно" data-title-en="Full Test all servers, up to the selected parallel count" title="Full Test всех серверов, до выбранного числа параллельно" onclick="fullBenchAll()">⚡ Full Test всех серверов</button>
               </div>
               <div id="benchSummary" style="margin-top:12px;display:none" class="cards">
                 <div class="card"><div class="card-label">Прошло</div><div class="card-value success" id="benchPassed">0</div></div>
@@ -1229,7 +1286,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
             <span id="deadServerSelectedBreakdown" style="font-size:12px;color:var(--muted)"></span>
             <button class="btn btn-danger btn-sm" id="deadServerMoveSelected" onclick="moveSelectedToDeadServers()">В Дохлые серверы</button>
             <button class="btn btn-sm" id="deadServerRestoreSelected" onclick="restoreSelectedDeadServers()">↩ Восстановить</button>
-            <button class="btn btn-accent btn-sm" onclick="quickBenchSelected()">⚡ Быстрый тест</button>
+            <button class="btn btn-accent btn-sm" id="benchQuickSelected" data-bench-scope="selected" data-title-ru="Quick Test выбранных серверов, до выбранного числа параллельно" data-title-en="Quick Test selected servers, up to the selected parallel count" title="Quick Test выбранных серверов, до выбранного числа параллельно" onclick="quickBenchSelected()">⚡ Быстрый тест</button>
             <button class="btn btn-sm" onclick="clearServerSelection()">Снять выбор</button>
           </div>
           <div class="profiles-table-wrap profile-grid-wrap">
@@ -1543,175 +1600,68 @@ https://sub.example.com/…"></textarea>
           <svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg>
         </div>
         <div class="section-body">
+          <div class="feature-card" style="margin-bottom:16px">
+            <h4>Runtime</h4>
+            <div class="field"><label>GEO loader</label><span id="featRuntimeGeoLoader" class="mono">—</span></div>
+            <div class="field"><label>Fake-IP persistence</label><span id="featRuntimeStoreFakeIp">—</span></div>
+            <div class="field"><label>UDP</label><span id="featRuntimeUdp">—</span></div>
+            <div class="field"><label>External Controller</label><span id="featRuntimeEcEnabled">—</span></div>
+            <div class="field"><label>External Controller address</label><span id="featRuntimeEcAddress" class="mono">—</span></div>
+            <div class="field"><label>External Controller status</label><span id="featRuntimeEcConnected">—</span></div>
+          </div>
           <div class="feature-grid">
-            <!-- 8.1 Глобальные -->
             <div class="feature-card">
-              <h4>Глобальные</h4>
-              <div class="field"><label>GEO loader</label><select id="featGeoLoader"><option>memconservative</option><option>standard</option></select></div>
+              <h4>Основные</h4>
               <div class="field"><label>Unified delay</label><label class="toggle"><input type="checkbox" id="featUnifiedDelay"><span class="slider"></span></label></div>
-              <div class="field"><label>Store fake-ip</label><label class="toggle"><input type="checkbox" id="featStoreFakeIp"><span class="slider"></span></label></div>
               <div class="field"><label>Store selected</label><label class="toggle"><input type="checkbox" id="featStoreSelected"><span class="slider"></span></label></div>
               <div class="field"><label>TCP concurrent</label><label class="toggle"><input type="checkbox" id="featTcpConcurrent"><span class="slider"></span></label></div>
               <div class="field"><label>Keep-alive interval (s)</label><input type="number" id="featKaInterval" class="mono" placeholder="15"></div>
               <div class="field"><label>Keep-alive idle (s)</label><input type="number" id="featKaIdle" class="mono" placeholder="15"></div>
               <div class="field"><label>Disable keep-alive</label><label class="toggle"><input type="checkbox" id="featDisableKa"><span class="slider"></span></label></div>
             </div>
-            <!-- 8.2 Proxy Groups -->
-            <div class="feature-card">
-              <h4>Proxy Groups</h4>
-              <div class="field"><label>Включены</label><label class="toggle"><input type="checkbox" id="featPgEnabled"><span class="slider"></span></label></div>
-              <div class="field"><label>Тип группы</label><select id="featPgType"><option>url-test</option><option>select</option><option>fallback</option><option>load-balance</option><option>relay</option></select></div>
-              <div class="field"><label>URL (health-check)</label><input id="featPgUrl" class="mono" placeholder="https://www.gstatic.com/generate_204"></div>
-              <div class="field"><label>Interval (s)</label><input type="number" id="featPgInterval" value="300" class="mono"></div>
-              <div class="field"><label>Timeout (ms)</label><input type="number" id="featPgTimeout" value="5000" class="mono"></div>
-              <div class="field"><label>Tolerance (ms)</label><input type="number" id="featPgTolerance" value="0" class="mono"></div>
-              <div class="field"><label>Lazy</label><label class="toggle"><input type="checkbox" id="featPgLazy"><span class="slider"></span></label></div>
-              <div class="field"><label>Max failed times</label><input type="number" id="featPgMaxFailed" value="5" class="mono"></div>
-              <div class="field"><label>Strategy</label><select id="featPgStrategy"><option>round-robin</option><option>consistent-hashing</option><option>sticky-sessions</option></select></div>
-              <div class="field"><label>Expected status</label><input id="featPgExpected" class="mono" placeholder="204 или 200-299"></div>
-              <div class="field"><label>Filter (regex)</label><input id="featPgFilter" class="mono" placeholder="(?i)HK|TW"></div>
-              <div class="field"><label>Exclude filter (regex)</label><input id="featPgExcludeFilter" class="mono" placeholder="(?i)US|JP"></div>
-              <div class="field"><label>Exclude type</label><input id="featPgExcludeType" class="mono" placeholder="Shadowsocks|Http"></div>
-              <div class="field"><label>Include all providers</label><label class="toggle"><input type="checkbox" id="featPgAllProviders"><span class="slider"></span></label></div>
-              <div class="field"><label>Include all</label><label class="toggle"><input type="checkbox" id="featPgIncludeAll"><span class="slider"></span></label></div>
-              <div class="field"><label>Include all proxies</label><label class="toggle"><input type="checkbox" id="featPgAllProxies"><span class="slider"></span></label></div>
-            </div>
-            <!-- 8.3 External Controller -->
-            <div class="feature-card">
-              <h4>External Controller</h4>
-              <div class="field"><label>Включён</label><label class="toggle"><input type="checkbox" id="featEcEnabled"><span class="slider"></span></label></div>
-              <div class="field"><label>Address</label><input id="featEcAddr" value="127.0.0.1:9090" class="mono"></div>
-              <div class="field"><label>Secret</label><input type="password" id="featEcSecret" placeholder="(не задан)"></div>
-              <div class="field"><label>Allow origins</label><input id="featEcOrigins" class="mono" placeholder="*"></div>
-              <div class="field"><label>Allow private network</label><label class="toggle"><input type="checkbox" id="featEcPrivNet"><span class="slider"></span></label></div>
-            </div>
-            <!-- 8.4 NTP -->
-            <div class="feature-card">
-              <h4>NTP</h4>
-              <div class="field"><label>Включён</label><label class="toggle"><input id="featNtpEnabled" type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Сервер</label><input id="featNtpServer" value="time.apple.com"></div>
-              <div class="field"><label>Port</label><input id="featNtpPort" type="number" value="123" class="mono"></div>
-              <div class="field"><label>Interval (min)</label><input id="featNtpInterval" type="number" value="60" class="mono"></div>
-              <div class="field"><label>Write to system</label><label class="toggle"><input id="featNtpWrite" type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Dialer proxy</label><input id="featNtpDialer" class="mono" placeholder="(напрямую)"></div>
-            </div>
-            <!-- 8.5 Per-proxy defaults -->
             <div class="feature-card">
               <h4>Per-proxy defaults</h4>
-              <div class="field"><label>UDP</label><label class="toggle"><input type="checkbox" checked=""><span class="slider"></span></label></div>
-              <div class="field"><label>TFO</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>MPTCP</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>IP version</label><select><option>dual</option><option>ipv4</option><option>ipv4-prefer</option><option>ipv6</option><option>ipv6-prefer</option></select></div>
-              <div class="field"><label>Smux enabled</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Smux protocol</label><select><option>smux</option><option>h2mux</option><option>yamux</option></select></div>
-              <div class="field"><label>Smux max connections</label><input type="number" value="0" class="mono"></div>
-              <div class="field"><label>Smux min streams</label><input type="number" value="0" class="mono"></div>
-              <div class="field"><label>Smux max streams</label><input type="number" value="0" class="mono"></div>
-              <div class="field"><label>Smux statistic</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Smux only TCP</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Smux padding</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Smux brutal up (Mbps)</label><input type="number" value="0" class="mono"></div>
-              <div class="field"><label>Smux brutal down (Mbps)</label><input type="number" value="0" class="mono"></div>
-              <div class="field"><label>Dialer proxy</label><input class="mono" placeholder="(нет цепочки)"></div>
+              <div class="field"><label>TFO</label><label class="toggle"><input type="checkbox" id="featPerProxyTfo"><span class="slider"></span></label></div>
+              <div class="field"><label>MPTCP</label><label class="toggle"><input type="checkbox" id="featPerProxyMptcp"><span class="slider"></span></label></div>
+              <div class="field"><label>IP version</label><select id="featPerProxyIpVersion"><option>dual</option><option>ipv4</option><option>ipv4-prefer</option><option>ipv6</option><option>ipv6-prefer</option></select></div>
             </div>
-            <!-- 8.6 DNS расширенные -->
             <div class="feature-card">
               <h4>DNS расширенные</h4>
-              <div class="field"><label>Cache algo</label><select><option>arc</option><option>lru</option></select></div>
-              <div class="field"><label>Prefer H3</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Respect rules</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Default nameserver</label><input class="mono" placeholder="223.5.5.5"></div>
-              <div class="field"><label>Proxy server nameserver</label><input class="mono" placeholder="https://1.1.1.1/dns-query"></div>
-              <div class="field"><label>Direct nameserver</label><input class="mono" placeholder="223.5.5.5"></div>
-              <div class="field"><label>Proxy server nameserver policy</label><textarea class="mono" rows="3" placeholder="server.example.com → 1.1.1.1&#10;*.provider.net → https://1.0.0.1/dns-query"></textarea></div>
-              <div class="field"><label>Direct nameserver follow policy</label><label class="toggle"><input type="checkbox" onchange="this.dataset.nullable='true'"><span class="slider"></span></label></div>
-              <div class="field"><label>Nameserver policy</label><textarea class="mono" rows="3" placeholder="geosite:cn → 223.5.5.5&#10;*.local → 127.0.0.1"></textarea></div>
-              <div class="field"><label>Fake-IP filter mode</label><select onchange="this.dataset.nullable='true'"><option value="">Не задано</option><option>blacklist</option><option>whitelist</option></select></div>
-              <div class="field"><label>Fake-IP filter</label><textarea class="mono" rows="2" placeholder="*.lan, *.local, geosite:cn"></textarea></div>
-              <div class="field"><label>Fake-IP TTL</label><input type="number" class="mono" placeholder="Не задано" oninput="this.dataset.nullable='true'"></div>
-              <div class="field"><label>Use hosts</label><label class="toggle"><input type="checkbox" onchange="this.dataset.nullable='true'"><span class="slider"></span></label></div>
-              <div class="field"><label>Use system hosts</label><label class="toggle"><input type="checkbox" onchange="this.dataset.nullable='true'"><span class="slider"></span></label></div>
-              <div class="field"><label>ECS</label><label class="toggle"><input type="checkbox" onchange="this.dataset.nullable='true'"><span class="slider"></span></label></div>
-              <div class="field"><label>ECS override</label><input class="mono" placeholder="(реальный IP клиента)"></div>
-              <div class="field"><label>Disable IPv4</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Disable IPv6</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Disable qtypes</label><input class="mono" placeholder="65 (HTTPS record)"></div>
-              <div class="field"><label>Fallback filter geoip</label><label class="toggle"><input type="checkbox" checked="" onchange="markFallbackFilterConfigured(this)"><span class="slider"></span></label></div>
-              <div class="field"><label>Fallback filter geoip code</label><input class="mono" value="CN" oninput="markFallbackFilterConfigured(this)"></div>
-              <div class="field"><label>Fallback filter geosite</label><input class="mono" placeholder="geosite:geolocation-!cn" oninput="markFallbackFilterConfigured(this)"></div>
-              <div class="field"><label>Fallback filter ipcidr</label><input class="mono" placeholder="240.0.0.0/4" oninput="markFallbackFilterConfigured(this)"></div>
-              <div class="field"><label>Fallback filter domain</label><input class="mono" placeholder="+.google.com" oninput="markFallbackFilterConfigured(this)"></div>
+              <div class="field"><label>Prefer H3</label><label class="toggle"><input type="checkbox" id="featDnsPreferH3"><span class="slider"></span></label></div>
+              <div class="field"><label>Respect rules</label><label class="toggle"><input type="checkbox" id="featDnsRespectRules"><span class="slider"></span></label></div>
+              <div class="field"><label>Default nameserver</label><textarea id="featDnsDefaultNameserver" class="mono" rows="2" placeholder="223.5.5.5"></textarea></div>
+              <div class="field"><label>Nameserver policy</label><textarea id="featDnsNameserverPolicy" class="mono" rows="3" placeholder="geosite:cn = 223.5.5.5&#10;*.local = 127.0.0.1"></textarea></div>
+              <div class="field"><label>Proxy server nameserver policy</label><textarea id="featDnsProxyServerNameserverPolicy" class="mono" rows="3" placeholder="server.example.com = 1.1.1.1&#10;*.provider.net = https://1.0.0.1/dns-query"></textarea></div>
+              <div class="field"><label>Direct nameserver follow policy</label><label class="toggle"><input type="checkbox" id="featDnsDirectFollowPolicy"><span class="slider"></span></label></div>
+              <div class="field"><label>Fake-IP filter mode</label><select id="featDnsFakeIpFilterMode"><option value="">Не задано</option><option>blacklist</option><option>whitelist</option></select></div>
+              <div class="field"><label>Fake-IP filter</label><textarea id="featDnsFakeIpFilter" class="mono" rows="2" placeholder="*.lan&#10;*.local&#10;geosite:cn"></textarea></div>
+              <div class="field"><label>Fake-IP TTL</label><input id="featDnsFakeIpTtl" type="number" class="mono" placeholder="Не задано"></div>
             </div>
-            <!-- 8.7 Sniffer -->
             <div class="feature-card">
               <h4>Sniffer</h4>
-              <div class="field"><label>Force domain</label><textarea class="mono" rows="2" placeholder="+.netflix.com&#10;+.nflxvideo.net"></textarea></div>
-              <div class="field"><label>Skip domain</label><textarea class="mono" rows="2" placeholder="+.apple.com&#10;Mijia Cloud"></textarea></div>
-              <div class="field"><label>Skip src address</label><textarea class="mono" rows="2" placeholder="192.168.0.0/16"></textarea></div>
-              <div class="field"><label>Skip dst address</label><textarea class="mono" rows="2" placeholder="127.0.0.1/8"></textarea></div>
+              <div class="field"><label>Force domain</label><textarea id="featSnifferForceDomain" class="mono" rows="2" placeholder="+.netflix.com&#10;+.nflxvideo.net"></textarea></div>
+              <div class="field"><label>Skip domain</label><textarea id="featSnifferSkipDomain" class="mono" rows="2" placeholder="+.apple.com&#10;Mijia Cloud"></textarea></div>
+              <div class="field"><label>Skip src address</label><textarea id="featSnifferSkipSrcAddress" class="mono" rows="2" placeholder="192.168.0.0/16"></textarea></div>
+              <div class="field"><label>Skip dst address</label><textarea id="featSnifferSkipDstAddress" class="mono" rows="2" placeholder="127.0.0.1/8"></textarea></div>
             </div>
-            <!-- 8.8 Sub-rules -->
-            <div class="feature-card">
-              <h4>Sub-rules</h4>
-              <textarea id="featSubRules" class="mono" rows="6" style="width:100%" placeholder="[Private]
-DOMAIN-SUFFIX,local,DIRECT
-IP-CIDR,192.168.0.0/16,DIRECT
-
-[AdBlock]
-DOMAIN-KEYWORD,ads,REJECT
-GEOSITE,category-ads-all,REJECT"></textarea>
-            </div>
-            <!-- 8.9 Typed rules -->
-            <div class="feature-card">
-              <h4>Typed rules</h4>
-              <div id="typedRulesList" style="margin-bottom:8px"></div>
-              <button class="btn btn-sm" onclick="addTypedRule()">+ Добавить правило</button>
-            </div>
-            <!-- 8.10 Raw rules -->
-            <div class="feature-card">
-              <h4>Raw rules</h4>
-              <textarea id="featRawRules" class="mono" rows="4" style="width:100%" placeholder="AND,(GEOIP,CN,DIRECT),(MATCH,PROXY)
-OR,((DOMAIN-SUFFIX,google.com),(DOMAIN-KEYword,google)),PROXY"></textarea>
-            </div>
-            <!-- 8.11 Proxy providers -->
-            <div class="feature-card">
-              <h4>Proxy providers</h4>
-              <div id="proxyProvidersList" style="margin-bottom:8px"></div>
-              <button class="btn btn-sm" onclick="addProxyProvider()">+ Добавить provider</button>
-            </div>
-            <!-- 8.12 Rule providers -->
-            <div class="feature-card">
-              <h4>Rule providers</h4>
-              <div id="ruleProvidersList" style="margin-bottom:8px"></div>
-              <button class="btn btn-sm" onclick="addRuleProvider()">+ Добавить provider</button>
-            </div>
-            <!-- 8.13 Tunnels -->
             <div class="feature-card">
               <h4>Tunnels</h4>
-              <div id="tunnelsList" style="margin-bottom:8px"></div>
-              <button class="btn btn-sm" onclick="addTunnel()">+ Добавить tunnel</button>
+              <div id="featTunnelsList" style="margin-bottom:8px"></div>
+              <button class="btn btn-sm" type="button" onclick="addFeatureTunnel({}, true)">+ Добавить tunnel</button>
             </div>
-            <!-- 8.14 Authentication -->
-            <div class="feature-card">
-              <h4>Authentication</h4>
-              <div class="field"><label>User:Pass (по строкам)</label><textarea id="featAuth" class="mono" rows="3" placeholder="user1:pass1&#10;user2:pass2"></textarea></div>
-              <div class="field"><label>Skip auth prefixes</label><textarea id="featSkipAuth" class="mono" rows="2" placeholder="127.0.0.1/8&#10;192.168.0.0/16"></textarea></div>
-            </div>
-            <!-- 8.15 Experimental -->
             <div class="feature-card">
               <h4>Experimental</h4>
-              <div class="field"><label>Disable QUIC GSO</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-              <div class="field"><label>Disable QUIC ECN</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
+              <div class="field"><label>Disable QUIC GSO</label><label class="toggle"><input type="checkbox" id="featDisableGso"><span class="slider"></span></label></div>
+              <div class="field"><label>Disable QUIC ECN</label><label class="toggle"><input type="checkbox" id="featDisableEcn"><span class="slider"></span></label></div>
             </div>
-            <!-- Hosts (отдельно) -->
             <div class="feature-card">
               <h4>Hosts</h4>
               <textarea id="featHosts" class="mono" rows="3" style="width:100%" placeholder="example.com=1.2.3.4&#10;local.test=127.0.0.1"></textarea>
             </div>
           </div>
           <div style="margin-top:16px;display:flex;gap:8px">
-            <button class="btn btn-accent" onclick="saveFeatures()">Сохранить</button>
-            <button class="btn" onclick="loadFeatures()">Загрузить</button>
+            <button class="btn btn-accent" id="featSave" onclick="saveFeatures()" disabled>Сохранить</button>
+            <button class="btn" id="featReload" onclick="loadFeatures(true)">Загрузить</button>
           </div>
         </div>
       </section>
@@ -2109,7 +2059,7 @@ OR,((DOMAIN-SUFFIX,google.com),(DOMAIN-KEYword,google)),PROXY"></textarea>
           </div>
           <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
             <button class="btn" onclick="loadTrash()">Обновить</button>
-            <button class="btn btn-accent" id="trashQuickAll" onclick="quickTestAllTrash()">⚡ Быстрый тест всех</button>
+            <button class="btn btn-accent" id="trashQuickAll" data-bench-scope="group" data-title-ru="Quick Test всех Dead Servers, до настроенного числа параллельно" data-title-en="Quick Test all Dead Servers, up to the configured parallel count" title="Quick Test всех Dead Servers, до настроенного числа параллельно" onclick="quickTestAllTrash()">⚡ Быстрый тест всех</button>
             <button class="btn" id="trashRestoreAll" onclick="restoreAllTrash()">↩ Восстановить все</button>
             <button class="btn" onclick="purgeGoneTrash()">Удалить отсутствующие</button>
             <button class="btn btn-danger" id="trashClearAll" onclick="clearAllTrash()">Очистить всё</button>
@@ -2246,6 +2196,49 @@ proxies:
 rules:
   - GEOIP,CN,DIRECT
   - MATCH,PROXY</div>
+        </div>
+      </section>
+
+      <!-- ═══ PROFILE DIAGNOSTIC LOGGER ═══ -->
+      <section class="section-panel" data-section="profile-logger" data-od-id="sec-profile-logger">
+        <div class="section-header" onclick="toggleSection(this)">
+          <h2>Логгер профиля</h2>
+          <svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg>
+        </div>
+        <div class="section-body">
+          <p id="profileLoggerWorkflow">Укажите IP устройства, выберите текущий активный сервер, запустите запись, затем воспроизведите проблему. В отчёт попадут только новые соединения этого устройства после запуска.</p>
+          <p class="msg info" id="profileLoggerPrivacy">Логгер не содержит ключи или URL подписок. Он фиксирует только новые прокси-соединения точно указанного клиента; события без его точного IP исключаются.</p>
+          <div class="profile-logger-grid" style="margin-top:16px">
+            <div class="profile-logger-panel">
+              <div class="form-row" style="align-items:flex-end">
+                <div class="form-group" style="flex:1;min-width:220px"><label for="profileLoggerProfile">Активный сервер</label><select id="profileLoggerProfile" data-native-select="1" data-title-ru="Диагностику можно запустить только для текущего активного сервера" data-title-en="Diagnostics can only start for the current active server" title="Диагностику можно запустить только для текущего активного сервера"></select><span id="profileLoggerActiveIdentity" class="mono" style="font-size:var(--fs-xs);color:var(--muted)">—</span></div>
+                <div class="form-group"><label for="profileLoggerDuration">Длительность</label><select id="profileLoggerDuration" data-native-select="1" data-title-ru="Запись автоматически завершится через выбранное время" data-title-en="Capture stops automatically after the selected time" title="Запись автоматически завершится через выбранное время"><option value="60">1 минута</option><option value="120">2 минуты</option><option value="180">3 минуты</option><option value="300">5 минут</option></select></div>
+                <div class="form-group"><label for="profileLoggerSourceIp">IP устройства (обязательно)</label><input id="profileLoggerSourceIp" class="mono" inputmode="decimal" placeholder="192.168.2.35" required aria-required="true" oninput="updateProfileLoggerStartState()" data-title-ru="Введите LAN IP устройства, на котором будете воспроизводить проблему" data-title-en="Enter the LAN IP of the device where you will reproduce the issue" title="Введите LAN IP устройства, на котором будете воспроизводить проблему"><span style="font-size:var(--fs-xs);color:var(--muted)">Например, IP телефона, ТВ или компьютера в списке устройств роутера.</span></div>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+                <button class="btn btn-accent" id="profileLoggerStart" onclick="startProfileLogger()" data-title-ru="Начать ограниченную запись активного профиля" data-title-en="Start a bounded capture of the active profile" title="Начать ограниченную запись активного профиля">▶ Запустить</button>
+                <button class="btn btn-danger" id="profileLoggerStop" onclick="stopProfileLogger()" data-title-ru="Остановить запись и сформировать отчёт" data-title-en="Stop capture and generate the report" title="Остановить запись и сформировать отчёт" disabled>■ Остановить</button>
+                <button class="btn" id="profileLoggerDiscard" onclick="discardProfileLogger()" data-title-ru="Удалить текущую запись или готовый отчёт" data-title-en="Delete the current capture or completed report" title="Удалить текущую запись или готовый отчёт" disabled>Удалить отчёт</button>
+              </div>
+              <div id="profileLoggerState" role="status" aria-live="polite" style="margin-top:14px;color:var(--muted)">Готов к записи</div>
+              <div class="profile-logger-stats">
+                <div class="profile-logger-stat"><span>Прошло</span><strong id="profileLoggerElapsed">0:00</strong></div>
+                <div class="profile-logger-stat"><span>Осталось</span><strong id="profileLoggerRemaining">0:00</strong></div>
+                <div class="profile-logger-stat"><span>Соединения</span><strong id="profileLoggerConnections">0</strong></div>
+                <div class="profile-logger-stat"><span>События / ошибки</span><strong id="profileLoggerEvents">0 / 0</strong></div>
+              </div>
+              <div id="profileLoggerTruncation" class="msg warning" style="display:none;margin-top:12px">Отчёт усечён: достигнут безопасный лимит соединений или событий.</div>
+            </div>
+            <div class="profile-logger-panel" id="profileLoggerReportPanel" style="display:none">
+              <h3 style="margin:0 0 10px">Отчёт для AI</h3>
+              <div id="profileLoggerSummary" style="font-size:var(--fs-sm);color:var(--muted);margin-bottom:10px"></div>
+              <textarea id="profileLoggerMarkdown" class="mono profile-logger-report" readonly aria-label="Markdown отчёт для AI"></textarea>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+                <button class="btn btn-accent" id="profileLoggerCopy" onclick="copyProfileLoggerReport()">Копировать</button>
+                <button class="btn" id="profileLoggerSave" onclick="saveProfileLoggerReport()">Сохранить .md</button>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -2390,12 +2383,17 @@ function previewApi(method, path, body) {
     '/api/telegram-probe/status': {configured:true,login_pending:true,two_factor_required:true,peer:'@hincyray_test',message_id:42},
     '/api/logs': {mihomo:'14:32:04 INFO proxy-active health check passed',daemon:'14:32:05 WARN TPROXY unavailable; REDIRECT fallback active'},
     '/api/mihomo-config': {config:'mixed-port: 10809\nredir-port: 10810\ntproxy-port: 10811'},
-    '/api/mihomo-features': {geodata_loader:'memconservative',unified_delay:true,store_fake_ip:true,store_selected:true,keep_alive_interval:30,keep_alive_idle:120,proxy_group:{enabled:true,group_type:'url-test',url:'https://www.gstatic.com/generate_204',interval:300,timeout:5000,max_failed_times:5},external_controller:{enabled:true,address:'127.0.0.1:9090',allow_origins:['http://192.168.1.1']},ntp:{enabled:true,server:'time.apple.com',port:123,interval:30,write_to_system:true},per_proxy:{udp:true,ip_version:'dual'},dns_cache_algorithm:'arc',dns_default_nameserver:['1.1.1.1'],sniffer_force_domain:['+.netflix.com'],authentication:['admin:preview'],hosts:{'local.test':'127.0.0.1'}},
+    '/api/mihomo-features': {parameters:{unified_delay:true,store_selected:true,keep_alive_interval:30,keep_alive_idle:120,disable_keep_alive:false,tcp_concurrent:true,per_proxy:{tfo:false,mptcp:false,ip_version:'dual'},dns:{prefer_h3:false,respect_rules:true,default_nameserver:['1.1.1.1'],nameserver_policy:{'geosite:private':['192.168.1.1']},proxy_server_nameserver_policy:{},direct_nameserver_follow_policy:true,fake_ip_filter_mode:'blacklist',fake_ip_filter:['*.lan','*.local'],fake_ip_ttl:60},sniffer:{force_domain:['+.netflix.com'],skip_domain:[],skip_src_address:[],skip_dst_address:[]},tunnels:[],hosts:{'local.test':'127.0.0.1'},experimental:{quic_go_disable_gso:false,quic_go_disable_ecn:false}},runtime:{geodata_loader:'memconservative',store_fake_ip:true,udp:true,external_controller:{enabled:true,address:'127.0.0.1:9090',connected:true}}},
     '/api/routing/connection-context': {connections:MOCK.active_connections},
     '/api/subscriptions/refresh-report': {report:{timestamp:now,refreshed:2,added:3,changed:2,removed:1,failed:1,entries:[{url:'https://sub.example.com/link1',title:'Premium · Europe & Asia',status:'updated',previous_count:17,new_count:20,added:3,changed:2,removed:0,error:null},{url:'https://sub.example.com/link2',title:'Reserve nodes',status:'error',previous_count:23,new_count:22,added:0,changed:0,removed:1,error:'timeout'}]}},
     '/api/undo': {undo:[{id:'preview-routing',timestamp:now-120,label:'Маршрутизация до применения GeoBase'}]},
     '/api/mihomo-config/preview': {config:'proxy-groups:\n  - name: proxy-active\n    type: fallback\n    proxies: [proxy, DIRECT]\nrules:\n  - IP-CIDR,203.0.113.0/24,proxy-active'},
   };
+  if (method === 'GET' && /^\/api\/profiles\/\d+$/.test(path)) {
+    const profile = MOCK.profiles.find(item => item.id === Number(path.split('/').at(-1)));
+    if (!profile) return Promise.reject(new Error('profile not found'));
+    return Promise.resolve({profile:{...structuredClone(profile),server_ref:`preview:${profile.id}`,raw:`vless://preview-secret@${profile.address}:${profile.port}#preview`,subscription_managed:!!subscriptionForGroup(profile.group),dead:!!profile.dead}});
+  }
   if (path === '/api/mihomo-api/connections/page') return Promise.resolve({connections:MOCK.active_connections,total:MOCK.active_connections.length});
   if (path === '/api/mihomo-api/connections') return Promise.resolve({connections:MOCK.active_connections});
   if (path === '/api/mihomo-api/connections/device-traffic') return Promise.resolve({devices:{}});
@@ -2408,6 +2406,8 @@ function previewApi(method, path, body) {
   }
   if (path === '/api/bench/stop') { previewBenchStatus = {...previewBenchStatus,state:'stopped',running:false}; return Promise.resolve({stopped:true}); }
   if (method === 'GET' && Object.prototype.hasOwnProperty.call(routes,path)) return Promise.resolve(structuredClone(routes[path]));
+  if (method === 'POST' && path === '/api/mihomo-features') return Promise.resolve({parameters:structuredClone(body.parameters),runtime:structuredClone(routes[path].runtime)});
+  if (method === 'POST' && path === '/api/profiles/revalidate-ungrouped') return Promise.resolve({checked:2,updated:1,unchanged:1,dataplane_applied:false,errors:[]});
   if (path === '/api/auth/login') return Promise.resolve({token:'preview-token'});
   if (path.includes('delay')) return Promise.resolve({delay:47});
   if (path.includes('speed-test')) return Promise.resolve({download_mbps:86.4,bytes:10485760,elapsed_ms:966});
@@ -2448,8 +2448,12 @@ async function api(method, path, body, silent=false) {
       throw new Error('unauthorized');
     }
     if (!resp.ok) {
-      let msg = data && typeof data === 'object' && data.error ? data.error : (text || resp.statusText);
-      if (msg === 'external controller not enabled') msg = t('External Controller выключен. Включите его в Mihomo → Параметры, чтобы работали память, статус прокси, задержка и EC-действия.');
+      let msg = data && typeof data === 'object' && data.error
+        ? data.error
+        : data && typeof data === 'object' && Array.isArray(data.errors) && data.errors.length
+          ? data.errors.slice(0,10).map(item => `${item.name || item.profile_id || t('Профиль')}: ${item.error || t('Ошибка')}`).join('; ')
+          : (text || resp.statusText);
+      if (msg === 'external controller not enabled') msg = t('External Controller недоступен. Проверьте его статус в Mihomo → Параметры.');
       if (!silent) showToast('error', msg);
       throw new Error(msg);
     }
@@ -2461,6 +2465,7 @@ async function api(method, path, body, silent=false) {
 
 const LONG_OPERATIONS = [
   [/^\/api\/subscriptions\/refresh(?:-one)?$/, 'Обновление подписок…'],
+  [/^\/api\/profiles\/revalidate-ungrouped$/, 'Локальная проверка профилей…'],
   [/^\/api\/deep-bench\/start$/, 'Глубокая проверка серверов…'],
   [/^\/api\/geo\/download$/, 'Загрузка GeoData…'],
   [/^\/api\/geobases\/(?:analyze|sync)$/, 'Обработка GeoBase…'],
@@ -2610,11 +2615,257 @@ function saveLogMd() {
   showToast('success',t('Лог сохранён в .md'));
 }
 
+// ─── PROFILE DIAGNOSTIC LOGGER ───────────────────────────────────────
+let profileLoggerSession = null;
+let profileLoggerReport = null;
+let profileLoggerPollTimer = null;
+let profileLoggerPollPending = false;
+let profileLoggerReportRequest = null;
+let profileLoggerFetchedSessionId = null;
+let profileLoggerGeneration = 0;
+
+function renderProfileLoggerProfiles() {
+  const select = document.getElementById('profileLoggerProfile');
+  if (!select) return;
+  const profiles = Array.isArray(MOCK.profiles) ? MOCK.profiles : [];
+  const active = profiles.find(profile => profile.active === true);
+  select.replaceChildren();
+  if (!profiles.length) {
+    const option = document.createElement('option');
+    option.textContent = t('Нет активного профиля');
+    option.disabled = true;
+    option.selected = true;
+    select.appendChild(option);
+  } else {
+    profiles.forEach(profile => {
+      const option = document.createElement('option');
+      option.value = String(profile.id);
+      option.textContent = `${profile.name || '#'+profile.id} (#${profile.id})`;
+      option.disabled = !profile.active;
+      option.selected = !!profile.active;
+      select.appendChild(option);
+    });
+  }
+  select.disabled = !!profileLoggerSession || !active;
+  safeSet('profileLoggerActiveIdentity', active ? `${active.name || '#'+active.id} · ID ${active.id}` : t('Нет активного профиля'));
+  const start = document.getElementById('profileLoggerStart');
+  if (start) start.disabled = !!profileLoggerSession || !active || !document.getElementById('profileLoggerSourceIp')?.value.trim();
+}
+
+function updateProfileLoggerStartState() { renderProfileLoggerProfiles(); }
+
+function profileLoggerTime(seconds) {
+  const safe = Math.max(0, Math.floor(Number(seconds) || 0));
+  return `${Math.floor(safe / 60)}:${String(safe % 60).padStart(2,'0')}`;
+}
+
+function profileLoggerErrorCount(status) {
+  if (Number.isFinite(Number(status?.error_count))) return Number(status.error_count);
+  return 0;
+}
+
+function renderProfileLoggerStatus(status) {
+  if (!status) return;
+  profileLoggerSession = status;
+  const now = Math.floor(Date.now() / 1000);
+  const elapsed = Math.max(0, Math.min(Number(status.deadline_unix || now) - Number(status.started_at_unix || now), now - Number(status.started_at_unix || now)));
+  const remaining = Math.max(0, Number(status.deadline_unix || now) - now);
+  safeSet('profileLoggerElapsed', profileLoggerTime(elapsed));
+  safeSet('profileLoggerRemaining', profileLoggerTime(remaining));
+  safeSet('profileLoggerConnections', String(status.connection_count ?? 0));
+  safeSet('profileLoggerEvents', `${status.event_count ?? 0} / ${profileLoggerErrorCount(status)}`);
+  safeSet('profileLoggerState', `${t('Запись активна')}: ${status.profile_name || '#'+status.profile_id} · ${status.session_id}`);
+  const start = document.getElementById('profileLoggerStart');
+  const stop = document.getElementById('profileLoggerStop');
+  const discard = document.getElementById('profileLoggerDiscard');
+  const profile = document.getElementById('profileLoggerProfile');
+  const duration = document.getElementById('profileLoggerDuration');
+  const sourceIp = document.getElementById('profileLoggerSourceIp');
+  if (start) start.disabled = true;
+  if (stop) stop.disabled = false;
+  if (discard) discard.disabled = false;
+  if (profile) profile.disabled = true;
+  if (duration) duration.disabled = true;
+  if (sourceIp) sourceIp.disabled = true;
+}
+
+function renderProfileLoggerReport(response, expectedSessionId) {
+  const report = response?.report;
+  if (!report || typeof report.markdown !== 'string' || report.session_id !== expectedSessionId) throw new Error('profile diagnostic session mismatch');
+  profileLoggerReport = report;
+  profileLoggerSession = null;
+  profileLoggerFetchedSessionId = report.session_id || profileLoggerFetchedSessionId;
+  const summary = report.summary || {};
+  const errors = Number(summary.poll_errors || 0) + Object.values(summary.failure_classifications || {}).reduce((total,value) => total + (Number(value) || 0), 0);
+  safeSet('profileLoggerElapsed', profileLoggerTime(report.observed_duration_seconds));
+  safeSet('profileLoggerRemaining', '0:00');
+  safeSet('profileLoggerConnections', String(summary.connections ?? report.connections?.length ?? 0));
+  safeSet('profileLoggerEvents', `${summary.events ?? report.events?.length ?? 0} / ${errors}`);
+  safeSet('profileLoggerState', `${t('Запись завершена')}: ${report.profile?.name || '#'+report.profile?.id}`);
+  const summaryEl = document.getElementById('profileLoggerSummary');
+  if (summaryEl) summaryEl.textContent = `${report.profile?.name || '#'+report.profile?.id} · ${profileLoggerTime(report.observed_duration_seconds)} · ${summary.connections || 0} ${t('Соединения').toLowerCase()} · ${summary.events || 0} ${t('События / ошибки').toLowerCase()}`;
+  safeValue('profileLoggerMarkdown', report.markdown);
+  const panel = document.getElementById('profileLoggerReportPanel');
+  if (panel) panel.style.display = '';
+  const truncated = Number(summary.dropped_connections || 0) > 0 || Number(summary.dropped_events || 0) > 0;
+  const warning = document.getElementById('profileLoggerTruncation');
+  if (warning) warning.style.display = truncated ? '' : 'none';
+  const stop = document.getElementById('profileLoggerStop');
+  const discard = document.getElementById('profileLoggerDiscard');
+  const duration = document.getElementById('profileLoggerDuration');
+  const sourceIp = document.getElementById('profileLoggerSourceIp');
+  if (stop) stop.disabled = true;
+  if (discard) discard.disabled = false;
+  if (duration) duration.disabled = false;
+  if (sourceIp) sourceIp.disabled = false;
+  renderProfileLoggerProfiles();
+  stopProfileLoggerPolling();
+}
+
+function clearProfileLoggerState() {
+  profileLoggerGeneration += 1;
+  stopProfileLoggerPolling();
+  profileLoggerSession = null;
+  profileLoggerReport = null;
+  profileLoggerReportRequest = null;
+  profileLoggerFetchedSessionId = null;
+  safeValue('profileLoggerMarkdown','');
+  safeValue('profileLoggerSourceIp','');
+  safeSet('profileLoggerElapsed','0:00');
+  safeSet('profileLoggerRemaining','0:00');
+  safeSet('profileLoggerConnections','0');
+  safeSet('profileLoggerEvents','0 / 0');
+  safeSet('profileLoggerState',t('Готов к записи'));
+  const panel = document.getElementById('profileLoggerReportPanel');
+  const warning = document.getElementById('profileLoggerTruncation');
+  const stop = document.getElementById('profileLoggerStop');
+  const discard = document.getElementById('profileLoggerDiscard');
+  const duration = document.getElementById('profileLoggerDuration');
+  const sourceIp = document.getElementById('profileLoggerSourceIp');
+  if (panel) panel.style.display = 'none';
+  if (warning) warning.style.display = 'none';
+  if (stop) stop.disabled = true;
+  if (discard) discard.disabled = true;
+  if (duration) duration.disabled = false;
+  if (sourceIp) sourceIp.disabled = false;
+  renderProfileLoggerProfiles();
+}
+
+function fetchProfileLoggerReport(sessionId) {
+  if (profileLoggerFetchedSessionId === sessionId && profileLoggerReport) return Promise.resolve(profileLoggerReport);
+  if (profileLoggerReportRequest) return profileLoggerReportRequest;
+  const generation = profileLoggerGeneration;
+  profileLoggerReportRequest = api('POST','/api/profile-diagnostics/report',{session_id:sessionId},true)
+    .then(response => {
+      if (generation !== profileLoggerGeneration) return null;
+      renderProfileLoggerReport(response,sessionId);
+      return response.report;
+    })
+    .finally(() => { profileLoggerReportRequest = null; });
+  return profileLoggerReportRequest;
+}
+
+function pollProfileLoggerStatus() {
+  if (profileLoggerPollPending || !document.querySelector('.section-panel[data-section="profile-logger"].open')) return Promise.resolve();
+  const generation = profileLoggerGeneration;
+  profileLoggerPollPending = true;
+  return api('GET','/api/profile-diagnostics/status',undefined,true).then(status => {
+    if (generation !== profileLoggerGeneration || !document.querySelector('.section-panel[data-section="profile-logger"].open')) return;
+    if (status?.active) {
+      renderProfileLoggerStatus(status.active);
+      startProfileLoggerPolling();
+    } else if (status?.completed) {
+      profileLoggerSession = status.completed;
+      stopProfileLoggerPolling();
+      return fetchProfileLoggerReport(status.completed.session_id);
+    } else {
+      clearProfileLoggerState();
+    }
+  }).catch(() => {}).finally(() => { profileLoggerPollPending = false; });
+}
+
+function startProfileLoggerPolling() {
+  if (profileLoggerPollTimer || !profileLoggerSession || !document.querySelector('.section-panel[data-section="profile-logger"].open')) return;
+  profileLoggerPollTimer = setInterval(pollProfileLoggerStatus, 2000);
+}
+
+function stopProfileLoggerPolling() {
+  if (profileLoggerPollTimer) clearInterval(profileLoggerPollTimer);
+  profileLoggerPollTimer = null;
+}
+
+function openProfileLogger() {
+  renderProfileLoggerProfiles();
+  pollProfileLoggerStatus();
+}
+
+function startProfileLogger() {
+  const active = (MOCK.profiles || []).find(profile => profile.active === true);
+  const selected = Number(document.getElementById('profileLoggerProfile')?.value);
+  if (!active || selected !== Number(active.id)) { showToast('error',t('Нет активного профиля')); return; }
+  const payload = {
+    profile_id: selected,
+    duration_seconds: Number(document.getElementById('profileLoggerDuration')?.value || 60),
+  };
+  const sourceIp = document.getElementById('profileLoggerSourceIp')?.value.trim();
+  if (!sourceIp) { showToast('error',t('Укажите IP устройства')); return; }
+  payload.source_ip = sourceIp;
+  api('POST','/api/profile-diagnostics/start',payload).then(response => {
+    profileLoggerGeneration += 1;
+    profileLoggerReport = null;
+    profileLoggerFetchedSessionId = null;
+    safeValue('profileLoggerMarkdown','');
+    const panel = document.getElementById('profileLoggerReportPanel');
+    if (panel) panel.style.display = 'none';
+    renderProfileLoggerStatus(response.session);
+    startProfileLoggerPolling();
+  }).catch(() => {});
+}
+
+function stopProfileLogger() {
+  if (!profileLoggerSession?.session_id) return;
+  const sessionId = profileLoggerSession.session_id;
+  const button = document.getElementById('profileLoggerStop');
+  setButtonPending(button,true,t('Остановить'));
+  api('POST','/api/profile-diagnostics/stop',{session_id:sessionId}).then(response => renderProfileLoggerReport(response,sessionId)).catch(() => {}).finally(() => {
+    setButtonPending(button,false);
+    if (button) button.disabled = !profileLoggerSession;
+  });
+}
+
+function discardProfileLogger() {
+  const sessionId = profileLoggerSession?.session_id || profileLoggerReport?.session_id;
+  const payload = sessionId ? {session_id:sessionId} : {};
+  api('POST','/api/profile-diagnostics/discard',payload).then(() => {
+    clearProfileLoggerState();
+    showToast('success',t('Отчёт удалён'));
+  }).catch(() => {});
+}
+
+function copyProfileLoggerReport() {
+  if (!profileLoggerReport || typeof profileLoggerReport.markdown !== 'string') return;
+  copyText(profileLoggerReport.markdown,t('Отчёт скопирован'));
+}
+
+function saveProfileLoggerReport() {
+  if (!profileLoggerReport || typeof profileLoggerReport.markdown !== 'string') return;
+  const blob = new Blob([profileLoggerReport.markdown],{type:'text/markdown'});
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = `profile-diagnostic-${profileLoggerReport.session_id || new Date().toISOString().slice(0,10)}.md`;
+  link.click();
+  URL.revokeObjectURL(link.href);
+  showToast('success',t('Отчёт сохранён'));
+}
+
 // ─── LOGIN ───────────────────────────────────────────────────────────
 function showLoginOverlay() {
+  clearProfileEditorSensitiveState();
+  clearProfileLoggerState();
   document.getElementById('loginOverlay').style.display = 'flex';
 }
 function doLogin() {
+  clearProfileLoggerState();
   const u = document.getElementById('loginUser').value;
   const p = document.getElementById('loginPass').value;
   if (!u || !p) { document.getElementById('loginError').textContent=t('Заполните оба поля'); document.getElementById('loginError').style.display='block'; return; }
@@ -2625,12 +2876,15 @@ function doLogin() {
     document.getElementById('loginOverlay').style.display='none';
     showToast('success',t('Авторизация успешна'));
     refreshDashboard();
+    if (document.querySelector('.section-panel[data-section="profile-logger"].open')) openProfileLogger();
   }).catch(e => {
     const err = document.getElementById('loginError');
     if (err) { err.textContent = e.message || 'login failed'; err.style.display='block'; }
   });
 }
 function doLogout() {
+  clearProfileEditorSensitiveState();
+  clearProfileLoggerState();
   api('POST','/api/auth/logout',{token:sessionStorage.getItem('hincyray_token')}).finally(() => {
     sessionStorage.removeItem('hincyray_token');
     showToast('info',t('Вы вышли из системы'));
@@ -2697,6 +2951,7 @@ const NAV_MAP = {
   'trace':       {group:'diagnostics',label:'Трассировка'},
   'unlock':      {group:'diagnostics',label:'Разблокировка'},
   'diag-network':{group:'diagnostics',label:'DNS / UDP / QUIC'},
+  'profile-logger':{group:'diagnostics',label:'Логгер профиля'},
   'deep-bench':  {group:'diagnostics',label:'Отложенное тестирование'},
   'trash':       {group:'diagnostics',label:'Мусор'},
   'backups':     {group:'admin',label:'Бэкапы и WebDAV'},
@@ -2712,7 +2967,7 @@ const GROUP_SUBS = {
   routing:     ['routing','connections-table','devices','dns'],
   mihomo:      ['features','config','logs','update'],
   automation:  ['auto-select','maintenance'],
-  diagnostics: ['trace','unlock','diag-network','deep-bench','trash'],
+  diagnostics: ['trace','unlock','diag-network','profile-logger','deep-bench','trash'],
   admin:       ['backups','auth','hwid','acrylic','tooltips'],
 };
 const GROUP_LABELS = {
@@ -2753,6 +3008,9 @@ function navTo(section) {
   // Persist
   localStorage.setItem('hr_current_section', section);
   if (section === 'connections-table') startConnectionsTableAutoRefresh();
+  if (section === 'profile-logger') openProfileLogger();
+  else stopProfileLoggerPolling();
+  if (section === 'features') loadFeatures();
 }
 
 function globalSearch(query) {
@@ -2933,7 +3191,7 @@ const I18N = {
   'Split Routing':'Split Routing','Таблица соединений':'Connections Table','По устройствам':'Per-Device','DNS':'DNS',
   'Параметры':'Parameters','Конфигурация':'Configuration','Логи':'Logs','Обновление':'Update',
   'Auto-Select':'Auto-Select','Обслуживание':'Maintenance','Цепь маршрутизации':'Routing Chain',
-  'Трассировка':'Traceroute','Разблокировка':'Unlock Check',
+  'Трассировка':'Traceroute','Разблокировка':'Unlock Check','Логгер профиля':'Profile Logger',
   'Бэкапы и WebDAV':'Backups & WebDAV','Авторизация':'Authorization','HWID':'HWID',
   'Acrylic':'Acrylic','Подсказки':'Tooltips',
   // Section h2 titles (unique ones not covered above)
@@ -2955,6 +3213,13 @@ const I18N = {
   'Активен':'Active','OK':'OK',
   // Cards — benchmark summary
   'Прошло':'Passed','Не прошло':'Failed','Средняя задержка':'Avg latency',
+  'В работе':'Active',
+  'Параллельных серверов':'Parallel servers',
+  '⚡ в строке проверяет только один сервер. ⚡ у группы/подписки, выбранная область и Full Test используют до настроенного числа параллельных серверов.':'A row ⚡ tests only one server. Group/subscription ⚡, selected scope, and Full Test use up to the configured parallel count.',
+  'Для группы, выбранной области и Full Test; строка ⚡ всегда одна.':'For group, selected-scope, and Full tests; a row ⚡ always tests one.',
+  'Quick Test только этого сервера':'Quick Test this server only',
+  'Quick Test группы, до настроенного числа серверов параллельно':'Quick Test group, up to the configured parallel count',
+  'Quick Test подписки, до настроенного числа серверов параллельно':'Quick Test subscription, up to the configured parallel count',
   // Cards — update
   'Текущая':'Current','Доступна':'Available',
   // Buttons
@@ -3003,8 +3268,7 @@ const I18N = {
   'Маршруты устройств применены':'Device routes applied','Профиль выбран':'Profile selected',
   'Настройки сохранены':'Settings saved','Настройки загружены':'Settings loaded',
   'Sub-Store сохранён':'Sub-Store saved','Sub-Store применён':'Sub-Store applied',
-  'Параметры Mihomo сохранены':'Mihomo features saved','Параметры загружены':'Features loaded',
-  'Параметры сохранены, применяю конфигурацию…':'Features saved, applying configuration…','Параметры Mihomo сохранены и применены':'Mihomo features saved and applied',
+  'Параметры Mihomo сохранены':'Mihomo features saved','Параметры загружены':'Features loaded','Параметры Mihomo сохранены и применены':'Mihomo features saved and applied',
   'Настройки авторизации сохранены':'Auth settings saved',
   'Настройки маршрутизации сохранены':'Routing settings saved',
   'Бэкап создан':'Backup created','Логи загружены':'Logs loaded',
@@ -3015,18 +3279,20 @@ const I18N = {
   'Network':'Network','Source IP':'Source IP','Host':'Host','Decision':'Decision','Reason':'Reason','Source':'Source','Candidates':'Candidates',
   'Тест задержки выполняется…':'Delay test running…','Тест скорости выполняется…':'Speed test running…',
   'Download':'Download','Bytes':'Bytes','Elapsed':'Elapsed',
-  'External Controller выключен. Включите его в Mihomo → Параметры, чтобы работали память, статус прокси, задержка и EC-действия.':'External Controller is disabled. Enable it in Mihomo → Features to use memory, proxy status, delay test and EC actions.',
+  'External Controller недоступен. Проверьте его статус в Mihomo → Параметры.':'External Controller is unavailable. Check its status in Mihomo → Parameters.',
   'Найдено устройств':'Devices found','Укажите host':'Enter host',
   'Сохранить настройки':'Save Settings',
   'Auto-switch при сбое':'Auto-switch on failure','Block QUIC глобально':'Block QUIC globally',
   'QUIC режим':'QUIC mode','Источник правил':'Rule source','VPN Subnet':'VPN Subnet',
   'Redirect Port':'Redirect Port','Policy Name':'Policy Name','Port Mode':'Port Mode','Proxy ports':'Proxy ports','Bypass ports':'Bypass ports',
   'Основные':'General','Сеть':'Network','Пресеты':'Presets','Правила':'Rules','Быстрые шаблоны':'Quick Templates',
-  'GEO loader':'GEO loader','Unified delay':'Unified delay','Store fake-ip':'Store fake-ip','TCP concurrent':'TCP concurrent',
-  'Включены':'Enabled','Тип группы':'Group type','Interval (s)':'Interval (s)','Tolerance (ms)':'Tolerance (ms)',
-  'Включён':'Enabled','Address':'Address','Secret':'Secret','Сервер':'Server','Interval (min)':'Interval (min)',
+  'GEO loader':'GEO loader','Unified delay':'Unified delay','Store selected':'Store selected','TCP concurrent':'TCP concurrent',
+  'Fake-IP persistence':'Fake-IP persistence','External Controller address':'External Controller address','External Controller status':'External Controller status','Подключён':'Connected','Не подключён':'Disconnected','Не задано':'Not set',
+  'Keep-alive interval (s)':'Keep-alive interval (s)','Keep-alive idle (s)':'Keep-alive idle (s)','Disable keep-alive':'Disable keep-alive',
   'UDP':'UDP','TFO':'TFO','MPTCP':'MPTCP','IP version':'IP version',
-  'Cache algo':'Cache algo','Prefer H3':'Prefer H3','Respect rules':'Respect rules','Proxy server nameserver policy':'Proxy server nameserver policy','Direct nameserver follow policy':'Direct nameserver follow policy',
+  'Prefer H3':'Prefer H3','Respect rules':'Respect rules','Default nameserver':'Default nameserver','Nameserver policy':'Nameserver policy','Proxy server nameserver policy':'Proxy server nameserver policy','Direct nameserver follow policy':'Direct nameserver follow policy','Fake-IP filter mode':'Fake-IP filter mode','Fake-IP filter':'Fake-IP filter','Fake-IP TTL':'Fake-IP TTL',
+  'Force domain':'Force domain','Skip domain':'Skip domain','Skip src address':'Skip src address','Skip dst address':'Skip dst address','Tunnels':'Tunnels','Experimental':'Experimental','Disable QUIC GSO':'Disable QUIC GSO','Disable QUIC ECN':'Disable QUIC ECN',
+  'некорректная строка':'invalid line','заполните address и target в строке':'fill address and target in row','Заполните обязательные числовые поля':'Fill the required numeric fields','Несохранённые изменения будут потеряны. Продолжить?':'Unsaved changes will be discarded. Continue?',
   'Интервал бенчмарка (ч)':'Benchmark interval (h)','Порог ошибок':'Error threshold',
   'Min success':'Min success','Cooldown (s)':'Cooldown (s)','Failure penalty':'Failure penalty',
   'Расписание':'Schedule','Задачи':'Tasks','Час (UTC)':'Hour (UTC)','Минута (UTC)':'Minute (UTC)','Интервал (дни)':'Interval (days)',
@@ -3035,10 +3301,10 @@ const I18N = {
   'Pipeline активен':'Pipeline active','Include фильтр (| разделитель)':'Include filter (| separator)','Exclude фильтр':'Exclude filter','Сортировка':'Sort by','Rename rules':'Rename rules','Deduplicate':'Deduplicate',
   'Авто-обновление':'Auto-update',
   // Feature card titles
-  'Глобальные':'Global','Proxy Groups':'Proxy Groups','External Controller':'External Controller','NTP':'NTP',
+  'Runtime':'Runtime','External Controller':'External Controller','Per-proxy defaults':'Per-proxy defaults','Sniffer':'Sniffer',
   'Per-proxy':'Per-proxy','DNS расширенные':'DNS Advanced',
   'Auto-Select':'Auto-Select','Failover':'Failover',
-  'Raw-правила':'Raw rules','Hosts':'Hosts',
+  'Hosts':'Hosts',
   // Table headers
   'Имя':'Name','Протокол':'Protocol','Транспорт':'Transport','Адрес':'Address',
   'Задержка':'Delay','Джиттер':'Jitter','Потери':'Loss','Скорость':'Speed','EWMA':'EWMA','Cooldown':'Cooldown','Ошибки':'Errors',
@@ -3060,16 +3326,25 @@ const I18N = {
   'Параметры acrylic-эффекта боковой панели':'Parameters for sidebar acrylic effect',
   'Прозрачность':'Opacity','Размытие':'Blur','Насыщенность':'Saturation','Шум':'Noise','Блик':'Gloss',
   'Группы прокси':'Proxy Groups','Лог подключений':'Connection Log',
-  'Добавить один профиль':'Add single profile','Добавить профиль':'Add profile','Share link':'Share link','Группа':'Group','Без группы':'No group','Переименовать':'Rename','Refresh':'Refresh','Избранные профили':'Favorite profiles','Нет избранных профилей':'No favorite profiles',
+  'Добавить один профиль':'Add single profile','Добавить профиль':'Add profile','Share link':'Share link','Группа':'Group','Без группы':'No group','Переименовать':'Rename','Редактировать профиль':'Edit profile','Refresh':'Refresh','Избранные профили':'Favorite profiles','Нет избранных профилей':'No favorite profiles',
+  'Загрузка профиля…':'Loading profile…','Не удалось загрузить профиль':'Could not load profile','Полная share-ссылка':'Full share link','Разобранные параметры профиля':'Parsed profile fields','Дохлый сервер':'Dead server','Показать секрет':'Show secret','Скрыть секрет':'Hide secret','Копировать ссылку':'Copy link','Ссылка скопирована':'Link copied','Ссылка управляется подпиской и доступна только для просмотра. Имя можно изменить.':'This link is managed by its subscription and is read-only. You can still edit the name.','Имя и share-ссылка не должны быть пустыми':'Name and share link must not be empty','Имя не должно быть пустым':'Name must not be empty','Профиль обновлён':'Profile updated','да':'yes','нет':'no',
+  'Проверить локальные профили':'Revalidate local profiles','Повторно разобрать локально сохранённые share-ссылки профилей без группы. Подписки и сеть не используются.':'Reparse locally stored share links for ungrouped profiles. No subscription or network fetch is performed.','Локальная проверка профилей…':'Revalidating local profiles…','Локальная проверка завершена':'Local revalidation complete','проверено':'checked','обновлено':'updated','без изменений':'unchanged','ошибок':'errors','Локальная проверка не изменила профили':'Local revalidation did not change profiles','Обновить эту подписку из источника':'Refresh this subscription from its source',
   'Geo asset path':'Geo asset path','Обновить каталог':'Refresh catalog','Добавить правило':'Add rule','Быстрая строка':'Quick row','Домены':'Domains','IPs':'IPs','Порты':'Ports','Популярные сервисы':'Popular services',  'Редактировать':'Edit','Удалить':'Delete','Правила сохранены':'Rules saved','Отмена':'Cancel','Редактировать правило':'Edit rule','Сохранить':'Save',
   'Активные соединения (max 50)':'Active connections (max 50)','Disable rules':'Disable rules','Auto-refresh subscriptions':'Auto-refresh subscriptions','Auto-refresh interval (ч)':'Auto-refresh interval (h)',
   'Текущие соединения по сайтам и используемые профили/серверы':'Current connections by site and used profiles/servers','Агрегация по сайту/IP. Источник маршрута берётся из observed Mihomo chain, без угадывания profile id.':'Aggregated by site/IP. Route source comes from observed Mihomo chain, without guessing profile id.','Сайтов':'Sites','Соединений':'Connections','Активный профиль':'Active profile','Сайт / IP':'Site / IP','Соед.':'Conns','Профиль / сервер':'Profile / server','Сеть / порт':'Network / port','Активных соединений нет':'No active connections','цепочка не указана':'chain is not specified','Автообновление':'Auto-refresh','Автообновление работает только пока это окно открыто':'Auto-refresh runs only while this window is open','Текущие маршруты соединений':'Current connection routes','Обновлено':'Updated','сек':'sec',
-  'Health-check enabled':'Health-check enabled','Health-check interval (s)':'Health-check interval (s)','Health-check timeout (ms)':'Health-check timeout (ms)','Health-check lazy':'Health-check lazy','Health-check expected status':'Health-check expected status','Age secret key':'Age secret key','Path in bundle':'Path in bundle','Size limit (bytes)':'Size limit (bytes)','Payload':'Payload','Header':'Header','Exclude type':'Exclude type','Proxy':'Proxy',
   'Введите данные для доступа к панели':'Enter credentials to access the panel',
   'Подтверждение':'Confirmation','Заполните оба поля':'Fill in both fields',
   'Сменить язык':'Switch language','Переключить тему':'Toggle theme','Свернуть меню':'Collapse menu',
   'Проверка:':'Checking:','Доступен':'Available','Заблокирован':'Blocked',
   'Восстановить':'Restore',
+  'Укажите IP устройства, выберите текущий активный сервер, запустите запись, затем воспроизведите проблему. В отчёт попадут только новые соединения этого устройства после запуска.':'Enter the device IP, select the current active server, start capture, then reproduce the issue. The report includes only this device\'s new connections created after Start.',
+  'Логгер не содержит ключи или URL подписок. Он фиксирует только новые прокси-соединения точно указанного клиента; события без его точного IP исключаются.':'The logger contains no keys or subscription URLs. It captures only new proxy connections from the exact specified client; events without its exact IP are excluded.',
+  'Активный сервер':'Active server','Длительность':'Duration','IP устройства (обязательно)':'Device IP (required)','Например, IP телефона, ТВ или компьютера в списке устройств роутера.':'For example, the phone, TV, or computer IP shown in the router device list.','Укажите IP устройства':'Enter the device IP',
+  '1 минута':'1 minute','2 минуты':'2 minutes','3 минуты':'3 minutes','5 минут':'5 minutes',
+  'Удалить отчёт':'Discard','Готов к записи':'Ready to capture','Прошло':'Elapsed','Осталось':'Remaining','Соединения':'Connections','События / ошибки':'Events / errors',
+  'Отчёт усечён: достигнут безопасный лимит соединений или событий.':'Report truncated: the safe connection or event limit was reached.',
+  'Отчёт для AI':'AI-ready report','Markdown отчёт для AI':'AI-ready Markdown report','Запись активна':'Capture active','Запись завершена':'Capture complete',
+  'Отчёт скопирован':'Report copied','Отчёт сохранён':'Report saved','Отчёт удалён':'Report discarded','Нет активного профиля':'No active profile',
   // TOOLTIPS (all tip: values)
   'Запущен ли процесс Mihomo (прозрачный прокси-движок)':'Whether the Mihomo process (transparent proxy engine) is running',
   'Текущий выбранный профиль, через который идёт трафик':'Currently selected profile routing traffic',
@@ -3102,20 +3377,10 @@ const I18N = {
   'Автоматически проверять новые версии Mihomo через GitHub API (через SOCKS прокси)':'Automatically check for new Mihomo versions via GitHub API (through SOCKS proxy)',
   'Загружать Geo данные по требованию (memconservative). Экономит RAM на роутере':'Load Geo data on demand (memconservative). Saves RAM on router',
   'Использовать RTT (round-trip time) вместо TTFB для измерения задержки. Более точное':'Use RTT (round-trip time) instead of TTFB for delay measurement. More accurate',
-  'Сохранять fake-ip mapping между перезапусками. Избегает повторного резолва':'Persist fake-ip mapping across restarts. Avoids re-resolution',
   'При резолве DNS подключаться ко всем IP одновременно. Выигрывает первый. Ускоряет подключение к multi-IP доменам':'On DNS resolve, connect to all IPs simultaneously. First wins. Speeds up multi-IP domain connections',
-  'Вместо одного активного профиля Mihomo управляет группой профилей. Failover/auto-select происходит внутри Mihomo без перезапуска ядра':'Instead of one active profile, Mihomo manages a group. Failover/auto-select happens inside Mihomo without core restart',
-  'select — ручной выбор. url-test — авто по задержке. fallback — по порядку. load-balance — распределение. relay — цепочка прокси':'select — manual. url-test — auto by latency. fallback — by order. load-balance — distribution. relay — proxy chain',
-  'Интервал health-check в секундах. Периодически проверяет все узлы в группе':'Health-check interval in seconds. Periodically checks all nodes in group',
-  'Допустимая разница задержки (мс). Узел не переключается, если новый быстрее менее чем на tolerance':'Acceptable delay difference (ms). Node won\'t switch if new one is faster by less than tolerance',
-  'Адрес:порт для REST API Mihomo. Можно 0.0.0.0:9090 для доступа с других устройств':'Address:port for Mihomo REST API. Can use 0.0.0.0:9090 for access from other devices',
-  'Bearer-токен для аутентификации запросов к REST API Mihomo':'Bearer token for Mihomo REST API authentication',
-  'NTP-сервер для синхронизации времени. Критично для TLS после перезагрузки без RTC-батареи':'NTP server for time sync. Critical for TLS after reboot without RTC battery',
-  'Разрешить UDP через прокси. Mihomo по умолчанию false. Включено для совместимости':'Allow UDP through proxy. Mihomo defaults to false. Enabled for compatibility',
   'TCP Fast Open — ускоряет установление соединения. Поддерживается не всеми серверами':'TCP Fast Open — speeds up connection. Not supported by all servers',
   'Multipath TCP — использует несколько путей для одного соединения. Редко поддерживается':'Multipath TCP — uses multiple paths for one connection. Rarely supported',
   'dual — оба; ipv4 — только IPv4; ipv4-prefer — оба, но IPv4 первым; ipv6/ipv6-prefer — аналогично':'dual — both; ipv4 — IPv4 only; ipv4-prefer — both, IPv4 first; ipv6/ipv6-prefer — similar',
-  'arc — Adaptive Replacement Cache (рекомендуется). lru — Least Recently Used (проще, меньше памяти)':'arc — Adaptive Replacement Cache (recommended). lru — Least Recently Used (simpler, less memory)',
   'Использовать HTTP/3 (QUIC) для DoH запросов. Быстрее, но может быть заблокирован':'Use HTTP/3 (QUIC) for DoH queries. Faster, but may be blocked',
   'Применять routing rules к DNS-запросам. DNS идёт через прокси для проксируемых доменов':'Apply routing rules to DNS queries. DNS goes through proxy for proxied domains',
   'Интервал автоматического бенчмарка (часы). 0 = отключено. Запускается по таймеру watchdog':'Auto benchmark interval (hours). 0 = disabled. Triggered by watchdog timer',
@@ -3136,14 +3401,14 @@ const I18N = {
   '▶ Запустить':'▶ Start','■ Остановить':'■ Stop','↻ Перезапустить':'↻ Restart','↻ Обновить все':'↻ Refresh All',
   '↻ Обновить каталог':'↻ Refresh Catalog','↻ Обновить логи':'↻ Refresh Logs','⬆ Применить':'⬆ Apply','⬆ Применить маршруты':'⬆ Apply Routes',
   '↑ Загрузить':'↑ Upload','↓ Скачать':'↓ Download',
-  '+ Быстрая строка':'+ Quick Row','+ Добавить provider':'+ Add Provider','+ Добавить tunnel':'+ Add Tunnel',
+  '+ Быстрая строка':'+ Quick Row','+ Добавить tunnel':'+ Add Tunnel',
   '+ Добавить правило':'+ Add Rule','+ Добавить профиль':'+ Add Profile','+ Добавить устройство':'+ Add Device',
   // Missing buttons/labels
   'Выбрать':'Select','Удалить':'Delete','Показать конфигурацию':'Show Configuration','Пароль':'Password',
   'Выключено':'Off','Ещё':'More','Домены / IP':'Domains / IP','Тип':'Type','Диагн.':'Diag.','Маршрут':'Route',
   'Split Routing / Прозрачный прокси':'Split Routing / Transparent Proxy',
   // Missing placeholders/labels
-  'Имя правила':'Rule name','ключ1|ключ2':'key1|key2','User:Pass (по строкам)':'User:Pass (per line)',
+  'Имя правила':'Rule name','ключ1|ключ2':'key1|key2',
   // Parenthetical texts
   '(напрямую)':'(direct)','(не задан)':'(not set)','(нет цепочки)':'(no chain)','(реальный IP клиента)':'(real client IP)',
   // showToast / dynamic JS strings
@@ -3257,6 +3522,9 @@ function applyLang(lang) {
       const ruKey = Object.keys(I18N).find(k => I18N[k] === ph);
       if (ruKey) el.setAttribute('placeholder', ruKey);
     }
+  });
+  document.querySelectorAll('[data-title-ru][data-title-en]').forEach(el => {
+    el.setAttribute('title', lang === 'en' ? el.dataset.titleEn : el.dataset.titleRu);
   });
   // Sort options
   document.querySelectorAll('option').forEach(el => {
@@ -3637,6 +3905,7 @@ function sortByColumn(colIdx) {
 }
 
 function shortGroupName(name) {
+  name = normalizedProfileGroup(name) || t('Без группы');
   // If group is a URL, show only the domain for readability.
   try {
     if (name.startsWith('http://') || name.startsWith('https://')) {
@@ -3656,7 +3925,25 @@ function jsStringAttr(value) {
 }
 
 function subscriptionForGroup(group) {
-  return (MOCK.subscriptions || []).find(s => s.url === group) || null;
+  const normalized = normalizedSubscriptionUrl(group);
+  if (!normalized) return null;
+  return (MOCK.subscriptions || []).find(s => normalizedSubscriptionUrl(s.url) === normalized) || null;
+}
+
+function normalizedProfileGroup(group) {
+  const value = String(group ?? '').trim();
+  return value || null;
+}
+
+function normalizedSubscriptionUrl(value) {
+  try {
+    const url = new URL(String(value ?? '').trim());
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    url.hash = '';
+    return url.href;
+  } catch {
+    return null;
+  }
 }
 
 function profileGroupDescriptors(data) {
@@ -3667,8 +3954,9 @@ function profileGroupDescriptors(data) {
       deadItems.push(profile);
       return;
     }
-    const key = `source:${profile.group || ''}`;
-    if (!sourceGroups.has(key)) sourceGroups.set(key, {key, source:profile.group, dead:false, items:[]});
+    const source = normalizedProfileGroup(profile.group);
+    const key = `source:${source || ''}`;
+    if (!sourceGroups.has(key)) sourceGroups.set(key, {key, source, dead:false, items:[]});
     sourceGroups.get(key).items.push(profile);
   });
   const groups = [...sourceGroups.values()];
@@ -3750,11 +4038,16 @@ function renderProfileGroup(descriptor) {
   const display = isCollapsed ? 'none' : '';
   const arrow = isCollapsed ? '▸' : '▾';
   const sub = dead ? null : subscriptionForGroup(source);
-  const subRefresh = sub ? `<button class="btn btn-sm" data-url="${attrEscape(sub.url)}" onclick="refreshSubscriptionByButton(this)">↻</button>` : '';
+  const subRefresh = sub ? `<button class="btn btn-sm" data-url="${attrEscape(sub.url)}" onclick="refreshSubscriptionByButton(this)" title="${attrEscape(t('Обновить эту подписку из источника'))}" aria-label="${attrEscape(t('Обновить эту подписку из источника'))}">↻</button>` : '';
+  const localRevalidate = source === null ? `<button class="btn btn-sm" data-testid="revalidate-ungrouped" onclick="revalidateUngroupedProfiles(this)" title="${attrEscape(t('Повторно разобрать локально сохранённые share-ссылки профилей без группы. Подписки и сеть не используются.'))}">↻ ${t('Проверить локальные профили')}</button>` : '';
   const groupIds = items.map(profile => profile.id);
   const benchmarkAction = sub ? `benchSubscription(${jsStringAttr(sub.url)})` : `benchGroup([${groupIds.join(',')}])`;
-  const groupActions = dead ? '' : `<button class="btn btn-sm" onclick="${benchmarkAction}" title="${t('Тест группы')}">⚡</button>
+  const groupBenchTitleRu = sub ? 'Quick Test подписки, до настроенного числа серверов параллельно' : 'Quick Test группы, до настроенного числа серверов параллельно';
+  const groupBenchTitleEn = sub ? 'Quick Test subscription, up to the configured parallel count' : 'Quick Test group, up to the configured parallel count';
+  const groupBenchTitle = t(groupBenchTitleRu);
+  const groupActions = dead ? '' : `<button class="btn btn-sm" data-bench-scope="group" data-title-ru="${attrEscape(groupBenchTitleRu)}" data-title-en="${attrEscape(groupBenchTitleEn)}" onclick="${benchmarkAction}" title="${attrEscape(groupBenchTitle)}">⚡</button>
     ${subRefresh}
+    ${localRevalidate}
     <button class="btn btn-sm" onclick="shareProfileGroup(${jsStringAttr(source || t('Без группы'))})">⤴ ${t('Поделиться / QR')}</button>
     <button class="btn-icon btn-sm" onclick="deleteProfileGroup(${jsStringAttr(source || t('Без группы'))})" title="${t('Удалить подписку?')}">✕</button>`;
   const selectable = items.filter(profile => !profile.active && profile.server_ref);
@@ -3771,11 +4064,12 @@ function renderProfileGroup(descriptor) {
 
 function renderProfileRow(p, groupKey, display) {
   const disabled = p.active || !p.server_ref;
-  const provenance = p.dead ? `<div class="profile-provenance" title="${attrEscape(p.group || t('Без группы'))}">${htmlEscape(shortGroupName(p.group || t('Без группы')))}</div>` : '';
+  const provenanceGroup = normalizedProfileGroup(p.group) || t('Без группы');
+  const provenance = p.dead ? `<div class="profile-provenance" title="${attrEscape(provenanceGroup)}">${htmlEscape(shortGroupName(provenanceGroup))}</div>` : '';
   return `<tr data-profile-row="${attrEscape(groupKey)}" class="${p.dead?'dead-server-row':''}" style="display:${display};${p.active?'background:var(--accent-soft)':''}">
     <td><span class="star ${p.favorite?'on':''}" onclick="toggleFav(${p.id})" title="${t('Избранное')}">★</span></td>
     <td data-profile-metric="id" class="mono" style="${profileMetricStyle('id')};color:var(--muted)">${p.id}</td>
-    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><div class="profile-name">${htmlEscape(p.name)}</div>${provenance}${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions"><input class="profile-select" type="checkbox" data-server-ref="${attrEscape(p.server_ref || '')}" ${selectedServerRefs.has(p.server_ref)?'checked':''} ${disabled?'disabled':''} onchange="toggleServerSelection(this.dataset.serverRef,this.checked)" aria-label="${attrEscape(t('Выбрать сервер'))}">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="Quick Test">⚡</button><button class="btn-icon btn-sm" onclick="editProfileName(${p.id})" title="${t('Переименовать')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
+    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><button class="profile-name profile-name-edit" onclick="openProfileEditor(${p.id})" title="${attrEscape(t('Редактировать профиль'))}">${htmlEscape(p.name)}</button>${provenance}${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions"><input class="profile-select" type="checkbox" data-server-ref="${attrEscape(p.server_ref || '')}" ${selectedServerRefs.has(p.server_ref)?'checked':''} ${disabled?'disabled':''} onchange="toggleServerSelection(this.dataset.serverRef,this.checked)" aria-label="${attrEscape(t('Выбрать сервер'))}">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" data-bench-scope="single" data-title-ru="Quick Test только этого сервера" data-title-en="Quick Test this server only" onclick="benchOne(${p.id})" title="${attrEscape(t('Quick Test только этого сервера'))}">⚡</button><button class="btn-icon btn-sm" onclick="openProfileEditor(${p.id})" title="${t('Редактировать профиль')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
     <td data-profile-metric="protocol" data-label="${attrEscape(t('Протокол'))}" style="${profileMetricStyle('protocol')}"><span class="badge badge-info" style="font-size:10px">${htmlEscape(p.protocol)}</span></td>
     <td data-profile-metric="latency" data-label="${attrEscape(t('Задержка'))}" class="mono" style="${profileMetricStyle('latency')}">${p.last_latency_ms != null ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
     <td data-profile-metric="loss" data-label="${attrEscape(t('Потери'))}" class="mono" style="${profileMetricStyle('loss')}">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
@@ -3833,7 +4127,7 @@ function renderFavorites(data) {
   body.innerHTML = favorites.map(p => `<tr style="${p.active?'background:var(--accent-soft)':''}">
     <td><span class="star on" onclick="toggleFav(${p.id})" title="${t('Избранное')}">★</span></td>
     <td data-profile-metric="id" class="mono" style="${profileMetricStyle('id')};color:var(--muted)">${p.id}</td>
-    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><div class="profile-name">${htmlEscape(p.name)}</div>${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" onclick="benchOne(${p.id})" title="Quick Test">⚡</button><button class="btn-icon btn-sm" onclick="editProfileName(${p.id})" title="${t('Переименовать')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
+    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><button class="profile-name profile-name-edit" onclick="openProfileEditor(${p.id})" title="${attrEscape(t('Редактировать профиль'))}">${htmlEscape(p.name)}</button>${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" data-bench-scope="single" data-title-ru="Quick Test только этого сервера" data-title-en="Quick Test this server only" onclick="benchOne(${p.id})" title="${attrEscape(t('Quick Test только этого сервера'))}">⚡</button><button class="btn-icon btn-sm" onclick="openProfileEditor(${p.id})" title="${t('Редактировать профиль')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
     <td data-profile-metric="protocol" style="${profileMetricStyle('protocol')}"><span class="badge badge-info" style="font-size:10px">${htmlEscape(p.protocol)}</span></td>
     <td data-profile-metric="latency" class="mono" style="${profileMetricStyle('latency')}">${p.last_latency_ms != null ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
     <td data-profile-metric="loss" class="mono" style="${profileMetricStyle('loss')}">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
@@ -3893,23 +4187,121 @@ function refreshSubscriptionByButton(btn) {
   if (!url) return showToast('error','missing subscription url');
   apiAction('POST','/api/subscriptions/refresh-one',{url},t('Подписка обновляется'),refreshDashboard);
 }
+function revalidateUngroupedProfiles(button) {
+  setButtonPending(button,true,t('Локальная проверка профилей…'));
+  return api('POST','/api/profiles/revalidate-ungrouped',{}).then(result => {
+    const errors = Array.isArray(result.errors) ? result.errors.length : 0;
+    const summary = `${t('Локальная проверка завершена')}: ${t('проверено')} ${result.checked || 0}, ${t('обновлено')} ${result.updated || 0}, ${t('без изменений')} ${result.unchanged || 0}, ${t('ошибок')} ${errors}`;
+    showToast(errors ? 'warning' : result.updated ? 'success' : 'info', result.updated ? summary : `${t('Локальная проверка не изменила профили')}. ${summary}`);
+    return loadProfiles();
+  }).catch(() => {}).finally(() => setButtonPending(button,false));
+}
 function deleteSubscriptionByButton(btn) {
   const url = btn?.dataset?.url;
   if (!url) return showToast('error','missing subscription url');
   confirmCmd(t('Удалить подписку?'),'/api/subscriptions/delete',{url});
 }
-function editProfileName(id) {
-  const p = MOCK.profiles.find(p => p.id === id);
-  if (!p) return;
-  openFormDialog({
-    title: t('Переименовать профиль'),
-    label: t('Новое имя профиля'),
-    value: p.name,
-    submit: next => api('POST','/api/profiles/update',{profile_id:id,name:next}).then(() => {
-      p.name = next;
-      renderProfiles(MOCK.profiles);
-      showToast('success',t('Имя профиля обновлено'));
-    }),
+let profileEditorState = null;
+let profileEditorGeneration = 0;
+function resetProfileEditorFields() {
+  safeValue('profileEditorName','');
+  safeValue('profileEditorRaw','');
+  ['Protocol','Transport','Address','Port','Group','Active','Dead','BlockQuic'].forEach(field => safeSet(`profileEditor${field}`,'—'));
+  const raw = document.getElementById('profileEditorRaw');
+  raw?.classList.remove('revealed');
+  const reveal = document.getElementById('profileEditorReveal');
+  if (reveal) { reveal.setAttribute('aria-pressed','false'); reveal.textContent=t('Показать секрет'); }
+  const note = document.getElementById('profileEditorManagedNote');
+  if (note) note.hidden = true;
+  const fields = document.getElementById('profileEditorFields');
+  if (fields) fields.disabled = true;
+  const save = document.getElementById('profileEditorSave');
+  if (save) save.disabled = true;
+}
+function clearProfileEditorSensitiveState() {
+  ++profileEditorGeneration;
+  profileEditorState = null;
+  resetProfileEditorFields();
+  const modal = document.getElementById('profileEditorModal');
+  if (modal) modal.style.display = 'none';
+}
+function openProfileEditor(profileId) {
+  const generation = ++profileEditorGeneration;
+  profileEditorState = {profileId,loaded:false,saving:false,generation};
+  resetProfileEditorFields();
+  safeSet('profileEditorTitle',t('Редактировать профиль'));
+  safeSet('profileEditorStatus',t('Загрузка профиля…'));
+  document.getElementById('profileEditorModal').style.display = 'flex';
+  api('GET','/api/profiles/'+profileId,undefined,true).then(data => {
+    if (!profileEditorState || profileEditorState.generation !== generation) return;
+    const detail = data?.profile;
+    if (!detail || detail.id !== profileId || !detail.server_ref) throw new Error(t('Не удалось загрузить профиль'));
+    profileEditorState = {profileId:detail.id,expectedServerRef:String(detail.server_ref),subscriptionManaged:detail.subscription_managed === true,loaded:false,saving:false,generation};
+    safeValue('profileEditorName',detail.name || '');
+    safeValue('profileEditorRaw',String(detail.raw || ''));
+    safeSet('profileEditorProtocol',detail.protocol || '—');
+    safeSet('profileEditorTransport',detail.transport || '—');
+    safeSet('profileEditorAddress',detail.address || '—');
+    safeSet('profileEditorPort',detail.port ?? '—');
+    safeSet('profileEditorGroup',normalizedProfileGroup(detail.group) || t('Без группы'));
+    safeSet('profileEditorActive',t(detail.active ? 'да' : 'нет'));
+    safeSet('profileEditorDead',t(detail.dead ? 'да' : 'нет'));
+    safeSet('profileEditorBlockQuic',t(detail.block_quic ? 'да' : 'нет'));
+    const raw = document.getElementById('profileEditorRaw');
+    raw.disabled = profileEditorState.subscriptionManaged;
+    const note = document.getElementById('profileEditorManagedNote');
+    if (note) note.hidden = !profileEditorState.subscriptionManaged;
+    document.getElementById('profileEditorFields').disabled = false;
+    if (profileEditorState.subscriptionManaged) raw.disabled = true;
+    document.getElementById('profileEditorSave').disabled = false;
+    profileEditorState.loaded = true;
+    safeSet('profileEditorStatus',profileEditorState.subscriptionManaged ? t('Ссылка управляется подпиской и доступна только для просмотра. Имя можно изменить.') : '');
+    requestAnimationFrame(() => document.getElementById('profileEditorName')?.focus());
+  }).catch(error => {
+    if (!profileEditorState || profileEditorState.generation !== generation) return;
+    profileEditorState.loaded = false;
+    safeSet('profileEditorStatus',error.message || t('Не удалось загрузить профиль'));
+  });
+}
+function closeProfileEditor() {
+  clearProfileEditorSensitiveState();
+}
+function toggleProfileRawVisibility() {
+  if (!profileEditorState?.loaded) return;
+  const raw = document.getElementById('profileEditorRaw');
+  const revealed = raw.classList.toggle('revealed');
+  const button = document.getElementById('profileEditorReveal');
+  button.setAttribute('aria-pressed',String(revealed));
+  button.textContent = t(revealed ? 'Скрыть секрет' : 'Показать секрет');
+}
+function copyProfileRaw() {
+  if (!profileEditorState?.loaded) return;
+  const raw = document.getElementById('profileEditorRaw').value;
+  if (!raw) return;
+  return copyText(raw,t('Ссылка скопирована'));
+}
+function saveProfileEditor() {
+  const state = profileEditorState;
+  if (!state?.loaded || state.saving) return;
+  const name = document.getElementById('profileEditorName').value.trim();
+  const raw = document.getElementById('profileEditorRaw').value.trim();
+  if (!name) return showToast('error',t('Имя не должно быть пустым'));
+  if (!state.subscriptionManaged && !raw) return showToast('error',t('Имя и share-ссылка не должны быть пустыми'));
+  const payload = {profile_id:state.profileId,expected_server_ref:state.expectedServerRef,name};
+  if (!state.subscriptionManaged) payload.raw = raw;
+  state.saving = true;
+  document.getElementById('profileEditorFields').disabled = true;
+  document.getElementById('profileEditorSave').disabled = true;
+  return api('POST','/api/profiles/update',payload).then(() => {
+    closeProfileEditor();
+    showToast('success',t('Профиль обновлён'));
+    return refreshDashboard();
+  }).catch(() => {
+    if (profileEditorState !== state) return;
+    state.saving = false;
+    document.getElementById('profileEditorFields').disabled = false;
+    if (state.subscriptionManaged) document.getElementById('profileEditorRaw').disabled = true;
+    document.getElementById('profileEditorSave').disabled = false;
   });
 }
 function htmlEscape(value) {
@@ -4890,98 +5282,23 @@ function handleGeoBaseListEvent(event) {
 document.getElementById('geobaseList')?.addEventListener('click', handleGeoBaseListEvent);
 document.getElementById('geobaseList')?.addEventListener('change', handleGeoBaseListEvent);
 
-// ─── TYPED RULES / PROVIDERS / TUNNELS (Features) ────────────────────
-function parseSubRules(value) {
-  const result=[]; let current=null;
-  String(value||'').split('\n').forEach(line => { const match=line.match(/^\[([^\]]+)\]$/); if(match) { current={name:match[1].trim(),rules:[]}; result.push(current); } else if(current && line.trim()) current.rules.push(line.trim()); });
-  return result;
-}
-function formatSubRules(rules) { return (rules||[]).map(group => `[${group.name}]\n${(group.rules||[]).join('\n')}`).join('\n\n'); }
-function inputsOf(row) { return [...row.querySelectorAll('input,select,textarea')]; }
-function readTypedRules() { return [...document.querySelectorAll('#typedRulesList > div')].map(row => { const [type,value,target,options]=inputsOf(row); return {rule_type:type?.value||'',value:value?.value||'',target:target?.value||'',options:featureCsv(options?.value)}; }).filter(rule=>rule.rule_type&&rule.value&&rule.target); }
-function readTunnels() { return [...document.querySelectorAll('#tunnelsList > div')].map(row => { const [network,address,target,proxy]=inputsOf(row); return {network:featureCsv(network?.value),address:address?.value||'',target:target?.value||'',proxy:proxy?.value||null}; }).filter(tunnel=>tunnel.address&&tunnel.target); }
-function headerMap(value) { return featureLines(value).reduce((out,line)=>{const [key,...rest]=line.split(':'); if(key&&rest.length) out[key.trim()]=featureCsv(rest.join(':')); return out;},{}); }
-function formatHeader(value) { return Object.entries(value||{}).map(([key,items])=>`${key}: ${(items||[]).join(', ')}`).join('\n'); }
-function readProxyProviders() { return [...document.querySelectorAll('#proxyProvidersList .provider-card')].map(row => { const [name,type,url,path,interval,healthUrl,filter,excludeFilter,proxy,excludeType,enabled,healthInterval,healthTimeout,lazy,expected,age,header,size,payload]=inputsOf(row); return {name:name?.value||'',provider_type:type?.value||'http',url:url?.value||null,path:path?.value||null,interval:+interval?.value||3600,proxy:proxy?.value||null,filter:filter?.value||null,exclude_filter:excludeFilter?.value||null,exclude_type:excludeType?.value||null,health_check_enabled:!!enabled?.checked,health_check_url:healthUrl?.value||'',health_check_interval:+healthInterval?.value||300,health_check_timeout:+healthTimeout?.value||5000,health_check_lazy:!!lazy?.checked,health_check_expected_status:expected?.value||null,age_secret_key:age?.value||null,header:headerMap(header?.value),size_limit:+size?.value||0,payload:featureLines(payload?.value)}; }).filter(provider=>provider.name); }
-function readRuleProviders() { return [...document.querySelectorAll('#ruleProvidersList .provider-card')].map(row => { const [name,type,behavior,format,url,path,interval,proxy,pathBundle,size,header,payload]=inputsOf(row); return {name:name?.value||'',provider_type:type?.value||'http',behavior:behavior?.value||'classical',format:format?.value||'yaml',url:url?.value||null,path:path?.value||null,interval:+interval?.value||3600,proxy:proxy?.value||null,path_in_bundle:pathBundle?.value||null,size_limit:+size?.value||0,header:headerMap(header?.value),payload:featureLines(payload?.value)}; }).filter(provider=>provider.name); }
-function ensureSelectValue(input, value) { if(input?.tagName !== 'SELECT' || value == null || [...input.options].some(option=>option.value===String(value))) return; const option=document.createElement('option'); option.value=String(value); option.textContent=String(value); input.appendChild(option); }
-function fillInputs(row, values) { inputsOf(row).forEach((input,index)=>{ const value=values[index]; if(value===undefined) return; if(input.type==='checkbox') input.checked=!!value; else { ensureSelectValue(input,value); input.value=value ?? ''; } }); }
-function renderTypedRules(rules) { const list=document.getElementById('typedRulesList'); if(!list) return; list.innerHTML=''; (rules||[]).forEach(rule=>{addTypedRule(); fillInputs(list.lastElementChild,[rule.rule_type,rule.value,rule.target,(rule.options||[]).join(', ')]);}); }
-function renderTunnels(tunnels) { const list=document.getElementById('tunnelsList'); if(!list) return; list.innerHTML=''; (tunnels||[]).forEach(tunnel=>{addTunnel(); fillInputs(list.lastElementChild,[(tunnel.network||[]).join(','),tunnel.address,tunnel.target,tunnel.proxy]);}); }
-function renderProxyProviders(providers) { const list=document.getElementById('proxyProvidersList'); if(!list) return; list.innerHTML=''; (providers||[]).forEach(provider=>{addProxyProvider(); fillInputs(list.lastElementChild,[provider.name,provider.provider_type,provider.url,provider.path,provider.interval,provider.health_check_url,provider.filter,provider.exclude_filter,provider.proxy,provider.exclude_type,provider.health_check_enabled,provider.health_check_interval,provider.health_check_timeout,provider.health_check_lazy,provider.health_check_expected_status,provider.age_secret_key,formatHeader(provider.header),provider.size_limit,(provider.payload||[]).join('\n')]);}); }
-function renderRuleProviders(providers) { const list=document.getElementById('ruleProvidersList'); if(!list) return; list.innerHTML=''; (providers||[]).forEach(provider=>{addRuleProvider(); fillInputs(list.lastElementChild,[provider.name,provider.provider_type,provider.behavior,provider.format,provider.url,provider.path,provider.interval,provider.proxy,provider.path_in_bundle,provider.size_limit,formatHeader(provider.header),(provider.payload||[]).join('\n')]);}); }
-function addTypedRule() {
-  const list = document.getElementById('typedRulesList');
+// ─── MIHOMO FEATURE TUNNELS ──────────────────────────────────────────
+function addFeatureTunnel(tunnel = {}, markDirty = false) {
+  const list = document.getElementById('featTunnelsList');
   if (!list) return;
   const row = document.createElement('div');
   row.style.cssText = 'display:flex;gap:4px;margin-bottom:4px;flex-wrap:wrap';
-  row.innerHTML = `<select style="width:130px"><option>DOMAIN</option><option>DOMAIN-SUFFIX</option><option>DOMAIN-KEYWORD</option><option>GEOSITE</option><option>GEOIP</option><option>IP-CIDR</option><option>IP-CIDR6</option><option>PROCESS-NAME</option><option>UID</option><option>DSCP</option><option>IN-NAME</option><option>IN-USER</option><option>RULE-SET</option></select>
-    <input class="mono" style="flex:1;min-width:100px" placeholder="value">
-    <select style="width:110px"><option>PROXY</option><option>proxy-active</option><option>proxy</option><option>DIRECT</option><option>REJECT</option></select>
-    <input class="mono" style="width:80px" placeholder="no-resolve">
-    <button class="btn-icon btn-sm" onclick="this.closest('div').remove()">✕</button>`;
+  row.innerHTML = `<select data-tunnel-field="network" style="width:100px"><option value="tcp">tcp</option><option value="udp">udp</option><option value="tcp,udp">tcp, udp</option></select>
+    <input data-tunnel-field="address" class="mono" style="flex:1;min-width:100px" placeholder="address:port">
+    <input data-tunnel-field="target" class="mono" style="flex:1;min-width:100px" placeholder="target:port">
+    <input data-tunnel-field="proxy" class="mono" style="width:100px" placeholder="proxy">
+    <button class="btn-icon btn-sm" onclick="this.closest('div').remove();setFeaturesDirty(true)">✕</button>`;
+  row.querySelector('[data-tunnel-field="network"]').value = Array.isArray(tunnel.network) ? tunnel.network.join(',') : (tunnel.network || 'tcp');
+  row.querySelector('[data-tunnel-field="address"]').value = tunnel.address || '';
+  row.querySelector('[data-tunnel-field="target"]').value = tunnel.target || '';
+  row.querySelector('[data-tunnel-field="proxy"]').value = tunnel.proxy || '';
   list.appendChild(row);
-}
-function addProxyProvider() {
-  const list = document.getElementById('proxyProvidersList');
-  if (!list) return;
-  const row = document.createElement('div');
-  row.className = 'provider-card';
-  row.style.cssText = 'border:1px solid var(--border);padding:8px;margin-bottom:8px';
-  row.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-weight:600;font-size:var(--fs-sm)">Provider</span><button class="btn-icon btn-sm" onclick="this.closest('.provider-card').remove()">✕</button></div>
-    <div class="field"><label>Name</label><input style="width:100%" placeholder="provider1"></div>
-    <div class="field"><label>Type</label><select><option>http</option><option>file</option><option>inline</option></select></div>
-    <div class="field"><label>URL</label><input class="mono" style="width:100%" placeholder="https://..."></div>
-    <div class="field"><label>Path</label><input class="mono" style="width:100%" placeholder="/path/to/file"></div>
-    <div class="field"><label>Interval (s)</label><input type="number" value="3600" class="mono"></div>
-    <div class="field"><label>Health-check URL</label><input class="mono" style="width:100%" placeholder="https://www.gstatic.com/generate_204"></div>
-    <div class="field"><label>Filter (regex)</label><input class="mono" style="width:100%" placeholder=""></div>
-    <div class="field"><label>Exclude filter</label><input class="mono" style="width:100%" placeholder=""></div>
-    <div class="field"><label>Proxy</label><input class="mono" style="width:100%" placeholder="Proxy group name"></div>
-    <div class="field"><label>Exclude type</label><input class="mono" style="width:100%" placeholder="Shadowsocks|Http"></div>
-    <div class="field"><label>Health-check enabled</label><label class="toggle"><input type="checkbox"><span class="slider"></span></label></div>
-    <div class="field"><label>Health-check interval (s)</label><input type="number" value="300" class="mono"></div>
-    <div class="field"><label>Health-check timeout (ms)</label><input type="number" value="5000" class="mono"></div>
-    <div class="field"><label>Health-check lazy</label><label class="toggle"><input type="checkbox" checked><span class="slider"></span></label></div>
-    <div class="field"><label>Health-check expected status</label><input class="mono" style="width:100%" placeholder="204 или 200-299"></div>
-    <div class="field"><label>Age secret key</label><input class="mono" style="width:100%" placeholder="AGE-SECRET-KEY-..."></div>
-    <div class="field"><label>Header</label><textarea class="mono" rows="2" style="width:100%" placeholder="User-Agent: HincyRay&#10;Authorization: Bearer ..."></textarea></div>
-    <div class="field"><label>Size limit (bytes)</label><input type="number" value="0" class="mono"></div>
-    <div class="field"><label>Payload</label><textarea class="mono" rows="3" style="width:100%" placeholder="- name: node-1&#10;  type: vless&#10;  server: example.com"></textarea></div>`;
-  list.appendChild(row);
-}
-function addRuleProvider() {
-  const list = document.getElementById('ruleProvidersList');
-  if (!list) return;
-  const row = document.createElement('div');
-  row.className = 'provider-card';
-  row.style.cssText = 'border:1px solid var(--border);padding:8px;margin-bottom:8px';
-  row.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-weight:600;font-size:var(--fs-sm)">Rule Provider</span><button class="btn-icon btn-sm" onclick="this.closest('.provider-card').remove()">✕</button></div>
-    <div class="field"><label>Name</label><input style="width:100%" placeholder="rule1"></div>
-    <div class="field"><label>Type</label><select><option>http</option><option>file</option><option>inline</option></select></div>
-    <div class="field"><label>Behavior</label><select><option>domain</option><option>ipcidr</option><option>classical</option></select></div>
-    <div class="field"><label>Format</label><select><option>yaml</option><option>text</option><option>mrs</option></select></div>
-    <div class="field"><label>URL</label><input class="mono" style="width:100%" placeholder="https://..."></div>
-    <div class="field"><label>Path</label><input class="mono" style="width:100%" placeholder="/path/to/file"></div>
-    <div class="field"><label>Interval (s)</label><input type="number" value="86400" class="mono"></div>
-    <div class="field"><label>Proxy</label><input class="mono" style="width:100%" placeholder="Proxy group name"></div>
-    <div class="field"><label>Path in bundle</label><input class="mono" style="width:100%" placeholder="rules/geosite.dat"></div>
-    <div class="field"><label>Size limit (bytes)</label><input type="number" value="0" class="mono"></div>
-    <div class="field"><label>Header</label><textarea class="mono" rows="2" style="width:100%" placeholder="User-Agent: HincyRay"></textarea></div>
-    <div class="field"><label>Payload</label><textarea class="mono" rows="3" style="width:100%" placeholder="DOMAIN-SUFFIX,example.com&#10;IP-CIDR,1.2.3.0/24"></textarea></div>`;
-  list.appendChild(row);
-}
-function addTunnel() {
-  const list = document.getElementById('tunnelsList');
-  if (!list) return;
-  const row = document.createElement('div');
-  row.style.cssText = 'display:flex;gap:4px;margin-bottom:4px;flex-wrap:wrap';
-  row.innerHTML = `<select style="width:100px"><option value="tcp">tcp</option><option value="udp">udp</option><option value="tcp,udp">tcp, udp</option></select>
-    <input class="mono" style="flex:1;min-width:100px" placeholder="address:port">
-    <input class="mono" style="flex:1;min-width:100px" placeholder="target:port">
-    <input class="mono" style="width:100px" placeholder="proxy">
-    <button class="btn-icon btn-sm" onclick="this.closest('div').remove()">✕</button>`;
-  list.appendChild(row);
+  if (markDirty) setFeaturesDirty(true);
 }
 
 // ─── DEVICE ROUTES ───────────────────────────────────────────────────
@@ -5397,7 +5714,10 @@ function updateBenchStatus(data) {
   const running = !!(data && data.running);
   const total = Number(data && (data.total || data.profile_count || 0)) || 0;
   const done = Number(data && (data.completed || data.done || (data.results && data.results.length) || 0)) || 0;
-  const current = (data && (data.current_profile || data.current_profile_name || data.current || '—')) || '—';
+  const activeProfiles = data && Array.isArray(data.active_profiles) ? data.active_profiles.slice(0, 6) : [];
+  const current = activeProfiles.length
+    ? `${t('В работе')}: ${activeProfiles.length} · ${activeProfiles.map(profile => profile.name).filter(Boolean).join(', ')}`
+    : (data && (data.current_profile || data.current_profile_name || data.current || '—')) || '—';
   const pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
   const progressEl = document.getElementById('benchProgress');
   const kittEl = document.getElementById('benchKitt');
@@ -5465,15 +5785,27 @@ function mergeBenchResultsIntoProfiles(results) {
 function pollBenchStatus() { api('GET','/api/bench/status').then(updateBenchStatus).catch(()=>{}); }
 
 function benchConcurrency() {
-  const value = Number(document.getElementById('benchConcurrency')?.value || localStorage.getItem('hr_bench_concurrency') || 1);
-  return Math.min(6, Math.max(1, Number.isInteger(value) ? value : 1));
+  const value = Number(document.getElementById('benchConcurrency')?.value);
+  return normalizeBenchConcurrency(value);
+}
+function normalizeBenchConcurrency(value) {
+  const number = Number(value);
+  return Math.min(6, Math.max(1, Number.isInteger(number) ? number : 1));
 }
 function saveBenchConcurrency(value) {
-  try { localStorage.setItem('hr_bench_concurrency', String(Math.min(6, Math.max(1, Number(value) || 1)))); } catch (_) {}
+  const normalized = normalizeBenchConcurrency(value);
+  const input = document.getElementById('benchConcurrency');
+  if (input) input.value = String(normalized);
+  try { localStorage.setItem('hr_bench_concurrency', String(normalized)); } catch (_) {}
 }
 function initBenchConcurrency() {
   const input = document.getElementById('benchConcurrency');
-  if (input) input.value = String(benchConcurrency());
+  if (!input) return;
+  let persisted = null;
+  try { persisted = localStorage.getItem('hr_bench_concurrency'); } catch (_) {}
+  const normalized = normalizeBenchConcurrency(persisted == null ? input.value : persisted);
+  input.value = String(normalized);
+  try { localStorage.setItem('hr_bench_concurrency', String(normalized)); } catch (_) {}
 }
 
 /// Benchmark a single profile by id. Uses the method/probe/download settings
@@ -5924,139 +6256,163 @@ function saveSubStore() {
 }
 
 // ─── MIHOMO FEATURES ─────────────────────────────────────────────────
-function featureControl(cardTitle, label) {
-  const card = [...document.querySelectorAll('[data-section="features"] .feature-card')]
-    .find(item => item.querySelector('h4')?.textContent.trim() === cardTitle);
-  const field = [...(card?.querySelectorAll('.field') || [])]
-    .find(item => item.querySelector('label')?.textContent.trim() === label);
-  return field?.querySelector('input,select,textarea') || null;
+let featuresLoaded = false;
+let featuresLoading = false;
+let featuresDirty = false;
+function setFeaturesDirty(dirty) {
+  featuresDirty = dirty;
+  document.querySelector('.section-panel[data-section="features"]')?.classList.toggle('is-dirty', dirty);
 }
-function featureValue(cardTitle, label, fallback='') { return featureControl(cardTitle,label)?.value ?? fallback; }
-function featureChecked(cardTitle, label, fallback=false) { return featureControl(cardTitle,label)?.checked ?? fallback; }
-function setFeatureValue(cardTitle, label, value) { const el=featureControl(cardTitle,label); if (el && value != null) el.value=Array.isArray(value) ? value.join('\n') : value; }
-function setFeatureChecked(cardTitle, label, value) { const el=featureControl(cardTitle,label); if (el && value != null) el.checked=!!value; }
+document.querySelector('.section-panel[data-section="features"]')?.addEventListener('input', () => setFeaturesDirty(true));
+document.querySelector('.section-panel[data-section="features"]')?.addEventListener('change', () => setFeaturesDirty(true));
 function featureLines(value) { return String(value || '').split('\n').map(item=>item.trim()).filter(Boolean); }
-function featureCsv(value) { return String(value || '').split(',').map(item=>item.trim()).filter(Boolean); }
-function featureMap(value) {
-  return featureLines(value).reduce((map,line) => { const [key,...rest]=line.split(/\s*(?:→|=)\s*/); if(key && rest.length) map[key.trim()]=rest.join(' ').split(',').map(item=>item.trim()).filter(Boolean); return map; },{});
+function featureMap(value, label = 'Nameserver policy') {
+  return featureLines(value).reduce((map,line,index) => {
+    const match = line.match(/^(.+?)\s*(?:→|=)\s*(.+)$/);
+    const items = match?.[2].split(',').map(item=>item.trim()).filter(Boolean) || [];
+    if (!match || !match[1].trim() || !items.length) throw new Error(`${t(label)}: ${t('некорректная строка')} ${index + 1}`);
+    map[match[1].trim()] = items;
+    return map;
+  },{});
 }
 function formatFeatureMap(value) { return Object.entries(value||{}).map(([key,items])=>`${key} → ${(items||[]).join(', ')}`).join('\n'); }
-function nullableFeatureChecked(card,label) { const el=featureControl(card,label); return el?.dataset.nullable === 'true' ? !!el.checked : null; }
-function setNullableFeatureChecked(card,label,value) { const el=featureControl(card,label); if(!el) return; el.dataset.nullable=value == null ? 'false' : 'true'; el.checked=!!value; }
-function nullableFeatureValue(card,label) { const el=featureControl(card,label); return el?.dataset.nullable === 'true' ? (el.value || null) : null; }
-function nullableFeatureNumber(card,label) { const value=nullableFeatureValue(card,label); return value == null ? null : Number(value); }
-function setNullableFeatureValue(card,label,value) { const el=featureControl(card,label); if(!el) return; el.dataset.nullable=value == null ? 'false' : 'true'; ensureSelectValue(el,value); el.value=value ?? ''; }
-function nullableFallbackFilter() { const card=[...document.querySelectorAll('[data-section="features"] .feature-card')].find(item=>item.querySelector('h4')?.textContent.trim()==='DNS расширенные'); return card?.dataset.fallbackConfigured === 'true' ? {geoip:featureChecked('DNS расширенные','Fallback filter geoip',true),geoip_code:featureValue('DNS расширенные','Fallback filter geoip code','CN'),geosite:featureLines(featureValue('DNS расширенные','Fallback filter geosite')),ipcidr:featureLines(featureValue('DNS расширенные','Fallback filter ipcidr')),domain:featureLines(featureValue('DNS расширенные','Fallback filter domain'))} : null; }
-function setNullableFallbackFilter(value) { const card=[...document.querySelectorAll('[data-section="features"] .feature-card')].find(item=>item.querySelector('h4')?.textContent.trim()==='DNS расширенные'); if(card) card.dataset.fallbackConfigured=value ? 'true' : 'false'; const fallback=value||{}; setFeatureChecked('DNS расширенные','Fallback filter geoip',fallback.geoip); setFeatureValue('DNS расширенные','Fallback filter geoip code',fallback.geoip_code); setFeatureValue('DNS расширенные','Fallback filter geosite',fallback.geosite); setFeatureValue('DNS расширенные','Fallback filter ipcidr',fallback.ipcidr); setFeatureValue('DNS расширенные','Fallback filter domain',fallback.domain); }
-function markFallbackFilterConfigured(control) { const card=control?.closest('.feature-card'); if(card) card.dataset.fallbackConfigured='true'; }
 function featureHosts(value) {
-  return featureLines(value).reduce((map,line) => { const [key,...rest]=line.split('='); if(key && rest.length) map[key.trim()]=rest.join('=').trim(); return map; },{});
+  return featureLines(value).reduce((map,line,index) => {
+    const [key,...rest] = line.split('=');
+    const address = rest.join('=').trim();
+    if (!key?.trim() || !rest.length || !address) throw new Error(`${t('Hosts')}: ${t('некорректная строка')} ${index + 1}`);
+    map[key.trim()] = address;
+    return map;
+  },{});
 }
-function saveFeatures() {
-  const splitList = v => (v || '').split(/[,\n]/).map(s=>s.trim()).filter(Boolean);
-  const secret = document.getElementById('featEcSecret')?.value || '';
-  const edited = {
-    geodata_loader: document.getElementById('featGeoLoader')?.value || 'memconservative',
-    unified_delay: document.getElementById('featUnifiedDelay')?.checked ?? false,
-    store_fake_ip: document.getElementById('featStoreFakeIp')?.checked ?? false,
-    store_selected: document.getElementById('featStoreSelected')?.checked ?? false,
-    tcp_concurrent: document.getElementById('featTcpConcurrent')?.checked ?? false,
-    keep_alive_interval: +(document.getElementById('featKaInterval')?.value || 0) || null,
-    keep_alive_idle: +(document.getElementById('featKaIdle')?.value || 0) || null,
-    disable_keep_alive: document.getElementById('featDisableKa')?.checked ?? false,
-    proxy_group: {
-      enabled: document.getElementById('featPgEnabled')?.checked ?? false,
-      group_type: document.getElementById('featPgType')?.value || 'url-test',
-      url: document.getElementById('featPgUrl')?.value || '',
-      interval: +(document.getElementById('featPgInterval')?.value || 300),
-      timeout: +(document.getElementById('featPgTimeout')?.value || 5000),
-      tolerance: +(document.getElementById('featPgTolerance')?.value || 0),
-      lazy: document.getElementById('featPgLazy')?.checked ?? false,
-      max_failed_times: +(document.getElementById('featPgMaxFailed')?.value || 5),
-      strategy: document.getElementById('featPgStrategy')?.value || 'round-robin',
-      expected_status: document.getElementById('featPgExpected')?.value || null,
-      filter: document.getElementById('featPgFilter')?.value || null,
-      exclude_filter: document.getElementById('featPgExcludeFilter')?.value || null,
-      exclude_type: document.getElementById('featPgExcludeType')?.value || null,
-      include_all_providers: document.getElementById('featPgAllProviders')?.checked ?? false,
-      include_all: document.getElementById('featPgIncludeAll')?.checked ?? false,
-      include_all_proxies: document.getElementById('featPgAllProxies')?.checked ?? false,
-    },
-    external_controller: {
-      enabled: document.getElementById('featEcEnabled')?.checked ?? false,
-      address: document.getElementById('featEcAddr')?.value || '127.0.0.1:9090',
-      secret: secret ? secret : null,
-      allow_origins: splitList(document.getElementById('featEcOrigins')?.value || ''),
-      allow_private_network: document.getElementById('featEcPrivNet')?.checked ?? false,
-    },
-    ntp: {enabled:featureChecked('NTP','Включён'),server:featureValue('NTP','Сервер','time.apple.com'),port:+featureValue('NTP','Port',123),interval:+featureValue('NTP','Interval (min)',30),write_to_system:featureChecked('NTP','Write to system'),dialer_proxy:featureValue('NTP','Dialer proxy') || null},
-    per_proxy: {udp:featureChecked('Per-proxy defaults','UDP',true),tfo:featureChecked('Per-proxy defaults','TFO'),mptcp:featureChecked('Per-proxy defaults','MPTCP'),ip_version:featureValue('Per-proxy defaults','IP version','dual'),dialer_proxy:featureValue('Per-proxy defaults','Dialer proxy') || null,smux:featureChecked('Per-proxy defaults','Smux enabled') ? {enabled:true,protocol:featureValue('Per-proxy defaults','Smux protocol','h2mux'),max_connections:+featureValue('Per-proxy defaults','Smux max connections',0),min_streams:+featureValue('Per-proxy defaults','Smux min streams',0),max_streams:+featureValue('Per-proxy defaults','Smux max streams',0),statistic:featureChecked('Per-proxy defaults','Smux statistic'),only_tcp:featureChecked('Per-proxy defaults','Smux only TCP'),padding:featureChecked('Per-proxy defaults','Smux padding'),brutal_up:+featureValue('Per-proxy defaults','Smux brutal up (Mbps)',0)||null,brutal_down:+featureValue('Per-proxy defaults','Smux brutal down (Mbps)',0)||null} : null},
-    dns_cache_algorithm: featureValue('DNS расширенные','Cache algo','arc'), dns_prefer_h3:featureChecked('DNS расширенные','Prefer H3'), dns_respect_rules:featureChecked('DNS расширенные','Respect rules'),
-    dns_default_nameserver:featureLines(featureValue('DNS расширенные','Default nameserver')), dns_proxy_server_nameserver:featureLines(featureValue('DNS расширенные','Proxy server nameserver')), dns_direct_nameserver:featureLines(featureValue('DNS расширенные','Direct nameserver')),
-    dns_proxy_server_nameserver_policy:featureMap(featureValue('DNS расширенные','Proxy server nameserver policy')), dns_nameserver_policy:featureMap(featureValue('DNS расширенные','Nameserver policy')),
-    dns_direct_nameserver_follow_policy:nullableFeatureChecked('DNS расширенные','Direct nameserver follow policy'), dns_fake_ip_filter_mode:nullableFeatureValue('DNS расширенные','Fake-IP filter mode'), dns_fake_ip_filter:featureLines(featureValue('DNS расширенные','Fake-IP filter')),
-    dns_fake_ip_ttl:nullableFeatureNumber('DNS расширенные','Fake-IP TTL'), dns_use_hosts:nullableFeatureChecked('DNS расширенные','Use hosts'), dns_use_system_hosts:nullableFeatureChecked('DNS расширенные','Use system hosts'), dns_ecs:featureValue('DNS расширенные','ECS override') || null, dns_ecs_override:nullableFeatureChecked('DNS расширенные','ECS'),
-    dns_disable_ipv4:featureChecked('DNS расширенные','Disable IPv4'), dns_disable_ipv6:featureChecked('DNS расширенные','Disable IPv6'), dns_disable_qtypes:featureLines(featureValue('DNS расширенные','Disable qtypes')).map(Number).filter(Number.isFinite),
-    dns_fallback_filter:nullableFallbackFilter(), sniffer_override_destination:document.getElementById('dnsSniffOverride')?.checked,
-    sniffer_force_domain:featureLines(featureValue('Sniffer','Force domain')),sniffer_skip_domain:featureLines(featureValue('Sniffer','Skip domain')),sniffer_skip_src_address:featureLines(featureValue('Sniffer','Skip src address')),sniffer_skip_dst_address:featureLines(featureValue('Sniffer','Skip dst address')),
-    authentication:featureLines(featureValue('Authentication','User:Pass (по строкам)')),skip_auth_prefixes:featureLines(featureValue('Authentication','Skip auth prefixes')),
-    quic_go_disable_gso:featureChecked('Experimental','Disable QUIC GSO'),quic_go_disable_ecn:featureChecked('Experimental','Disable QUIC ECN'),
-    sub_rules:parseSubRules(document.getElementById('featSubRules')?.value), raw_rules:featureLines(document.getElementById('featRawRules')?.value),
-    typed_rules:readTypedRules(), proxy_providers:readProxyProviders(), rule_providers:readRuleProviders(), tunnels:readTunnels(),
-    hosts:featureHosts(document.getElementById('featHosts')?.value),
-  };
-  // Preserve fields not yet represented in this screen: backend replaces the whole MihomoFeatures object.
-  api('GET','/api/mihomo-features',undefined,true).catch(()=>({})).then(current => {
-    const body = {...current, ...edited, proxy_group:{...(current.proxy_group||{}), ...edited.proxy_group}, external_controller:{...(current.external_controller||{}), ...edited.external_controller}};
-    api('POST','/api/mihomo-features',body).then(() => {
-      showToast('info', t('Параметры сохранены, применяю конфигурацию…'));
-      return api('POST','/api/routing/apply',{});
-    }).then(() => {
-      showToast('success', t('Параметры Mihomo сохранены и применены'));
-      refreshDashboard();
-    }).catch(()=>{});
+function featureNumber(id, required = false) {
+  const value = document.getElementById(id)?.value.trim() || '';
+  if (required && value === '') throw new Error(t('Заполните обязательные числовые поля'));
+  return value === '' ? null : Number(value);
+}
+function readFeatureTunnels() {
+  return [...document.querySelectorAll('#featTunnelsList > div')].map((row,index) => {
+    const value = field => row.querySelector(`[data-tunnel-field="${field}"]`)?.value.trim() || '';
+    const tunnel = {network:value('network').split(',').filter(Boolean),address:value('address'),target:value('target'),proxy:value('proxy') || null};
+    if (!tunnel.network.length || !tunnel.address || !tunnel.target) throw new Error(`${t('Tunnels')}: ${t('заполните address и target в строке')} ${index + 1}`);
+    return tunnel;
   });
 }
-function loadFeatures() {
-  api('GET','/api/mihomo-features').then(d => {
-    safeValue('featGeoLoader', d.geodata_loader);
-    safeChecked('featUnifiedDelay', d.unified_delay);
-    safeChecked('featStoreFakeIp', d.store_fake_ip);
-    safeChecked('featStoreSelected', d.store_selected);
-    safeChecked('featTcpConcurrent', d.tcp_concurrent);
-    safeValue('featKaInterval', d.keep_alive_interval);
-    safeValue('featKaIdle', d.keep_alive_idle);
-    safeChecked('featDisableKa', d.disable_keep_alive);
-    const pg = d.proxy_group || {};
-    safeChecked('featPgEnabled', pg.enabled);
-    safeValue('featPgType', pg.group_type);
-    safeValue('featPgUrl', pg.url);
-    safeValue('featPgInterval', pg.interval);
-    safeValue('featPgTimeout', pg.timeout);
-    safeValue('featPgTolerance', pg.tolerance);
-    safeChecked('featPgLazy', pg.lazy);
-    safeValue('featPgMaxFailed', pg.max_failed_times);
-    safeValue('featPgStrategy', pg.strategy);
-    safeValue('featPgExpected', pg.expected_status);
-    safeValue('featPgFilter', pg.filter);
-    safeValue('featPgExcludeFilter', pg.exclude_filter);
-    safeValue('featPgExcludeType', pg.exclude_type);
-    safeChecked('featPgAllProviders', pg.include_all_providers);
-    safeChecked('featPgIncludeAll', pg.include_all);
-    safeChecked('featPgAllProxies', pg.include_all_proxies);
-    const ec = d.external_controller || {};
-    safeChecked('featEcEnabled', ec.enabled);
-    safeValue('featEcAddr', ec.address);
-    safeValue('featEcSecret', ec.secret);
-    safeValue('featEcOrigins', Array.isArray(ec.allow_origins) ? ec.allow_origins.join('\n') : (ec.allow_origins || ''));
-    safeChecked('featEcPrivNet', ec.allow_private_network);
-    const ntp=d.ntp||{}; safeChecked('featNtpEnabled',ntp.enabled); safeValue('featNtpServer',ntp.server); safeValue('featNtpPort',ntp.port); safeValue('featNtpInterval',ntp.interval); safeChecked('featNtpWrite',ntp.write_to_system); safeValue('featNtpDialer',ntp.dialer_proxy);
-    const per=d.per_proxy||{}, smux=per.smux||{}; setFeatureChecked('Per-proxy defaults','UDP',per.udp); setFeatureChecked('Per-proxy defaults','TFO',per.tfo); setFeatureChecked('Per-proxy defaults','MPTCP',per.mptcp); setFeatureValue('Per-proxy defaults','IP version',per.ip_version); setFeatureValue('Per-proxy defaults','Dialer proxy',per.dialer_proxy); setFeatureChecked('Per-proxy defaults','Smux enabled',smux.enabled); setFeatureValue('Per-proxy defaults','Smux protocol',smux.protocol); setFeatureValue('Per-proxy defaults','Smux max connections',smux.max_connections); setFeatureValue('Per-proxy defaults','Smux min streams',smux.min_streams); setFeatureValue('Per-proxy defaults','Smux max streams',smux.max_streams); setFeatureChecked('Per-proxy defaults','Smux statistic',smux.statistic); setFeatureChecked('Per-proxy defaults','Smux only TCP',smux.only_tcp); setFeatureChecked('Per-proxy defaults','Smux padding',smux.padding); setFeatureValue('Per-proxy defaults','Smux brutal up (Mbps)',smux.brutal_up); setFeatureValue('Per-proxy defaults','Smux brutal down (Mbps)',smux.brutal_down);
-    setFeatureValue('DNS расширенные','Cache algo',d.dns_cache_algorithm); setFeatureChecked('DNS расширенные','Prefer H3',d.dns_prefer_h3); setFeatureChecked('DNS расширенные','Respect rules',d.dns_respect_rules); setFeatureValue('DNS расширенные','Default nameserver',d.dns_default_nameserver); setFeatureValue('DNS расширенные','Proxy server nameserver',d.dns_proxy_server_nameserver); setFeatureValue('DNS расширенные','Direct nameserver',d.dns_direct_nameserver); setFeatureValue('DNS расширенные','Proxy server nameserver policy',formatFeatureMap(d.dns_proxy_server_nameserver_policy)); setFeatureValue('DNS расширенные','Nameserver policy',formatFeatureMap(d.dns_nameserver_policy)); setNullableFeatureChecked('DNS расширенные','Direct nameserver follow policy',d.dns_direct_nameserver_follow_policy); setNullableFeatureValue('DNS расширенные','Fake-IP filter mode',d.dns_fake_ip_filter_mode); setFeatureValue('DNS расширенные','Fake-IP filter',d.dns_fake_ip_filter); setNullableFeatureValue('DNS расширенные','Fake-IP TTL',d.dns_fake_ip_ttl); setNullableFeatureChecked('DNS расширенные','Use hosts',d.dns_use_hosts); setNullableFeatureChecked('DNS расширенные','Use system hosts',d.dns_use_system_hosts); setNullableFeatureChecked('DNS расширенные','ECS',d.dns_ecs_override); setFeatureValue('DNS расширенные','ECS override',d.dns_ecs); setFeatureChecked('DNS расширенные','Disable IPv4',d.dns_disable_ipv4); setFeatureChecked('DNS расширенные','Disable IPv6',d.dns_disable_ipv6); setFeatureValue('DNS расширенные','Disable qtypes',d.dns_disable_qtypes); setNullableFallbackFilter(d.dns_fallback_filter);
-    safeChecked('dnsSniffOverride',d.sniffer_override_destination); setFeatureValue('Sniffer','Force domain',d.sniffer_force_domain); setFeatureValue('Sniffer','Skip domain',d.sniffer_skip_domain); setFeatureValue('Sniffer','Skip src address',d.sniffer_skip_src_address); setFeatureValue('Sniffer','Skip dst address',d.sniffer_skip_dst_address); safeValue('featAuth',Array.isArray(d.authentication)?d.authentication.join('\n'):d.authentication); safeValue('featSkipAuth',Array.isArray(d.skip_auth_prefixes)?d.skip_auth_prefixes.join('\n'):d.skip_auth_prefixes); setFeatureChecked('Experimental','Disable QUIC GSO',d.quic_go_disable_gso); setFeatureChecked('Experimental','Disable QUIC ECN',d.quic_go_disable_ecn); safeValue('featSubRules',formatSubRules(d.sub_rules)); safeValue('featRawRules',Array.isArray(d.raw_rules)?d.raw_rules.join('\n'):d.raw_rules); safeValue('featHosts',Object.entries(d.hosts||{}).map(([host,value])=>`${host}=${value}`).join('\n')); renderTypedRules(d.typed_rules); renderProxyProviders(d.proxy_providers); renderRuleProviders(d.rule_providers); renderTunnels(d.tunnels);
-    refreshCustomSelects();
+function renderFeatureTunnels(tunnels) {
+  const list = document.getElementById('featTunnelsList');
+  if (!list) return;
+  list.innerHTML = '';
+  (Array.isArray(tunnels) ? tunnels : []).forEach(addFeatureTunnel);
+}
+function featureParametersFromControls() {
+  return {
+    unified_delay: document.getElementById('featUnifiedDelay').checked,
+    store_selected: document.getElementById('featStoreSelected').checked,
+    keep_alive_interval: featureNumber('featKaInterval', true),
+    keep_alive_idle: featureNumber('featKaIdle', true),
+    disable_keep_alive: document.getElementById('featDisableKa').checked,
+    tcp_concurrent: document.getElementById('featTcpConcurrent').checked,
+    per_proxy: {
+      tfo: document.getElementById('featPerProxyTfo').checked,
+      mptcp: document.getElementById('featPerProxyMptcp').checked,
+      ip_version: document.getElementById('featPerProxyIpVersion').value,
+    },
+    dns: {
+      prefer_h3: document.getElementById('featDnsPreferH3').checked,
+      respect_rules: document.getElementById('featDnsRespectRules').checked,
+      default_nameserver: featureLines(document.getElementById('featDnsDefaultNameserver').value),
+      nameserver_policy: featureMap(document.getElementById('featDnsNameserverPolicy').value, 'Nameserver policy'),
+      proxy_server_nameserver_policy: featureMap(document.getElementById('featDnsProxyServerNameserverPolicy').value, 'Proxy server nameserver policy'),
+      direct_nameserver_follow_policy: document.getElementById('featDnsDirectFollowPolicy').checked,
+      fake_ip_filter_mode: document.getElementById('featDnsFakeIpFilterMode').value || null,
+      fake_ip_filter: featureLines(document.getElementById('featDnsFakeIpFilter').value),
+      fake_ip_ttl: featureNumber('featDnsFakeIpTtl'),
+    },
+    sniffer: {
+      force_domain: featureLines(document.getElementById('featSnifferForceDomain').value),
+      skip_domain: featureLines(document.getElementById('featSnifferSkipDomain').value),
+      skip_src_address: featureLines(document.getElementById('featSnifferSkipSrcAddress').value),
+      skip_dst_address: featureLines(document.getElementById('featSnifferSkipDstAddress').value),
+    },
+    tunnels: readFeatureTunnels(),
+    hosts: featureHosts(document.getElementById('featHosts').value),
+    experimental: {
+      quic_go_disable_gso: document.getElementById('featDisableGso').checked,
+      quic_go_disable_ecn: document.getElementById('featDisableEcn').checked,
+    },
+  };
+}
+function setFeatureRuntime(runtime) {
+  const ec = runtime.external_controller || {};
+  safeSet('featRuntimeGeoLoader', runtime.geodata_loader);
+  safeSet('featRuntimeStoreFakeIp', runtime.store_fake_ip ? t('включён') : t('выключен'));
+  safeSet('featRuntimeUdp', runtime.udp ? t('включён') : t('выключен'));
+  safeSet('featRuntimeEcEnabled', ec.enabled ? t('включён') : t('выключен'));
+  safeSet('featRuntimeEcAddress', ec.address);
+  safeSet('featRuntimeEcConnected', ec.connected ? t('Подключён') : t('Не подключён'));
+}
+function setFeatureParameters(parameters) {
+  safeChecked('featUnifiedDelay', parameters.unified_delay);
+  safeChecked('featStoreSelected', parameters.store_selected);
+  safeValue('featKaInterval', parameters.keep_alive_interval);
+  safeValue('featKaIdle', parameters.keep_alive_idle);
+  safeChecked('featDisableKa', parameters.disable_keep_alive);
+  safeChecked('featTcpConcurrent', parameters.tcp_concurrent);
+  const perProxy = parameters.per_proxy || {};
+  safeChecked('featPerProxyTfo', perProxy.tfo);
+  safeChecked('featPerProxyMptcp', perProxy.mptcp);
+  safeValue('featPerProxyIpVersion', perProxy.ip_version || 'dual');
+  const dns = parameters.dns || {};
+  safeChecked('featDnsPreferH3', dns.prefer_h3);
+  safeChecked('featDnsRespectRules', dns.respect_rules);
+  safeValue('featDnsDefaultNameserver', Array.isArray(dns.default_nameserver) ? dns.default_nameserver.join('\n') : '');
+  safeValue('featDnsNameserverPolicy', formatFeatureMap(dns.nameserver_policy));
+  safeValue('featDnsProxyServerNameserverPolicy', formatFeatureMap(dns.proxy_server_nameserver_policy));
+  safeChecked('featDnsDirectFollowPolicy', dns.direct_nameserver_follow_policy);
+  safeValue('featDnsFakeIpFilterMode', dns.fake_ip_filter_mode);
+  safeValue('featDnsFakeIpFilter', Array.isArray(dns.fake_ip_filter) ? dns.fake_ip_filter.join('\n') : '');
+  safeValue('featDnsFakeIpTtl', dns.fake_ip_ttl);
+  const sniffer = parameters.sniffer || {};
+  safeValue('featSnifferForceDomain', Array.isArray(sniffer.force_domain) ? sniffer.force_domain.join('\n') : '');
+  safeValue('featSnifferSkipDomain', Array.isArray(sniffer.skip_domain) ? sniffer.skip_domain.join('\n') : '');
+  safeValue('featSnifferSkipSrcAddress', Array.isArray(sniffer.skip_src_address) ? sniffer.skip_src_address.join('\n') : '');
+  safeValue('featSnifferSkipDstAddress', Array.isArray(sniffer.skip_dst_address) ? sniffer.skip_dst_address.join('\n') : '');
+  renderFeatureTunnels(parameters.tunnels);
+  safeValue('featHosts', Object.entries(parameters.hosts || {}).map(([host,value])=>`${host}=${value}`).join('\n'));
+  const experimental = parameters.experimental || {};
+  safeChecked('featDisableGso', experimental.quic_go_disable_gso);
+  safeChecked('featDisableEcn', experimental.quic_go_disable_ecn);
+  refreshCustomSelects();
+}
+function saveFeatures() {
+  const save = document.getElementById('featSave');
+  if (!save || save.disabled) return;
+  let parameters;
+  try { parameters = featureParametersFromControls(); }
+  catch (error) { return showToast('error', error.message); }
+  save.disabled = true;
+  api('POST','/api/mihomo-features',{parameters}).then(data => {
+    setFeatureParameters(data.parameters || {});
+    setFeatureRuntime(data.runtime || {});
+    featuresLoaded = true;
+    setFeaturesDirty(false);
+    showToast('success', t('Параметры Mihomo сохранены и применены'));
+  }).catch(()=>{}).finally(() => { save.disabled = false; });
+}
+function loadFeatures(force = false) {
+  if (featuresLoading || (!force && featuresLoaded)) return Promise.resolve();
+  if (force && featuresDirty && !window.confirm(t('Несохранённые изменения будут потеряны. Продолжить?'))) return Promise.resolve();
+  const save = document.getElementById('featSave');
+  if (save) save.disabled = true;
+  featuresLoading = true;
+  return api('GET','/api/mihomo-features').then(data => {
+    setFeatureParameters(data.parameters || {});
+    setFeatureRuntime(data.runtime || {});
+    featuresLoaded = true;
+    setFeaturesDirty(false);
+    if (save) save.disabled = false;
     showToast('success',t('Параметры загружены'));
-  }).catch(()=>{});
+  }).catch(()=>{}).finally(() => { featuresLoading = false; });
 }
 
 // ─── ROUTING SETTINGS SAVE ───────────────────────────────────────────
@@ -6242,8 +6598,6 @@ const TOOLTIPS = {
   'sSocks': 'Адрес SOCKS5 прокси-сервера Mihomo',
   'sHttp': 'Адрес HTTP прокси-сервера Mihomo',
   'sVersion': 'Текущая версия бинарника Mihomo',
-  // Benchmark
-  'benchConcurrency': 'Сколько серверов проверять одновременно: от 1 до 6',
   // Split Routing
   'splitEnabled': 'Включить прозрачное проксирование для WiFi-сегмента HincyRay-VPN (192.168.2.0/24). Трафик этого сегмента автоматически направляется через Mihomo без настройки клиентов',
   'rAutoSwitch': 'Автоматически переключаться на следующий лучший профиль при 3 подряд проваленных health-check',
@@ -6282,28 +6636,15 @@ const TOOLTIPS = {
 
 // Selector-based tooltips: apply to labels containing specific text
 const LABEL_TOOLTIPS = [
-  // Mihomo Features — Global
+  // Mihomo expert settings
   {text:'GEO loader', tip:'Загружать Geo данные по требованию (memconservative). Экономит RAM на роутере'},
   {text:'Unified delay', tip:'Использовать RTT (round-trip time) вместо TTFB для измерения задержки. Более точное'},
-  {text:'Store fake-ip', tip:'Сохранять fake-ip mapping между перезапусками. Избегает повторного резолва'},
   {text:'TCP concurrent', tip:'При резолве DNS подключаться ко всем IP одновременно. Выигрывает первый. Ускоряет подключение'},
-  // Proxy Groups
-  {text:'Включены', tip:'Вместо одного активного профиля Mihomo управляет группой профилей. Failover/auto-select происходит внутри Mihomo без перезапуска ядра'},
-  {text:'Тип группы', tip:'select — ручной выбор. url-test — авто по задержке. fallback — по порядку. load-balance — распределение. relay — цепочка прокси'},
-  {text:'Interval (s)', tip:'Интервал health-check в секундах. Периодически проверяет все узлы в группе'},
-  {text:'Tolerance (ms)', tip:'Допустимая разница задержки (мс). Узел не переключается, если новый быстрее менее чем на tolerance'},
-  // External Controller
-  {text:'Address', tip:'Адрес:порт для REST API Mihomo. Можно 0.0.0.0:9090 для доступа с других устройств'},
-  {text:'Secret', tip:'Bearer-токен для аутентификации запросов к REST API Mihomo'},
-  // NTP
-  {text:'Сервер', tip:'NTP-сервер для синхронизации времени. Критично для TLS после перезагрузки без RTC-батареи'},
   // Per-proxy
-  {text:'UDP', tip:'Разрешить UDP через прокси. Mihomo по умолчанию false. Включено для совместимости'},
   {text:'TFO', tip:'TCP Fast Open — ускоряет установление соединения. Поддерживается не всеми серверами'},
   {text:'MPTCP', tip:'Multipath TCP — использует несколько путей для одного соединения. Редко поддерживается'},
   {text:'IP version', tip:'dual — оба; ipv4 — только IPv4; ipv4-prefer — оба, но IPv4 первым; ipv6/ipv6-prefer — аналогично'},
   // DNS advanced
-  {text:'Cache algo', tip:'arc — Adaptive Replacement Cache (рекомендуется). lru — Least Recently Used (проще, меньше памяти)'},
   {text:'Prefer H3', tip:'Использовать HTTP/3 (QUIC) для DoH запросов. Быстрее, но может быть заблокирован'},
   {text:'Respect rules', tip:'Применять routing rules к DNS-запросам. DNS идёт через прокси для проксируемых доменов'},
   // Auto-Select
@@ -6379,9 +6720,10 @@ function normalizeProfiles(statsData, profilesData) {
   // Stats endpoint has raw benchmark fields (latency, speed, failures, etc.).
    if (profilesData && Array.isArray(profilesData.profiles)) {
      return profilesData.profiles.map(p => {
+       const {raw:_raw,...safeProfile} = p;
        const st = statsMap[p.id];
-       if (!st) return Object.assign({dead:false}, p);
-       return Object.assign({}, p, {
+       if (!st) return Object.assign({dead:false}, safeProfile);
+       return Object.assign({}, safeProfile, {
         server_ref: p.server_ref || st.server_ref,
         dead: p.dead ?? st.dead ?? false,
         favorite: st.favorite ?? p.favorite ?? false,
@@ -6590,7 +6932,7 @@ function normalizeConnections(data, limit = 50) {
     };
   });
 }
-function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>null), api('GET','/api/profiles').catch(()=>null)]).then(([stats,profiles]) => { MOCK.profiles = normalizeProfiles(stats, profiles); const liveRefs = new Set(MOCK.profiles.map(profile => profile.server_ref).filter(Boolean)); [...selectedServerRefs].forEach(serverRef => { if (!liveRefs.has(serverRef)) selectedServerRefs.delete(serverRef); }); renderProfiles(MOCK.profiles); }); }
+function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>null), api('GET','/api/profiles').catch(()=>null)]).then(([stats,profiles]) => { MOCK.profiles = normalizeProfiles(stats, profiles); const liveRefs = new Set(MOCK.profiles.map(profile => profile.server_ref).filter(Boolean)); [...selectedServerRefs].forEach(serverRef => { if (!liveRefs.has(serverRef)) selectedServerRefs.delete(serverRef); }); renderProfiles(MOCK.profiles); renderProfileLoggerProfiles(); }); }
 function loadRouting() { return api('GET','/api/routing').then(d => {
   MOCK.routing_rules = d.rules || d.routing_rules || [];
   MOCK.routing_servers = Array.isArray(d.servers) ? d.servers : [];
@@ -6805,6 +7147,10 @@ function init() {
     row.classList.add('reveal-selected');
   });
   document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && document.getElementById('profileEditorModal')?.style.display !== 'none') {
+      closeProfileEditor();
+      return;
+    }
     const control = event.target.closest('.nav-group-header,.nav-sub-item,.sub-tab,.chip,.star,.cell-edit,.sidebar-collapse-btn,.lang-toggle,.logout-icon-collapsed');
     if (!control || (event.key !== 'Enter' && event.key !== ' ')) return;
     event.preventDefault();
@@ -7145,7 +7491,7 @@ function loadTrash() {
         <td style="padding:4px 8px">${escapeHtml(e.name)}</td>
         <td style="padding:4px 8px">${e.still_in_profiles ? '✅ в подписке' : '❌ удалён'}</td>
         <td style="padding:4px 8px">${e.promoted_at_unix ? new Date(e.promoted_at_unix * 1000).toLocaleDateString('ru-RU') : '—'}</td>
-        <td style="padding:4px 8px;display:flex;gap:6px;flex-wrap:wrap">${e.profile_id == null ? '' : `<button class="btn" onclick="quickTestTrash(${e.profile_id})">⚡ Быстрый тест</button>`}<button class="btn" onclick="restoreTrash('${escapeAttr(e.server_ref)}')">↩ Восстановить</button></td>
+        <td style="padding:4px 8px;display:flex;gap:6px;flex-wrap:wrap">${e.profile_id == null ? '' : `<button class="btn" data-bench-scope="single" data-title-ru="Quick Test только этого сервера" data-title-en="Quick Test this server only" title="${attrEscape(t('Quick Test только этого сервера'))}" onclick="quickTestTrash(${e.profile_id})">⚡ Быстрый тест</button>`}<button class="btn" onclick="restoreTrash('${escapeAttr(e.server_ref)}')">↩ Восстановить</button></td>
       </tr>`).join('')}</tbody></table>`;
   }).catch(() => {});
 }
@@ -7197,6 +7543,8 @@ document.addEventListener('DOMContentLoaded', function() {
   };
 });
 
+window.addEventListener('pagehide', clearProfileEditorSensitiveState);
+window.addEventListener('pagehide', clearProfileLoggerState);
 document.addEventListener('DOMContentLoaded', init);
 </script>
 

@@ -20,10 +20,13 @@ DAEMON = ROOT / "src" / "hincyray.rs"
 
 def served_routes() -> set[tuple[str, str]]:
     text = DAEMON.read_text(encoding="utf-8")
-    return {
+    routes = {
         (method, path)
         for method, path in re.findall(r'\("(GET|POST)",\s*"([^"]+)"\)\s*=>', text)
     }
+    if 'path.strip_prefix("/api/profiles/")' in text:
+        routes.add(("GET", "/api/profiles/{id}"))
+    return routes
 
 
 def ui_routes() -> set[tuple[str, str]]:
@@ -38,6 +41,8 @@ def ui_routes() -> set[tuple[str, str]]:
         for match in re.finditer(pattern, text):
             method = match.groupdict().get("method") or "POST"
             routes.add((method, match.group("path")))
+    if "api('GET','/api/profiles/'+profileId" in text:
+        routes.add(("GET", "/api/profiles/{id}"))
     return routes
 
 
@@ -50,7 +55,7 @@ REQUIRED_MARKERS = [
     "/api/telegram-probe/request-code",
     "/api/telegram-probe/confirm",
     "/api/telegram-probe/delete",
-    "v1.2.2",
+    "v1.3.0",
     "/api/memory-guard",
     "/api/subscriptions/refresh-report",
     "/api/undo",
@@ -70,6 +75,11 @@ REQUIRED_MARKERS = [
     'id="benchFullAll"',
     "function fullBenchAll()",
     "concurrency: benchConcurrency()",
+    "function normalizeBenchConcurrency(value)",
+    "localStorage.getItem('hr_bench_concurrency')",
+    "active_profiles",
+    'data-bench-scope="single"',
+    'data-bench-scope="group"',
     "method: 'quick'",
     "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/whitelist.txt",
     "reader.readAsText(file, 'UTF-8');",
@@ -194,7 +204,24 @@ REQUIRED_MARKERS = [
     "function isConnectionsTableActive()",
     "id=\"routingVisualInterval\"",
     "Автообновление работает только пока эта вкладка открыта",
-    "data-testid=\"profile-rename-modal\"",
+    "data-testid=\"profile-editor-modal\"",
+    'id="profileEditorRaw" class="mono profile-secret-mask" rows="6" maxlength="65536"',
+    'id="profileEditorSave" type="submit" disabled',
+    "api('GET','/api/profiles/'+profileId,undefined,true)",
+    "api('POST','/api/profiles/update',payload)",
+    "expected_server_ref:state.expectedServerRef",
+    "if (!state.subscriptionManaged) payload.raw = raw;",
+    "profileEditorState = null;",
+    "safeValue('profileEditorRaw','');",
+    "function clearProfileEditorSensitiveState()",
+    "window.addEventListener('pagehide', clearProfileEditorSensitiveState);",
+    "function normalizedProfileGroup(group)",
+    "function normalizedSubscriptionUrl(value)",
+    "const {raw:_raw,...safeProfile} = p;",
+    "data-testid=\"revalidate-ungrouped\"",
+    "source === null",
+    "api('POST','/api/profiles/revalidate-ungrouped',{})",
+    "apiAction('POST','/api/subscriptions/refresh-one',{url}",
     "function openFormDialog(",
     "function enhanceResponsiveTables(",
     "function previewAndApplyRouting()",
@@ -217,6 +244,36 @@ REQUIRED_MARKERS = [
     "const byServerRef = new Map();",
     "s.server_ref",
     "p.dead?`<span class=\"badge badge-danger\">${t('Дохлые серверы')}</span>`",
+    'id="featSave"',
+    'id="featSave" onclick="saveFeatures()" disabled',
+    'id="featRuntimeGeoLoader"',
+    'id="featRuntimeStoreFakeIp"',
+    'id="featRuntimeUdp"',
+    'id="featRuntimeEcAddress"',
+    'id="featRuntimeEcConnected"',
+    'id="featPerProxyTfo"',
+    'id="featDnsPreferH3"',
+    'id="featSnifferForceDomain"',
+    "if (section === 'features') loadFeatures();",
+    "api('POST','/api/mihomo-features',{parameters})",
+    "setFeatureParameters(data.parameters || {});",
+    "setFeatureRuntime(data.runtime || {});",
+    "'Не задано':'Not set'",
+    "if (featuresLoading || (!force && featuresLoaded)) return Promise.resolve();",
+    "setFeaturesDirty(false);",
+    "throw new Error(`${t(label)}: ${t('некорректная строка')} ${index + 1}`)",
+    "function startProfileLogger()",
+    "if (!sourceIp) { showToast('error',t('Укажите IP устройства')); return; }",
+    "payload.source_ip = sourceIp",
+    "function stopProfileLoggerPolling()",
+    "profileLoggerPollTimer = setInterval(pollProfileLoggerStatus, 2000)",
+    "api('POST','/api/profile-diagnostics/start',payload)",
+    "api('POST','/api/profile-diagnostics/stop',{session_id:sessionId})",
+    "api('GET','/api/profile-diagnostics/status',undefined,true)",
+    "api('POST','/api/profile-diagnostics/report',{session_id:sessionId},true)",
+    "report.session_id !== expectedSessionId",
+    "api('POST','/api/profile-diagnostics/discard',payload)",
+    "new Blob([profileLoggerReport.markdown]",
 ]
 
 FORBIDDEN_MARKERS = [
@@ -261,6 +318,23 @@ FORBIDDEN_MARKERS = [
     "DB_EXPLICIT_SELECTED.add(p.raw)",
     "apiAction('POST', '/api/trash/restore', { raw }",
     "Сырой профиль: ${raw}",
+    "function editProfileName(",
+    "profileEditorState.raw",
+    'id="featPgEnabled"',
+    'id="featEcSecret"',
+    'id="featNtpEnabled"',
+    'id="featAuth"',
+    'id="featSubRules"',
+    'id="featRawRules"',
+    'id="typedRulesList"',
+    'id="proxyProvidersList"',
+    'id="ruleProvidersList"',
+    "function featureControl(",
+    "function addProxyProvider(",
+    "function addRuleProvider(",
+    "function addTypedRule(",
+    "api('GET','/api/mihomo-features',undefined,true).catch",
+    "dns_fallback_filter:",
 ]
 
 GEOBASE_DOM_IDS = [
@@ -340,6 +414,34 @@ DEAD_SERVERS_DOM_IDS = [
     "deadServerMoveSelected",
     "deadServerRestoreSelected",
 ]
+
+PROFILE_LOGGER_DOM_IDS = [
+    "profileLoggerProfile",
+    "profileLoggerDuration",
+    "profileLoggerSourceIp",
+    "profileLoggerStart",
+    "profileLoggerStop",
+    "profileLoggerDiscard",
+    "profileLoggerState",
+    "profileLoggerElapsed",
+    "profileLoggerRemaining",
+    "profileLoggerConnections",
+    "profileLoggerEvents",
+    "profileLoggerTruncation",
+    "profileLoggerReportPanel",
+    "profileLoggerSummary",
+    "profileLoggerMarkdown",
+    "profileLoggerCopy",
+    "profileLoggerSave",
+]
+
+PROFILE_LOGGER_UI_ROUTES = {
+    ("POST", "/api/profile-diagnostics/start"),
+    ("GET", "/api/profile-diagnostics/status"),
+    ("POST", "/api/profile-diagnostics/stop"),
+    ("POST", "/api/profile-diagnostics/report"),
+    ("POST", "/api/profile-diagnostics/discard"),
+}
 
 
 def nav_sections(html_text: str) -> set[str]:
@@ -461,7 +563,10 @@ if (JSON.stringify(parsed) !== JSON.stringify(expected)) throw new Error(JSON.st
 
 def verify_dead_server_projection(html_text: str) -> str | None:
     try:
-        projection = js_function(html_text, "profileGroupDescriptors")
+        projection = "\n".join(
+            js_function(html_text, name)
+            for name in ("normalizedProfileGroup", "profileGroupDescriptors")
+        )
     except ValueError as error:
         return str(error)
     program = f"""
@@ -485,12 +590,39 @@ if (input[1].group !== 'subscription-a') throw new Error('profile provenance mut
     return None
 
 
+def verify_reduced_mihomo_features(html_text: str) -> str | None:
+    try:
+        save = js_function(html_text, "saveFeatures")
+        parameters = js_function(html_text, "featureParametersFromControls")
+    except ValueError as error:
+        return str(error)
+    forbidden_save_markers = (
+        "api('GET','/api/mihomo-features'",
+        "/api/routing/apply",
+        "dnsSniffOverride",
+        "proxy_group",
+        "external_controller",
+        "authentication",
+        "proxy_providers",
+        "rule_providers",
+        "raw_rules",
+        "typed_rules",
+    )
+    found = [marker for marker in forbidden_save_markers if marker in save or marker in parameters]
+    if found:
+        return "legacy/save fields found: " + ", ".join(found)
+    if "let parameters;" not in save or "{parameters}" not in save:
+        return "POST body is not the reduced parameters envelope"
+    return None
+
+
 def main() -> int:
     html_text = HTML.read_text(encoding="utf-8")
     missing_markers = [marker for marker in REQUIRED_MARKERS if marker not in html_text]
     forbidden_markers = [marker for marker in FORBIDDEN_MARKERS if marker in html_text]
     missing_system_ids = [dom_id for dom_id in SYSTEM_DOM_IDS if not dom_id_exists(html_text, dom_id)]
     missing_dead_server_ids = [dom_id for dom_id in DEAD_SERVERS_DOM_IDS if not dom_id_exists(html_text, dom_id)]
+    missing_profile_logger_ids = [dom_id for dom_id in PROFILE_LOGGER_DOM_IDS if not dom_id_exists(html_text, dom_id)]
     missing_geobase_ids = [dom_id for dom_id in GEOBASE_DOM_IDS if not dom_id_exists(html_text, dom_id)]
     duplicate_geobase_ids = [dom_id for dom_id in GEOBASE_DOM_IDS if dom_id_count(html_text, dom_id) > 1]
     nav = nav_sections(html_text)
@@ -502,14 +634,16 @@ def main() -> int:
     served = served_routes()
     used = ui_routes()
     missing_geobase_routes = sorted(GEOBASE_UI_ROUTES - used)
+    missing_profile_logger_routes = sorted(PROFILE_LOGGER_UI_ROUTES - used)
     missing_routes = sorted(used - served)
     missing_routes = [(method, path) for method, path in missing_routes if not path.endswith("/")]
     sort_error = verify_nullable_sort(html_text)
     geobase_parser_error = verify_geobase_network_parser(html_text)
     dead_server_projection_error = verify_dead_server_projection(html_text)
+    mihomo_features_error = verify_reduced_mihomo_features(html_text)
     rule_target_markup = re.search(r'<select id="ruleTarget">(?P<body>.*?)</select>', html_text, re.S)
     numeric_profile_targets = re.findall(r"profile:\d+", rule_target_markup.group("body") if rule_target_markup else "")
-    if missing_markers or forbidden_markers or numeric_profile_targets or missing_system_ids or missing_dead_server_ids or missing_geobase_ids or duplicate_geobase_ids or missing_geobase_routes or nav_without_panel or nav_without_map or map_without_panel or missing_routes or sort_error or geobase_parser_error or dead_server_projection_error:
+    if missing_markers or forbidden_markers or numeric_profile_targets or missing_system_ids or missing_dead_server_ids or missing_profile_logger_ids or missing_geobase_ids or duplicate_geobase_ids or missing_geobase_routes or missing_profile_logger_routes or nav_without_panel or nav_without_map or map_without_panel or missing_routes or sort_error or geobase_parser_error or dead_server_projection_error or mihomo_features_error:
         if missing_markers:
             print("Missing required UI markers:")
             for marker in missing_markers:
@@ -530,6 +664,10 @@ def main() -> int:
             print("Dead Servers controls are missing required DOM ids:")
             for dom_id in missing_dead_server_ids:
                 print(f"  - {dom_id}")
+        if missing_profile_logger_ids:
+            print("Profile Logger is missing required DOM ids:")
+            for dom_id in missing_profile_logger_ids:
+                print(f"  - {dom_id}")
         if missing_geobase_ids:
             print("GeoBase Constructor is missing required DOM ids:")
             for dom_id in missing_geobase_ids:
@@ -541,6 +679,10 @@ def main() -> int:
         if missing_geobase_routes:
             print("GeoBase Constructor is missing required API calls:")
             for method, path in missing_geobase_routes:
+                print(f"  - {method} {path}")
+        if missing_profile_logger_routes:
+            print("Profile Logger is missing required API calls:")
+            for method, path in missing_profile_logger_routes:
                 print(f"  - {method} {path}")
         if nav_without_panel:
             print("Sidebar navigation points to missing section panels:")
@@ -564,6 +706,8 @@ def main() -> int:
             print(f"GeoBase network parser contract failed: {geobase_parser_error}")
         if dead_server_projection_error:
             print(f"Dead Servers virtual projection contract failed: {dead_server_projection_error}")
+        if mihomo_features_error:
+            print(f"Reduced Mihomo features contract failed: {mihomo_features_error}")
         return 1
     print(f"frontend contract ok: {len(used)} UI routes checked")
     return 0

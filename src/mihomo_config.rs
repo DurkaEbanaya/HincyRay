@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
@@ -29,275 +30,9 @@ use crate::xray_config::{
 // MihomoFeatures — all opt-in Mihomo-specific config options
 // ---------------------------------------------------------------------------
 
-/// Sing-mux (multiplexing) settings for proxy connections.
-///
-/// Multiplexes multiple streams over a single TCP connection, reducing
-/// connection-setup overhead — especially valuable on high-latency or
-/// unreliable links (e.g. LTE with poor CINR).
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct SmuxConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_smux_protocol")]
-    pub protocol: String,
-    #[serde(default)]
-    pub max_connections: u32,
-    #[serde(default)]
-    pub min_streams: u32,
-    #[serde(default)]
-    pub max_streams: u32,
-    #[serde(default)]
-    pub statistic: bool,
-    #[serde(default)]
-    pub only_tcp: bool,
-    #[serde(default)]
-    pub padding: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub brutal_up: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub brutal_down: Option<u32>,
-}
-
-impl Default for SmuxConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            protocol: default_smux_protocol(),
-            max_connections: 0,
-            min_streams: 0,
-            max_streams: 0,
-            statistic: false,
-            only_tcp: false,
-            padding: false,
-            brutal_up: None,
-            brutal_down: None,
-        }
-    }
-}
-
-/// Proxy group type. When `enabled`, Mihomo manages failover/auto-select
-/// internally — no core restart needed on profile switch.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProxyGroupType {
-    /// Manual selection — user picks a proxy from the group.
-    Select,
-    /// Auto-select by lowest latency (health-checked periodically).
-    #[default]
-    UrlTest,
-    /// Failover in list order — switch to next when current fails.
-    Fallback,
-    /// Distribute traffic across proxies by strategy.
-    LoadBalance,
-    /// Chain proxies in order. Deprecated by upstream in favour of
-    /// per-proxy `dialer-proxy`, but still supported for config parity.
-    Relay,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum LoadBalanceStrategy {
-    /// Round-robin — each request to a different proxy.
-    RoundRobin,
-    /// Same target domain → same proxy (sticky by domain).
-    #[default]
-    ConsistentHashing,
-    /// Same source+target → same proxy (sticky by pair, 10-min TTL).
-    StickySessions,
-}
-
-/// Configuration for the proxy-group feature.
-///
-/// When `enabled`, instead of a single `proxy` outbound, Mihomo gets a
-/// `proxy-groups` section with a group named `proxy` (so existing rules
-/// still work unchanged). The group wraps all profiles and handles
-/// auto-select / failover / load-balance internally.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ProxyGroupConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub group_type: ProxyGroupType,
-    #[serde(default = "default_health_check_url")]
-    pub url: String,
-    #[serde(default = "default_health_check_interval")]
-    pub interval: u32,
-    #[serde(default)]
-    pub tolerance: u32,
-    #[serde(default = "default_health_check_timeout")]
-    pub timeout: u32,
-    #[serde(default = "default_true")]
-    pub lazy: bool,
-    #[serde(default = "default_max_failed_times")]
-    pub max_failed_times: u32,
-    #[serde(default)]
-    pub strategy: LoadBalanceStrategy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_status: Option<String>,
-    /// Regex filter — only include nodes whose name matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter: Option<String>,
-    /// Regex filter — exclude nodes whose name matches.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exclude_filter: Option<String>,
-    /// Exclude by proxy type, pipe-separated (e.g. "Shadowsocks|Http").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exclude_type: Option<String>,
-    /// Auto-include all nodes from all proxy-providers in this group.
-    #[serde(default)]
-    pub include_all_providers: bool,
-    /// Include all proxies AND all proxy-providers (sorted by name).
-    #[serde(default)]
-    pub include_all: bool,
-    /// Include all proxies only (no providers), sorted by name.
-    #[serde(default)]
-    pub include_all_proxies: bool,
-}
-
-impl Default for ProxyGroupConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            group_type: ProxyGroupType::default(),
-            url: default_health_check_url(),
-            interval: default_health_check_interval(),
-            tolerance: 0,
-            timeout: default_health_check_timeout(),
-            lazy: true,
-            max_failed_times: default_max_failed_times(),
-            strategy: LoadBalanceStrategy::default(),
-            expected_status: None,
-            filter: None,
-            exclude_filter: None,
-            exclude_type: None,
-            include_all_providers: false,
-            include_all: false,
-            include_all_proxies: false,
-        }
-    }
-}
-
-/// A single proxy-provider entry — Mihomo fetches and refreshes the
-/// subscription itself, with optional health-check and filtering.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ProxyProviderConfig {
-    pub name: String,
-    #[serde(default = "default_provider_type")]
-    pub provider_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(default = "default_provider_interval")]
-    pub interval: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exclude_filter: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exclude_type: Option<String>,
-    #[serde(default)]
-    pub health_check_enabled: bool,
-    #[serde(default = "default_health_check_url")]
-    pub health_check_url: String,
-    #[serde(default = "default_health_check_interval")]
-    pub health_check_interval: u32,
-    #[serde(default = "default_health_check_timeout")]
-    pub health_check_timeout: u32,
-    #[serde(default = "default_true")]
-    pub health_check_lazy: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub health_check_expected_status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub age_secret_key: Option<String>,
-    #[serde(default)]
-    pub header: HashMap<String, Vec<String>>,
-    #[serde(default)]
-    pub size_limit: u64,
-    /// For `inline` type: raw proxy YAML lines.
-    #[serde(default)]
-    pub payload: Vec<String>,
-}
-
-impl Default for ProxyProviderConfig {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            provider_type: default_provider_type(),
-            url: None,
-            path: None,
-            interval: default_provider_interval(),
-            proxy: None,
-            filter: None,
-            exclude_filter: None,
-            exclude_type: None,
-            health_check_enabled: false,
-            health_check_url: default_health_check_url(),
-            health_check_interval: default_health_check_interval(),
-            health_check_timeout: default_health_check_timeout(),
-            health_check_lazy: true,
-            health_check_expected_status: None,
-            age_secret_key: None,
-            header: HashMap::new(),
-            size_limit: 0,
-            payload: Vec::new(),
-        }
-    }
-}
-
-/// A single rule-provider entry — external rule sets (domain/ipcidr/
-/// classical) loaded from HTTP, file, or inline.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct RuleProviderConfig {
-    pub name: String,
-    #[serde(default = "default_provider_type")]
-    pub provider_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(default = "default_provider_interval")]
-    pub interval: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy: Option<String>,
-    #[serde(default = "default_rule_behavior")]
-    pub behavior: String,
-    #[serde(default = "default_rule_format")]
-    pub format: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path_in_bundle: Option<String>,
-    #[serde(default)]
-    pub size_limit: u64,
-    #[serde(default)]
-    pub header: HashMap<String, Vec<String>>,
-    /// For `inline` type: raw rule strings.
-    #[serde(default)]
-    pub payload: Vec<String>,
-}
-
-impl Default for RuleProviderConfig {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            provider_type: default_provider_type(),
-            url: None,
-            path: None,
-            interval: default_provider_interval(),
-            proxy: None,
-            behavior: default_rule_behavior(),
-            format: default_rule_format(),
-            path_in_bundle: None,
-            size_limit: 0,
-            header: HashMap::new(),
-            payload: Vec::new(),
-        }
-    }
-}
-
 /// A single tunnel entry — TCP/UDP port forwarding through Mihomo.
-#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     /// `["tcp"]`, `["udp"]`, or `["tcp", "udp"]`.
     pub network: Vec<String>,
@@ -310,149 +45,33 @@ pub struct TunnelConfig {
     pub proxy: Option<String>,
 }
 
-/// NTP service configuration. Synchronises system time — critical for
-/// TLS certificate validation after router reboot without RTC battery.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct NtpConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub write_to_system: bool,
-    #[serde(default = "default_ntp_server")]
-    pub server: String,
-    #[serde(default = "default_ntp_port")]
-    pub port: u16,
-    #[serde(default = "default_ntp_interval")]
-    pub interval: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dialer_proxy: Option<String>,
-}
-
-impl Default for NtpConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            write_to_system: false,
-            server: default_ntp_server(),
-            port: default_ntp_port(),
-            interval: default_ntp_interval(),
-            dialer_proxy: None,
-        }
-    }
-}
-
-/// External REST API controller. Enables `/proxies/{name}/delay`,
-/// `/connections`, `/traffic`, `/configs` (hot-reload), `/restart`, etc.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+/// Persisted credentials for the fixed internal external controller.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ExternalControllerConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_external_controller_addr")]
-    pub address: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
-    #[serde(default)]
-    pub allow_origins: Vec<String>,
-    #[serde(default)]
-    pub allow_private_network: bool,
-}
-
-impl Default for ExternalControllerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            address: default_external_controller_addr(),
-            secret: None,
-            allow_origins: Vec::new(),
-            allow_private_network: false,
-        }
-    }
-}
-
-/// DNS fallback filter — determines when fallback DNS results are used.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct FallbackFilter {
-    #[serde(default = "default_true")]
-    pub geoip: bool,
-    #[serde(default = "default_geoip_code")]
-    pub geoip_code: String,
-    #[serde(default)]
-    pub geosite: Vec<String>,
-    #[serde(default)]
-    pub ipcidr: Vec<String>,
-    #[serde(default)]
-    pub domain: Vec<String>,
-}
-
-impl Default for FallbackFilter {
-    fn default() -> Self {
-        Self {
-            geoip: true,
-            geoip_code: default_geoip_code(),
-            geosite: Vec::new(),
-            ipcidr: Vec::new(),
-            domain: Vec::new(),
-        }
-    }
 }
 
 /// Per-proxy default fields applied to every outbound proxy unless
 /// overridden by individual profile settings.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PerProxyDefaults {
-    /// Allow UDP through proxy (Mihomo default is `false`).
-    #[serde(default = "default_true")]
-    pub udp: bool,
     #[serde(default)]
     pub tfo: bool,
     #[serde(default)]
     pub mptcp: bool,
     #[serde(default = "default_ip_version")]
     pub ip_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub smux: Option<SmuxConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dialer_proxy: Option<String>,
 }
 
 impl Default for PerProxyDefaults {
     fn default() -> Self {
         Self {
-            udp: true,
             tfo: false,
             mptcp: false,
             ip_version: default_ip_version(),
-            smux: None,
-            dialer_proxy: None,
         }
     }
-}
-
-/// A single sub-rule group — a named set of routing rules that can be
-/// referenced from the main rules via `SUB-RULE,(conditions),<name>`.
-///
-/// Sub-rules allow complex nested routing: the main rule set delegates
-/// to a named sub-rule group, which evaluates its own rules and
-/// returns the first match. If no sub-rule matches, evaluation
-/// continues in the main rule set.
-///
-/// Example Mihomo config:
-/// ```yaml
-/// sub-rules:
-///   ad-block:
-///     - DOMAIN-SUFFIX,doubleclick.net,REJECT
-///     - DOMAIN-SUFFIX,googleadservices.com,REJECT
-///     - MATCH,PROXY
-/// rules:
-///   - GEOSITE,category-ads,SUB-RULE,(>ad-block)
-/// ```
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-pub struct SubRuleConfig {
-    /// Name of the sub-rule group — referenced in main rules.
-    pub name: String,
-    /// Rules in this group (Mihomo rule strings).
-    #[serde(default)]
-    pub rules: Vec<String>,
 }
 
 /// All Mihomo-specific opt-in features. Stored in `HincyrayState` and
@@ -461,21 +80,15 @@ pub struct SubRuleConfig {
 ///
 /// Defaults are tuned for a resource-constrained router (Keenetic Giga
 /// KN-1012, 496 MB RAM, aarch64, kernel 4.9):
-/// - `geodata-loader = memconservative` — on-demand GEO loading.
 /// - `unified-delay = true` — RTT-based latency.
-/// - `store-fake-ip / store-selected = true` — persist across restarts.
+/// - `store-fake-ip = true` and `per-proxy.udp = true` are fixed invariants.
+/// - `store-selected = true` — persist group selections.
 /// - `keep-alive-interval = 30, keep-alive-idle = 120` — router-tuned.
-/// - `dns-cache-algorithm = arc` — better hit rate than LRU.
-/// - `per-proxy.udp = true` — UDP is needed for QUIC/DNS.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MihomoFeatures {
     // --- Global config ---
-    #[serde(default = "default_geodata_loader")]
-    pub geodata_loader: String,
     #[serde(default = "default_true")]
     pub unified_delay: bool,
-    #[serde(default = "default_true")]
-    pub store_fake_ip: bool,
     #[serde(default = "default_true")]
     pub store_selected: bool,
     #[serde(default = "default_keep_alive_interval")]
@@ -494,12 +107,6 @@ pub struct MihomoFeatures {
     #[serde(default)]
     pub quic_go_disable_ecn: bool,
 
-    // --- Authentication ---
-    #[serde(default)]
-    pub authentication: Vec<String>,
-    #[serde(default)]
-    pub skip_auth_prefixes: Vec<String>,
-
     // --- Hosts ---
     #[serde(default)]
     pub hosts: HashMap<String, String>,
@@ -508,45 +115,19 @@ pub struct MihomoFeatures {
     #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
 
-    // --- NTP ---
-    #[serde(default)]
-    pub ntp: NtpConfig,
-
     // --- External Controller ---
     #[serde(default)]
     pub external_controller: ExternalControllerConfig,
-
-    // --- Proxy Groups ---
-    #[serde(default)]
-    pub proxy_group: ProxyGroupConfig,
-
-    // --- Proxy Providers ---
-    #[serde(default)]
-    pub proxy_providers: Vec<ProxyProviderConfig>,
-
-    // --- Rule Providers ---
-    #[serde(default)]
-    pub rule_providers: Vec<RuleProviderConfig>,
-
-    // --- Sub-rules ---
-    #[serde(default)]
-    pub sub_rules: Vec<SubRuleConfig>,
 
     // --- Per-proxy defaults ---
     #[serde(default)]
     pub per_proxy: PerProxyDefaults,
 
     // --- DNS extra ---
-    #[serde(default = "default_dns_cache_algorithm")]
-    pub dns_cache_algorithm: String,
     #[serde(default)]
     pub dns_prefer_h3: bool,
     #[serde(default)]
     pub dns_respect_rules: bool,
-    #[serde(default)]
-    pub dns_proxy_server_nameserver: Vec<String>,
-    #[serde(default)]
-    pub dns_direct_nameserver: Vec<String>,
     /// DNS nameserver-policy: domain → list of DNS servers.
     /// Keys support domain wildcards (e.g. `+.google.com`) and geosite
     /// references (e.g. `geosite:cn`). Values are DNS server URLs.
@@ -564,23 +145,6 @@ pub struct MihomoFeatures {
     pub dns_fake_ip_filter: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_fake_ip_ttl: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_use_hosts: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_use_system_hosts: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_ecs: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_ecs_override: Option<bool>,
-    #[serde(default)]
-    pub dns_disable_ipv4: bool,
-    #[serde(default)]
-    pub dns_disable_ipv6: bool,
-    #[serde(default)]
-    pub dns_disable_qtypes: Vec<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_fallback_filter: Option<FallbackFilter>,
-
     // --- Sniffer extra ---
     /// Override destination with sniffed domain so DOMAIN-* rules match
     /// even when clients bypass the router's DNS (DoH/DoT).  Default true.
@@ -594,31 +158,12 @@ pub struct MihomoFeatures {
     pub sniffer_skip_src_address: Vec<String>,
     #[serde(default)]
     pub sniffer_skip_dst_address: Vec<String>,
-
-    // --- Raw rules ---
-    /// Raw Mihomo rule strings appended before MATCH (e.g. AND/OR/NOT
-    /// logic rules that can't be expressed via the domain/ip/port model).
-    #[serde(default)]
-    pub raw_rules: Vec<String>,
-    #[serde(default)]
-    pub typed_rules: Vec<MihomoRuleConfig>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MihomoRuleConfig {
-    pub rule_type: String,
-    pub value: String,
-    pub target: String,
-    #[serde(default)]
-    pub options: Vec<String>,
 }
 
 impl Default for MihomoFeatures {
     fn default() -> Self {
         Self {
-            geodata_loader: default_geodata_loader(),
             unified_delay: true,
-            store_fake_ip: true,
             store_selected: true,
             keep_alive_interval: default_keep_alive_interval(),
             keep_alive_idle: default_keep_alive_idle(),
@@ -626,22 +171,12 @@ impl Default for MihomoFeatures {
             tcp_concurrent: false,
             quic_go_disable_gso: false,
             quic_go_disable_ecn: false,
-            authentication: Vec::new(),
-            skip_auth_prefixes: Vec::new(),
             hosts: HashMap::new(),
             tunnels: Vec::new(),
-            ntp: NtpConfig::default(),
             external_controller: ExternalControllerConfig::default(),
-            proxy_group: ProxyGroupConfig::default(),
-            proxy_providers: Vec::new(),
-            rule_providers: Vec::new(),
-            sub_rules: Vec::new(),
             per_proxy: PerProxyDefaults::default(),
-            dns_cache_algorithm: default_dns_cache_algorithm(),
             dns_prefer_h3: false,
             dns_respect_rules: false,
-            dns_proxy_server_nameserver: Vec::new(),
-            dns_direct_nameserver: Vec::new(),
             dns_nameserver_policy: HashMap::new(),
             dns_default_nameserver: Vec::new(),
             dns_proxy_server_nameserver_policy: HashMap::new(),
@@ -649,21 +184,11 @@ impl Default for MihomoFeatures {
             dns_fake_ip_filter_mode: None,
             dns_fake_ip_filter: Vec::new(),
             dns_fake_ip_ttl: None,
-            dns_use_hosts: None,
-            dns_use_system_hosts: None,
-            dns_ecs: None,
-            dns_ecs_override: None,
-            dns_disable_ipv4: false,
-            dns_disable_ipv6: false,
-            dns_disable_qtypes: Vec::new(),
-            dns_fallback_filter: None,
             sniffer_override_destination: true,
             sniffer_force_domain: Vec::new(),
             sniffer_skip_domain: Vec::new(),
             sniffer_skip_src_address: Vec::new(),
             sniffer_skip_dst_address: Vec::new(),
-            raw_rules: Vec::new(),
-            typed_rules: Vec::new(),
         }
     }
 }
@@ -674,10 +199,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_geodata_loader() -> String {
-    "memconservative".to_owned()
-}
-
 fn default_keep_alive_interval() -> u32 {
     30
 }
@@ -686,68 +207,8 @@ fn default_keep_alive_idle() -> u32 {
     120
 }
 
-fn default_dns_cache_algorithm() -> String {
-    "arc".to_owned()
-}
-
 fn default_ip_version() -> String {
     "dual".to_owned()
-}
-
-fn default_ntp_server() -> String {
-    "time.apple.com".to_owned()
-}
-
-fn default_ntp_port() -> u16 {
-    123
-}
-
-fn default_ntp_interval() -> u32 {
-    30
-}
-
-fn default_external_controller_addr() -> String {
-    "127.0.0.1:9090".to_owned()
-}
-
-fn default_health_check_url() -> String {
-    "https://www.gstatic.com/generate_204".to_owned()
-}
-
-fn default_health_check_interval() -> u32 {
-    300
-}
-
-fn default_health_check_timeout() -> u32 {
-    5000
-}
-
-fn default_max_failed_times() -> u32 {
-    5
-}
-
-fn default_provider_type() -> String {
-    "http".to_owned()
-}
-
-fn default_provider_interval() -> u32 {
-    3600
-}
-
-fn default_rule_behavior() -> String {
-    "classical".to_owned()
-}
-
-fn default_rule_format() -> String {
-    "yaml".to_owned()
-}
-
-fn default_geoip_code() -> String {
-    "CN".to_owned()
-}
-
-fn default_smux_protocol() -> String {
-    "h2mux".to_owned()
 }
 
 /// Tag/name constants used in generated Mihomo configs.
@@ -781,18 +242,13 @@ pub struct PinnedServerRoute<'a> {
 
 /// Apply global Mihomo feature flags to a config JSON object.
 ///
-/// Adds: `geodata-loader`, `unified-delay`, `profile.store-*`,
-/// `keep-alive-*`, `experimental`, `authentication`, `skip-auth-prefixes`,
-/// `hosts`, `tunnels`, `ntp`, `external-controller`.
+/// Adds retained expert options plus fixed router invariants.
 fn apply_global_features(config: &mut Value, features: &MihomoFeatures) {
-    config["geodata-loader"] = json!(features.geodata_loader);
+    config["geodata-loader"] = json!("memconservative");
     config["unified-delay"] = json!(features.unified_delay);
 
     // profile.store-* — persist fake-ip map and group selections
-    let mut profile = json!({});
-    if features.store_fake_ip {
-        profile["store-fake-ip"] = json!(true);
-    }
+    let mut profile = json!({"store-fake-ip": true});
     if features.store_selected {
         profile["store-selected"] = json!(true);
     }
@@ -826,13 +282,6 @@ fn apply_global_features(config: &mut Value, features: &MihomoFeatures) {
         config["experimental"] = exp;
     }
 
-    if !features.authentication.is_empty() {
-        config["authentication"] = json!(features.authentication);
-    }
-    if !features.skip_auth_prefixes.is_empty() {
-        config["skip-auth-prefixes"] = json!(features.skip_auth_prefixes);
-    }
-
     if !features.hosts.is_empty() {
         config["hosts"] = json!(features.hosts);
     }
@@ -841,39 +290,18 @@ fn apply_global_features(config: &mut Value, features: &MihomoFeatures) {
         config["tunnels"] = build_tunnels_json(&features.tunnels);
     }
 
-    if features.ntp.enabled {
-        config["ntp"] = build_ntp_json(&features.ntp);
-    }
-
-    if features.external_controller.enabled {
-        config["external-controller"] = json!(features.external_controller.address);
-        if let Some(secret) = &features.external_controller.secret
-            && !secret.is_empty()
-        {
-            config["secret"] = json!(secret);
-        }
-        if !features.external_controller.allow_origins.is_empty()
-            || features.external_controller.allow_private_network
-        {
-            let mut cors = json!({});
-            if !features.external_controller.allow_origins.is_empty() {
-                cors["allow-origins"] = json!(features.external_controller.allow_origins);
-            }
-            if features.external_controller.allow_private_network {
-                cors["allow-private-network"] = json!(true);
-            }
-            config["external-controller-cors"] = cors;
-        }
+    config["external-controller"] = json!("127.0.0.1:9090");
+    if let Some(secret) = &features.external_controller.secret
+        && !secret.is_empty()
+    {
+        config["secret"] = json!(secret);
     }
 }
 
-/// Apply per-proxy default fields (udp, tfo, mptcp, ip-version, smux,
-/// dialer-proxy) to a proxy JSON object.
+/// Apply fixed UDP plus retained per-proxy expert fields.
 fn apply_per_proxy_fields(proxy: &mut Value, features: &MihomoFeatures) {
     let pp = &features.per_proxy;
-    if pp.udp {
-        proxy["udp"] = json!(true);
-    }
+    proxy["udp"] = json!(true);
     if pp.tfo {
         proxy["tfo"] = json!(true);
     }
@@ -883,74 +311,6 @@ fn apply_per_proxy_fields(proxy: &mut Value, features: &MihomoFeatures) {
     if pp.ip_version != "dual" {
         proxy["ip-version"] = json!(pp.ip_version);
     }
-    // smux is incompatible with flow-based proxies (xtls-rprx-vision etc.)
-    // because flow requires raw TCP passthrough for TLS splicing, while
-    // smux multiplexes streams and breaks the TLS handshake.
-    let has_flow = proxy
-        .get("flow")
-        .and_then(Value::as_str)
-        .is_some_and(|f| !f.is_empty());
-    if let Some(smux) = &pp.smux
-        && smux.enabled
-        && !has_flow
-    {
-        proxy["smux"] = build_smux_json(smux);
-    }
-    if let Some(dialer) = &pp.dialer_proxy
-        && !dialer.is_empty()
-    {
-        proxy["dialer-proxy"] = json!(dialer);
-    }
-}
-
-/// Build the `smux` JSON object from `SmuxConfig`.
-fn build_smux_json(smux: &SmuxConfig) -> Value {
-    let mut s = json!({
-        "enabled": true,
-        "protocol": smux.protocol,
-        "statistic": smux.statistic,
-        "only-tcp": smux.only_tcp,
-        "padding": smux.padding,
-    });
-    if smux.max_connections > 0 {
-        s["max-connections"] = json!(smux.max_connections);
-    }
-    if smux.min_streams > 0 {
-        s["min-streams"] = json!(smux.min_streams);
-    }
-    if smux.max_streams > 0 {
-        s["max-streams"] = json!(smux.max_streams);
-    }
-    if smux.brutal_up.is_some() || smux.brutal_down.is_some() {
-        let mut brutal = json!({"enabled": true});
-        if let Some(up) = smux.brutal_up {
-            brutal["up"] = json!(up);
-        }
-        if let Some(down) = smux.brutal_down {
-            brutal["down"] = json!(down);
-        }
-        s["brutal-opts"] = brutal;
-    }
-    s
-}
-
-/// Build the `ntp` JSON object from `NtpConfig`.
-fn build_ntp_json(ntp: &NtpConfig) -> Value {
-    let mut n = json!({
-        "enable": true,
-        "server": ntp.server,
-        "port": ntp.port,
-        "interval": ntp.interval,
-    });
-    if ntp.write_to_system {
-        n["write-to-system"] = json!(true);
-    }
-    if let Some(dp) = &ntp.dialer_proxy
-        && !dp.is_empty()
-    {
-        n["dialer-proxy"] = json!(dp);
-    }
-    n
 }
 
 /// Build the `tunnels` JSON array from a list of `TunnelConfig`.
@@ -975,111 +335,12 @@ fn build_tunnels_json(tunnels: &[TunnelConfig]) -> Value {
     )
 }
 
-/// Build the `proxy-providers` JSON object from a list of configs.
-fn build_proxy_providers_json(providers: &[ProxyProviderConfig]) -> Value {
-    let mut map = serde_json::Map::new();
-    for p in providers {
-        let mut entry = json!({
-            "type": p.provider_type,
-            "interval": p.interval,
-        });
-        if let Some(url) = &p.url {
-            entry["url"] = json!(url);
-        }
-        if let Some(path) = &p.path {
-            entry["path"] = json!(path);
-        }
-        if let Some(proxy) = &p.proxy {
-            entry["proxy"] = json!(proxy);
-        }
-        if let Some(filter) = &p.filter {
-            entry["filter"] = json!(filter);
-        }
-        if let Some(exclude) = &p.exclude_filter {
-            entry["exclude-filter"] = json!(exclude);
-        }
-        if let Some(exclude_type) = &p.exclude_type {
-            entry["exclude-type"] = json!(exclude_type);
-        }
-        if p.health_check_enabled {
-            let mut hc = json!({
-                "enable": true,
-                "url": p.health_check_url,
-                "interval": p.health_check_interval,
-                "timeout": p.health_check_timeout,
-                "lazy": p.health_check_lazy,
-            });
-            if let Some(status) = &p.health_check_expected_status {
-                hc["expected-status"] = json!(status);
-            }
-            entry["health-check"] = hc;
-        }
-        if let Some(key) = &p.age_secret_key {
-            entry["age-secret-key"] = json!(key);
-        }
-        if !p.header.is_empty() {
-            entry["header"] = json!(p.header);
-        }
-        if p.size_limit > 0 {
-            entry["size-limit"] = json!(p.size_limit);
-        }
-        if !p.payload.is_empty() {
-            entry["payload"] = json!(p.payload);
-        }
-        map.insert(p.name.clone(), entry);
-    }
-    Value::Object(map)
-}
-
-/// Build the `rule-providers` JSON object from a list of configs.
-fn build_rule_providers_json(providers: &[RuleProviderConfig]) -> Result<Value, String> {
-    let mut map = serde_json::Map::new();
-    for r in providers {
-        if map.contains_key(&r.name) {
-            return Err(format!("duplicate rule provider name {:?}", r.name));
-        }
-        let mut entry = json!({
-            "type": r.provider_type,
-            "behavior": r.behavior,
-            "format": r.format,
-            "interval": r.interval,
-        });
-        if let Some(url) = &r.url {
-            entry["url"] = json!(url);
-        }
-        if let Some(path) = &r.path {
-            entry["path"] = json!(path);
-        }
-        if let Some(proxy) = &r.proxy {
-            entry["proxy"] = json!(proxy);
-        }
-        if let Some(pib) = &r.path_in_bundle {
-            entry["path-in-bundle"] = json!(pib);
-        }
-        if r.size_limit > 0 {
-            entry["size-limit"] = json!(r.size_limit);
-        }
-        if !r.header.is_empty() {
-            entry["header"] = json!(r.header);
-        }
-        if !r.payload.is_empty() {
-            entry["payload"] = json!(r.payload);
-        }
-        map.insert(r.name.clone(), entry);
-    }
-    Ok(Value::Object(map))
-}
-
 fn merge_router_rule_providers(
-    providers: &[RuleProviderConfig],
     managed: &[GeoBaseRuleProvider],
     mihomo_home: Option<&str>,
 ) -> Result<Option<Value>, String> {
-    let mut map = build_rule_providers_json(providers)?
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    let mut names: HashSet<String> = map.keys().cloned().collect();
+    let mut map = serde_json::Map::new();
+    let mut names = HashSet::new();
     let enabled_managed: Vec<&GeoBaseRuleProvider> =
         managed.iter().filter(|provider| provider.enabled).collect();
     let lexical_home =
@@ -1100,20 +361,6 @@ fn merge_router_rule_providers(
             None => None,
         };
     let mut effective_paths = HashMap::<PathBuf, String>::new();
-
-    for provider in providers
-        .iter()
-        .filter(|provider| provider.provider_type == "file")
-    {
-        let Some(path) = provider.path.as_deref() else {
-            continue;
-        };
-        if let Some(effective) =
-            effective_provider_path(path, home.as_deref(), lexical_home.as_deref())
-        {
-            insert_effective_provider_path(&mut effective_paths, effective, &provider.name)?;
-        }
-    }
 
     for provider in enabled_managed {
         provider.validate()?;
@@ -1233,120 +480,6 @@ fn insert_effective_provider_path(
     Ok(())
 }
 
-/// Build the `sub-rules` JSON object from a list of `SubRuleConfig`.
-///
-/// Each sub-rule group becomes a named key with an array of rule strings.
-fn build_sub_rules_json(sub_rules: &[SubRuleConfig]) -> Value {
-    let mut map = serde_json::Map::new();
-    for sr in sub_rules {
-        if sr.name.is_empty() || sr.rules.is_empty() {
-            continue;
-        }
-        map.insert(sr.name.clone(), json!(sr.rules));
-    }
-    Value::Object(map)
-}
-
-/// Build a proxy-groups JSON array.
-///
-/// When proxy groups are enabled, the active profile and all extra
-/// profiles become individual proxies (named `profile-0`, `profile-1`,
-/// etc.), and a proxy group named `proxy` (so existing rules still
-/// work) wraps them with auto-select / failover / load-balance.
-fn build_proxy_groups_json(
-    group_config: &ProxyGroupConfig,
-    proxy_names: &[String],
-    extra_group_names: &[String],
-) -> Option<Value> {
-    if !group_config.enabled || proxy_names.is_empty() {
-        return None;
-    }
-
-    let mut group = json!({
-        "name": PROXY_NAME,
-        "url": group_config.url,
-        "interval": group_config.interval,
-        "timeout": group_config.timeout,
-        "lazy": group_config.lazy,
-        "max-failed-times": group_config.max_failed_times,
-    });
-
-    let group_type_str = match group_config.group_type {
-        ProxyGroupType::Select => "select",
-        ProxyGroupType::UrlTest => "url-test",
-        ProxyGroupType::Fallback => "fallback",
-        ProxyGroupType::LoadBalance => "load-balance",
-        ProxyGroupType::Relay => "relay",
-    };
-    group["type"] = json!(group_type_str);
-
-    // DIRECT is included in "select" groups (user can manually choose
-    // it) and as a last-resort in "fallback" groups (so traffic goes
-    // direct when all proxies are unreachable, preventing storms).
-    // In url-test / load-balance groups DIRECT is excluded because it
-    // would always win the latency test (direct is always faster than
-    // any VPN), defeating the purpose of the group.
-    let mut proxies = Vec::new();
-    if group_config.group_type == ProxyGroupType::Select {
-        proxies.push(DIRECT_NAME.to_owned());
-    }
-    proxies.extend(proxy_names.iter().cloned());
-    proxies.extend(extra_group_names.iter().cloned());
-    if group_config.group_type == ProxyGroupType::Fallback {
-        proxies.push(DIRECT_NAME.to_owned());
-    }
-    group["proxies"] = json!(proxies);
-
-    if group_config.group_type == ProxyGroupType::UrlTest {
-        group["tolerance"] = json!(group_config.tolerance);
-    }
-
-    if group_config.group_type == ProxyGroupType::LoadBalance {
-        let strategy_str = match group_config.strategy {
-            LoadBalanceStrategy::RoundRobin => "round-robin",
-            LoadBalanceStrategy::ConsistentHashing => "consistent-hashing",
-            LoadBalanceStrategy::StickySessions => "sticky-sessions",
-        };
-        group["strategy"] = json!(strategy_str);
-    }
-
-    if let Some(status) = &group_config.expected_status {
-        group["expected-status"] = json!(status);
-    }
-
-    // Node filtering by name regex or proxy type.
-    if let Some(filter) = &group_config.filter
-        && !filter.is_empty()
-    {
-        group["filter"] = json!(filter);
-    }
-    if let Some(exclude) = &group_config.exclude_filter
-        && !exclude.is_empty()
-    {
-        group["exclude-filter"] = json!(exclude);
-    }
-    if let Some(exclude_type) = &group_config.exclude_type
-        && !exclude_type.is_empty()
-    {
-        group["exclude-type"] = json!(exclude_type);
-    }
-
-    // Auto-include all nodes from all proxy-providers.
-    if group_config.include_all_providers {
-        group["include-all-providers"] = json!(true);
-    }
-    // Include all proxies AND all proxy-providers (sorted by name).
-    if group_config.include_all {
-        group["include-all"] = json!(true);
-    }
-    // Include all proxies only (no providers), sorted by name.
-    if group_config.include_all_proxies {
-        group["include-all-proxies"] = json!(true);
-    }
-
-    Some(json!([group]))
-}
-
 // ---------------------------------------------------------------------------
 // Config builders
 // ---------------------------------------------------------------------------
@@ -1361,13 +494,7 @@ pub fn build_mihomo_config(
 ) -> Result<String, String> {
     let mut proxy = build_proxy(profile, PROXY_NAME)?;
     apply_per_proxy_fields(&mut proxy, features);
-    let mut rules: Vec<String> = features
-        .typed_rules
-        .iter()
-        .filter_map(mihomo_typed_rule_to_string)
-        .collect();
-    rules.extend(features.raw_rules.iter().filter(|r| !r.is_empty()).cloned());
-    rules.push(format!("MATCH,{}", PROXY_NAME));
+    let rules = vec![format!("MATCH,{}", PROXY_NAME)];
     let mut config = json!({
         "mode": "rule",
         "log-level": "info",
@@ -1380,14 +507,6 @@ pub fn build_mihomo_config(
         "rules": rules,
     });
     apply_global_features(&mut config, features);
-
-    // Sub-rules — named rule groups referenced via SUB-RULE rule type.
-    if !features.sub_rules.is_empty() {
-        let sub_rules = build_sub_rules_json(&features.sub_rules);
-        if sub_rules.as_object().is_some_and(|m| !m.is_empty()) {
-            config["sub-rules"] = sub_rules;
-        }
-    }
 
     serde_yaml::to_string(&config).map_err(|error| error.to_string())
 }
@@ -1483,16 +602,8 @@ pub fn build_mihomo_router_config(
     // of timing out every connection (which causes a storm that can
     // OOM the router). When the proxy recovers, mihomo switches back.
     //
-    // When the user has explicitly enabled proxy groups (url-test /
-    // fallback / load-balance / select), those groups are used instead
-    // and the direct-fallback is merged into them.
     let active_proxy_name = PROXY_ACTIVE_NAME.to_owned();
 
-    let proxy_provider_names: HashSet<&str> = features
-        .proxy_providers
-        .iter()
-        .map(|provider| provider.name.as_str())
-        .collect();
     let mut internal_names: HashSet<&str> =
         [PROXY_ACTIVE_NAME, PROXY_NAME, DIRECT_NAME, REJECT_NAME]
             .into_iter()
@@ -1501,17 +612,11 @@ pub fn build_mihomo_router_config(
         if name.trim().is_empty() || !internal_names.insert(name) {
             return Err(format!("duplicate or empty proxy/group name {name:?}"));
         }
-        if proxy_provider_names.contains(name.as_str()) {
-            return Err(format!("proxy name collides with provider {name:?}"));
-        }
     }
     for route in pinned_server_routes {
         for name in [route.outbound_name.as_str(), route.group_name.as_str()] {
             if name.trim().is_empty() || !internal_names.insert(name) {
                 return Err(format!("duplicate or empty proxy/group name {name:?}"));
-            }
-            if proxy_provider_names.contains(name) {
-                return Err(format!("proxy/group name collides with provider {name:?}"));
             }
         }
     }
@@ -1543,16 +648,6 @@ pub fn build_mihomo_router_config(
             REJECT_NAME
         ));
     }
-
-    // First-class extra Mihomo rules and user-defined raw Mihomo rules
-    // inserted before port-mode fallbacks and MATCH.
-    rules.extend(
-        features
-            .typed_rules
-            .iter()
-            .filter_map(mihomo_typed_rule_to_string),
-    );
-    rules.extend(features.raw_rules.iter().filter(|r| !r.is_empty()).cloned());
 
     // Explicit VPN exceptions override all broad RU Direct rules.
     for domain in extra
@@ -1676,30 +771,14 @@ pub fn build_mihomo_router_config(
         "sniffer": build_sniffer_json(features),
     });
 
-    // Proxy groups — wraps all profiles in an auto-select / failover /
-    // load-balance group named "proxy" (so existing rules still work).
-    if features.proxy_group.enabled {
-        let proxy_names: Vec<String> = std::iter::once(active_proxy_name.clone())
-            .chain(extra_profiles.iter().map(|(_, name)| name.clone()))
-            .collect();
-        if let Some(groups) = build_proxy_groups_json(&features.proxy_group, &proxy_names, &[]) {
-            config["proxy-groups"] = groups;
-        }
-    } else {
-        // Direct-fallback: when proxy groups are not explicitly enabled,
-        // wrap the single active proxy in a `fallback` group with DIRECT
-        // as the last resort. This prevents connection storms when the
-        // upstream proxy is unreachable — mihomo automatically routes
-        // traffic direct instead of timing out every connection.
-        config["proxy-groups"] = json!([{
-            "name": PROXY_NAME,
-            "type": "fallback",
-            "proxies": [active_proxy_name, DIRECT_NAME],
-            "url": FALLBACK_HEALTH_URL,
-            "interval": 10,
-            "timeout": 3000,
-        }]);
-    }
+    config["proxy-groups"] = json!([{
+        "name": PROXY_NAME,
+        "type": "fallback",
+        "proxies": [active_proxy_name, DIRECT_NAME],
+        "url": FALLBACK_HEALTH_URL,
+        "interval": 10,
+        "timeout": 3000,
+    }]);
 
     let groups = config
         .get_mut("proxy-groups")
@@ -1729,39 +808,11 @@ pub fn build_mihomo_router_config(
         }));
     }
 
-    // Proxy providers — Mihomo fetches subscriptions itself.
-    if !features.proxy_providers.is_empty() {
-        config["proxy-providers"] = build_proxy_providers_json(&features.proxy_providers);
-        // If proxy groups are enabled, add `use` to reference providers.
-        if let Some(groups) = config
-            .get_mut("proxy-groups")
-            .and_then(|g| g.as_array_mut())
-            && let Some(first_group) = groups.first_mut()
-        {
-            let provider_names: Vec<String> = features
-                .proxy_providers
-                .iter()
-                .map(|p| p.name.clone())
-                .collect();
-            first_group["use"] = json!(provider_names);
-        }
-    }
-
-    // Rule providers — user-defined entries plus validated local GeoBase sets.
-    if let Some(providers) = merge_router_rule_providers(
-        &features.rule_providers,
-        &extra.geobase_rule_providers,
-        extra.mihomo_home.as_deref(),
-    )? {
+    // Rule providers are validated local managed GeoBase sets only.
+    if let Some(providers) =
+        merge_router_rule_providers(&extra.geobase_rule_providers, extra.mihomo_home.as_deref())?
+    {
         config["rule-providers"] = providers;
-    }
-
-    // Sub-rules — named rule groups referenced via SUB-RULE rule type.
-    if !features.sub_rules.is_empty() {
-        let sub_rules = build_sub_rules_json(&features.sub_rules);
-        if sub_rules.as_object().is_some_and(|m| !m.is_empty()) {
-            config["sub-rules"] = sub_rules;
-        }
     }
 
     // DNS — always included in router config (firewall DNATs DNS to 1053).
@@ -1792,9 +843,7 @@ pub fn build_mihomo_router_config(
 /// using its default filter (which references `geosite:cn` and
 /// requires the MMDB database).
 ///
-/// Feature-enhanced DNS options (cache-algorithm, proxy-server-nameserver,
-/// direct-nameserver, prefer-h3, respect-rules, fallback-filter) are
-/// applied from `MihomoFeatures`.
+/// Retained DNS options are applied from `MihomoFeatures`.
 fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeatures) -> Value {
     let mut dns_config = json!({
         "enable": true,
@@ -1802,7 +851,7 @@ fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeat
         "enhanced-mode": "fake-ip",
         "fake-ip-range": "198.18.0.1/16",
         "fake-ip-filter": features.dns_fake_ip_filter,
-        "cache-algorithm": features.dns_cache_algorithm,
+        "cache-algorithm": "arc",
         "nameserver": dns.remote_servers,
         "fallback": dns.remote_servers,
     });
@@ -1823,30 +872,14 @@ fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeat
     if let Some(ttl) = features.dns_fake_ip_ttl {
         dns_config["fake-ip-ttl"] = json!(ttl);
     }
-    if let Some(use_hosts) = features.dns_use_hosts {
-        dns_config["use-hosts"] = json!(use_hosts);
-    }
-    if let Some(use_system_hosts) = features.dns_use_system_hosts {
-        dns_config["use-system-hosts"] = json!(use_system_hosts);
-    }
     if features.dns_respect_rules {
         dns_config["respect-rules"] = json!(true);
     }
-    let proxy_server_nameservers = if features.dns_proxy_server_nameserver.is_empty() {
-        &dns.local_servers
-    } else {
-        &features.dns_proxy_server_nameserver
-    };
-    if !proxy_server_nameservers.is_empty() {
-        dns_config["proxy-server-nameserver"] = json!(proxy_server_nameservers);
+    if !dns.local_servers.is_empty() {
+        dns_config["proxy-server-nameserver"] = json!(dns.local_servers);
     }
-    let direct_nameservers = if features.dns_direct_nameserver.is_empty() {
-        &dns.local_servers
-    } else {
-        &features.dns_direct_nameserver
-    };
-    if !direct_nameservers.is_empty() {
-        dns_config["direct-nameserver"] = json!(direct_nameservers);
+    if !dns.local_servers.is_empty() {
+        dns_config["direct-nameserver"] = json!(dns.local_servers);
     }
     if let Some(follow) = features.dns_direct_nameserver_follow_policy {
         dns_config["direct-nameserver-follow-policy"] = json!(follow);
@@ -1872,40 +905,6 @@ fn build_dns_config(dns: &crate::xray_config::DnsSettings, features: &MihomoFeat
         if policy.as_object().is_some_and(|m| !m.is_empty()) {
             dns_config["proxy-server-nameserver-policy"] = policy;
         }
-    }
-    if let Some(ecs) = &features.dns_ecs
-        && !ecs.is_empty()
-    {
-        dns_config["ecs"] = json!(ecs);
-    }
-    if let Some(override_ecs) = features.dns_ecs_override {
-        dns_config["ecs-override"] = json!(override_ecs);
-    }
-    if features.dns_disable_ipv4 {
-        dns_config["disable-ipv4"] = json!(true);
-    }
-    if features.dns_disable_ipv6 {
-        dns_config["disable-ipv6"] = json!(true);
-    }
-    for qtype in &features.dns_disable_qtypes {
-        dns_config[format!("disable-qtype-{qtype}")] = json!(true);
-    }
-    if let Some(filter) = &features.dns_fallback_filter {
-        let mut ff = json!({});
-        if filter.geoip {
-            ff["geoip"] = json!(true);
-        }
-        ff["geoip-code"] = json!(filter.geoip_code);
-        if !filter.geosite.is_empty() {
-            ff["geosite"] = json!(filter.geosite);
-        }
-        if !filter.ipcidr.is_empty() {
-            ff["ipcidr"] = json!(filter.ipcidr);
-        }
-        if !filter.domain.is_empty() {
-            ff["domain"] = json!(filter.domain);
-        }
-        dns_config["fallback-filter"] = ff;
     }
     dns_config
 }
@@ -2023,155 +1022,7 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
 
     match network.as_str() {
         "xhttp" => {
-            let mut xhttp_opts = json!({});
-            if let Some(path) = query_value(&url, "path").filter(|value| !value.is_empty()) {
-                xhttp_opts["path"] = json!(path);
-            }
-            if let Some(host) = query_value(&url, "host").filter(|value| !value.is_empty()) {
-                xhttp_opts["host"] = json!(host);
-            }
-            if let Some(mode) = query_value(&url, "mode").filter(|value| !value.is_empty()) {
-                xhttp_opts["mode"] = json!(mode);
-            }
-
-            // ── Advanced xhttp fields (anti-DPI / XMUX / session) ──
-
-            // no-grpc-header
-            if is_truthy_option(
-                query_value_multi(&url, &["noGRPCHeader", "no_grpc_header", "no-grpc-header"])
-                    .as_deref(),
-            ) {
-                xhttp_opts["no-grpc-header"] = json!(true);
-            }
-
-            // x-padding-* fields
-            if let Some(v) = query_value_multi(
-                &url,
-                &["xPaddingBytes", "x_padding_bytes", "x-padding-bytes"],
-            ) {
-                xhttp_opts["x-padding-bytes"] = json!(v);
-            }
-            if let Some(v) = query_value_multi(&url, &["xPaddingObfsMode", "x_padding_obfs_mode"]) {
-                xhttp_opts["x-padding-obfs-mode"] = json!(v);
-            }
-            if let Some(v) = query_value_multi(&url, &["xPaddingKey", "x_padding_key"]) {
-                xhttp_opts["x-padding-key"] = json!(v);
-            }
-            if let Some(v) = query_value_multi(&url, &["xPaddingHeader", "x_padding_header"]) {
-                xhttp_opts["x-padding-header"] = json!(v);
-            }
-            if let Some(v) = query_value_multi(&url, &["xPaddingPlacement", "x_padding_placement"])
-            {
-                xhttp_opts["x-padding-placement"] = json!(v);
-            }
-            if let Some(v) = query_value_multi(&url, &["xPaddingMethod", "x_padding_method"]) {
-                xhttp_opts["x-padding-method"] = json!(v);
-            }
-
-            // uplink-http-method
-            if let Some(v) = query_value_multi(
-                &url,
-                &[
-                    "uplinkHttpMethod",
-                    "uplink_http_method",
-                    "uplink-http-method",
-                ],
-            ) {
-                xhttp_opts["uplink-http-method"] = json!(v);
-            }
-
-            // session-* fields
-            if let Some(v) = query_value_multi(&url, &["sessionPlacement", "session_placement"]) {
-                xhttp_opts["session-placement"] = json!(v);
-            }
-            if let Some(v) = query_value_multi(&url, &["sessionKey", "session_key"]) {
-                xhttp_opts["session-key"] = json!(v);
-            }
-
-            // seq-* fields
-            if let Some(v) = query_value_multi(&url, &["seqPlacement", "seq_placement"]) {
-                xhttp_opts["seq-placement"] = json!(v);
-            }
-            if let Some(v) = query_value_multi(&url, &["seqKey", "seq_key"]) {
-                xhttp_opts["seq-key"] = json!(v);
-            }
-
-            // uplink-data-* fields
-            if let Some(v) =
-                query_value_multi(&url, &["uplinkDataPlacement", "uplink_data_placement"])
-            {
-                xhttp_opts["uplink-data-placement"] = json!(v);
-            }
-            if let Some(v) = query_value_multi(&url, &["uplinkDataKey", "uplink_data_key"]) {
-                xhttp_opts["uplink-data-key"] = json!(v);
-            }
-
-            // uplink-chunk-size (integer)
-            if let Some(v) = query_value_multi(&url, &["uplinkChunkSize", "uplink_chunk_size"])
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                xhttp_opts["uplink-chunk-size"] = json!(v);
-            }
-
-            // sc-max-each-post-bytes (integer, stream-up mode)
-            if let Some(v) =
-                query_value_multi(&url, &["scMaxEachPostBytes", "sc_max_each_post_bytes"])
-                    .and_then(|s| s.parse::<u32>().ok())
-            {
-                xhttp_opts["sc-max-each-post-bytes"] = json!(v);
-            }
-
-            // sc-min-posts-interval-ms (integer, stream-up mode)
-            if let Some(v) =
-                query_value_multi(&url, &["scMinPostsIntervalMs", "sc_min_posts_interval_ms"])
-                    .and_then(|s| s.parse::<u32>().ok())
-            {
-                xhttp_opts["sc-min-posts-interval-ms"] = json!(v);
-            }
-
-            // reuse-settings (XMUX-like connection reuse)
-            let mut reuse = json!({});
-            if let Some(v) =
-                query_value_multi(&url, &["xmuxMaxConcurrency", "xmux_max_concurrency"])
-                    .and_then(|s| s.parse::<u32>().ok())
-            {
-                reuse["max-concurrency"] = json!(v);
-            }
-            if let Some(v) =
-                query_value_multi(&url, &["xmuxMaxConnections", "xmux_max_connections"])
-                    .and_then(|s| s.parse::<u32>().ok())
-            {
-                reuse["max-connections"] = json!(v);
-            }
-            if let Some(v) =
-                query_value_multi(&url, &["xmuxCMaxReuseTimes", "xmux_c_max_reuse_times"])
-                    .and_then(|s| s.parse::<u32>().ok())
-            {
-                reuse["c-max-reuse-times"] = json!(v);
-            }
-            if let Some(v) =
-                query_value_multi(&url, &["xmuxHMaxRequestTimes", "xmux_h_max_request_times"])
-                    .and_then(|s| s.parse::<u32>().ok())
-            {
-                reuse["h-max-request-times"] = json!(v);
-            }
-            if let Some(v) =
-                query_value_multi(&url, &["xmuxHMaxReusableSecs", "xmux_h_max_reusable_secs"])
-                    .and_then(|s| s.parse::<u32>().ok())
-            {
-                reuse["h-max-reusable-secs"] = json!(v);
-            }
-            if let Some(v) =
-                query_value_multi(&url, &["xmuxHKeepAlivePeriod", "xmux_h_keep_alive_period"])
-                    .and_then(|s| s.parse::<u32>().ok())
-            {
-                reuse["h-keep-alive-period"] = json!(v);
-            }
-            if reuse.as_object().is_some_and(|m| !m.is_empty()) {
-                xhttp_opts["reuse-settings"] = reuse;
-            }
-
-            proxy["xhttp-opts"] = xhttp_opts;
+            proxy["xhttp-opts"] = build_xhttp_opts(&url)?;
         }
         "ws" => {
             let mut ws_opts = json!({});
@@ -2200,6 +1051,781 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
     }
 
     Ok(proxy)
+}
+
+const MAX_XHTTP_EXTRA_BYTES: usize = 16 * 1024;
+const MAX_XHTTP_STRING_BYTES: usize = 4096;
+const MAX_XHTTP_HEADERS: usize = 32;
+const MAX_XHTTP_HEADER_NAME_BYTES: usize = 128;
+const MAX_XHTTP_HEADER_VALUE_BYTES: usize = 4096;
+const MAX_XHTTP_SESSION_LENGTH: u32 = 4096;
+
+fn build_xhttp_opts(url: &Url) -> Result<Value, String> {
+    let extra = parse_xhttp_extra(url)?;
+    let xmux = match extra.get("xmux") {
+        Some(Value::Object(object)) => Some(object),
+        Some(_) => return Err(xhttp_extra_error("xmux", "must be an object")),
+        None => None,
+    };
+    let mut opts = json!({});
+
+    copy_xhttp_query_string(&mut opts, url, "path", &["path"])?;
+    copy_xhttp_query_string(&mut opts, url, "host", &["host"])?;
+    copy_xhttp_query_string(&mut opts, url, "mode", &["mode"])?;
+    copy_xhttp_headers(&mut opts, url, &extra)?;
+
+    copy_xhttp_bool(
+        &mut opts,
+        url,
+        &extra,
+        "no-grpc-header",
+        &["noGRPCHeader", "no_grpc_header", "no-grpc-header"],
+        "noGRPCHeader",
+    )?;
+    copy_xhttp_range(
+        &mut opts,
+        url,
+        &extra,
+        "x-padding-bytes",
+        &["xPaddingBytes", "x_padding_bytes", "x-padding-bytes"],
+        "xPaddingBytes",
+        0,
+    )?;
+    copy_xhttp_bool(
+        &mut opts,
+        url,
+        &extra,
+        "x-padding-obfs-mode",
+        &["xPaddingObfsMode", "x_padding_obfs_mode"],
+        "xPaddingObfsMode",
+    )?;
+    copy_xhttp_string(
+        &mut opts,
+        url,
+        &extra,
+        "x-padding-key",
+        &["xPaddingKey", "x_padding_key"],
+        "xPaddingKey",
+    )?;
+    copy_xhttp_string(
+        &mut opts,
+        url,
+        &extra,
+        "x-padding-header",
+        &["xPaddingHeader", "x_padding_header"],
+        "xPaddingHeader",
+    )?;
+    copy_xhttp_enum(
+        &mut opts,
+        url,
+        &extra,
+        "x-padding-placement",
+        &["xPaddingPlacement", "x_padding_placement"],
+        &["xPaddingPlacement"],
+        &["queryInHeader", "cookie", "header", "query"],
+    )?;
+    copy_xhttp_enum(
+        &mut opts,
+        url,
+        &extra,
+        "x-padding-method",
+        &["xPaddingMethod", "x_padding_method"],
+        &["xPaddingMethod"],
+        &["repeat-x", "tokenish"],
+    )?;
+    copy_xhttp_http_method(
+        &mut opts,
+        url,
+        &extra,
+        &[
+            "uplinkHTTPMethod",
+            "uplinkHttpMethod",
+            "uplink_http_method",
+            "uplink-http-method",
+        ],
+        "uplinkHTTPMethod",
+    )?;
+
+    for (output, query_names, extra_keys, allowed) in [
+        (
+            "session-placement",
+            &[
+                "sessionIDPlacement",
+                "sessionIdPlacement",
+                "sessionPlacement",
+                "session_id_placement",
+                "session_placement",
+            ][..],
+            &[
+                "sessionIDPlacement",
+                "sessionIdPlacement",
+                "sessionPlacement",
+            ][..],
+            &["path", "query", "cookie", "header"][..],
+        ),
+        (
+            "seq-placement",
+            &["seqPlacement", "seq_placement"][..],
+            &["seqPlacement"][..],
+            &["path", "query", "cookie", "header"][..],
+        ),
+        (
+            "uplink-data-placement",
+            &["uplinkDataPlacement", "uplink_data_placement"][..],
+            &["uplinkDataPlacement"][..],
+            &["auto", "body", "cookie", "header"][..],
+        ),
+    ] {
+        copy_xhttp_enum(
+            &mut opts,
+            url,
+            &extra,
+            output,
+            query_names,
+            extra_keys,
+            allowed,
+        )?;
+    }
+    for (output, query_names, extra_keys) in [
+        (
+            "session-key",
+            &[
+                "sessionIDKey",
+                "sessionIdKey",
+                "sessionKey",
+                "session_id_key",
+                "session_key",
+            ][..],
+            &["sessionIDKey", "sessionIdKey", "sessionKey"][..],
+        ),
+        ("seq-key", &["seqKey", "seq_key"][..], &["seqKey"][..]),
+        (
+            "uplink-data-key",
+            &["uplinkDataKey", "uplink_data_key"][..],
+            &["uplinkDataKey"][..],
+        ),
+    ] {
+        copy_xhttp_string_multi(&mut opts, url, &extra, output, query_names, extra_keys)?;
+    }
+    copy_xhttp_string_multi(
+        &mut opts,
+        url,
+        &extra,
+        "session-table",
+        &[
+            "sessionIDTable",
+            "sessionIdTable",
+            "sessionTable",
+            "session_id_table",
+            "session_table",
+        ],
+        &["sessionIDTable", "sessionIdTable", "sessionTable"],
+    )?;
+    copy_xhttp_range_multi(
+        &mut opts,
+        url,
+        &extra,
+        "session-length",
+        &[
+            "sessionIDLength",
+            "sessionIdLength",
+            "sessionLength",
+            "session_id_length",
+            "session_length",
+        ],
+        &["sessionIDLength", "sessionIdLength", "sessionLength"],
+        1,
+    )?;
+    validate_xhttp_session_id(&opts)?;
+    copy_xhttp_range_allow_zero(
+        &mut opts,
+        url,
+        &extra,
+        "uplink-chunk-size",
+        &["uplinkChunkSize", "uplink_chunk_size"],
+        "uplinkChunkSize",
+        64,
+    )?;
+    if opts.get("uplink-chunk-size").is_none()
+        && opts
+            .get("uplink-data-placement")
+            .and_then(Value::as_str)
+            .is_some_and(|placement| matches!(placement, "header" | "cookie"))
+    {
+        // Mihomo v1.19.29 fails packet-up before sending when this range is
+        // omitted. This matches Xray's header/cookie placement default.
+        opts["uplink-chunk-size"] = json!("3000-4000");
+    }
+    for (output, query_names, extra_key, minimum) in [
+        (
+            "sc-max-each-post-bytes",
+            &["scMaxEachPostBytes", "sc_max_each_post_bytes"][..],
+            "scMaxEachPostBytes",
+            1,
+        ),
+        (
+            "sc-min-posts-interval-ms",
+            &["scMinPostsIntervalMs", "sc_min_posts_interval_ms"][..],
+            "scMinPostsIntervalMs",
+            1,
+        ),
+    ] {
+        copy_xhttp_range(
+            &mut opts,
+            url,
+            &extra,
+            output,
+            query_names,
+            extra_key,
+            minimum,
+        )?;
+    }
+
+    let mut reuse = json!({});
+    for (output, query_names, extra_key) in [
+        (
+            "max-concurrency",
+            &["xmuxMaxConcurrency", "xmux_max_concurrency"][..],
+            "maxConcurrency",
+        ),
+        (
+            "max-connections",
+            &["xmuxMaxConnections", "xmux_max_connections"][..],
+            "maxConnections",
+        ),
+        (
+            "c-max-reuse-times",
+            &["xmuxCMaxReuseTimes", "xmux_c_max_reuse_times"][..],
+            "cMaxReuseTimes",
+        ),
+        (
+            "h-max-request-times",
+            &["xmuxHMaxRequestTimes", "xmux_h_max_request_times"][..],
+            "hMaxRequestTimes",
+        ),
+        (
+            "h-max-reusable-secs",
+            &["xmuxHMaxReusableSecs", "xmux_h_max_reusable_secs"][..],
+            "hMaxReusableSecs",
+        ),
+    ] {
+        copy_xhttp_range_from(&mut reuse, url, xmux, output, query_names, extra_key, 0)?;
+    }
+    copy_xhttp_integer_from(
+        &mut reuse,
+        url,
+        xmux,
+        "h-keep-alive-period",
+        &["xmuxHKeepAlivePeriod", "xmux_h_keep_alive_period"],
+        "hKeepAlivePeriod",
+    )?;
+    if reuse.as_object().is_some_and(|object| !object.is_empty()) {
+        opts["reuse-settings"] = reuse;
+    }
+
+    reject_xhttp_download_settings(url, &extra)?;
+
+    Ok(opts)
+}
+
+fn copy_xhttp_headers(
+    output: &mut Value,
+    url: &Url,
+    extra: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let value = query_value(url, "headers")
+        .map(|raw| {
+            if raw.len() > MAX_XHTTP_EXTRA_BYTES {
+                return Err(xhttp_extra_error("headers", "exceeds the size limit"));
+            }
+            serde_json::from_str::<Value>(&raw)
+                .map_err(|_| xhttp_extra_error("headers", "must be a JSON object"))
+        })
+        .transpose()?
+        .or_else(|| extra.get("headers").cloned());
+    let Some(value) = value else { return Ok(()) };
+    let object = value
+        .as_object()
+        .ok_or_else(|| xhttp_extra_error("headers", "must be an object"))?;
+    if object.len() > MAX_XHTTP_HEADERS {
+        return Err(xhttp_extra_error("headers", "has too many entries"));
+    }
+    let mut headers = serde_json::Map::with_capacity(object.len());
+    for (key, value) in object {
+        if key.is_empty()
+            || key.len() > MAX_XHTTP_HEADER_NAME_BYTES
+            || !key.bytes().all(is_http_token_byte)
+        {
+            return Err(xhttp_extra_error(
+                "headers",
+                "contains an invalid header name",
+            ));
+        }
+        let value = value
+            .as_str()
+            .ok_or_else(|| xhttp_extra_error("headers", "values must be strings"))?;
+        if value.len() > MAX_XHTTP_HEADER_VALUE_BYTES || value.chars().any(char::is_control) {
+            return Err(xhttp_extra_error(
+                "headers",
+                "contains an invalid header value",
+            ));
+        }
+        headers.insert(key.clone(), json!(value));
+    }
+    output["headers"] = Value::Object(headers);
+    Ok(())
+}
+
+fn reject_xhttp_download_settings(
+    url: &Url,
+    extra: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let value = query_value_multi(url, &["downloadSettings", "download_settings"])
+        .map(|raw| {
+            if raw.len() > MAX_XHTTP_EXTRA_BYTES {
+                return Err(xhttp_extra_error(
+                    "downloadSettings",
+                    "exceeds the size limit",
+                ));
+            }
+            serde_json::from_str::<Value>(&raw)
+                .map_err(|_| xhttp_extra_error("downloadSettings", "must be a JSON object"))
+        })
+        .transpose()?
+        .or_else(|| extra.get("downloadSettings").cloned());
+    match value {
+        None => Ok(()),
+        Some(Value::Object(object)) if object.is_empty() => Ok(()),
+        Some(Value::Object(_)) => Err(xhttp_extra_error(
+            "downloadSettings",
+            "is not compatible with Mihomo v1.19.29 without unsafe nested proxy/TLS passthrough",
+        )),
+        Some(_) => Err(xhttp_extra_error("downloadSettings", "must be an object")),
+    }
+}
+
+fn validate_xhttp_session_id(opts: &Value) -> Result<(), String> {
+    let Some(length) = opts.get("session-length").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let (minimum, maximum) = parse_checked_xhttp_range(length)
+        .ok_or_else(|| xhttp_extra_error("sessionIDLength", "has an invalid range"))?;
+    if maximum > MAX_XHTTP_SESSION_LENGTH {
+        return Err(xhttp_extra_error(
+            "sessionIDLength",
+            "exceeds the 4096-character limit",
+        ));
+    }
+    let table = opts
+        .get("session-table")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let alphabet_size = match table {
+        "" | "uuid" => return Ok(()),
+        "ALPHABET" | "alphabet" => 26_u64,
+        "Alphabet" => 52,
+        "BASE36" | "base36" => 36,
+        "Base62" => 62,
+        "HEX" | "hex" => 16,
+        "number" => 10,
+        custom => custom.chars().collect::<HashSet<_>>().len() as u64,
+    };
+    if alphabet_size < 2 {
+        return Err(xhttp_extra_error(
+            "sessionIDTable",
+            "must contain at least two distinct characters",
+        ));
+    }
+    let mut possibilities = 0_u64;
+    let mut values_at_length = 1_u64;
+    for current in 1..=maximum {
+        values_at_length = values_at_length.saturating_mul(alphabet_size);
+        if current >= minimum {
+            possibilities = possibilities.saturating_add(values_at_length);
+            if possibilities >= (2_u64 << 30) {
+                return Ok(());
+            }
+        }
+    }
+    Err(xhttp_extra_error(
+        "sessionIDTable/sessionIDLength",
+        "must provide at least 2^31 possible session IDs",
+    ))
+}
+
+fn parse_xhttp_extra(url: &Url) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(raw) = query_value(url, "extra") else {
+        return Ok(serde_json::Map::new());
+    };
+    if raw.len() > MAX_XHTTP_EXTRA_BYTES {
+        return Err(format!(
+            "VLESS XHTTP extra exceeds the {MAX_XHTTP_EXTRA_BYTES}-byte limit"
+        ));
+    }
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Object(object)) => Ok(object),
+        Ok(_) => Err("VLESS XHTTP extra must be a JSON object".to_owned()),
+        Err(_) => Err("VLESS XHTTP extra is not valid JSON".to_owned()),
+    }
+}
+
+fn copy_xhttp_query_string(
+    output: &mut Value,
+    url: &Url,
+    output_key: &str,
+    query_names: &[&str],
+) -> Result<(), String> {
+    if let Some(value) = query_value_multi(url, query_names) {
+        output[output_key] = json!(checked_xhttp_string(output_key, &value)?);
+    }
+    Ok(())
+}
+
+fn copy_xhttp_string(
+    output: &mut Value,
+    url: &Url,
+    extra: &serde_json::Map<String, Value>,
+    output_key: &str,
+    query_names: &[&str],
+    extra_key: &str,
+) -> Result<(), String> {
+    copy_xhttp_string_multi(output, url, extra, output_key, query_names, &[extra_key])
+}
+
+fn copy_xhttp_string_multi(
+    output: &mut Value,
+    url: &Url,
+    extra: &serde_json::Map<String, Value>,
+    output_key: &str,
+    query_names: &[&str],
+    extra_keys: &[&str],
+) -> Result<(), String> {
+    let value = if let Some(value) = query_value_multi(url, query_names) {
+        Some(value)
+    } else {
+        json_value_multi(extra, extra_keys)
+            .map(|(key, value)| xhttp_json_string(key, value))
+            .transpose()?
+    };
+    if let Some(value) = value {
+        output[output_key] = json!(checked_xhttp_string(extra_keys[0], &value)?);
+    }
+    Ok(())
+}
+
+fn copy_xhttp_bool(
+    output: &mut Value,
+    url: &Url,
+    extra: &serde_json::Map<String, Value>,
+    output_key: &str,
+    query_names: &[&str],
+    extra_key: &str,
+) -> Result<(), String> {
+    let value = if let Some(value) = query_value_multi(url, query_names) {
+        Some(parse_xhttp_bool(extra_key, &value)?)
+    } else {
+        extra
+            .get(extra_key)
+            .map(|value| xhttp_json_bool(extra_key, value))
+            .transpose()?
+    };
+    if let Some(value) = value {
+        output[output_key] = json!(value);
+    }
+    Ok(())
+}
+
+fn copy_xhttp_enum(
+    output: &mut Value,
+    url: &Url,
+    extra: &serde_json::Map<String, Value>,
+    output_key: &str,
+    query_names: &[&str],
+    extra_keys: &[&str],
+    allowed: &[&str],
+) -> Result<(), String> {
+    let value = if let Some(value) = query_value_multi(url, query_names) {
+        Some(value)
+    } else {
+        json_value_multi(extra, extra_keys)
+            .map(|(key, value)| xhttp_json_string(key, value))
+            .transpose()?
+    };
+    if let Some(value) = value {
+        let value = checked_xhttp_string(extra_keys[0], &value)?;
+        if !allowed.contains(&value.as_str()) {
+            return Err(xhttp_extra_error(extra_keys[0], "has an unsupported value"));
+        }
+        output[output_key] = json!(value);
+    }
+    Ok(())
+}
+
+fn copy_xhttp_http_method(
+    output: &mut Value,
+    url: &Url,
+    extra: &serde_json::Map<String, Value>,
+    query_names: &[&str],
+    extra_key: &str,
+) -> Result<(), String> {
+    let value = if let Some(value) = query_value_multi(url, query_names) {
+        Some(value)
+    } else {
+        extra
+            .get(extra_key)
+            .map(|value| xhttp_json_string(extra_key, value))
+            .transpose()?
+    };
+    if let Some(value) = value {
+        if value.is_empty() || value.len() > 32 || !value.bytes().all(is_http_token_byte) {
+            return Err(xhttp_extra_error(extra_key, "must be a valid HTTP method"));
+        }
+        output["uplink-http-method"] = json!(value);
+    }
+    Ok(())
+}
+
+fn copy_xhttp_range(
+    output: &mut Value,
+    url: &Url,
+    extra: &serde_json::Map<String, Value>,
+    output_key: &str,
+    query_names: &[&str],
+    extra_key: &str,
+    minimum: u32,
+) -> Result<(), String> {
+    copy_xhttp_range_from(
+        output,
+        url,
+        Some(extra),
+        output_key,
+        query_names,
+        extra_key,
+        minimum,
+    )
+}
+
+fn copy_xhttp_range_allow_zero(
+    output: &mut Value,
+    url: &Url,
+    extra: &serde_json::Map<String, Value>,
+    output_key: &str,
+    query_names: &[&str],
+    extra_key: &str,
+    minimum_nonzero: u32,
+) -> Result<(), String> {
+    let value = if let Some(value) = query_value_multi(url, query_names) {
+        Some(value)
+    } else {
+        extra
+            .get(extra_key)
+            .map(|value| xhttp_json_range(extra_key, value))
+            .transpose()?
+    };
+    if let Some(value) = value {
+        let checked = if value.trim() == "0" {
+            "0".to_owned()
+        } else {
+            checked_xhttp_range(extra_key, &value, minimum_nonzero)?
+        };
+        output[output_key] = json!(checked);
+    }
+    Ok(())
+}
+
+fn copy_xhttp_range_multi(
+    output: &mut Value,
+    url: &Url,
+    extra: &serde_json::Map<String, Value>,
+    output_key: &str,
+    query_names: &[&str],
+    extra_keys: &[&str],
+    minimum: u32,
+) -> Result<(), String> {
+    let value = if let Some(value) = query_value_multi(url, query_names) {
+        Some(value)
+    } else {
+        json_value_multi(extra, extra_keys)
+            .map(|(key, value)| xhttp_json_range(key, value))
+            .transpose()?
+    };
+    if let Some(value) = value {
+        output[output_key] = json!(checked_xhttp_range(extra_keys[0], &value, minimum)?);
+    }
+    Ok(())
+}
+
+fn json_value_multi<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    keys: &[&'a str],
+) -> Option<(&'a str, &'a Value)> {
+    keys.iter()
+        .find_map(|key| object.get(*key).map(|value| (*key, value)))
+}
+
+fn copy_xhttp_range_from(
+    output: &mut Value,
+    url: &Url,
+    extra: Option<&serde_json::Map<String, Value>>,
+    output_key: &str,
+    query_names: &[&str],
+    extra_key: &str,
+    minimum: u32,
+) -> Result<(), String> {
+    let value = if let Some(value) = query_value_multi(url, query_names) {
+        Some(value)
+    } else {
+        extra
+            .and_then(|object| object.get(extra_key))
+            .map(|value| xhttp_json_range(extra_key, value))
+            .transpose()?
+    };
+    if let Some(value) = value {
+        output[output_key] = json!(checked_xhttp_range(extra_key, &value, minimum)?);
+    }
+    Ok(())
+}
+
+fn copy_xhttp_integer_from(
+    output: &mut Value,
+    url: &Url,
+    extra: Option<&serde_json::Map<String, Value>>,
+    output_key: &str,
+    query_names: &[&str],
+    extra_key: &str,
+) -> Result<(), String> {
+    let value = if let Some(value) = query_value_multi(url, query_names) {
+        value
+            .parse::<i32>()
+            .map_err(|_| xhttp_extra_error(extra_key, "must be a 32-bit integer"))?
+    } else if let Some(value) = extra.and_then(|object| object.get(extra_key)) {
+        match value {
+            Value::Number(number) => number
+                .as_i64()
+                .and_then(|number| i32::try_from(number).ok())
+                .ok_or_else(|| xhttp_extra_error(extra_key, "must be a 32-bit integer"))?,
+            Value::String(text) => text
+                .parse::<i32>()
+                .map_err(|_| xhttp_extra_error(extra_key, "must be a 32-bit integer"))?,
+            _ => return Err(xhttp_extra_error(extra_key, "must be an integer")),
+        }
+    } else {
+        return Ok(());
+    };
+    output[output_key] = json!(value);
+    Ok(())
+}
+
+fn xhttp_json_string(field: &str, value: &Value) -> Result<String, String> {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| xhttp_extra_error(field, "must be a string"))
+}
+
+fn xhttp_json_bool(field: &str, value: &Value) -> Result<bool, String> {
+    match value {
+        Value::Bool(value) => Ok(*value),
+        Value::String(value) => parse_xhttp_bool(field, value),
+        _ => Err(xhttp_extra_error(field, "must be a boolean")),
+    }
+}
+
+fn parse_xhttp_bool(field: &str, value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(xhttp_extra_error(field, "must be a boolean")),
+    }
+}
+
+fn xhttp_json_range(field: &str, value: &Value) -> Result<String, String> {
+    match value {
+        Value::String(value) => Ok(value.clone()),
+        Value::Number(number) => number
+            .as_u64()
+            .filter(|number| *number <= u64::from(u32::MAX))
+            .map(|number| number.to_string())
+            .ok_or_else(|| xhttp_extra_error(field, "must be a non-negative 32-bit range")),
+        _ => Err(xhttp_extra_error(
+            field,
+            "must be a string or integer range",
+        )),
+    }
+}
+
+fn checked_xhttp_range(field: &str, value: &str, minimum: u32) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 64 {
+        return Err(xhttp_extra_error(field, "has an invalid range"));
+    }
+    let mut parts = value.split('-');
+    let minimum_value = parts
+        .next()
+        .and_then(|part| part.trim().parse::<u32>().ok())
+        .ok_or_else(|| xhttp_extra_error(field, "has an invalid range"))?;
+    let maximum_value = parts
+        .next()
+        .map(str::trim)
+        .map(str::parse::<u32>)
+        .transpose()
+        .map_err(|_| xhttp_extra_error(field, "has an invalid range"))?
+        .unwrap_or(minimum_value);
+    if parts.next().is_some() || minimum_value < minimum || maximum_value < minimum_value {
+        return Err(xhttp_extra_error(field, "has an invalid range"));
+    }
+    if minimum_value == maximum_value {
+        Ok(minimum_value.to_string())
+    } else {
+        Ok(format!("{minimum_value}-{maximum_value}"))
+    }
+}
+
+fn parse_checked_xhttp_range(value: &str) -> Option<(u32, u32)> {
+    let mut parts = value.split('-');
+    let minimum = parts.next()?.parse().ok()?;
+    let maximum = parts
+        .next()
+        .map(str::parse)
+        .transpose()
+        .ok()?
+        .unwrap_or(minimum);
+    (parts.next().is_none() && maximum >= minimum).then_some((minimum, maximum))
+}
+
+fn checked_xhttp_string(field: &str, value: &str) -> Result<String, String> {
+    if value.len() > MAX_XHTTP_STRING_BYTES || value.chars().any(char::is_control) {
+        return Err(xhttp_extra_error(
+            field,
+            "must be a bounded string without control characters",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn xhttp_extra_error(field: &str, expectation: &str) -> String {
+    format!("VLESS XHTTP extra field {field} {expectation}")
 }
 
 /// Build a VMess proxy for Mihomo from a `vmess://base64(json)` link.
@@ -3298,18 +2924,6 @@ fn outbound_tag_to_name(tag: &str) -> String {
     }
 }
 
-fn mihomo_typed_rule_to_string(rule: &MihomoRuleConfig) -> Option<String> {
-    let rule_type = rule.rule_type.trim().to_ascii_uppercase();
-    let value = rule.value.trim();
-    let target = outbound_tag_to_name(rule.target.trim());
-    if rule_type.is_empty() || value.is_empty() || target.is_empty() {
-        return None;
-    }
-    let mut parts = vec![rule_type, value.to_owned(), target];
-    parts.extend(rule.options.iter().filter(|item| !item.is_empty()).cloned());
-    Some(parts.join(","))
-}
-
 /// Check whether a query parameter value is truthy (1 or true).
 fn is_truthy_option(value: Option<&str>) -> bool {
     value.is_some_and(|text| text == "1" || text.eq_ignore_ascii_case("true"))
@@ -3533,11 +3147,9 @@ fn apply_grpc_advanced(grpc_opts: &mut Value, url: &Url) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalControllerConfig, FALLBACK_HEALTH_URL, FallbackFilter, LoadBalanceStrategy,
-        MihomoFeatures, NtpConfig, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME, PROXY_NAME,
-        PerProxyDefaults, PinnedServerRoute, ProxyGroupConfig, ProxyGroupType, ProxyProviderConfig,
-        REDIR_LISTENER, RuleProviderConfig, SmuxConfig, SubRuleConfig, TPROXY_LISTENER,
-        TunnelConfig, build_anytls_proxy, build_http_proxy, build_hysteria_proxy,
+        ExternalControllerConfig, FALLBACK_HEALTH_URL, MihomoFeatures, PAROVOZIK_PROXY_GROUP,
+        PROXY_ACTIVE_NAME, PROXY_NAME, PerProxyDefaults, PinnedServerRoute, REDIR_LISTENER,
+        TPROXY_LISTENER, TunnelConfig, build_anytls_proxy, build_http_proxy, build_hysteria_proxy,
         build_hysteria2_proxy, build_masque_proxy, build_mihomo_bench_config, build_mihomo_config,
         build_mihomo_router_config, build_openvpn_proxy, build_shadowsocks_proxy,
         build_shadowsocksr_proxy, build_snell_proxy, build_socks_proxy, build_ssh_proxy,
@@ -3922,8 +3534,6 @@ mod tests {
             group_name: "pinned-group".to_owned(),
             profile: &profiles[2],
         };
-        let mut features = MihomoFeatures::default();
-        features.proxy_group.enabled = true;
         let yaml = build_mihomo_router_config(
             &profiles[0],
             &[(&profiles[1], "candidate".to_owned())],
@@ -3936,17 +3546,14 @@ mod tests {
             QuicMode::Proxy,
             false,
             &RouterExtra::default(),
-            &features,
+            &MihomoFeatures::default(),
         )
         .expect("router config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
         let groups = config["proxy-groups"].as_array().expect("groups");
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0]["name"], PROXY_NAME);
-        assert_eq!(
-            groups[0]["proxies"],
-            json!([PROXY_ACTIVE_NAME, "candidate"])
-        );
+        assert_eq!(groups[0]["proxies"], json!([PROXY_ACTIVE_NAME, "DIRECT"]));
         assert_eq!(
             groups[1]["proxies"],
             json!(["pinned-out", PROXY_ACTIVE_NAME])
@@ -4442,32 +4049,6 @@ mod tests {
         );
     }
 
-    // --- Authentication tests ---
-
-    #[test]
-    fn authentication_added_when_configured() {
-        let mut features = default_features();
-        features.authentication = vec!["user1:pass1".to_owned()];
-        features.skip_auth_prefixes = vec!["127.0.0.1/8".to_owned()];
-        let config = build_test_router_config(&features);
-        assert_eq!(
-            config
-                .get("authentication")
-                .and_then(Value::as_array)
-                .expect("authentication")[0]
-                .as_str(),
-            Some("user1:pass1")
-        );
-        assert_eq!(
-            config
-                .get("skip-auth-prefixes")
-                .and_then(Value::as_array)
-                .expect("skip-auth-prefixes")[0]
-                .as_str(),
-            Some("127.0.0.1/8")
-        );
-    }
-
     // --- Hosts tests ---
 
     #[test]
@@ -4513,54 +4094,18 @@ mod tests {
         assert_eq!(tunnel.get("proxy").and_then(Value::as_str), Some("proxy"));
     }
 
-    // --- NTP tests ---
-
-    #[test]
-    fn ntp_section_added_when_enabled() {
-        let mut features = default_features();
-        features.ntp = NtpConfig {
-            enabled: true,
-            write_to_system: true,
-            server: "pool.ntp.org".to_owned(),
-            port: 123,
-            interval: 60,
-            dialer_proxy: None,
-        };
-        let config = build_test_router_config(&features);
-        let ntp = config.get("ntp").expect("ntp");
-        assert_eq!(ntp.get("enable").and_then(Value::as_bool), Some(true));
-        assert_eq!(
-            ntp.get("server").and_then(Value::as_str),
-            Some("pool.ntp.org")
-        );
-        assert_eq!(
-            ntp.get("write-to-system").and_then(Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn ntp_section_omitted_when_disabled() {
-        let config = build_test_router_config(&default_features());
-        assert!(config.get("ntp").is_none());
-    }
-
     // --- External controller tests ---
 
     #[test]
-    fn external_controller_added_when_enabled() {
+    fn external_controller_is_fixed_and_preserves_secret() {
         let mut features = default_features();
         features.external_controller = ExternalControllerConfig {
-            enabled: true,
-            address: "0.0.0.0:9090".to_owned(),
             secret: Some("test-secret".to_owned()),
-            allow_origins: vec!["*".to_owned()],
-            allow_private_network: true,
         };
         let config = build_test_router_config(&features);
         assert_eq!(
             config.get("external-controller").and_then(Value::as_str),
-            Some("0.0.0.0:9090")
+            Some("127.0.0.1:9090")
         );
         assert_eq!(
             config.get("secret").and_then(Value::as_str),
@@ -4569,9 +4114,10 @@ mod tests {
     }
 
     #[test]
-    fn external_controller_omitted_when_disabled() {
+    fn external_controller_has_no_cors() {
         let config = build_test_router_config(&default_features());
-        assert!(config.get("external-controller").is_none());
+        assert_eq!(config["external-controller"], "127.0.0.1:9090");
+        assert!(config.get("external-controller-cors").is_none());
     }
 
     // --- DNS enhancement tests ---
@@ -4587,21 +4133,6 @@ mod tests {
     }
 
     #[test]
-    fn dns_includes_proxy_server_nameserver_when_configured() {
-        let mut features = default_features();
-        features.dns_proxy_server_nameserver = vec!["223.5.5.5".to_owned()];
-        let config = build_test_router_config(&features);
-        let dns = config.get("dns").expect("dns");
-        assert_eq!(
-            dns.get("proxy-server-nameserver")
-                .and_then(Value::as_array)
-                .expect("proxy-server-nameserver")[0]
-                .as_str(),
-            Some("223.5.5.5")
-        );
-    }
-
-    #[test]
     fn dns_uses_local_servers_to_bootstrap_proxy_hostnames_by_default() {
         let config = build_test_router_config(&default_features());
         let dns = config.get("dns").expect("dns");
@@ -4611,21 +4142,6 @@ mod tests {
                 .expect("proxy-server-nameserver")[0]
                 .as_str(),
             Some("223.5.5.5")
-        );
-    }
-
-    #[test]
-    fn dns_includes_direct_nameserver_when_configured() {
-        let mut features = default_features();
-        features.dns_direct_nameserver = vec!["system".to_owned()];
-        let config = build_test_router_config(&features);
-        let dns = config.get("dns").expect("dns");
-        assert_eq!(
-            dns.get("direct-nameserver")
-                .and_then(Value::as_array)
-                .expect("direct-nameserver")[0]
-                .as_str(),
-            Some("system")
         );
     }
 
@@ -4661,23 +4177,6 @@ mod tests {
             dns.get("respect-rules").and_then(Value::as_bool),
             Some(true)
         );
-    }
-
-    #[test]
-    fn dns_includes_fallback_filter_when_configured() {
-        let mut features = default_features();
-        features.dns_fallback_filter = Some(FallbackFilter {
-            geoip: true,
-            geoip_code: "CN".to_owned(),
-            geosite: vec!["gfw".to_owned()],
-            ipcidr: vec!["240.0.0.0/4".to_owned()],
-            domain: vec!["+.google.com".to_owned()],
-        });
-        let config = build_test_router_config(&features);
-        let dns = config.get("dns").expect("dns");
-        let ff = dns.get("fallback-filter").expect("fallback-filter");
-        assert_eq!(ff.get("geoip").and_then(Value::as_bool), Some(true));
-        assert_eq!(ff.get("geoip-code").and_then(Value::as_str), Some("CN"));
     }
 
     // --- Sniffer enhancement tests ---
@@ -4759,195 +4258,6 @@ mod tests {
     }
 
     #[test]
-    fn per_proxy_smux_added_when_enabled() {
-        let mut features = default_features();
-        features.per_proxy.smux = Some(SmuxConfig {
-            enabled: true,
-            protocol: "h2mux".to_owned(),
-            padding: true,
-            ..SmuxConfig::default()
-        });
-        let config = build_test_router_config(&features);
-        let proxies = config
-            .get("proxies")
-            .and_then(Value::as_array)
-            .expect("proxies");
-        let smux = &proxies[0].get("smux").expect("smux");
-        assert_eq!(smux.get("enabled").and_then(Value::as_bool), Some(true));
-        assert_eq!(smux.get("protocol").and_then(Value::as_str), Some("h2mux"));
-        assert_eq!(smux.get("padding").and_then(Value::as_bool), Some(true));
-    }
-
-    #[test]
-    fn per_proxy_smux_skipped_for_flow_proxy() {
-        // VLESS Reality with xtls-rprx-vision flow is incompatible with smux.
-        // The config builder must skip smux for proxies that have a flow field.
-        let mut features = default_features();
-        features.per_proxy.smux = Some(SmuxConfig {
-            enabled: true,
-            protocol: "h2mux".to_owned(),
-            padding: true,
-            ..SmuxConfig::default()
-        });
-        // Build a config with a Reality+vision profile (has flow field)
-        let profiles = parse_profiles(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp&security=reality&flow=xtls-rprx-vision&pbk=AAAA&sid=00#TestReality",
-        );
-        let profile = &profiles[0];
-        let extra = RouterExtra {
-            dns: Some(DnsSettings::default()),
-            ..RouterExtra::default()
-        };
-        let yaml = build_mihomo_router_config(
-            profile,
-            &[],
-            &[],
-            &[],
-            "0.0.0.0",
-            10808,
-            Some(10810),
-            true,
-            QuicMode::Block,
-            false,
-            &extra,
-            &features,
-        )
-        .expect("router config");
-        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
-        let proxies = config
-            .get("proxies")
-            .and_then(Value::as_array)
-            .expect("proxies");
-        // The proxy should have flow but NOT smux
-        assert!(
-            proxies[0].get("flow").is_some(),
-            "proxy should have flow field"
-        );
-        assert!(
-            proxies[0].get("smux").is_none(),
-            "smux must NOT be applied to flow-based proxies"
-        );
-    }
-
-    #[test]
-    fn per_proxy_dialer_proxy_added_when_configured() {
-        let mut features = default_features();
-        features.per_proxy.dialer_proxy = Some("dialer-group".to_owned());
-        let config = build_test_router_config(&features);
-        let proxies = config
-            .get("proxies")
-            .and_then(Value::as_array)
-            .expect("proxies");
-        assert_eq!(
-            proxies[0].get("dialer-proxy").and_then(Value::as_str),
-            Some("dialer-group")
-        );
-    }
-
-    // --- Proxy group tests ---
-
-    #[test]
-    fn proxy_group_url_test_generates_group_section() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            group_type: ProxyGroupType::UrlTest,
-            url: "https://www.gstatic.com/generate_204".to_owned(),
-            interval: 300,
-            tolerance: 50,
-            timeout: 5000,
-            lazy: true,
-            max_failed_times: 5,
-            strategy: LoadBalanceStrategy::default(),
-            expected_status: None,
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let groups = config
-            .get("proxy-groups")
-            .and_then(Value::as_array)
-            .expect("proxy-groups");
-        assert_eq!(groups.len(), 1);
-        let group = &groups[0];
-        assert_eq!(group.get("name").and_then(Value::as_str), Some("proxy"));
-        assert_eq!(group.get("type").and_then(Value::as_str), Some("url-test"));
-        assert_eq!(group.get("tolerance").and_then(Value::as_u64), Some(50));
-        // Active profile renamed to "proxy-active"
-        let proxies = group
-            .get("proxies")
-            .and_then(Value::as_array)
-            .expect("group proxies");
-        // DIRECT must NOT be in url-test groups (it would always win)
-        assert!(
-            !proxies.iter().any(|p| p.as_str() == Some("DIRECT")),
-            "DIRECT must not be in url-test groups"
-        );
-        assert!(proxies.iter().any(|p| p.as_str() == Some("proxy-active")));
-    }
-
-    #[test]
-    fn proxy_group_select_includes_direct() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            group_type: ProxyGroupType::Select,
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let groups = config
-            .get("proxy-groups")
-            .and_then(Value::as_array)
-            .expect("proxy-groups");
-        let proxies = groups[0]
-            .get("proxies")
-            .and_then(Value::as_array)
-            .expect("group proxies");
-        // SELECT groups should include DIRECT as a manual option
-        assert!(
-            proxies.iter().any(|p| p.as_str() == Some("DIRECT")),
-            "SELECT groups should include DIRECT"
-        );
-        assert!(proxies.iter().any(|p| p.as_str() == Some("proxy-active")));
-    }
-
-    #[test]
-    fn proxy_group_load_balance_includes_strategy() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            group_type: ProxyGroupType::LoadBalance,
-            strategy: LoadBalanceStrategy::RoundRobin,
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let groups = config
-            .get("proxy-groups")
-            .and_then(Value::as_array)
-            .expect("proxy-groups");
-        assert_eq!(
-            groups[0].get("strategy").and_then(Value::as_str),
-            Some("round-robin")
-        );
-    }
-
-    #[test]
-    fn proxy_group_relay_emits_relay_type() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            group_type: ProxyGroupType::Relay,
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let groups = config
-            .get("proxy-groups")
-            .and_then(Value::as_array)
-            .expect("proxy-groups");
-        assert_eq!(groups[0].get("type").and_then(Value::as_str), Some("relay"));
-        assert!(groups[0].get("proxies").is_some());
-    }
-
-    #[test]
     fn proxy_group_disabled_uses_single_proxy_name() {
         let config = build_test_router_config(&default_features());
         // When proxy groups disabled, active proxy outbound is named
@@ -4979,59 +4289,6 @@ mod tests {
         assert_eq!(group_proxies.len(), 2);
         assert_eq!(group_proxies[0].as_str(), Some("proxy-active"));
         assert_eq!(group_proxies[1].as_str(), Some("DIRECT"));
-    }
-
-    // --- Proxy provider tests ---
-
-    #[test]
-    fn proxy_providers_added_when_configured() {
-        let mut features = default_features();
-        features.proxy_providers = vec![ProxyProviderConfig {
-            name: "provider1".to_owned(),
-            provider_type: "http".to_owned(),
-            url: Some("https://provider.example/sub".to_owned()),
-            interval: 3600,
-            health_check_enabled: true,
-            ..ProxyProviderConfig::default()
-        }];
-        let config = build_test_router_config(&features);
-        let providers = config
-            .get("proxy-providers")
-            .and_then(Value::as_object)
-            .expect("proxy-providers");
-        assert!(providers.contains_key("provider1"));
-        let p = &providers["provider1"];
-        assert_eq!(p.get("type").and_then(Value::as_str), Some("http"));
-        assert_eq!(
-            p.get("url").and_then(Value::as_str),
-            Some("https://provider.example/sub")
-        );
-        assert!(p.get("health-check").is_some());
-    }
-
-    // --- Rule provider tests ---
-
-    #[test]
-    fn rule_providers_added_when_configured() {
-        let mut features = default_features();
-        features.rule_providers = vec![RuleProviderConfig {
-            name: "ads".to_owned(),
-            provider_type: "http".to_owned(),
-            url: Some("https://example.com/ads.yaml".to_owned()),
-            behavior: "domain".to_owned(),
-            format: "yaml".to_owned(),
-            interval: 86400,
-            ..RuleProviderConfig::default()
-        }];
-        let config = build_test_router_config(&features);
-        let providers = config
-            .get("rule-providers")
-            .and_then(Value::as_object)
-            .expect("rule-providers");
-        assert!(providers.contains_key("ads"));
-        let r = &providers["ads"];
-        assert_eq!(r.get("behavior").and_then(Value::as_str), Some("domain"));
-        assert_eq!(r.get("format").and_then(Value::as_str), Some("yaml"));
     }
 
     // --- Domain rule prefix tests ---
@@ -5125,9 +4382,7 @@ mod tests {
     #[test]
     fn mihomo_features_serde_round_trip() {
         let features = MihomoFeatures {
-            geodata_loader: "standard".to_owned(),
             unified_delay: false,
-            store_fake_ip: false,
             store_selected: false,
             keep_alive_interval: 60,
             keep_alive_idle: 240,
@@ -5135,8 +4390,6 @@ mod tests {
             tcp_concurrent: true,
             quic_go_disable_gso: true,
             quic_go_disable_ecn: false,
-            authentication: vec!["admin:secret".to_owned()],
-            skip_auth_prefixes: vec!["10.0.0.0/8".to_owned()],
             hosts: {
                 let mut h = std::collections::HashMap::new();
                 h.insert("local.test".to_owned(), "127.0.0.1".to_owned());
@@ -5148,64 +4401,16 @@ mod tests {
                 target: "example.com:443".to_owned(),
                 proxy: None,
             }],
-            ntp: NtpConfig {
-                enabled: true,
-                write_to_system: true,
-                server: "time.cloudflare.com".to_owned(),
-                port: 123,
-                interval: 15,
-                dialer_proxy: Some("DIRECT".to_owned()),
-            },
             external_controller: ExternalControllerConfig {
-                enabled: true,
-                address: "0.0.0.0:9090".to_owned(),
                 secret: Some("secret123".to_owned()),
-                allow_origins: vec!["*".to_owned()],
-                allow_private_network: true,
             },
-            proxy_group: ProxyGroupConfig {
-                enabled: true,
-                group_type: ProxyGroupType::Fallback,
-                url: "https://cp.cloudflare.com".to_owned(),
-                interval: 600,
-                tolerance: 100,
-                timeout: 3000,
-                lazy: false,
-                max_failed_times: 3,
-                strategy: LoadBalanceStrategy::StickySessions,
-                expected_status: Some("204".to_owned()),
-                ..ProxyGroupConfig::default()
-            },
-            proxy_providers: vec![],
-            rule_providers: vec![],
-            sub_rules: vec![SubRuleConfig {
-                name: "ad-block".to_owned(),
-                rules: vec!["DOMAIN-SUFFIX,doubleclick.net,REJECT".to_owned()],
-            }],
             per_proxy: PerProxyDefaults {
-                udp: false,
                 tfo: true,
                 mptcp: false,
                 ip_version: "ipv4".to_owned(),
-                smux: Some(SmuxConfig {
-                    enabled: true,
-                    protocol: "smux".to_owned(),
-                    max_connections: 4,
-                    min_streams: 4,
-                    max_streams: 0,
-                    statistic: true,
-                    only_tcp: false,
-                    padding: true,
-                    brutal_up: Some(50),
-                    brutal_down: Some(100),
-                }),
-                dialer_proxy: Some("relay".to_owned()),
             },
-            dns_cache_algorithm: "lru".to_owned(),
             dns_prefer_h3: true,
             dns_respect_rules: true,
-            dns_proxy_server_nameserver: vec!["223.5.5.5".to_owned()],
-            dns_direct_nameserver: vec!["system".to_owned()],
             dns_nameserver_policy: {
                 let mut p = std::collections::HashMap::new();
                 p.insert(
@@ -5214,18 +4419,10 @@ mod tests {
                 );
                 p
             },
-            dns_fallback_filter: Some(FallbackFilter {
-                geoip: false,
-                geoip_code: "US".to_owned(),
-                geosite: vec!["gfw".to_owned()],
-                ipcidr: vec!["240.0.0.0/4".to_owned()],
-                domain: vec!["+.google.com".to_owned()],
-            }),
             sniffer_force_domain: vec!["+.test.com".to_owned()],
             sniffer_skip_domain: vec!["skip.test".to_owned()],
             sniffer_skip_src_address: vec!["192.168.1.0/24".to_owned()],
             sniffer_skip_dst_address: vec!["10.0.0.0/8".to_owned()],
-            raw_rules: vec!["AND,((DOMAIN,test.com),(NETWORK,udp)),DIRECT".to_owned()],
             ..MihomoFeatures::default()
         };
         let json = serde_json::to_string(&features).expect("serialize");
@@ -5238,15 +4435,72 @@ mod tests {
         // Empty JSON should produce default MihomoFeatures
         let json = "{}";
         let features: MihomoFeatures = serde_json::from_str(json).expect("deserialize empty");
-        assert_eq!(features.geodata_loader, "memconservative");
         assert!(features.unified_delay);
-        assert!(features.store_fake_ip);
         assert!(features.store_selected);
         assert_eq!(features.keep_alive_interval, 30);
         assert_eq!(features.keep_alive_idle, 120);
-        assert_eq!(features.dns_cache_algorithm, "arc");
-        assert!(features.per_proxy.udp);
         assert_eq!(features.per_proxy.ip_version, "dual");
+    }
+
+    #[test]
+    fn legacy_removed_fields_are_ignored_and_not_projected() {
+        let legacy = json!({
+            "relay": {"enabled": true},
+            "ntp": {"enabled": true, "server": "time.example"},
+            "authentication": ["user:secret"],
+            "skip_auth_prefixes": ["0.0.0.0/0"],
+            "proxy_group": {"enabled": true, "group_type": "relay"},
+            "proxy_providers": [{"name": "remote", "url": "https://provider.example/sub/token"}],
+            "rule_providers": [{"name": "rules", "url": "https://provider.example/rules"}],
+            "sub_rules": [{"name": "legacy", "rules": ["MATCH,DIRECT"]}],
+            "raw_rules": ["DOMAIN,legacy.example,DIRECT"],
+            "typed_rules": [{"rule_type": "DOMAIN", "value": "typed.example", "target": "DIRECT"}],
+            "dns_ecs": "1.2.3.0/24",
+            "dns_disable_ipv4": true,
+            "dns_disable_qtypes": [65],
+            "dns_fallback_filter": {"geoip": true},
+            "per_proxy": {"udp": false, "smux": {"enabled": true}, "dialer_proxy": "legacy"},
+            "external_controller": {
+                "enabled": false,
+                "address": "0.0.0.0:9999",
+                "secret": "preserved-secret",
+                "allow_origins": ["*"],
+                "allow_private_network": true
+            }
+        });
+        let features: MihomoFeatures = serde_json::from_value(legacy).expect("legacy state");
+        assert_eq!(
+            features.external_controller.secret.as_deref(),
+            Some("preserved-secret")
+        );
+        let config = build_test_router_config(&features);
+        for key in [
+            "ntp",
+            "authentication",
+            "skip-auth-prefixes",
+            "proxy-providers",
+            "sub-rules",
+            "external-controller-cors",
+        ] {
+            assert!(
+                config.get(key).is_none(),
+                "unexpected legacy projection {key}"
+            );
+        }
+        assert_eq!(config["external-controller"], "127.0.0.1:9090");
+        assert_eq!(config["profile"]["store-fake-ip"], true);
+        assert_eq!(config["proxies"][0]["udp"], true);
+        let rules = config["rules"].as_array().expect("rules");
+        assert!(!rules.iter().any(|rule| {
+            rule.as_str().is_some_and(|rule| {
+                rule.contains("legacy.example") || rule.contains("typed.example")
+            })
+        }));
+        let dns = &config["dns"];
+        assert!(dns.get("ecs").is_none());
+        assert!(dns.get("disable-ipv4").is_none());
+        assert!(dns.get("disable-qtype-65").is_none());
+        assert!(dns.get("fallback-filter").is_none());
     }
 
     // --- Simple config (build_mihomo_config) feature tests ---
@@ -5283,99 +4537,11 @@ mod tests {
             "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
         );
         let profile = &profiles[0];
-        let mut features = default_features();
-        features.external_controller = ExternalControllerConfig {
-            enabled: true,
-            address: "127.0.0.1:9090".to_owned(),
-            secret: None,
-            allow_origins: vec![],
-            allow_private_network: false,
-        };
+        let features = default_features();
         let yaml =
             build_mihomo_config(profile, "127.0.0.1", 10808, &features).expect("mihomo config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
         assert!(config.get("external-controller").is_some());
-    }
-
-    // ── Tier 1: proxy group filtering ──────────────────────────────
-
-    #[test]
-    fn proxy_group_filter_emits_filter_field() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            filter: Some("HK|Hong Kong".to_owned()),
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let group = &config["proxy-groups"][0];
-        assert_eq!(
-            group.get("filter").and_then(Value::as_str),
-            Some("HK|Hong Kong")
-        );
-    }
-
-    #[test]
-    fn proxy_group_exclude_filter_emits_exclude_filter() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            exclude_filter: Some("REJECT|DIRECT".to_owned()),
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let group = &config["proxy-groups"][0];
-        assert_eq!(
-            group.get("exclude-filter").and_then(Value::as_str),
-            Some("REJECT|DIRECT")
-        );
-    }
-
-    #[test]
-    fn proxy_group_exclude_type_emits_exclude_type() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            exclude_type: Some("Shadowsocks|Http".to_owned()),
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let group = &config["proxy-groups"][0];
-        assert_eq!(
-            group.get("exclude-type").and_then(Value::as_str),
-            Some("Shadowsocks|Http")
-        );
-    }
-
-    #[test]
-    fn proxy_group_include_all_providers_flag() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            include_all_providers: true,
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let group = &config["proxy-groups"][0];
-        assert_eq!(
-            group.get("include-all-providers").and_then(Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn proxy_group_no_filter_fields_when_not_set() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let group = &config["proxy-groups"][0];
-        assert!(group.get("filter").is_none());
-        assert!(group.get("exclude-filter").is_none());
-        assert!(group.get("exclude-type").is_none());
-        assert!(group.get("include-all-providers").is_none());
     }
 
     // ── Tier 1: tcp-concurrent global feature ──────────────────────
@@ -5613,7 +4779,7 @@ mod tests {
     #[test]
     fn build_vless_xhttp_with_padding_fields() {
         let profiles = parse_profiles(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=reality&pbk=pubkey&xPaddingBytes=100-1000&xPaddingObfsMode=random#Test",
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=reality&pbk=pubkey&xPaddingBytes=100-1000&xPaddingObfsMode=true#Test",
         );
         let profile = &profiles[0];
         let proxy = build_vless_proxy(profile, PROXY_NAME).expect("vless proxy");
@@ -5625,9 +4791,322 @@ mod tests {
         assert_eq!(
             xhttp_opts
                 .get("x-padding-obfs-mode")
-                .and_then(Value::as_str),
-            Some("random")
+                .and_then(Value::as_bool),
+            Some(true)
         );
+    }
+
+    #[test]
+    fn build_vless_xhttp_maps_happ_extra_with_mihomo_types() {
+        let extra = json!({
+            "xPaddingBytes": "100-1000",
+            "xPaddingObfsMode": true,
+            "xPaddingKey": "padding_key",
+            "xPaddingHeader": "X-Cache",
+            "xPaddingPlacement": "queryInHeader",
+            "xPaddingMethod": "tokenish",
+            "uplinkHTTPMethod": "PUT",
+            "sessionPlacement": "header",
+            "sessionKey": "X-Session",
+            "seqPlacement": "query",
+            "seqKey": "seq",
+            "uplinkDataPlacement": "cookie",
+            "uplinkDataKey": "chunk",
+            "uplinkChunkSize": "3072-4096",
+            "scMaxEachPostBytes": 1000000,
+            "scMinPostsIntervalMs": "20-40",
+            "noGRPCHeader": "true",
+            "xmux": {
+                "maxConcurrency": "16-32",
+                "maxConnections": 4,
+                "cMaxReuseTimes": "64-128",
+                "hMaxRequestTimes": "800-900",
+                "hMaxReusableSecs": "900-1800",
+                "hKeepAlivePeriod": -1
+            }
+        });
+        let mut url = url::Url::parse(
+            "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp&security=reality&pbk=public-key#Test",
+        )
+        .expect("base URL");
+        url.query_pairs_mut()
+            .append_pair("extra", &extra.to_string());
+        let profiles = parse_profiles(url.as_str());
+        let proxy = build_vless_proxy(&profiles[0], PROXY_NAME).expect("vless proxy");
+        let xhttp = proxy.get("xhttp-opts").expect("xhttp-opts");
+
+        assert_eq!(
+            xhttp,
+            &json!({
+                "no-grpc-header": true,
+                "x-padding-bytes": "100-1000",
+                "x-padding-obfs-mode": true,
+                "x-padding-key": "padding_key",
+                "x-padding-header": "X-Cache",
+                "x-padding-placement": "queryInHeader",
+                "x-padding-method": "tokenish",
+                "uplink-http-method": "PUT",
+                "session-placement": "header",
+                "session-key": "X-Session",
+                "seq-placement": "query",
+                "seq-key": "seq",
+                "uplink-data-placement": "cookie",
+                "uplink-data-key": "chunk",
+                "uplink-chunk-size": "3072-4096",
+                "sc-max-each-post-bytes": "1000000",
+                "sc-min-posts-interval-ms": "20-40",
+                "reuse-settings": {
+                    "max-concurrency": "16-32",
+                    "max-connections": "4",
+                    "c-max-reuse-times": "64-128",
+                    "h-max-request-times": "800-900",
+                    "h-max-reusable-secs": "900-1800",
+                    "h-keep-alive-period": -1
+                }
+            })
+        );
+
+        let yaml =
+            build_mihomo_bench_config(&profiles[0], "127.0.0.1", 20808).expect("generated config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("structural YAML");
+        assert_eq!(config["proxies"][0]["xhttp-opts"], *xhttp);
+    }
+
+    #[test]
+    fn build_vless_xhttp_defaults_chunk_size_for_header_uplink() {
+        let extra = json!({
+            "uplinkHTTPMethod": "GET",
+            "uplinkDataPlacement": "header",
+            "uplinkDataKey": "X-Data",
+            "scMaxEachPostBytes": "2048-2048"
+        });
+        let mut url = url::Url::parse(
+            "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp&mode=packet-up#Test",
+        )
+        .expect("base URL");
+        url.query_pairs_mut()
+            .append_pair("extra", &extra.to_string());
+        let profile = parse_profiles(url.as_str()).pop().expect("profile");
+        let proxy = build_vless_proxy(&profile, PROXY_NAME).expect("xhttp proxy");
+        assert_eq!(proxy["xhttp-opts"]["uplink-chunk-size"], "3000-4000");
+    }
+
+    #[test]
+    fn build_vless_xhttp_top_level_values_override_extra() {
+        let extra = json!({
+            "xPaddingBytes": "100-200",
+            "xPaddingObfsMode": false,
+            "headers": { "X-Origin": "extra" },
+            "sessionIDPlacement": "cookie",
+            "xmux": { "maxConcurrency": "16-32" }
+        });
+        let mut url = url::Url::parse(
+            "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp&xPaddingBytes=300-400&xPaddingObfsMode=on&headers=%7B%22X-Origin%22%3A%22top-level%22%7D&sessionIDPlacement=header&xmuxMaxConcurrency=8-12#Test",
+        )
+        .expect("base URL");
+        url.query_pairs_mut()
+            .append_pair("extra", &extra.to_string());
+        let profiles = parse_profiles(url.as_str());
+        let proxy = build_vless_proxy(&profiles[0], PROXY_NAME).expect("vless proxy");
+        let xhttp = proxy.get("xhttp-opts").expect("xhttp-opts");
+
+        assert_eq!(xhttp["x-padding-bytes"], "300-400");
+        assert_eq!(xhttp["x-padding-obfs-mode"], true);
+        assert_eq!(xhttp["headers"], json!({"X-Origin": "top-level"}));
+        assert_eq!(xhttp["session-placement"], "header");
+        assert_eq!(xhttp["reuse-settings"]["max-concurrency"], "8-12");
+    }
+
+    #[test]
+    fn build_vless_xhttp_consumes_current_official_extra_shape() {
+        let extra = json!({
+            "headers": {
+                "X-Trace": "diagnostic-value",
+                "User-Agent": "fixture-agent"
+            },
+            "xPaddingBytes": "100-1000",
+            "xPaddingObfsMode": true,
+            "xPaddingKey": "padding-name",
+            "xPaddingHeader": "Referer",
+            "xPaddingPlacement": "queryInHeader",
+            "xPaddingMethod": "tokenish",
+            "sessionIDPlacement": "header",
+            "sessionIDKey": "X-Session",
+            "sessionIDTable": "Base62",
+            "sessionIDLength": "16-32",
+            "uplinkChunkSize": 0,
+            "scMaxEachPostBytes": 1000000,
+            "scMinPostsIntervalMs": 30,
+            "downloadSettings": {}
+        });
+        let mut url = url::Url::parse(
+            "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp#Test",
+        )
+        .expect("base URL");
+        url.query_pairs_mut()
+            .append_pair("extra", &extra.to_string());
+        let profile = parse_profiles(url.as_str()).pop().expect("profile");
+        let proxy = build_vless_proxy(&profile, PROXY_NAME).expect("supported official shape");
+        let xhttp = proxy["xhttp-opts"].as_object().expect("xhttp opts");
+
+        assert_eq!(
+            xhttp.len(),
+            14,
+            "every supplied nonempty key must be mapped"
+        );
+        assert_eq!(xhttp["headers"]["X-Trace"], "diagnostic-value");
+        assert_eq!(xhttp["session-placement"], "header");
+        assert_eq!(xhttp["session-key"], "X-Session");
+        assert_eq!(xhttp["session-table"], "Base62");
+        assert_eq!(xhttp["session-length"], "16-32");
+        assert_eq!(xhttp["uplink-chunk-size"], "0");
+    }
+
+    #[test]
+    fn build_vless_xhttp_preserves_legacy_session_aliases() {
+        let extra = json!({
+            "sessionPlacement": "cookie",
+            "sessionKey": "sid",
+            "sessionTable": "hex",
+            "sessionLength": 24
+        });
+        let mut url = url::Url::parse(
+            "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp#Test",
+        )
+        .expect("base URL");
+        url.query_pairs_mut()
+            .append_pair("extra", &extra.to_string());
+        let profile = parse_profiles(url.as_str()).pop().expect("profile");
+        let proxy = build_vless_proxy(&profile, PROXY_NAME).expect("legacy aliases");
+        assert_eq!(
+            proxy["xhttp-opts"],
+            json!({
+                "session-placement": "cookie",
+                "session-key": "sid",
+                "session-table": "hex",
+                "session-length": "24"
+            })
+        );
+    }
+
+    #[test]
+    fn build_vless_xhttp_validates_headers_sessions_and_positive_bounds() {
+        for (field, value) in [
+            ("headers", json!({"Bad Header": "value"})),
+            ("headers", json!({"X-Test": 7})),
+            ("sessionIDPlacement", json!("body")),
+            ("sessionIDLength", json!(0)),
+            ("sessionIDLength", json!(4097)),
+            ("uplinkChunkSize", json!(63)),
+            ("scMaxEachPostBytes", json!(0)),
+            ("scMinPostsIntervalMs", json!(0)),
+        ] {
+            let mut url = url::Url::parse(
+                "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp#Test",
+            )
+            .expect("base URL");
+            url.query_pairs_mut()
+                .append_pair("extra", &json!({field: value}).to_string());
+            let profile = parse_profiles(url.as_str()).pop().expect("profile");
+            let error = build_vless_proxy(&profile, PROXY_NAME).expect_err("invalid field");
+            assert!(error.contains(field), "{field}: {error}");
+            assert!(
+                !error.contains("custom-secret-table"),
+                "value leaked: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_vless_xhttp_accepts_custom_session_table() {
+        let mut url = url::Url::parse(
+            "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp#Test",
+        )
+        .expect("base URL");
+        url.query_pairs_mut().append_pair(
+            "extra",
+            &json!({"sessionIDTable":"abcXYZ09-_","sessionIDLength":16}).to_string(),
+        );
+        let profile = parse_profiles(url.as_str()).pop().expect("profile");
+        let proxy = build_vless_proxy(&profile, PROXY_NAME).expect("custom session table");
+        assert_eq!(proxy["xhttp-opts"]["session-table"], "abcXYZ09-_");
+        assert_eq!(proxy["xhttp-opts"]["session-length"], "16");
+    }
+
+    #[test]
+    fn build_vless_xhttp_rejects_too_small_session_id_space() {
+        let extra = json!({
+            "sessionIDTable": "number",
+            "sessionIDLength": 3
+        });
+        let mut url = url::Url::parse(
+            "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp#Test",
+        )
+        .expect("base URL");
+        url.query_pairs_mut()
+            .append_pair("extra", &extra.to_string());
+        let profile = parse_profiles(url.as_str()).pop().expect("profile");
+        let error = build_vless_proxy(&profile, PROXY_NAME).expect_err("small session space");
+
+        assert!(error.contains("sessionIDTable/sessionIDLength"));
+        assert!(error.contains("2^31"));
+    }
+
+    #[test]
+    fn build_vless_xhttp_rejects_nonempty_download_settings_explicitly() {
+        let extra = json!({
+            "downloadSettings": {
+                "host": "download.example",
+                "headers": {"Authorization": "secret-value"}
+            }
+        });
+        let mut url = url::Url::parse(
+            "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp#Test",
+        )
+        .expect("base URL");
+        url.query_pairs_mut()
+            .append_pair("extra", &extra.to_string());
+        let profile = parse_profiles(url.as_str()).pop().expect("profile");
+        let error = build_vless_proxy(&profile, PROXY_NAME).expect_err("unsupported download");
+
+        assert!(error.contains("downloadSettings"));
+        assert!(error.contains("Mihomo v1.19.29"));
+        assert!(!error.contains("download.example"));
+        assert!(!error.contains("secret-value"));
+    }
+
+    #[test]
+    fn build_vless_xhttp_rejects_malformed_extra_without_echoing_it() {
+        for extra in [
+            "not-json-secret",
+            "[]",
+            r#"{"xPaddingObfsMode":"sometimes"}"#,
+        ] {
+            let mut url = url::Url::parse(
+                "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp#Test",
+            )
+            .expect("base URL");
+            url.query_pairs_mut().append_pair("extra", extra);
+            let profiles = parse_profiles(url.as_str());
+            let error = build_vless_proxy(&profiles[0], PROXY_NAME).expect_err("invalid extra");
+            assert!(error.contains("VLESS XHTTP extra"), "{error}");
+            assert!(!error.contains(extra), "extra leaked in error: {error}");
+        }
+    }
+
+    #[test]
+    fn build_vless_xhttp_rejects_oversized_extra() {
+        let extra = format!(r#"{{"unknown":"{}"}}"#, "x".repeat(16 * 1024));
+        let mut url = url::Url::parse(
+            "vless://11111111-1111-1111-1111-111111111111@provider.example:443?type=xhttp#Test",
+        )
+        .expect("base URL");
+        url.query_pairs_mut().append_pair("extra", &extra);
+        let profiles = parse_profiles(url.as_str());
+        let error = build_vless_proxy(&profiles[0], PROXY_NAME).expect_err("oversized extra");
+
+        assert_eq!(error, "VLESS XHTTP extra exceeds the 16384-byte limit");
+        assert!(!error.contains(&"x".repeat(64)));
     }
 
     #[test]
@@ -5640,12 +5119,12 @@ mod tests {
         let xhttp_opts = proxy.get("xhttp-opts").expect("xhttp-opts");
         let reuse = xhttp_opts.get("reuse-settings").expect("reuse-settings");
         assert_eq!(
-            reuse.get("max-concurrency").and_then(Value::as_u64),
-            Some(16)
+            reuse.get("max-concurrency").and_then(Value::as_str),
+            Some("16")
         );
         assert_eq!(
-            reuse.get("max-connections").and_then(Value::as_u64),
-            Some(4)
+            reuse.get("max-connections").and_then(Value::as_str),
+            Some("4")
         );
         assert_eq!(
             reuse.get("h-keep-alive-period").and_then(Value::as_u64),
@@ -5678,45 +5157,6 @@ mod tests {
         assert!(xhttp_opts.get("no-grpc-header").is_none());
         assert!(xhttp_opts.get("x-padding-bytes").is_none());
         assert!(xhttp_opts.get("reuse-settings").is_none());
-    }
-
-    // ── Sub-rules tests ─────────────────────────────────────────────
-
-    #[test]
-    fn sub_rules_emitted_when_configured() {
-        let mut features = default_features();
-        features.sub_rules = vec![SubRuleConfig {
-            name: "ad-block".to_owned(),
-            rules: vec![
-                "DOMAIN-SUFFIX,doubleclick.net,REJECT".to_owned(),
-                "MATCH,PROXY".to_owned(),
-            ],
-        }];
-        let config = build_test_router_config(&features);
-        let sub_rules = config
-            .get("sub-rules")
-            .and_then(Value::as_object)
-            .expect("sub-rules");
-        assert!(sub_rules.contains_key("ad-block"));
-        let rules = sub_rules["ad-block"].as_array().expect("rules array");
-        assert_eq!(rules.len(), 2);
-    }
-
-    #[test]
-    fn sub_rules_absent_when_empty() {
-        let config = build_test_router_config(&default_features());
-        assert!(config.get("sub-rules").is_none());
-    }
-
-    #[test]
-    fn sub_rules_skips_empty_names() {
-        let mut features = default_features();
-        features.sub_rules = vec![SubRuleConfig {
-            name: String::new(),
-            rules: vec!["MATCH,PROXY".to_owned()],
-        }];
-        let config = build_test_router_config(&features);
-        assert!(config.get("sub-rules").is_none());
     }
 
     // ── GEOIP / IP-ASN rule tests ───────────────────────────────────
@@ -6414,17 +5854,11 @@ mod tests {
     #[test]
     fn dns_parity_fields_are_emitted_when_configured() {
         let mut features = default_features();
-        features.dns_fake_ip_filter_mode = Some("rule".to_owned());
+        features.dns_fake_ip_filter_mode = Some("blacklist".to_owned());
         features.dns_fake_ip_filter = vec!["MATCH,fake-ip".to_owned()];
         features.dns_fake_ip_ttl = Some(60);
-        features.dns_use_hosts = Some(false);
-        features.dns_use_system_hosts = Some(false);
         features.dns_default_nameserver = vec!["1.1.1.1".to_owned()];
         features.dns_direct_nameserver_follow_policy = Some(true);
-        features.dns_ecs = Some("1.2.3.0/24".to_owned());
-        features.dns_ecs_override = Some(true);
-        features.dns_disable_ipv4 = true;
-        features.dns_disable_qtypes = vec![65];
         let mut proxy_policy = std::collections::HashMap::new();
         proxy_policy.insert("node.example.com".to_owned(), vec!["8.8.8.8".to_owned()]);
         features.dns_proxy_server_nameserver_policy = proxy_policy;
@@ -6433,138 +5867,17 @@ mod tests {
         let dns = config.get("dns").expect("dns");
         assert_eq!(
             dns.get("fake-ip-filter-mode").and_then(Value::as_str),
-            Some("rule")
+            Some("blacklist")
         );
         assert_eq!(dns.get("fake-ip-ttl").and_then(Value::as_u64), Some(60));
-        assert_eq!(dns.get("use-hosts").and_then(Value::as_bool), Some(false));
-        assert_eq!(
-            dns.get("use-system-hosts").and_then(Value::as_bool),
-            Some(false)
-        );
         assert_eq!(
             dns.get("direct-nameserver-follow-policy")
                 .and_then(Value::as_bool),
             Some(true)
         );
-        assert_eq!(dns.get("ecs").and_then(Value::as_str), Some("1.2.3.0/24"));
-        assert_eq!(dns.get("ecs-override").and_then(Value::as_bool), Some(true));
-        assert_eq!(dns.get("disable-ipv4").and_then(Value::as_bool), Some(true));
-        assert_eq!(
-            dns.get("disable-qtype-65").and_then(Value::as_bool),
-            Some(true)
-        );
+        assert!(dns.get("ecs").is_none());
+        assert!(dns.get("disable-ipv4").is_none());
         assert!(dns.get("proxy-server-nameserver-policy").is_some());
-    }
-
-    // ── v0.11.0: Proxy group include-all / include-all-proxies ────
-
-    #[test]
-    fn proxy_group_include_all_flag() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            include_all: true,
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let group = &config["proxy-groups"][0];
-        assert_eq!(
-            group.get("include-all").and_then(Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn proxy_group_include_all_proxies_flag() {
-        let mut features = default_features();
-        features.proxy_group = ProxyGroupConfig {
-            enabled: true,
-            include_all_proxies: true,
-            ..ProxyGroupConfig::default()
-        };
-        let config = build_test_router_config(&features);
-        let group = &config["proxy-groups"][0];
-        assert_eq!(
-            group.get("include-all-proxies").and_then(Value::as_bool),
-            Some(true)
-        );
-    }
-
-    // ── v0.11.0: Raw rules (AND/OR/NOT logic) ──────────────────────
-
-    #[test]
-    fn raw_rules_emitted_in_router_config() {
-        let mut features = default_features();
-        features.raw_rules = vec![
-            "AND,((DOMAIN,baidu.com),(NETWORK,udp)),DIRECT".to_owned(),
-            "NOT,((DOMAIN,baidu.com)),PROXY".to_owned(),
-        ];
-        let config = build_test_router_config(&features);
-        let rules = config
-            .get("rules")
-            .and_then(Value::as_array)
-            .expect("rules");
-        assert!(
-            rules
-                .iter()
-                .any(|r| r.as_str() == Some("AND,((DOMAIN,baidu.com),(NETWORK,udp)),DIRECT")),
-            "AND rule should be present"
-        );
-        assert!(
-            rules
-                .iter()
-                .any(|r| r.as_str() == Some("NOT,((DOMAIN,baidu.com)),PROXY")),
-            "NOT rule should be present"
-        );
-        // Raw rules should appear before MATCH
-        let match_idx = rules
-            .iter()
-            .position(|r| r.as_str().is_some_and(|s| s.starts_with("MATCH,")));
-        let and_idx = rules
-            .iter()
-            .position(|r| r.as_str() == Some("AND,((DOMAIN,baidu.com),(NETWORK,udp)),DIRECT"));
-        assert!(and_idx.is_some_and(|ai| match_idx.is_some_and(|mi| ai < mi)));
-    }
-
-    #[test]
-    fn raw_rules_absent_when_empty() {
-        let config = build_test_router_config(&default_features());
-        let rules = config
-            .get("rules")
-            .and_then(Value::as_array)
-            .expect("rules");
-        // Only the QUIC block AND rule and MATCH should be present — no user raw rules
-        assert!(
-            !rules
-                .iter()
-                .any(|r| { r.as_str().is_some_and(|s| s.starts_with("NOT,")) })
-        );
-    }
-
-    #[test]
-    fn typed_rules_emitted_before_raw_rules() {
-        let mut features = default_features();
-        features.typed_rules = vec![super::MihomoRuleConfig {
-            rule_type: "IN-NAME".to_owned(),
-            value: REDIR_LISTENER.to_owned(),
-            target: "active".to_owned(),
-            options: Vec::new(),
-        }];
-        features.raw_rules = vec!["DSCP,4,DIRECT".to_owned()];
-        let config = build_test_router_config(&features);
-        let rules = config
-            .get("rules")
-            .and_then(Value::as_array)
-            .expect("rules");
-        let typed_idx = rules
-            .iter()
-            .position(|r| r.as_str() == Some("IN-NAME,redir-in,proxy"))
-            .expect("typed rule");
-        let raw_idx = rules
-            .iter()
-            .position(|r| r.as_str() == Some("DSCP,4,DIRECT"))
-            .expect("raw rule");
-        assert!(typed_idx < raw_idx);
     }
 
     #[test]
@@ -6826,26 +6139,15 @@ mod tests {
             proxy_ports: vec!["443".to_owned()],
             ..RouterExtra::default()
         };
-        let features = MihomoFeatures {
-            typed_rules: vec![super::MihomoRuleConfig {
-                rule_type: "DSCP".to_owned(),
-                value: "4".to_owned(),
-                target: "direct".to_owned(),
-                options: vec![],
-            }],
-            raw_rules: vec!["DOMAIN,raw.example,DIRECT".to_owned()],
-            ..MihomoFeatures::default()
-        };
-        let yaml = build_router_with_extra(&extra, &[route_rule], false, &features)
-            .expect("router config");
+        let yaml =
+            build_router_with_extra(&extra, &[route_rule], false, &MihomoFeatures::default())
+                .expect("router config");
         let rules = router_rules(&yaml);
         assert_eq!(
             rules,
             [
                 "DOMAIN-SUFFIX,ordinary.example,DIRECT",
                 "AND,((NETWORK,udp),(DST-PORT,443)),REJECT",
-                "DSCP,4,DIRECT",
-                "DOMAIN,raw.example,DIRECT",
                 "DOMAIN-SUFFIX,auto.example,proxy",
                 "RULE-SET,active-second-in-input,proxy",
                 "RULE-SET,direct-first-in-input,DIRECT",
@@ -6949,30 +6251,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_rule_provider_names_are_rejected() {
-        let extra = RouterExtra {
-            geobase_rule_providers: vec![managed_provider(
-                "shared-name",
-                "/opt/etc/hincyray/geobase/list.txt",
-                GeoBaseRuleBehavior::Domain,
-                GeoBaseRuleTarget::Active,
-            )],
-            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
-            ..RouterExtra::default()
-        };
-        let features = MihomoFeatures {
-            rule_providers: vec![RuleProviderConfig {
-                name: "shared-name".to_owned(),
-                ..RuleProviderConfig::default()
-            }],
-            ..MihomoFeatures::default()
-        };
-        let error = build_router_with_extra(&extra, &[], true, &features)
-            .expect_err("duplicate provider must fail");
-        assert!(error.contains("duplicate rule provider name"));
-    }
-
-    #[test]
     fn managed_provider_requires_mihomo_home_and_stays_below_it() {
         let provider = managed_provider(
             "geobase-active",
@@ -7020,32 +6298,6 @@ mod tests {
         };
         let error = build_router_with_extra(&extra, &[], true, &MihomoFeatures::default())
             .expect_err("duplicate managed paths must fail");
-        assert!(error.contains("duplicate effective rule provider path"));
-    }
-
-    #[test]
-    fn managed_provider_path_cannot_collide_with_user_path() {
-        let extra = RouterExtra {
-            geobase_rule_providers: vec![managed_provider(
-                "geobase-active",
-                "/opt/etc/hincyray/geobases/shared.txt",
-                GeoBaseRuleBehavior::Domain,
-                GeoBaseRuleTarget::Active,
-            )],
-            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
-            ..RouterExtra::default()
-        };
-        let features = MihomoFeatures {
-            rule_providers: vec![RuleProviderConfig {
-                name: "user-file".to_owned(),
-                provider_type: "file".to_owned(),
-                path: Some("./geobases/../geobases/shared.txt".to_owned()),
-                ..RuleProviderConfig::default()
-            }],
-            ..MihomoFeatures::default()
-        };
-        let error = build_router_with_extra(&extra, &[], true, &features)
-            .expect_err("user file path collision must fail");
         assert!(error.contains("duplicate effective rule provider path"));
     }
 

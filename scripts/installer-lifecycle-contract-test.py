@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "hincyray-install.sh"
 GUIDE = ROOT / "AGENTS.md"
+DAEMON = ROOT / "src" / "hincyray.rs"
 HEREDOC_START = 'cat > "${STAGING}/etc/init.d/S99hincyray" << \'INITEOF\'\n'
 HEREDOC_END = "\nINITEOF"
 
@@ -34,6 +35,7 @@ def require(text: str, markers: list[str], scope: str) -> None:
 def main() -> None:
     installer = INSTALLER.read_text(encoding="utf-8")
     guide = GUIDE.read_text(encoding="utf-8")
+    daemon = DAEMON.read_text(encoding="utf-8")
     init = generated_init(installer)
 
     with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as file:
@@ -79,7 +81,7 @@ def main() -> None:
             'register_runtime_tree',
             'acquire_transaction_lock',
             'release_transaction_lock',
-            'VERSION="1.2.2"',
+            'VERSION="1.3.0"',
             'public_get() {',
             'releases/download/v${VERSION}/hincyray',
             'raw.githubusercontent.com/DurkaEbanaya/HincyRay/v${VERSION}/scripts/wifi-segment-setup.sh',
@@ -108,6 +110,11 @@ def main() -> None:
     stop_index = installer.index('HINCYRAY_LIFECYCLE_OWNER=$$ "$INIT_SCRIPT" stop')
     runtime_snapshot_index = installer.index("register_runtime_tree", stop_index)
     assert stop_index < runtime_snapshot_index, "runtime state must be snapshotted after the daemon stops"
+
+    accept_end = daemon.index('eprintln!("hincyray: shutting down...")')
+    core_stop = daemon.index("inner.core.stop()", accept_end)
+    geobase_join = daemon.index("cancel_and_join_geobase(&daemon)", accept_end)
+    assert core_stop < geobase_join, "daemon must stop/reap Mihomo before blocking GeoBase join"
 
     print("installer lifecycle contract ok")
 

@@ -1,4 +1,4 @@
-# HincyRay v1.2.2
+# HincyRay v1.3.0
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,16 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 Демон `ndm` в Keenetic пересоздаёт все iptables chains при изменениях конфигурации, событиях WAN и обновлении DHCP. HincyRay устанавливает hook-скрипт в `/opt/etc/ndm/netfilter.d/hincyray.sh`, который **ndm вызывает сам** после каждой перезагрузки firewall, переустанавливая все правила атомарно. Watchdog каждые 10 секунд — запасная страховка.
 
 ## Возможности
+
+### v1.3.0
+
+v1.3.0 добавляет **Логгер профиля** для воспроизведения нестабильной работы сайтов и streaming через активный сервер. Ограниченная сессия на 1–5 минут записывает только новые соединения явно указанного LAN-клиента, относящиеся к профилю warning/error events, routing chains, traffic counters, состояние памяти/runtime, последний результат сервисной диагностики и структурно отредактированную конфигурацию. Готовый ограниченный Markdown-отчёт можно сразу вставлять в диалог с нейросетью; share links, URL подписок, authentication и ключи в него не попадают.
+
+У профилей появился безопасный on-demand редактор имени и полной ручной share-ссылки с отображением protocol, transport, address, port, lifecycle и provenance. Ссылки из подписок остаются read-only. Группа `No group` умеет локально повторно разобрать и проверить все ручные профили одной атомарной операцией.
+
+Страница Mihomo Parameters сокращена до полезного для роутера runtime status и валидируемых Expert-настроек. Удалены неподдерживаемые и параллельные поверхности конфигурации, External Controller закреплён на loopback, а изменение параметров теперь валидируется, применяется, сохраняется либо полностью откатывается одной транзакцией.
+
+Также исправлены orphan/split-brain процессы Mihomo с проверкой владельца всех обязательных listener ports, ограничено и ускорено чтение таблицы соединений, добавлена совместимость с Happ/Xray XHTTP `extra`, включая header-based `GET` packet uplink на Mihomo v1.19.29, а selector параллелизма benchmark сохраняется и наглядно запускает до шести workers. Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.3.0.md`](docs/releases/v1.3.0.md).
 
 ### v1.2.2
 
@@ -352,7 +362,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.2.2 зафиксированы в [`docs/releases/v1.2.2.md`](docs/releases/v1.2.2.md).
+Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.3.0 зафиксированы в [`docs/releases/v1.3.0.md`](docs/releases/v1.3.0.md).
 
 ## Установка
 

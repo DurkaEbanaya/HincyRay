@@ -25,6 +25,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -35,7 +38,7 @@ use tempfile::NamedTempFile;
 
 use crate::benchmark::{
     BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL,
-    DEFAULT_UPLOAD_URL, QuickProbeConfig, ResourceTestResult, SharedJob, run_bench,
+    DEFAULT_UPLOAD_URL, QuickProbeConfig, ResourceTestResult, SharedJob, new_bench_job, run_bench,
 };
 use crate::geobase::{
     self, Classification, DomainClassification, GeoBaseArtifactKind, GeoBaseGenerationInput,
@@ -44,18 +47,29 @@ use crate::geobase::{
 };
 use crate::hincyray_api::{
     ApiContractDescriptor, ConnectionPageResponse, ConnectionQueryRequest, DeviceTrafficRequest,
-    DeviceTrafficResponse, DeviceTrafficSummary, MemoryEstimateResponse, OnboardingStatusResponse,
-    ReadinessCheck, RoutingConnectionContextResponse, RoutingPreviewDiff, RoutingPreviewResponse,
-    RoutingServerSummary, RoutingSummaryResponse, SafeModeRequest, SafeModeResponse,
-    api_endpoint_contracts, openapi_document,
+    DeviceTrafficResponse, DeviceTrafficSummary, MemoryEstimateResponse, MihomoDnsParameters,
+    MihomoExperimentalParameters, MihomoExternalControllerRuntime, MihomoParameters,
+    MihomoParametersResponse, MihomoParametersRuntime, MihomoParametersUpdateRequest,
+    MihomoPerProxyParameters, MihomoSnifferParameters, OnboardingStatusResponse, ProfileDetail,
+    ProfileDetailResponse, ProfileDiagnosticConnection, ProfileDiagnosticDiscardRequest,
+    ProfileDiagnosticDiscardResponse, ProfileDiagnosticEnvironment, ProfileDiagnosticEvent,
+    ProfileDiagnosticLatestStats, ProfileDiagnosticMemory, ProfileDiagnosticProfile,
+    ProfileDiagnosticReport, ProfileDiagnosticReportResponse, ProfileDiagnosticServiceResult,
+    ProfileDiagnosticSessionRequest, ProfileDiagnosticSessionStatus, ProfileDiagnosticStartRequest,
+    ProfileDiagnosticStartResponse, ProfileDiagnosticStatusResponse, ProfileDiagnosticSummary,
+    ProfileRevalidationError, ProfileSafeFields, ProfileUpdateRequest, ProfileUpdateResponse,
+    ProfilesRevalidateResponse, ReadinessCheck, RoutingConnectionContextResponse,
+    RoutingPreviewDiff, RoutingPreviewResponse, RoutingServerSummary, RoutingSummaryResponse,
+    SafeModeRequest, SafeModeResponse, api_endpoint_contracts, openapi_document,
 };
-#[cfg(test)]
-use crate::hincyray_mihomo_api::{controller_dial_address, first_stream_json};
 use crate::hincyray_mihomo_api::{
-    mihomo_api_delay, mihomo_api_delete, mihomo_api_get, mihomo_api_get_json,
+    MAX_DIAGNOSTIC_CONNECTIONS_JSON_BYTES, mihomo_api_delay, mihomo_api_delete, mihomo_api_get,
+    mihomo_api_get_connections_json, mihomo_api_get_connections_json_bounded, mihomo_api_get_json,
     mihomo_api_get_response, mihomo_api_post, mihomo_api_post_response, mihomo_api_put,
     mihomo_api_stream_get, mihomo_api_stream_get_json, mihomo_controller,
 };
+#[cfg(test)]
+use crate::hincyray_mihomo_api::{controller_dial_address, first_stream_json};
 use crate::hincyray_routing::{RoutingResource, RoutingResourceKind, normalize_routing_resource};
 #[cfg(test)]
 use crate::hincyray_security::verify_password;
@@ -77,7 +91,9 @@ use crate::telegram_probe::{
     load_config as load_telegram_config, request_login_code as telegram_request_login_code,
     revoke_and_delete as telegram_revoke_and_delete, save_config as save_telegram_config,
 };
-use crate::xray_config::{DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule};
+use crate::xray_config::{
+    DNS_INBOUND_PORT, DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule,
+};
 use crate::xray_config::{GeoBaseRuleBehavior, GeoBaseRuleProvider, GeoBaseRuleTarget};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
@@ -100,6 +116,18 @@ const MIHOMO_VALIDATE_TIMEOUT: Duration = Duration::from_secs(15);
 const MIHOMO_VALIDATE_MEMORY_LIMIT: &str = "64MiB";
 const MIHOMO_VALIDATE_GOGC: &str = "20";
 const COMMAND_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024;
+const MAX_PROFILE_NAME_CHARS: usize = 256;
+const MAX_PROFILE_RAW_BYTES: usize = 64 * 1024;
+const MAX_PROFILE_REVALIDATION_ERRORS: usize = 100;
+const PROFILE_DIAGNOSTIC_MIN_DURATION_SECS: u32 = 60;
+const PROFILE_DIAGNOSTIC_MAX_DURATION_SECS: u32 = 300;
+const PROFILE_DIAGNOSTIC_COMPLETED_TTL_SECS: u64 = 15 * 60;
+const PROFILE_DIAGNOSTIC_MAX_CONNECTIONS: usize = 256;
+const PROFILE_DIAGNOSTIC_MAX_INITIAL_CONNECTION_IDS: usize = 4096;
+const PROFILE_DIAGNOSTIC_MAX_EVENTS: usize = 256;
+const PROFILE_DIAGNOSTIC_MAX_CONFIG_BYTES: usize = 64 * 1024;
+const PROFILE_DIAGNOSTIC_MAX_REPORT_BYTES: usize = 256 * 1024;
+const PROFILE_DIAGNOSTIC_MAX_STRING_CHARS: usize = 512;
 const GEOBASE_JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const GEOBASE_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const GEOBASE_DNS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -231,13 +259,19 @@ pub fn run() -> Result<(), String> {
         }
     }
 
-    // GeoBase may be using the controller or store. Stop and join it before
-    // tearing either the core or its filesystem dependencies down.
     eprintln!("hincyray: shutting down...");
+    cancel_and_join_profile_diagnostics(&daemon);
+    // Reap Mihomo after the bounded diagnostic worker has stopped so its final
+    // environment snapshot still describes the captured core.
+    {
+        let mut inner = lock(&daemon.inner);
+        if let Err(error) = inner.core.stop() {
+            eprintln!("hincyray: core shutdown failed: {error}");
+        }
+    }
     cancel_and_join_geobase(&daemon);
     {
         let mut inner = lock(&daemon.inner);
-        let _ = inner.core.stop();
         let vpn_subnet = inner.state.split_routing.vpn_subnet.clone();
         let _ = inner.firewall.stop(&vpn_subnet);
         // v0.19.8: flush any pending dirty state from the watchdog
@@ -338,11 +372,19 @@ fn cli_doctor() -> Result<(), String> {
 pub struct Daemon {
     inner: Arc<Mutex<DaemonInner>>,
     apply: Arc<Mutex<()>>,
+    profile_diagnostic_join: Arc<Mutex<()>>,
+    geoip_cache: Arc<Mutex<Option<GeoIpCacheEntry>>>,
     password_work: Arc<PasswordWorkLimiter>,
     state_path: PathBuf,
     mihomo_config_path: PathBuf,
     geobase_store_root: PathBuf,
     geobase_store: GeoBaseStore,
+    #[cfg(test)]
+    mihomo_controller_override: Arc<Mutex<Option<String>>>,
+    #[cfg(test)]
+    fail_active_profile_persist_after_write: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_profile_history_persist_after_write: Arc<AtomicBool>,
 }
 
 struct DaemonInner {
@@ -389,6 +431,78 @@ struct DaemonInner {
     deep_bench_status: DeepBenchStatus,
     geobase: GeoBaseRuntime,
     pinned_route_now: HashMap<String, String>,
+    profile_diagnostics: ProfileDiagnosticRuntime,
+    core_generation: u64,
+}
+
+#[derive(Default)]
+struct ProfileDiagnosticRuntime {
+    starting: bool,
+    active: Option<ProfileDiagnosticCapture>,
+    completed: Option<ProfileDiagnosticReport>,
+    worker: Option<ProfileDiagnosticWorker>,
+}
+
+struct ProfileDiagnosticWorker {
+    session_id: String,
+    cancel: Arc<AtomicBool>,
+    stop_reason: Arc<Mutex<Option<String>>>,
+    handle: JoinHandle<()>,
+}
+
+struct ProfileDiagnosticWorkerExitGuard {
+    daemon: Daemon,
+    session_id: String,
+    armed: bool,
+}
+
+impl Drop for ProfileDiagnosticWorkerExitGuard {
+    fn drop(&mut self) {
+        if self.armed && thread::panicking() {
+            let mut inner = lock(&self.daemon.inner);
+            if inner
+                .profile_diagnostics
+                .active
+                .as_ref()
+                .is_some_and(|capture| capture.session_id == self.session_id)
+            {
+                inner.profile_diagnostics.active = None;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProfileDiagnosticCapture {
+    session_id: String,
+    profile: ProfileDiagnosticProfile,
+    source_ip: IpAddr,
+    started_at_unix: u64,
+    deadline_unix: u64,
+    duration_seconds: u32,
+    core_generation: u64,
+    environment_start: ProfileDiagnosticEnvironment,
+    config_summary: String,
+    latest_stats: Option<ProfileDiagnosticLatestStats>,
+    initial_connection_ids: HashSet<String>,
+    connection_raw_ids: HashMap<String, usize>,
+    connections: Vec<ProfileDiagnosticConnection>,
+    events: Vec<ProfileDiagnosticEvent>,
+    poll_errors: usize,
+    dropped_connections: usize,
+    dropped_events: usize,
+}
+
+struct GeoIpCacheEntry {
+    key: GeoIpCacheKey,
+    reader: Arc<maxminddb::Reader<Vec<u8>>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GeoIpCacheKey {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -588,6 +702,28 @@ impl BenchRuntime {
             })
             .unwrap_or_default()
     }
+
+    fn reserve(&mut self, job: SharedJob, cancel: Arc<AtomicBool>) -> Result<(), ()> {
+        if self.is_running() {
+            return Err(());
+        }
+        self.handle.take();
+        self.job = Some(job);
+        self.cancel = Some(cancel);
+        Ok(())
+    }
+
+    fn release_reservation(&mut self, job: &SharedJob) {
+        if self
+            .job
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, job))
+        {
+            self.job = None;
+            self.cancel = None;
+            self.handle = None;
+        }
+    }
 }
 
 /// Web UI authentication settings. Only an Argon2id PHC string is persisted.
@@ -764,9 +900,7 @@ pub struct HincyrayState {
     /// applying an update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mihomo_version: Option<String>,
-    /// v0.9: All Mihomo-specific opt-in features (proxy groups,
-    /// external controller, NTP, smux, DNS enhancements, sniffer
-    /// enhancements, tunnels, hosts, authentication, experimental).
+    /// Retained expert Mihomo parameters plus the internal controller secret.
     #[serde(default)]
     pub mihomo_features: MihomoFeatures,
     /// v0.13: Web UI authentication (login/password).
@@ -2063,19 +2197,57 @@ impl Daemon {
                 deep_bench_status: DeepBenchStatus::default(),
                 geobase: GeoBaseRuntime::default(),
                 pinned_route_now: HashMap::new(),
+                profile_diagnostics: ProfileDiagnosticRuntime::default(),
+                core_generation: 0,
             })),
             apply: Arc::new(Mutex::new(())),
+            profile_diagnostic_join: Arc::new(Mutex::new(())),
+            geoip_cache: Arc::new(Mutex::new(None)),
             password_work: Arc::new(PasswordWorkLimiter::new(MAX_CONCURRENT_PASSWORD_OPS)),
             state_path,
             mihomo_config_path,
             geobase_store_root,
             geobase_store,
+            #[cfg(test)]
+            mihomo_controller_override: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_active_profile_persist_after_write: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_profile_history_persist_after_write: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn geobase_store(&self) -> &GeoBaseStore {
         &self.geobase_store
     }
+
+    #[cfg(test)]
+    fn set_mihomo_controller_override(&self, address: impl Into<String>) {
+        *lock(&self.mihomo_controller_override) = Some(address.into());
+    }
+
+    #[cfg(test)]
+    fn fail_next_active_profile_persist_after_write(&self) {
+        self.fail_active_profile_persist_after_write
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_profile_history_persist_after_write(&self) {
+        self.fail_profile_history_persist_after_write
+            .store(true, Ordering::SeqCst);
+    }
+}
+
+fn daemon_mihomo_controller(
+    _daemon: &Daemon,
+    features: &MihomoFeatures,
+) -> Option<(String, Option<String>)> {
+    #[cfg(test)]
+    if let Some(address) = lock(&_daemon.mihomo_controller_override).clone() {
+        return Some((address, features.external_controller.secret.clone()));
+    }
+    mihomo_controller(features)
 }
 
 /// Proxy core lifecycle (Mihomo). Holds at most one child in memory;
@@ -2086,22 +2258,115 @@ struct CoreManager {
     child: Option<Child>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SocketProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ExpectedSocket {
+    protocol: SocketProtocol,
+    port: u16,
+}
+
+#[derive(Clone, Debug)]
+struct CoreSocketContract {
+    sockets: Vec<ExpectedSocket>,
+}
+
+impl CoreSocketContract {
+    fn from_state(
+        state: &HincyrayState,
+        controller: Option<&(String, Option<String>)>,
+    ) -> Result<Self, String> {
+        let mut sockets = vec![
+            ExpectedSocket {
+                protocol: SocketProtocol::Tcp,
+                port: state.socks_port,
+            },
+            ExpectedSocket {
+                protocol: SocketProtocol::Udp,
+                port: state.socks_port,
+            },
+        ];
+        if state.split_routing.enabled {
+            sockets.extend([
+                ExpectedSocket {
+                    protocol: SocketProtocol::Tcp,
+                    port: DNS_INBOUND_PORT,
+                },
+                ExpectedSocket {
+                    protocol: SocketProtocol::Udp,
+                    port: DNS_INBOUND_PORT,
+                },
+                ExpectedSocket {
+                    protocol: SocketProtocol::Tcp,
+                    port: state.split_routing.redirect_port,
+                },
+            ]);
+            if state.split_routing.tproxy_available {
+                sockets.push(ExpectedSocket {
+                    protocol: SocketProtocol::Udp,
+                    port: state
+                        .split_routing
+                        .redirect_port
+                        .checked_add(1)
+                        .ok_or_else(|| "Mihomo TPROXY port overflows u16".to_owned())?,
+                });
+            }
+        }
+        if let Some((address, _)) = controller {
+            sockets.push(ExpectedSocket {
+                protocol: SocketProtocol::Tcp,
+                port: controller_port(address)?,
+            });
+        }
+        sockets.sort_unstable_by_key(|socket| {
+            (
+                match socket.protocol {
+                    SocketProtocol::Tcp => 0,
+                    SocketProtocol::Udp => 1,
+                },
+                socket.port,
+            )
+        });
+        sockets.dedup();
+        Ok(Self { sockets })
+    }
+}
+
+fn controller_port(address: &str) -> Result<u16, String> {
+    address
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| format!("invalid Mihomo controller address {address:?}"))
+}
+
 impl CoreManager {
     fn new() -> Self {
         Self { child: None }
     }
 
     fn is_running(&mut self) -> bool {
+        self.running_pid().is_ok_and(|pid| pid.is_some())
+    }
+
+    fn running_pid(&mut self) -> Result<Option<u32>, String> {
         let Some(child) = self.child.as_mut() else {
-            return false;
+            return Ok(None);
         };
         match child.try_wait() {
-            Ok(None) => true,
-            Ok(Some(_)) => {
-                self.child = None;
-                false
-            }
-            Err(_) => false,
+            Ok(None) => Ok(Some(child.id())),
+            Ok(Some(_)) => match child.wait() {
+                Ok(_) => {
+                    self.child = None;
+                    Ok(None)
+                }
+                Err(error) => Err(format!("reap exited Mihomo child: {error}")),
+            },
+            Err(error) => Err(format!("inspect tracked Mihomo child: {error}")),
         }
     }
 
@@ -2114,11 +2379,7 @@ impl CoreManager {
     }
 
     fn pid(&mut self) -> Option<u32> {
-        if self.is_running() {
-            self.child.as_ref().map(Child::id)
-        } else {
-            None
-        }
+        self.running_pid().ok().flatten()
     }
 
     fn start(
@@ -2127,7 +2388,7 @@ impl CoreManager {
         config_path: &Path,
         geo_dir: Option<&str>,
     ) -> Result<(), String> {
-        if self.is_running() {
+        if self.running_pid()?.is_some() {
             return Ok(());
         }
         if !config_path.exists() {
@@ -2149,6 +2410,28 @@ impl CoreManager {
         // interfere with the process's initialisation.
         let stdout = open_log_file("mihomo.log").unwrap_or(Stdio::null());
         cmd.stdout(stdout).stderr(stderr);
+        #[cfg(target_os = "linux")]
+        {
+            // Capture before fork. If the daemon dies before the child installs
+            // PDEATHSIG, the post-prctl PPID check kills the child explicitly.
+            let parent_pid = unsafe { libc::getpid() };
+            // SAFETY: the closure only invokes async-signal-safe libc calls and
+            // constructs an io::Error after fork, before exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent_pid {
+                        libc::kill(libc::getpid(), libc::SIGKILL);
+                        return Err(std::io::Error::other(
+                            "HincyRay parent exited while spawning Mihomo",
+                        ));
+                    }
+                    Ok(())
+                });
+            }
+        }
         let child = cmd
             .spawn()
             .map_err(|error| format!("mihomo spawn: {error}"))?;
@@ -2157,12 +2440,32 @@ impl CoreManager {
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        if let Ok(Some(_)) = child.try_wait() {
+            self.child = None;
+            return Ok(());
         }
-        self.child = None;
-        Ok(())
+        if let Err(kill_error) = child.kill() {
+            return match child.try_wait() {
+                Ok(Some(_)) => {
+                    self.child = None;
+                    Ok(())
+                }
+                Ok(None) => Err(format!("kill tracked Mihomo child: {kill_error}")),
+                Err(wait_error) => Err(format!(
+                    "kill tracked Mihomo child: {kill_error}; inspect after kill failure: {wait_error}"
+                )),
+            };
+        }
+        match child.wait() {
+            Ok(_) => {
+                self.child = None;
+                Ok(())
+            }
+            Err(error) => Err(format!("reap tracked Mihomo child: {error}")),
+        }
     }
 
     fn restart(
@@ -2174,6 +2477,117 @@ impl CoreManager {
         self.stop()?;
         self.start(binary_path, config_path, geo_dir)
     }
+
+    fn owns_socket_contract(&mut self, contract: &CoreSocketContract) -> Result<bool, String> {
+        let Some(pid) = self.running_pid()? else {
+            return Ok(false);
+        };
+        tracked_process_owns_sockets(pid, &contract.sockets)
+    }
+}
+
+impl Drop for CoreManager {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop() {
+            eprintln!("hincyray: failed to stop tracked Mihomo child during drop: {error}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn tracked_process_owns_sockets(pid: u32, expected: &[ExpectedSocket]) -> Result<bool, String> {
+    let owned_inodes = process_socket_inodes(pid)?;
+    if owned_inodes.is_empty() {
+        return Ok(false);
+    }
+    let mut matched = HashSet::new();
+    for (path, protocol) in [
+        ("/proc/net/tcp", SocketProtocol::Tcp),
+        ("/proc/net/tcp6", SocketProtocol::Tcp),
+        ("/proc/net/udp", SocketProtocol::Udp),
+        ("/proc/net/udp6", SocketProtocol::Udp),
+    ] {
+        let content = read_bounded_proc_file(Path::new(path))?;
+        matched.extend(parse_proc_net_sockets(&content, protocol, &owned_inodes));
+    }
+    Ok(expected.iter().all(|socket| matched.contains(socket)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tracked_process_owns_sockets(_pid: u32, _expected: &[ExpectedSocket]) -> Result<bool, String> {
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn process_socket_inodes(pid: u32) -> Result<HashSet<u64>, String> {
+    const MAX_TRACKED_FDS: usize = 4096;
+    let fd_path = PathBuf::from(format!("/proc/{pid}/fd"));
+    let entries =
+        fs::read_dir(&fd_path).map_err(|error| format!("read {}: {error}", fd_path.display()))?;
+    let mut inodes = HashSet::new();
+    for entry in entries.take(MAX_TRACKED_FDS) {
+        let entry = entry.map_err(|error| format!("read {} entry: {error}", fd_path.display()))?;
+        let Ok(target) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        if let Some(inode) = parse_socket_inode(&target.to_string_lossy()) {
+            inodes.insert(inode);
+        }
+    }
+    Ok(inodes)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_socket_inode(target: &str) -> Option<u64> {
+    target
+        .strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_proc_file(path: &Path) -> Result<String, String> {
+    const MAX_PROC_NET_BYTES: u64 = 4 * 1024 * 1024;
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let mut content = String::new();
+    file.take(MAX_PROC_NET_BYTES)
+        .read_to_string(&mut content)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    Ok(content)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_net_sockets(
+    content: &str,
+    protocol: SocketProtocol,
+    owned_inodes: &HashSet<u64>,
+) -> HashSet<ExpectedSocket> {
+    content
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() <= 9
+                || (protocol == SocketProtocol::Tcp && fields[3] != "0A")
+                || (protocol == SocketProtocol::Udp
+                    && (fields[3] != "07" || !fields[2].ends_with(":0000")))
+            {
+                return None;
+            }
+            let port = fields[1]
+                .rsplit_once(':')
+                .and_then(|(_, port)| u16::from_str_radix(port, 16).ok())?;
+            let inode = fields[9].parse::<u64>().ok()?;
+            owned_inodes
+                .contains(&inode)
+                .then_some(ExpectedSocket { protocol, port })
+        })
+        .collect()
 }
 
 /// Firewall lifecycle manager. Installs iptables NAT REDIRECT (TCP) +
@@ -3171,20 +3585,42 @@ fn load_state_with_hasher(
     let Ok(text) = fs::read_to_string(state_path) else {
         return HincyrayState::default();
     };
-    let (mut state, auth_migration) = match deserialize_persisted_state_with_hasher(&text, hash) {
-        Ok(result) => result,
-        Err(error) => {
+    let (mut state, auth_migration, legacy_mihomo_migration) =
+        match deserialize_persisted_state_with_hasher(&text, hash) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!(
+                    "hincyray: state file {} is corrupted ({}), backing up and starting fresh",
+                    state_path.display(),
+                    error
+                );
+                let backup = state_path.with_extension("json.corrupt");
+                let _ = fs::write(&backup, &text);
+                eprintln!("hincyray: corrupted state saved to {}", backup.display());
+                (
+                    HincyrayState::default(),
+                    AuthMigration::Unchanged,
+                    LegacyMihomoMigration::default(),
+                )
+            }
+        };
+    if legacy_mihomo_migration.unsafe_listener_auth {
+        eprintln!(
+            "hincyray: legacy Mihomo authentication was removed; forcing listener to loopback"
+        );
+    }
+    if legacy_mihomo_migration.removed_surface {
+        eprintln!("hincyray: removed unsupported legacy Mihomo parameters from persisted state");
+        if legacy_mihomo_migration.removed_tunnels != 0 {
             eprintln!(
-                "hincyray: state file {} is corrupted ({}), backing up and starting fresh",
-                state_path.display(),
-                error
+                "hincyray: removed {} invalid legacy tunnel(s)",
+                legacy_mihomo_migration.removed_tunnels
             );
-            let backup = state_path.with_extension("json.corrupt");
-            let _ = fs::write(&backup, &text);
-            eprintln!("hincyray: corrupted state saved to {}", backup.display());
-            (HincyrayState::default(), AuthMigration::Unchanged)
         }
-    };
+        if let Err(error) = persist_state(state_path, &state) {
+            eprintln!("hincyray: failed to persist sanitized Mihomo state: {error}");
+        }
+    }
     // The transparent proxy requires DNS — force enabled when split
     // routing is on so the state matches the firewall DNAT rules.
     if state.split_routing.enabled {
@@ -3283,6 +3719,7 @@ fn load_state_with_hasher(
     let stale_profile_stats_changed = prune_stale_profile_stats(&mut state);
     let mut migration_changed = routing_identity_changed
         || auth_migration.changed()
+        || legacy_mihomo_migration.removed_surface
         || dead_servers_changed
         || deep_bench_filter_changed
         || active_dead_membership_changed
@@ -3332,14 +3769,111 @@ fn migrate_legacy_target(
 }
 
 fn deserialize_persisted_state(text: &str) -> Result<HincyrayState, String> {
-    deserialize_persisted_state_with_hasher(text, hash_password).map(|(state, _)| state)
+    deserialize_persisted_state_with_hasher(text, hash_password).map(|(state, _, _)| state)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LegacyMihomoMigration {
+    removed_surface: bool,
+    unsafe_listener_auth: bool,
+    removed_tunnels: usize,
+}
+
+fn sanitize_legacy_mihomo_features(value: &mut Value) -> LegacyMihomoMigration {
+    let listen_exposed = value
+        .get("listen_host")
+        .and_then(Value::as_str)
+        .is_some_and(|host| !is_loopback_host(host));
+    let Some(features) = value
+        .get_mut("mihomo_features")
+        .and_then(Value::as_object_mut)
+    else {
+        return LegacyMihomoMigration::default();
+    };
+    let legacy_auth = features.contains_key("authentication");
+    let legacy_skip_auth = features.contains_key("skip_auth_prefixes");
+    let before = features.len();
+    const RETAINED_FEATURES: &[&str] = &[
+        "unified_delay",
+        "store_selected",
+        "keep_alive_interval",
+        "keep_alive_idle",
+        "disable_keep_alive",
+        "tcp_concurrent",
+        "quic_go_disable_gso",
+        "quic_go_disable_ecn",
+        "hosts",
+        "tunnels",
+        "external_controller",
+        "per_proxy",
+        "dns_prefer_h3",
+        "dns_respect_rules",
+        "dns_nameserver_policy",
+        "dns_default_nameserver",
+        "dns_proxy_server_nameserver_policy",
+        "dns_direct_nameserver_follow_policy",
+        "dns_fake_ip_filter_mode",
+        "dns_fake_ip_filter",
+        "dns_fake_ip_ttl",
+        "sniffer_override_destination",
+        "sniffer_force_domain",
+        "sniffer_skip_domain",
+        "sniffer_skip_src_address",
+        "sniffer_skip_dst_address",
+    ];
+    features.retain(|field, _| RETAINED_FEATURES.contains(&field.as_str()));
+    let mut removed_surface = features.len() != before;
+    if let Some(per_proxy) = features.get_mut("per_proxy").and_then(Value::as_object_mut) {
+        let before = per_proxy.len();
+        per_proxy.retain(|field, _| matches!(field.as_str(), "tfo" | "mptcp" | "ip_version"));
+        removed_surface |= per_proxy.len() != before;
+    }
+    if let Some(controller) = features
+        .get_mut("external_controller")
+        .and_then(Value::as_object_mut)
+    {
+        let before = controller.len();
+        controller.retain(|field, _| field == "secret");
+        removed_surface |= controller.len() != before;
+    }
+    let mut removed_tunnels = 0;
+    if let Some(tunnels) = features.get_mut("tunnels").and_then(Value::as_array_mut) {
+        for tunnel in tunnels.iter_mut().filter_map(Value::as_object_mut) {
+            let before = tunnel.len();
+            tunnel.retain(|field, _| {
+                matches!(field.as_str(), "network" | "address" | "target" | "proxy")
+            });
+            removed_surface |= tunnel.len() != before;
+        }
+        let before = tunnels.len();
+        tunnels.retain(|value| {
+            serde_json::from_value::<crate::mihomo_config::TunnelConfig>(value.clone())
+                .is_ok_and(|tunnel| valid_tunnel_config(&tunnel))
+        });
+        removed_tunnels = before - tunnels.len();
+        removed_surface |= removed_tunnels != 0;
+    }
+    LegacyMihomoMigration {
+        removed_surface,
+        unsafe_listener_auth: listen_exposed && (legacy_auth || legacy_skip_auth),
+        removed_tunnels,
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn deserialize_persisted_state_with_hasher(
     text: &str,
     hash: impl FnOnce(&str) -> Result<String, String>,
-) -> Result<(HincyrayState, AuthMigration), String> {
+) -> Result<(HincyrayState, AuthMigration, LegacyMihomoMigration), String> {
     let mut value: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    let legacy_mihomo_migration = sanitize_legacy_mihomo_features(&mut value);
     if let Some(split) = value
         .get_mut("split_routing")
         .and_then(Value::as_object_mut)
@@ -3353,8 +3887,11 @@ fn deserialize_persisted_state_with_hasher(
     }
     let mut state: HincyrayState =
         serde_json::from_value(value).map_err(|error| error.to_string())?;
+    if legacy_mihomo_migration.unsafe_listener_auth {
+        state.listen_host = "127.0.0.1".to_owned();
+    }
     let auth_migration = state.web_ui_auth.migrate_legacy_password_with(hash);
-    Ok((state, auth_migration))
+    Ok((state, auth_migration, legacy_mihomo_migration))
 }
 
 fn compact_state_for_persist(state: &mut HincyrayState) {
@@ -3594,13 +4131,7 @@ fn build_daemon_config(
 fn effective_mihomo_features(state: &HincyrayState) -> MihomoFeatures {
     let mut features = state.mihomo_features.clone();
     if state.safe_mode_enabled {
-        features.proxy_providers.clear();
-        features.rule_providers.clear();
-        features.sub_rules.clear();
-        features.raw_rules.clear();
-        features.typed_rules.clear();
         features.tunnels.clear();
-        features.per_proxy.smux = None;
     }
     features
 }
@@ -4592,6 +5123,11 @@ fn dispatch_from(
     daemon: &Daemon,
     peer_ip: IpAddr,
 ) -> (u16, &'static str, String) {
+    if method == "GET"
+        && let Some(raw_id) = path.strip_prefix("/api/profiles/")
+    {
+        return handle_profile_detail(raw_id, daemon);
+    }
     match (method, path) {
         ("GET", "/") => (200, "text/html; charset=utf-8", index_html().to_owned()),
         ("GET", "/api/health") => (
@@ -4632,8 +5168,7 @@ fn dispatch_from(
                 "split_routing": inner.state.split_routing,
                 "dns_enabled": inner.state.dns_settings.enabled,
                 "hwid": inner.state.hwid_config.hwid,
-                "proxy_group_enabled": inner.state.mihomo_features.proxy_group.enabled,
-                "ec_enabled": inner.state.mihomo_features.external_controller.enabled,
+                "ec_enabled": true,
                 "maintenance": inner.state.maintenance,
             });
             (200, "application/json", response.to_string())
@@ -4658,7 +5193,7 @@ fn dispatch_from(
                         "address": profile.address,
                         "port": profile.port,
                         "active": active_id == Some(profile.id),
-                        "group": profile.group,
+                        "group": normalized_profile_group(profile.group.as_deref()),
                         "dead": profile_is_dead(&inner.state, profile),
                         "block_quic": profile.block_quic,
                     })
@@ -4674,6 +5209,9 @@ fn dispatch_from(
         ("POST", "/api/profiles/add") => handle_profile_add(body, daemon),
         ("POST", "/api/profiles/delete") => handle_profile_delete(body, daemon),
         ("POST", "/api/profiles/update") => handle_profile_update(body, daemon),
+        ("POST", "/api/profiles/revalidate-ungrouped") => {
+            handle_profiles_revalidate_ungrouped(daemon)
+        }
         ("POST", "/api/profiles/share") => handle_profile_share(body, daemon),
         ("POST", "/api/profile-groups/share") => handle_profile_group_share(body, daemon),
         ("POST", "/api/profile-groups/delete") => handle_profile_group_delete(body, daemon),
@@ -4694,6 +5232,15 @@ fn dispatch_from(
         }
         ("POST", "/api/telegram-probe/confirm") => handle_telegram_probe_confirm(body, daemon),
         ("POST", "/api/telegram-probe/delete") => handle_telegram_probe_delete(daemon),
+        ("POST", "/api/profile-diagnostics/start") => handle_profile_diagnostic_start(body, daemon),
+        ("GET", "/api/profile-diagnostics/status") => handle_profile_diagnostic_status(daemon),
+        ("POST", "/api/profile-diagnostics/stop") => handle_profile_diagnostic_stop(body, daemon),
+        ("POST", "/api/profile-diagnostics/report") => {
+            handle_profile_diagnostic_report(body, daemon)
+        }
+        ("POST", "/api/profile-diagnostics/discard") => {
+            handle_profile_diagnostic_discard(body, daemon)
+        }
         ("GET", "/api/stats") => handle_stats(daemon),
         ("POST", "/api/favorites/toggle") => handle_favorites_toggle(body, daemon),
         ("GET", "/api/favorites") => handle_favorites_list(daemon),
@@ -5025,14 +5572,16 @@ fn handle_set_active(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
     };
     let id = id as usize;
 
-    let mut inner = lock(&daemon.inner);
-    let Some(profile) = inner
-        .state
-        .profiles
-        .iter()
-        .find(|profile| profile.id == id)
-        .cloned()
-    else {
+    let profile = {
+        let inner = lock(&daemon.inner);
+        inner
+            .state
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .cloned()
+    };
+    let Some(profile) = profile else {
         return (
             404,
             "application/json",
@@ -5040,7 +5589,7 @@ fn handle_set_active(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
         );
     };
 
-    if let Err(error) = apply_active_profile(&mut inner, daemon, id) {
+    if let Err(error) = apply_active_profile(daemon, id) {
         return (
             error.http_status(),
             "application/json",
@@ -5344,6 +5893,7 @@ fn redact_xhttp_opts(value: &mut serde_yaml::Value) {
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
         match key.as_str() {
+            "headers" => redact_mapping_fields(child, &[]),
             "reuse-settings" => redact_mapping_fields(
                 child,
                 &[
@@ -5365,6 +5915,7 @@ fn redact_xhttp_opts(value: &mut serde_yaml::Value) {
             | "x-padding-method"
             | "uplink-http-method"
             | "session-placement"
+            | "session-length"
             | "seq-placement"
             | "uplink-data-placement"
             | "uplink-chunk-size"
@@ -6000,15 +6551,82 @@ fn wait_for_core_readiness(
     daemon: &Daemon,
     controller: Option<&(String, Option<String>)>,
 ) -> Result<(), String> {
+    let (contract, enforce_socket_ownership) = {
+        let inner = lock(&daemon.inner);
+        let contract = CoreSocketContract::from_state(&inner.state, controller);
+        (contract, daemon_enforces_socket_ownership(daemon))
+    };
+    let contract = match contract {
+        Ok(contract) => contract,
+        Err(error) => {
+            let stop_result = lock(&daemon.inner).core.stop();
+            return Err(readiness_failure_with_stop(error, stop_result));
+        }
+    };
+    let result = observe_core_readiness(controller, || {
+        let mut inner = lock(&daemon.inner);
+        core_matches_runtime_contract(&mut inner.core, &contract, enforce_socket_ownership)
+    });
+    if let Err(error) = result {
+        let stop_result = lock(&daemon.inner).core.stop();
+        return Err(readiness_failure_with_stop(error, stop_result));
+    }
+    Ok(())
+}
+
+fn wait_for_core_readiness_locked(
+    inner: &mut DaemonInner,
+    daemon: &Daemon,
+    controller: Option<&(String, Option<String>)>,
+) -> Result<(), String> {
+    let contract = match CoreSocketContract::from_state(&inner.state, controller) {
+        Ok(contract) => contract,
+        Err(error) => {
+            let stop_result = inner.core.stop();
+            return Err(readiness_failure_with_stop(error, stop_result));
+        }
+    };
+    let result = observe_core_readiness(controller, || {
+        core_matches_runtime_contract(
+            &mut inner.core,
+            &contract,
+            daemon_enforces_socket_ownership(daemon),
+        )
+    });
+    if let Err(error) = result {
+        let stop_result = inner.core.stop();
+        return Err(readiness_failure_with_stop(error, stop_result));
+    }
+    Ok(())
+}
+
+fn observe_core_readiness(
+    controller: Option<&(String, Option<String>)>,
+    mut core_status: impl FnMut() -> Result<(bool, bool), String>,
+) -> Result<(), String> {
+    observe_core_readiness_until(
+        controller,
+        &mut core_status,
+        Duration::from_secs(2),
+        Duration::from_secs(6),
+        Duration::from_millis(100),
+    )
+}
+
+fn observe_core_readiness_until(
+    controller: Option<&(String, Option<String>)>,
+    mut core_status: impl FnMut() -> Result<(bool, bool), String>,
+    stable_for: Duration,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<(), String> {
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(6);
+    let deadline = started + timeout;
     let mut controller_ready = controller.is_none();
     loop {
-        {
-            let mut inner = lock(&daemon.inner);
-            if !inner.core.is_running() {
-                return Err("mihomo exited during readiness observation".to_owned());
-            }
+        let (running, ownership_ready) = core_status()?;
+        if !running {
+            return Err("mihomo exited during readiness observation".to_owned());
         }
         if !controller_ready
             && let Some((address, secret)) = controller
@@ -6016,18 +6634,50 @@ fn wait_for_core_readiness(
         {
             controller_ready = true;
         }
-        if started.elapsed() >= Duration::from_secs(2) && controller_ready {
+        if started.elapsed() >= stable_for && controller_ready && ownership_ready {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(if controller_ready {
+            return Err(if !ownership_ready {
+                "tracked Mihomo child does not own its expected listeners".to_owned()
+            } else if controller_ready {
                 "mihomo did not remain running for 2 seconds".to_owned()
             } else {
                 "mihomo external controller did not become ready".to_owned()
             });
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(poll_interval);
     }
+}
+
+fn core_matches_runtime_contract(
+    core: &mut CoreManager,
+    contract: &CoreSocketContract,
+    enforce_socket_ownership: bool,
+) -> Result<(bool, bool), String> {
+    let running = core.running_pid()?.is_some();
+    if !running {
+        return Ok((false, false));
+    }
+    let owns_sockets = !enforce_socket_ownership || core.owns_socket_contract(contract)?;
+    Ok((true, owns_sockets))
+}
+
+fn readiness_failure_with_stop(error: String, stop_result: Result<(), String>) -> String {
+    match stop_result {
+        Ok(()) => error,
+        Err(stop_error) => format!("{error}; stop tracked Mihomo child: {stop_error}"),
+    }
+}
+
+#[cfg(not(test))]
+fn daemon_enforces_socket_ownership(_daemon: &Daemon) -> bool {
+    true
+}
+
+#[cfg(test)]
+fn daemon_enforces_socket_ownership(daemon: &Daemon) -> bool {
+    lock(&daemon.mihomo_controller_override).is_none()
 }
 
 fn hot_reload_mihomo_config(
@@ -6043,13 +6693,104 @@ fn hot_reload_mihomo_config(
     )
 }
 
+fn hot_reload_or_restart_core_locked(
+    inner: &mut DaemonInner,
+    daemon: &Daemon,
+    state: &HincyrayState,
+    controller: Option<&(String, Option<String>)>,
+    config_path: &Path,
+    geo_dir: Option<&str>,
+) -> Result<(), String> {
+    let contract = CoreSocketContract::from_state(state, controller)?;
+    let status = core_matches_runtime_contract(
+        &mut inner.core,
+        &contract,
+        daemon_enforces_socket_ownership(daemon),
+    );
+    let (running, owned) = match status {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("hincyray: tracked Mihomo ownership check failed, restarting: {error}");
+            return inner.core.restart(&state.mihomo_path, config_path, geo_dir);
+        }
+    };
+    let result = if running
+        && owned
+        && let Some(controller) = controller
+    {
+        hot_reload_mihomo_config(controller, config_path)
+    } else {
+        inner.core.restart(&state.mihomo_path, config_path, geo_dir)
+    };
+    if result.is_ok() {
+        inner.core_generation = inner.core_generation.saturating_add(1);
+    }
+    result
+}
+
+#[derive(Clone, Debug)]
+struct FirewallRuntimeIdentity {
+    active: bool,
+    tproxy_available: bool,
+    policy_mark: Option<String>,
+    redirect_port: Option<u16>,
+    vpn_subnet: Option<String>,
+    policy_name: Option<String>,
+}
+
+impl FirewallRuntimeIdentity {
+    fn capture(firewall: &FirewallManager) -> Self {
+        Self {
+            active: firewall.active,
+            tproxy_available: firewall.tproxy_available,
+            policy_mark: firewall.policy_mark.clone(),
+            redirect_port: firewall.redirect_port,
+            vpn_subnet: firewall.vpn_subnet.clone(),
+            policy_name: firewall.policy_name.clone(),
+        }
+    }
+
+    fn matches(&self, firewall: &FirewallManager) -> bool {
+        self.active == firewall.active
+            && self.tproxy_available == firewall.tproxy_available
+            && self.policy_mark == firewall.policy_mark
+            && self.redirect_port == firewall.redirect_port
+            && self.vpn_subnet == firewall.vpn_subnet
+            && self.policy_name == firewall.policy_name
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ActivationRuntimeIdentity {
+    core_running: bool,
+    firewall: FirewallRuntimeIdentity,
+}
+
+fn capture_activation_runtime(inner: &mut DaemonInner) -> ActivationRuntimeIdentity {
+    ActivationRuntimeIdentity {
+        core_running: inner.core.is_running(),
+        firewall: FirewallRuntimeIdentity::capture(&inner.firewall),
+    }
+}
+
 fn restore_previous_activation(
     daemon: &Daemon,
     previous_config: Option<&[u8]>,
-    previous_running: bool,
+    previous_runtime: &ActivationRuntimeIdentity,
     state: &HincyrayState,
-    firewall_was_running: bool,
 ) -> String {
+    let mut inner = lock(&daemon.inner);
+    restore_previous_activation_locked(&mut inner, daemon, previous_config, previous_runtime, state)
+        .0
+}
+
+fn restore_previous_activation_locked(
+    inner: &mut DaemonInner,
+    daemon: &Daemon,
+    previous_config: Option<&[u8]>,
+    previous_runtime: &ActivationRuntimeIdentity,
+    state: &HincyrayState,
+) -> (String, bool) {
     let config_result = match previous_config {
         Some(bytes) => atomic_write_config(&daemon.mihomo_config_path, bytes),
         None => match fs::remove_file(&daemon.mihomo_config_path) {
@@ -6067,57 +6808,73 @@ fn restore_previous_activation(
         },
     };
     let geo_dir = geo_dir_from_state(state);
-    let core_result = {
-        let mut inner = lock(&daemon.inner);
-        if previous_running && previous_config.is_some() {
-            let controller = mihomo_controller(&state.mihomo_features);
-            if inner.core.is_running()
-                && let Some(controller) = controller.as_ref()
-            {
-                hot_reload_mihomo_config(controller, &daemon.mihomo_config_path)
-            } else {
-                inner.core.restart(
-                    &state.mihomo_path,
-                    &daemon.mihomo_config_path,
-                    geo_dir.as_deref(),
-                )
-            }
+    let core_result = if config_result.is_ok() {
+        if previous_runtime.core_running && previous_config.is_some() {
+            let controller = daemon_mihomo_controller(daemon, &state.mihomo_features);
+            hot_reload_or_restart_core_locked(
+                inner,
+                daemon,
+                state,
+                controller.as_ref(),
+                &daemon.mihomo_config_path,
+                geo_dir.as_deref(),
+            )
         } else {
             inner.core.stop()
         }
+    } else {
+        Err("config restore failed; runtime left unchanged".to_owned())
     };
-    let firewall_result = {
-        let mut inner = lock(&daemon.inner);
-        let expected_running = firewall_was_running && state.split_routing.enabled;
-        let contract_matches = inner.firewall.active == expected_running
-            && (!expected_running
-                || (inner.firewall.redirect_port == Some(state.split_routing.redirect_port)
-                    && inner.firewall.vpn_subnet.as_deref()
-                        == Some(state.split_routing.vpn_subnet.as_str())
-                    && inner.firewall.policy_name.as_deref()
-                        == Some(state.split_routing.policy_name.as_str())
-                    && inner.firewall.policy_mark.as_deref()
-                        == state.split_routing.policy_mark.as_deref()));
-        if contract_matches {
-            Ok(())
-        } else if expected_running {
-            let _ = inner.firewall.stop(&state.split_routing.vpn_subnet);
-            inner.firewall.start(
-                state.split_routing.redirect_port,
-                &state.split_routing.vpn_subnet,
-                &state.split_routing.policy_name,
-                state.split_routing.policy_mark.as_deref(),
-            )
-        } else {
-            let _ = inner.firewall.stop(&state.split_routing.vpn_subnet);
-            Ok(())
+    let firewall_result = if previous_runtime.firewall.matches(&inner.firewall) {
+        Ok(())
+    } else if previous_runtime.firewall.active {
+        let current_subnet = inner
+            .firewall
+            .vpn_subnet
+            .clone()
+            .unwrap_or_else(|| state.split_routing.vpn_subnet.clone());
+        let _ = inner.firewall.stop(&current_subnet);
+        match (
+            previous_runtime.firewall.redirect_port,
+            previous_runtime.firewall.vpn_subnet.as_deref(),
+            previous_runtime.firewall.policy_name.as_deref(),
+        ) {
+            (Some(redirect_port), Some(vpn_subnet), Some(policy_name)) => inner
+                .firewall
+                .start(
+                    redirect_port,
+                    vpn_subnet,
+                    policy_name,
+                    previous_runtime.firewall.policy_mark.as_deref(),
+                )
+                .and_then(|()| {
+                    previous_runtime
+                        .firewall
+                        .matches(&inner.firewall)
+                        .then_some(())
+                        .ok_or_else(|| {
+                            "restored firewall identity differs from previous".to_owned()
+                        })
+                }),
+            _ => Err("previous firewall identity is incomplete".to_owned()),
         }
+    } else {
+        let current_subnet = inner
+            .firewall
+            .vpn_subnet
+            .clone()
+            .unwrap_or_else(|| state.split_routing.vpn_subnet.clone());
+        inner.firewall.stop(&current_subnet)
     };
-    format!(
-        "config={}, core={}, firewall={}",
-        result_label(&config_result),
-        result_label(&core_result),
-        result_label(&firewall_result)
+    let complete = config_result.is_ok() && core_result.is_ok() && firewall_result.is_ok();
+    (
+        format!(
+            "config={}, core={}, firewall={}",
+            result_label(&config_result),
+            result_label(&core_result),
+            result_label(&firewall_result)
+        ),
+        complete,
     )
 }
 
@@ -6163,13 +6920,11 @@ fn activate_current_config_locked(
     configure_firewall: bool,
     projection: GeoBaseProjection,
 ) -> Result<ActivationResult, String> {
-    let (state, previous_running, firewall_was_running) = {
+    let (state, previous_runtime) = {
         let mut inner = lock(&daemon.inner);
-        (
-            inner.state.clone(),
-            inner.core.is_running(),
-            inner.firewall.is_running(),
-        )
+        let state = inner.state.clone();
+        let runtime = capture_activation_runtime(&mut inner);
+        (state, runtime)
     };
     let (mut config_yaml, generation, activated_bases) = config_plan(&state, daemon, projection)?;
     write_parovozik_provider_files(&state)?;
@@ -6189,20 +6944,20 @@ fn activate_current_config_locked(
     };
     atomic_write_config(&daemon.mihomo_config_path, config_yaml.as_bytes())?;
 
-    let should_run = previous_running || start_if_stopped;
-    let controller = mihomo_controller(&state.mihomo_features);
+    let should_run = previous_runtime.core_running || start_if_stopped;
+    let controller = daemon_mihomo_controller(daemon, &state.mihomo_features);
     let activation = (|| -> Result<(String, String), String> {
         if should_run {
-            if previous_running && let Some(controller) = controller.as_ref() {
-                hot_reload_mihomo_config(controller, &daemon.mihomo_config_path)?;
-            } else {
-                let mut inner = lock(&daemon.inner);
-                inner.core.restart(
-                    &state.mihomo_path,
-                    &daemon.mihomo_config_path,
-                    geo_dir.as_deref(),
-                )?;
-            }
+            let mut inner = lock(&daemon.inner);
+            hot_reload_or_restart_core_locked(
+                &mut inner,
+                daemon,
+                &state,
+                controller.as_ref(),
+                &daemon.mihomo_config_path,
+                geo_dir.as_deref(),
+            )?;
+            drop(inner);
             wait_for_core_readiness(daemon, controller.as_ref())?;
         }
 
@@ -6265,16 +7020,16 @@ fn activate_current_config_locked(
                 }
                 atomic_write_config(&daemon.mihomo_config_path, config_yaml.as_bytes())?;
                 if should_run {
-                    if previous_running && let Some(controller) = controller.as_ref() {
-                        hot_reload_mihomo_config(controller, &daemon.mihomo_config_path)?;
-                    } else {
-                        let mut inner = lock(&daemon.inner);
-                        inner.core.restart(
-                            &final_state.mihomo_path,
-                            &daemon.mihomo_config_path,
-                            geo_dir.as_deref(),
-                        )?;
-                    }
+                    let mut inner = lock(&daemon.inner);
+                    hot_reload_or_restart_core_locked(
+                        &mut inner,
+                        daemon,
+                        &final_state,
+                        controller.as_ref(),
+                        &daemon.mihomo_config_path,
+                        geo_dir.as_deref(),
+                    )?;
+                    drop(inner);
                     wait_for_core_readiness(daemon, controller.as_ref())?;
                 }
             }
@@ -6301,9 +7056,8 @@ fn activate_current_config_locked(
             let rollback = restore_previous_activation(
                 daemon,
                 previous_config.as_deref(),
-                previous_running,
+                &previous_runtime,
                 &state,
-                firewall_was_running,
             );
             return Err(format!("{error}; rollback: {rollback}"));
         }
@@ -6315,9 +7069,8 @@ fn activate_current_config_locked(
                 let rollback = restore_previous_activation(
                     daemon,
                     previous_config.as_deref(),
-                    previous_running,
+                    &previous_runtime,
                     &state,
-                    firewall_was_running,
                 );
                 return Err(format!("{error}; rollback: {rollback}"));
             }
@@ -6347,11 +7100,14 @@ fn handle_core_start(daemon: &Daemon) -> (u16, &'static str, String) {
 fn handle_core_stop(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
     match inner.core.stop() {
-        Ok(()) => (
-            200,
-            "application/json",
-            json!({"core_status": inner.core.status()}).to_string(),
-        ),
+        Ok(()) => {
+            inner.core_generation = inner.core_generation.saturating_add(1);
+            (
+                200,
+                "application/json",
+                json!({"core_status": inner.core.status()}).to_string(),
+            )
+        }
         Err(error) => (500, "application/json", json!({"error": error}).to_string()),
     }
 }
@@ -6372,6 +7128,12 @@ fn handle_bench_status(daemon: &Daemon) -> (u16, &'static str, String) {
     let job = inner.bench.snapshot();
     let method = job.method.map(|m| m.as_str().to_owned());
     let summary = bench_summary(&job);
+    let active_profiles = job
+        .active_profiles
+        .iter()
+        .take(6)
+        .cloned()
+        .collect::<Vec<_>>();
     let response = json!({
         "running": job.running,
         "method": method,
@@ -6379,6 +7141,7 @@ fn handle_bench_status(daemon: &Daemon) -> (u16, &'static str, String) {
         "completed": job.completed,
         "current_profile_id": job.current_profile_id,
         "current_profile_name": job.current_profile_name,
+        "active_profiles": active_profiles,
         "last_updated": job.last_updated,
         "cancel_requested": job.cancel_requested,
         "results": job.results,
@@ -6495,8 +7258,19 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         );
     }
 
-    let (profiles, core_path) = {
-        let inner = lock(&daemon.inner);
+    let daemon_for_callback = daemon.clone();
+    let on_result = Box::new(move |result: BenchResult| {
+        apply_bench_result(&daemon_for_callback, result);
+    });
+    let quick_probe =
+        matches!(method, BenchMethod::Quick | BenchMethod::Full).then(|| QuickProbeConfig {
+            telegram_session_path: telegram_session_path(&daemon.state_path)
+                .to_string_lossy()
+                .into_owned(),
+            telegram: load_telegram_config(&telegram_config_path(&daemon.state_path)).ok(),
+        });
+    let snapshot = {
+        let mut inner = lock(&daemon.inner);
         if inner.bench.is_running() {
             return (
                 409,
@@ -6513,61 +7287,42 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             Ok(profiles) => profiles,
             Err((status, error)) => return json_error(status, &error),
         };
-        let core_path = benchmark_mihomo_path(&inner.state.mihomo_path);
-        (profiles, core_path)
-    };
-
-    if profiles.is_empty() {
-        return (
-            400,
-            "application/json",
-            json!({"error": "no profiles to benchmark; import first"}).to_string(),
-        );
-    }
-
-    let job = Arc::new(Mutex::new(BenchJob::default()));
-    let cancel = Arc::new(AtomicBool::new(false));
-    let daemon_for_callback = daemon.clone();
-    let on_result = Box::new(move |result: BenchResult| {
-        apply_bench_result(&daemon_for_callback, result);
-    });
-    let quick_probe =
-        matches!(method, BenchMethod::Quick | BenchMethod::Full).then(|| QuickProbeConfig {
-            telegram_session_path: telegram_session_path(&daemon.state_path)
-                .to_string_lossy()
-                .into_owned(),
-            telegram: load_telegram_config(&telegram_config_path(&daemon.state_path)).ok(),
-        });
-
-    let handle = run_bench(
-        profiles,
-        method,
-        probe_url,
-        download_url,
-        upload_url,
-        core_path,
-        quick_probe,
-        test_download,
-        test_upload,
-        concurrency,
-        Arc::clone(&job),
-        Arc::clone(&cancel),
-        on_result,
-    );
-
-    {
-        let mut inner = lock(&daemon.inner);
-        // Drop a previously finished handle, if any.
-        if let Some(prev) = inner.bench.handle.take() {
-            let _ = prev.join();
+        if profiles.is_empty() {
+            return json_error(400, "no profiles to benchmark; import first");
         }
-        inner.bench.job = Some(job);
-        inner.bench.cancel = Some(cancel);
+        let core_path = benchmark_mihomo_path(&inner.state.mihomo_path);
+        let job = new_bench_job(method, profiles.len(), concurrency);
+        let cancel = Arc::new(AtomicBool::new(false));
+        if inner
+            .bench
+            .reserve(Arc::clone(&job), Arc::clone(&cancel))
+            .is_err()
+        {
+            return json_error(409, "benchmark already running; call /api/bench/stop first");
+        }
+        let handle = match run_bench(
+            profiles,
+            method,
+            probe_url,
+            download_url,
+            upload_url,
+            core_path,
+            quick_probe,
+            test_download,
+            test_upload,
+            Arc::clone(&job),
+            cancel,
+            on_result,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                inner.bench.release_reservation(&job);
+                return json_error(500, &error);
+            }
+        };
         inner.bench.handle = Some(handle);
-    }
-
-    let inner = lock(&daemon.inner);
-    let snapshot = inner.bench.snapshot();
+        inner.bench.snapshot()
+    };
     let response = json!({
         "started": true,
         "method": method.as_str(),
@@ -6865,7 +7620,7 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
                 "port": profile.port,
                 "active": active_id == Some(profile.id),
                 "favorite": favorite,
-                "group": profile.group,
+                "group": normalized_profile_group(profile.group.as_deref()),
                 "dead": profile_is_dead(&inner.state, profile),
                 "last_latency_ms": stat.filter(|s| s.has_latency).map(|s| s.last_latency_ms),
                 "last_jitter_ms": stat.filter(|s| s.has_jitter).map(|s| s.last_jitter_ms),
@@ -7250,92 +8005,713 @@ fn handle_profile_delete(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
     )
 }
 
-/// Update a profile's metadata (name and/or block_quic).
-/// Body: `{"profile_id": N, "name": "...", "block_quic": true}`.
-/// If `block_quic` changes on the active profile, regenerates config
-/// and restarts the core.
-fn handle_profile_update(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
-    let Ok(value) = serde_json::from_str::<Value>(body) else {
-        return (
-            400,
-            "application/json",
-            json!({"error": "invalid JSON body"}).to_string(),
-        );
-    };
-    let Some(id) = value
-        .get("profile_id")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize)
+fn profile_is_subscription_managed(state: &HincyrayState, profile: &Profile) -> bool {
+    let Some(group) = normalized_subscription_url(profile.group.as_deref().unwrap_or_default())
     else {
-        return (
-            400,
-            "application/json",
-            json!({"error": "missing profile_id"}).to_string(),
-        );
+        return false;
     };
+    state.subscriptions.iter().any(|subscription| {
+        normalized_subscription_url(&subscription.url).is_some_and(|url| url == group)
+    })
+}
 
-    let new_name = value.get("name").and_then(Value::as_str);
-    let new_block_quic = value.get("block_quic").and_then(Value::as_bool);
+fn normalized_profile_group(group: Option<&str>) -> Option<&str> {
+    group.map(str::trim).filter(|group| !group.is_empty())
+}
 
-    if new_name.is_none() && new_block_quic.is_none() {
-        return (
-            400,
-            "application/json",
-            json!({"error": "nothing to update — provide \"name\" or \"block_quic\""}).to_string(),
-        );
+fn normalized_subscription_url(value: &str) -> Option<String> {
+    let mut url = url::Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
     }
+    url.set_fragment(None);
+    Some(url.to_string())
+}
 
-    let mut inner = lock(&daemon.inner);
-    let Some(profile) = inner.state.profiles.iter_mut().find(|p| p.id == id) else {
+fn profile_safe_fields(state: &HincyrayState, profile: &Profile) -> ProfileSafeFields {
+    ProfileSafeFields {
+        id: profile.id,
+        server_ref: profile_server_ref(profile),
+        name: profile.name.clone(),
+        protocol: profile.protocol.to_string(),
+        transport: profile.transport(),
+        address: profile.address.clone(),
+        port: profile.port,
+        group: normalized_profile_group(profile.group.as_deref()).map(str::to_owned),
+        active: state.active_profile_id == Some(profile.id),
+        favorite: state.favorites.iter().any(|raw| raw == &profile.raw),
+        dead: profile_is_dead(state, profile),
+        block_quic: profile.block_quic,
+        subscription_managed: profile_is_subscription_managed(state, profile),
+    }
+}
+
+fn handle_profile_detail(raw_id: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    if raw_id.is_empty() || raw_id.len() > 20 || !raw_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return json_error(400, "profile id must be a bounded non-negative integer");
+    }
+    let Ok(id) = raw_id.parse::<usize>() else {
+        return json_error(400, "profile id is out of range");
+    };
+    let inner = lock(&daemon.inner);
+    let Some(profile) = inner.state.profiles.iter().find(|profile| profile.id == id) else {
         return (
             404,
             "application/json",
             json!({"error": "profile not found", "profile_id": id}).to_string(),
         );
     };
+    let safe = profile_safe_fields(&inner.state, profile);
+    json_response(&ProfileDetailResponse {
+        profile: ProfileDetail {
+            id: safe.id,
+            server_ref: safe.server_ref,
+            name: safe.name,
+            raw: profile.raw.clone(),
+            protocol: safe.protocol,
+            transport: safe.transport,
+            address: safe.address,
+            port: safe.port,
+            group: safe.group,
+            active: safe.active,
+            favorite: safe.favorite,
+            dead: safe.dead,
+            block_quic: safe.block_quic,
+            subscription_managed: safe.subscription_managed,
+        },
+    })
+}
 
-    let mut changed_block_quic = false;
-    if let Some(name) = new_name {
-        profile.name = name.to_owned();
+fn parse_single_profile(raw: &str) -> Result<Profile, String> {
+    if raw.len() > MAX_PROFILE_RAW_BYTES {
+        return Err(format!(
+            "raw profile exceeds the {MAX_PROFILE_RAW_BYTES} byte limit"
+        ));
     }
-    if let Some(block) = new_block_quic
-        && profile.block_quic != block
+    let parsed = parse_input(raw);
+    if !parsed.subscriptions.is_empty() {
+        return Err("subscription URLs cannot be used as a profile share link".to_owned());
+    }
+    if parsed.candidates != 1 || parsed.profiles.len() != 1 || parsed.unsupported_placeholders != 0
     {
-        profile.block_quic = block;
-        changed_block_quic = true;
+        return Err("raw must contain exactly one supported profile share link".to_owned());
     }
+    parsed
+        .profiles
+        .into_iter()
+        .next()
+        .ok_or_else(|| "raw does not contain a supported profile share link".to_owned())
+}
 
-    let is_active = inner.state.active_profile_id == Some(id);
+fn profile_has_enabled_pinned_route(state: &HincyrayState, profile: &Profile) -> bool {
+    let canonical = canonical_profile_raw(profile);
+    let pinned_refs: HashSet<&str> = state
+        .server_route_registry
+        .iter()
+        .filter(|entry| entry.canonical_raw == canonical)
+        .map(|entry| entry.server_ref.as_str())
+        .collect();
+    state
+        .routing_rules
+        .iter()
+        .filter(|rule| rule.enabled)
+        .map(|rule| rule.target.as_str())
+        .chain(
+            state
+                .device_routes
+                .iter()
+                .filter(|route| route.enabled)
+                .map(|route| route.target.as_str()),
+        )
+        .filter_map(|target| match RoutingTarget::parse(target).ok()? {
+            RoutingTarget::Server(server_ref) => Some(server_ref),
+            _ => None,
+        })
+        .any(|server_ref| pinned_refs.contains(server_ref.as_str()))
+        || (state.split_routing.parovozik_enabled
+            && state
+                .split_routing
+                .parovozik_server_refs
+                .iter()
+                .any(|server_ref| pinned_refs.contains(server_ref.as_str())))
+}
 
-    // If block_quic changed on the active profile, regenerate config
-    // and restart the core so the change takes effect.
-    if changed_block_quic && is_active {
-        let geo_dir = geo_dir_from_state(&inner.state);
-        if let Ok((binary_path, config_path)) = regenerate_config(&inner.state, daemon) {
-            let _ = inner
-                .core
-                .restart(&binary_path, &config_path, geo_dir.as_deref());
+fn replace_string_value(values: &mut Vec<String>, old: &str, new: &str) {
+    for value in values.iter_mut().filter(|value| value.as_str() == old) {
+        *value = new.to_owned();
+    }
+    let mut unique = HashSet::new();
+    values.retain(|value| unique.insert(value.clone()));
+}
+
+fn migrate_profile_identity(state: &mut HincyrayState, old: &Profile, replacement: &Profile) {
+    if old.raw != replacement.raw {
+        replace_string_value(&mut state.favorites, &old.raw, &replacement.raw);
+        state
+            .stats
+            .retain(|stat| stat.profile_raw != replacement.raw || stat.profile_raw == old.raw);
+        for stat in state
+            .stats
+            .iter_mut()
+            .filter(|stat| stat.profile_raw == old.raw)
+        {
+            stat.profile_raw = replacement.raw.clone();
         }
     }
 
-    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+    let old_lifecycle_ref = profile_server_ref(old);
+    let new_lifecycle_ref = profile_server_ref(replacement);
+    if old_lifecycle_ref != new_lifecycle_ref {
+        if state.dead_server_refs.remove(&old_lifecycle_ref) {
+            state.dead_server_refs.insert(new_lifecycle_ref.clone());
+        }
+        if let Some(promoted_at) = state.dead_promoted_at.remove(&old_lifecycle_ref) {
+            state
+                .dead_promoted_at
+                .entry(new_lifecycle_ref.clone())
+                .or_insert(promoted_at);
+        }
+        if let ProfileFilter::Explicit(server_refs) = &mut state.deep_bench.profile_filter {
+            replace_string_value(server_refs, &old_lifecycle_ref, &new_lifecycle_ref);
+        }
+        for snapshot in &mut state.quality_history {
+            if snapshot.server_ref == old_lifecycle_ref {
+                snapshot.server_ref = new_lifecycle_ref.clone();
+            }
+        }
+    }
+
+    let old_canonical = canonical_profile_raw(old);
+    let new_canonical = canonical_profile_raw(replacement);
+    if old_canonical != new_canonical {
+        let old_routing_refs: HashSet<String> = state
+            .server_route_registry
+            .iter()
+            .filter(|entry| entry.canonical_raw == old_canonical)
+            .map(|entry| entry.server_ref.clone())
+            .chain(std::iter::once(server_ref_for_canonical(&old_canonical)))
+            .collect();
+        let new_routing_ref = server_ref_for_canonical(&new_canonical);
+        for target in state
+            .routing_rules
+            .iter_mut()
+            .map(|rule| &mut rule.target)
+            .chain(
+                state
+                    .device_routes
+                    .iter_mut()
+                    .map(|route| &mut route.target),
+            )
+        {
+            if let Ok(RoutingTarget::Server(server_ref)) = RoutingTarget::parse(target)
+                && old_routing_refs.contains(&server_ref)
+            {
+                *target = format!("server:{new_routing_ref}");
+            }
+        }
+        for old_ref in old_routing_refs {
+            replace_string_value(
+                &mut state.split_routing.parovozik_server_refs,
+                &old_ref,
+                &new_routing_ref,
+            );
+        }
+        state
+            .server_route_registry
+            .retain(|entry| entry.canonical_raw != old_canonical);
+    }
+}
+
+fn restore_file_snapshot(path: &Path, previous: Option<&[u8]>) -> Result<(), String> {
+    match previous {
+        Some(bytes) => atomic_write_config(path, bytes),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        },
+    }
+}
+
+struct QualityHistorySnapshot {
+    bytes: Option<Vec<u8>>,
+    history: Vec<DailyQualitySnapshot>,
+}
+
+fn load_quality_history_for_profile_mutation(
+    state_path: &Path,
+    profiles: &[Profile],
+) -> Result<QualityHistorySnapshot, String> {
+    let bytes = match fs::read(quality_history_path(state_path)) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("read quality history: {error}")),
+    };
+    let mut history: Vec<DailyQualitySnapshot> = match bytes.as_deref() {
+        Some(bytes) => serde_json::from_slice(bytes)
+            .map_err(|error| format!("parse quality history JSON: {error}"))?,
+        None => Vec::new(),
+    };
+    for snapshot in &mut history {
+        snapshot.server_ref = migrate_lifecycle_ref(&snapshot.server_ref, profiles).0;
+    }
+    Ok(QualityHistorySnapshot { bytes, history })
+}
+
+fn commit_profile_replacements(
+    inner: &mut MutexGuard<DaemonInner>,
+    daemon: &Daemon,
+    previous_state: HincyrayState,
+    candidate: HincyrayState,
+    apply_dataplane: bool,
+    persist_history: bool,
+    history_snapshot: Option<&QualityHistorySnapshot>,
+) -> Result<bool, String> {
+    let previous_config = match fs::read(&daemon.mihomo_config_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("read previous Mihomo config: {error}")),
+    };
+    let history_path = quality_history_path(&daemon.state_path);
+    let previous_runtime = capture_activation_runtime(inner);
+    let previous_dirty = inner.dirty;
+    inner.state = candidate;
+
+    if apply_dataplane
+        && let Err(error) = apply_profile_dataplane_locked(inner, daemon, &previous_runtime)
+    {
+        inner.state = previous_state.clone();
+        inner.dirty = previous_dirty;
+        let (runtime_rollback, _) = restore_previous_activation_locked(
+            inner,
+            daemon,
+            previous_config.as_deref(),
+            &previous_runtime,
+            &previous_state,
+        );
+        return Err(format!(
+            "profile dataplane apply failed: {error}; rollback: memory=restored, {runtime_rollback}"
+        ));
+    }
+
+    let persist_result = persist_state(&daemon.state_path, &inner.state).and_then(|()| {
+        if persist_history {
+            persist_quality_history(&history_path, &inner.state.quality_history)?;
+            #[cfg(test)]
+            if daemon
+                .fail_profile_history_persist_after_write
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err("injected profile history persist failure after write".to_owned());
+            }
+        }
+        Ok(())
+    });
+    if let Err(error) = persist_result {
+        let restored_state = previous_state.clone();
+        inner.state = previous_state;
+        inner.dirty = previous_dirty;
+        let state_rollback = persist_state(&daemon.state_path, &restored_state);
+        let history_rollback = if persist_history {
+            restore_file_snapshot(
+                &history_path,
+                history_snapshot.and_then(|snapshot| snapshot.bytes.as_deref()),
+            )
+        } else {
+            Ok(())
+        };
+        let (runtime_rollback, _) = restore_previous_activation_locked(
+            inner,
+            daemon,
+            previous_config.as_deref(),
+            &previous_runtime,
+            &restored_state,
+        );
+        return Err(format!(
+            "persist profile mutation: {error}; rollback: state={}, history={}, {runtime_rollback}",
+            result_label(&state_rollback),
+            result_label(&history_rollback)
+        ));
+    }
+    Ok(apply_dataplane)
+}
+
+fn apply_profile_dataplane_locked(
+    inner: &mut MutexGuard<DaemonInner>,
+    daemon: &Daemon,
+    previous_runtime: &ActivationRuntimeIdentity,
+) -> Result<(), String> {
+    let (config_yaml, _, _) = config_plan(&inner.state, daemon, GeoBaseProjection::Applied)?;
+    write_parovozik_provider_files(&inner.state)?;
+    let geo_dir = geo_dir_from_state(&inner.state);
+    let validation =
+        validate_mihomo_config_yaml(&inner.state.mihomo_path, &config_yaml, geo_dir.as_deref());
+    if validation.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(format!(
+            "config validation failed: {}",
+            validation_error(&validation)
+        ));
+    }
+    atomic_write_config(&daemon.mihomo_config_path, config_yaml.as_bytes())?;
+    if !previous_runtime.core_running {
+        return Ok(());
+    }
+    let controller = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
+    let state = inner.state.clone();
+    hot_reload_or_restart_core_locked(
+        inner,
+        daemon,
+        &state,
+        controller.as_ref(),
+        &daemon.mihomo_config_path,
+        geo_dir.as_deref(),
+    )?;
+    wait_for_core_readiness_locked(inner, daemon, controller.as_ref())
+}
+
+fn handle_profile_update(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request: ProfileUpdateRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid profile update JSON: {error}")),
+    };
+    if request.name.is_none() && request.raw.is_none() && request.block_quic.is_none() {
+        return json_error(400, "provide at least one of name, raw, or block_quic");
+    }
+    if !valid_lifecycle_ref(&request.expected_server_ref) {
+        return json_error(400, "expected_server_ref is malformed");
+    }
+    if request
+        .name
+        .as_ref()
+        .is_some_and(|name| name.chars().count() > MAX_PROFILE_NAME_CHARS)
+    {
+        return json_error(400, "profile name exceeds 256 characters");
+    }
+    let parsed_raw = match request.raw.as_deref() {
+        Some(raw) => match parse_single_profile(raw) {
+            Ok(profile) => Some(profile),
+            Err(error) => return json_error(400, &error),
+        },
+        None => None,
+    };
+
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    let mut inner = lock(&daemon.inner);
+    let mut previous_state = inner.state.clone();
+    let Some(old) = previous_state
+        .profiles
+        .iter()
+        .find(|profile| profile.id == request.profile_id)
+        .cloned()
+    else {
         return (
-            500,
+            404,
             "application/json",
-            json!({"error": format!("persist state: {error}")}).to_string(),
+            json!({"error": "profile not found", "profile_id": request.profile_id}).to_string(),
+        );
+    };
+    let actual_ref = profile_server_ref(&old);
+    if actual_ref != request.expected_server_ref {
+        return (
+            409,
+            "application/json",
+            json!({
+                "error": "profile identity changed; refresh the profile list and retry",
+                "profile_id": request.profile_id,
+                "expected_server_ref": request.expected_server_ref,
+                "actual_server_ref": actual_ref,
+            })
+            .to_string(),
+        );
+    }
+    if parsed_raw.is_some() && profile_is_subscription_managed(&previous_state, &old) {
+        return json_error(
+            400,
+            "subscription-managed profile raw links cannot be edited; create a manual copy instead",
         );
     }
 
-    (
-        200,
-        "application/json",
-        json!({
-            "profile_id": id,
-            "name": inner.state.profiles.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default(),
-            "block_quic": inner.state.profiles.iter().find(|p| p.id == id).map(|p| p.block_quic).unwrap_or(false),
-        })
-        .to_string(),
-    )
+    let mut replacement = parsed_raw.unwrap_or_else(|| old.clone());
+    replacement.id = old.id;
+    replacement.name = request.name.clone().unwrap_or_else(|| old.name.clone());
+    replacement.group = old.group.clone();
+    replacement.selected = old.selected;
+    replacement.block_quic = request.block_quic.unwrap_or(old.block_quic);
+
+    if previous_state.profiles.iter().any(|profile| {
+        profile.id != old.id
+            && canonical_lifecycle_identity(profile) == canonical_lifecycle_identity(&replacement)
+    }) {
+        return json_error(409, "another profile already has this connection identity");
+    }
+
+    let rollback_state = previous_state.clone();
+    sync_server_route_registry(&mut previous_state);
+    let old_lifecycle_ref = profile_server_ref(&old);
+    let new_lifecycle_ref = profile_server_ref(&replacement);
+    if old_lifecycle_ref != new_lifecycle_ref
+        && previous_state
+            .profiles
+            .iter()
+            .any(|profile| profile.id != old.id && profile_server_ref(profile) == old_lifecycle_ref)
+    {
+        return json_error(
+            409,
+            "profile connection identity is shared; remove the duplicate before changing raw",
+        );
+    }
+    let history_snapshot = if old_lifecycle_ref != new_lifecycle_ref {
+        match load_quality_history_for_profile_mutation(
+            &daemon.state_path,
+            &previous_state.profiles,
+        ) {
+            Ok(snapshot) => {
+                previous_state.quality_history = snapshot.history.clone();
+                Some(snapshot)
+            }
+            Err(error) => return json_error(500, &error),
+        }
+    } else {
+        None
+    };
+    let raw_or_quic_changed =
+        old.raw != replacement.raw || old.block_quic != replacement.block_quic;
+    let apply_dataplane = previous_state.active_profile_id.is_some()
+        && raw_or_quic_changed
+        && (previous_state.active_profile_id == Some(old.id)
+            || profile_has_enabled_pinned_route(&previous_state, &old));
+    let mut candidate = previous_state.clone();
+    let Some(slot) = candidate
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.id == old.id)
+    else {
+        return json_error(500, "profile disappeared during update");
+    };
+    *slot = replacement.clone();
+    migrate_profile_identity(&mut candidate, &old, &replacement);
+    sync_server_route_registry(&mut candidate);
+    let persist_history = old_lifecycle_ref != new_lifecycle_ref
+        && candidate
+            .quality_history
+            .iter()
+            .any(|snapshot| snapshot.server_ref == new_lifecycle_ref);
+
+    let dataplane_applied = match commit_profile_replacements(
+        &mut inner,
+        daemon,
+        rollback_state,
+        candidate,
+        apply_dataplane,
+        persist_history,
+        history_snapshot.as_ref(),
+    ) {
+        Ok(applied) => applied,
+        Err(error) => return json_error(500, &error),
+    };
+    let profile = inner
+        .state
+        .profiles
+        .iter()
+        .find(|profile| profile.id == old.id)
+        .expect("committed profile exists");
+    json_response(&ProfileUpdateResponse {
+        profile: profile_safe_fields(&inner.state, profile),
+        dataplane_applied,
+    })
+}
+
+fn handle_profiles_revalidate_ungrouped(daemon: &Daemon) -> (u16, &'static str, String) {
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    let mut inner = lock(&daemon.inner);
+    let mut previous_state = inner.state.clone();
+    let ungrouped: Vec<Profile> = previous_state
+        .profiles
+        .iter()
+        .filter(|profile| normalized_profile_group(profile.group.as_deref()).is_none())
+        .cloned()
+        .collect();
+    if ungrouped.is_empty() {
+        return json_response(&ProfilesRevalidateResponse {
+            checked: 0,
+            updated: 0,
+            unchanged: 0,
+            dataplane_applied: false,
+            errors: Vec::new(),
+        });
+    }
+
+    let mut validated = Vec::with_capacity(ungrouped.len());
+    let mut errors = Vec::new();
+    for old in &ungrouped {
+        match parse_single_profile(&old.raw) {
+            Ok(mut replacement) => {
+                replacement.id = old.id;
+                replacement.name = old.name.clone();
+                replacement.group = None;
+                replacement.selected = old.selected;
+                replacement.block_quic = old.block_quic;
+                validated.push((old.clone(), replacement));
+            }
+            Err(error) => {
+                if errors.len() < MAX_PROFILE_REVALIDATION_ERRORS {
+                    errors.push(ProfileRevalidationError {
+                        profile_id: old.id,
+                        name: old.name.chars().take(MAX_PROFILE_NAME_CHARS).collect(),
+                        error: error.chars().take(256).collect(),
+                    });
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        let response = ProfilesRevalidateResponse {
+            checked: ungrouped.len(),
+            updated: 0,
+            unchanged: ungrouped.len(),
+            dataplane_applied: false,
+            errors,
+        };
+        return (
+            400,
+            "application/json",
+            serde_json::to_string(&response).unwrap_or_default(),
+        );
+    }
+
+    let mut old_identity_counts = HashMap::new();
+    for profile in &previous_state.profiles {
+        *old_identity_counts
+            .entry(canonical_lifecycle_identity(profile))
+            .or_insert(0_usize) += 1;
+    }
+    let mut new_identity_counts = old_identity_counts.clone();
+    let mut identity_changes = Vec::new();
+    for (old, replacement) in &validated {
+        let old_identity = canonical_lifecycle_identity(old);
+        let new_identity = canonical_lifecycle_identity(replacement);
+        if old_identity == new_identity {
+            continue;
+        }
+        if let Some(count) = new_identity_counts.get_mut(&old_identity) {
+            *count = count.saturating_sub(1);
+        }
+        *new_identity_counts.entry(new_identity.clone()).or_insert(0) += 1;
+        identity_changes.push((replacement, new_identity));
+    }
+    identity_changes.sort_by_key(|(profile, _)| profile.id);
+    for (profile, _) in identity_changes
+        .into_iter()
+        .filter(|(_, identity)| new_identity_counts.get(identity).copied().unwrap_or(0) > 1)
+        .take(MAX_PROFILE_REVALIDATION_ERRORS)
+    {
+        errors.push(ProfileRevalidationError {
+            profile_id: profile.id,
+            name: profile.name.chars().take(MAX_PROFILE_NAME_CHARS).collect(),
+            error: "duplicate connection identity after revalidation".to_owned(),
+        });
+    }
+    if !errors.is_empty() {
+        let response = ProfilesRevalidateResponse {
+            checked: ungrouped.len(),
+            updated: 0,
+            unchanged: ungrouped.len(),
+            dataplane_applied: false,
+            errors,
+        };
+        return (
+            409,
+            "application/json",
+            serde_json::to_string(&response).unwrap_or_default(),
+        );
+    }
+
+    let rollback_state = previous_state.clone();
+    sync_server_route_registry(&mut previous_state);
+    let lifecycle_changes = validated
+        .iter()
+        .any(|(old, replacement)| profile_server_ref(old) != profile_server_ref(replacement));
+    let history_snapshot = if lifecycle_changes {
+        match load_quality_history_for_profile_mutation(
+            &daemon.state_path,
+            &previous_state.profiles,
+        ) {
+            Ok(snapshot) => {
+                previous_state.quality_history = snapshot.history.clone();
+                Some(snapshot)
+            }
+            Err(error) => return json_error(500, &error),
+        }
+    } else {
+        None
+    };
+    let mut candidate = previous_state.clone();
+    let mut updated = 0;
+    let mut apply_dataplane = false;
+    let mut persist_history = false;
+    for (old, replacement) in validated {
+        let changed = old.protocol != replacement.protocol
+            || old.address != replacement.address
+            || old.port != replacement.port
+            || old.raw != replacement.raw;
+        if !changed {
+            continue;
+        }
+        updated += 1;
+        apply_dataplane |= candidate.active_profile_id.is_some()
+            && (candidate.active_profile_id == Some(old.id)
+                || profile_has_enabled_pinned_route(&candidate, &old));
+        persist_history |= profile_server_ref(&old) != profile_server_ref(&replacement)
+            && candidate
+                .quality_history
+                .iter()
+                .any(|snapshot| snapshot.server_ref == profile_server_ref(&old));
+        let Some(slot) = candidate
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == old.id)
+        else {
+            return json_error(500, "profile disappeared during revalidation");
+        };
+        *slot = replacement.clone();
+        migrate_profile_identity(&mut candidate, &old, &replacement);
+    }
+    sync_server_route_registry(&mut candidate);
+    let unchanged = ungrouped.len().saturating_sub(updated);
+    if updated == 0 {
+        return json_response(&ProfilesRevalidateResponse {
+            checked: ungrouped.len(),
+            updated,
+            unchanged,
+            dataplane_applied: false,
+            errors: Vec::new(),
+        });
+    }
+    let dataplane_applied = match commit_profile_replacements(
+        &mut inner,
+        daemon,
+        rollback_state,
+        candidate,
+        apply_dataplane,
+        persist_history,
+        history_snapshot.as_ref(),
+    ) {
+        Ok(applied) => applied,
+        Err(error) => return json_error(500, &error),
+    };
+    json_response(&ProfilesRevalidateResponse {
+        checked: ungrouped.len(),
+        updated,
+        unchanged,
+        dataplane_applied,
+        errors: Vec::new(),
+    })
 }
 
 /// Return a profile's raw share link and QR SVG. The UI deliberately sends
@@ -8979,6 +10355,9 @@ fn handle_api_contracts() -> (u16, &'static str, String) {
         version: 1,
         bounded_endpoints: vec![
             "/api/onboarding/status",
+            "/api/profiles/{id}",
+            "/api/profiles/update",
+            "/api/profiles/revalidate-ungrouped",
             "/api/routing/summary",
             "/api/routing/connection-context",
             "/api/routing/preview",
@@ -8986,6 +10365,11 @@ fn handle_api_contracts() -> (u16, &'static str, String) {
             "/api/memory-estimate",
             "/api/mihomo-api/connections/page",
             "/api/mihomo-api/connections/device-traffic",
+            "/api/profile-diagnostics/start",
+            "/api/profile-diagnostics/status",
+            "/api/profile-diagnostics/stop",
+            "/api/profile-diagnostics/report",
+            "/api/profile-diagnostics/discard",
             "/api/safe-mode",
         ],
         schema_endpoint: "/api/openapi.json",
@@ -10091,7 +11475,7 @@ fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
 /// v0.17: Reset routing policy to factory defaults.
 ///
 /// Resets: ru_direct, match_target, port_mode, proxy_ports,
-/// quic_mode, routing_rules, raw_rules. Infrastructure settings (enabled,
+/// quic_mode, and routing_rules. Infrastructure settings (enabled,
 /// auto_switch, vpn_subnet, redirect_port, policy_name, geo_asset_path)
 /// are preserved. Pass `{"apply":true}` to persist, regenerate the config,
 /// restart the core, and roll state back if activation fails.
@@ -10143,9 +11527,6 @@ fn handle_routing_reset(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
             network: "udp".to_owned(),
             port_mode: "include".to_owned(),
         }];
-
-        // Clear user-defined raw Mihomo rules (RKN bypass injects its own).
-        inner.state.mihomo_features.raw_rules = Vec::new();
 
         if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
             return (
@@ -10693,7 +12074,7 @@ fn handle_routing_chain_check(body: &str, daemon: &Daemon) -> (u16, &'static str
             active_profile_id,
             route,
             inner.state.routing_rules.clone(),
-            mihomo_controller(&inner.state.mihomo_features),
+            daemon_mihomo_controller(daemon, &inner.state.mihomo_features),
         )
     };
 
@@ -11036,7 +12417,7 @@ fn find_arp_device(ip: &str) -> Option<String> {
 }
 
 fn mihomo_source_seen(addr: &str, secret: Option<&str>, source_ip: &str) -> Result<bool, String> {
-    let value = mihomo_api_get_json(addr, secret, "/connections")?;
+    let value = mihomo_api_get_connections_json(addr, secret)?;
     let Some(connections) = value.get("connections").and_then(Value::as_array) else {
         return Ok(false);
     };
@@ -11441,7 +12822,13 @@ fn handle_dns_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
             json!({"error": "invalid JSON body"}).to_string(),
         );
     };
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
     let mut inner = lock(&daemon.inner);
+    let previous_dns = inner.state.dns_settings.clone();
+    let previous_override = inner.state.mihomo_features.sniffer_override_destination;
     if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
         inner.state.dns_settings.enabled = v;
     }
@@ -11469,6 +12856,8 @@ fn handle_dns_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
         inner.state.mihomo_features.sniffer_override_destination = v;
     }
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        inner.state.dns_settings = previous_dns;
+        inner.state.mihomo_features.sniffer_override_destination = previous_override;
         return (
             500,
             "application/json",
@@ -11730,43 +13119,2005 @@ fn apply_maintenance_settings(settings: &mut MaintenanceSettings, value: &Value)
     }
 }
 
-/// Return the current MihomoFeatures configuration.
-fn handle_mihomo_features_get(daemon: &Daemon) -> (u16, &'static str, String) {
-    let inner = lock(&daemon.inner);
-    (
-        200,
-        "application/json",
-        serde_json::to_string(&inner.state.mihomo_features).unwrap_or_else(|_| "{}".to_owned()),
-    )
+fn mihomo_parameters(features: &MihomoFeatures) -> MihomoParameters {
+    MihomoParameters {
+        unified_delay: features.unified_delay,
+        store_selected: features.store_selected,
+        keep_alive_interval: features.keep_alive_interval,
+        keep_alive_idle: features.keep_alive_idle,
+        disable_keep_alive: features.disable_keep_alive,
+        tcp_concurrent: features.tcp_concurrent,
+        hosts: features.hosts.clone(),
+        tunnels: features.tunnels.clone(),
+        per_proxy: MihomoPerProxyParameters {
+            tfo: features.per_proxy.tfo,
+            mptcp: features.per_proxy.mptcp,
+            ip_version: features.per_proxy.ip_version.clone(),
+        },
+        dns: MihomoDnsParameters {
+            prefer_h3: features.dns_prefer_h3,
+            respect_rules: features.dns_respect_rules,
+            default_nameserver: features.dns_default_nameserver.clone(),
+            nameserver_policy: features.dns_nameserver_policy.clone(),
+            proxy_server_nameserver_policy: features.dns_proxy_server_nameserver_policy.clone(),
+            direct_nameserver_follow_policy: features.dns_direct_nameserver_follow_policy,
+            fake_ip_filter_mode: features.dns_fake_ip_filter_mode.clone(),
+            fake_ip_filter: features.dns_fake_ip_filter.clone(),
+            fake_ip_ttl: features.dns_fake_ip_ttl,
+        },
+        sniffer: MihomoSnifferParameters {
+            force_domain: features.sniffer_force_domain.clone(),
+            skip_domain: features.sniffer_skip_domain.clone(),
+            skip_src_address: features.sniffer_skip_src_address.clone(),
+            skip_dst_address: features.sniffer_skip_dst_address.clone(),
+        },
+        experimental: MihomoExperimentalParameters {
+            quic_go_disable_gso: features.quic_go_disable_gso,
+            quic_go_disable_ecn: features.quic_go_disable_ecn,
+        },
+    }
 }
 
-/// Update the MihomoFeatures configuration. The body must be a complete
-/// `MihomoFeatures` JSON object (obtainable via GET /api/mihomo-features).
-/// All fields have serde defaults, so missing fields use their defaults.
-fn handle_mihomo_features_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
-    let features: MihomoFeatures = match serde_json::from_str(body) {
-        Ok(f) => f,
-        Err(e) => {
-            return (
-                400,
-                "application/json",
-                json!({"error": format!("invalid MihomoFeatures JSON: {e}")}).to_string(),
+fn mihomo_parameters_response(
+    features: &MihomoFeatures,
+    external_controller_connected: bool,
+) -> MihomoParametersResponse {
+    MihomoParametersResponse {
+        parameters: mihomo_parameters(features),
+        runtime: MihomoParametersRuntime {
+            geodata_loader: "memconservative",
+            store_fake_ip: true,
+            udp: true,
+            external_controller: MihomoExternalControllerRuntime {
+                enabled: true,
+                address: "127.0.0.1:9090",
+                connected: external_controller_connected,
+            },
+        },
+    }
+}
+
+fn apply_mihomo_parameters(features: &mut MihomoFeatures, parameters: MihomoParameters) {
+    features.unified_delay = parameters.unified_delay;
+    features.store_selected = parameters.store_selected;
+    features.keep_alive_interval = parameters.keep_alive_interval;
+    features.keep_alive_idle = parameters.keep_alive_idle;
+    features.disable_keep_alive = parameters.disable_keep_alive;
+    features.tcp_concurrent = parameters.tcp_concurrent;
+    features.quic_go_disable_gso = parameters.experimental.quic_go_disable_gso;
+    features.quic_go_disable_ecn = parameters.experimental.quic_go_disable_ecn;
+    features.hosts = parameters.hosts;
+    features.tunnels = parameters.tunnels;
+    features.per_proxy.tfo = parameters.per_proxy.tfo;
+    features.per_proxy.mptcp = parameters.per_proxy.mptcp;
+    features.per_proxy.ip_version = parameters.per_proxy.ip_version;
+    features.dns_prefer_h3 = parameters.dns.prefer_h3;
+    features.dns_respect_rules = parameters.dns.respect_rules;
+    features.dns_nameserver_policy = parameters.dns.nameserver_policy;
+    features.dns_default_nameserver = parameters.dns.default_nameserver;
+    features.dns_proxy_server_nameserver_policy = parameters.dns.proxy_server_nameserver_policy;
+    features.dns_direct_nameserver_follow_policy = parameters.dns.direct_nameserver_follow_policy;
+    features.dns_fake_ip_filter_mode = parameters.dns.fake_ip_filter_mode;
+    features.dns_fake_ip_filter = parameters.dns.fake_ip_filter;
+    features.dns_fake_ip_ttl = parameters.dns.fake_ip_ttl;
+    features.sniffer_force_domain = parameters.sniffer.force_domain;
+    features.sniffer_skip_domain = parameters.sniffer.skip_domain;
+    features.sniffer_skip_src_address = parameters.sniffer.skip_src_address;
+    features.sniffer_skip_dst_address = parameters.sniffer.skip_dst_address;
+}
+
+fn validate_mihomo_parameters(parameters: &MihomoParameters) -> Result<(), String> {
+    const MAX_ITEMS: usize = 256;
+    const MAX_TEXT: usize = 512;
+    if parameters.keep_alive_interval > 86_400 || parameters.keep_alive_idle > 86_400 {
+        return Err("keep-alive values must be between 0 and 86400 seconds".to_owned());
+    }
+    if !matches!(
+        parameters.per_proxy.ip_version.as_str(),
+        "dual" | "ipv4" | "ipv6" | "ipv4-prefer" | "ipv6-prefer"
+    ) {
+        return Err("per_proxy.ip_version is invalid".to_owned());
+    }
+    if !matches!(
+        parameters.dns.fake_ip_filter_mode.as_deref(),
+        None | Some("blacklist") | Some("whitelist")
+    ) {
+        return Err("dns_fake_ip_filter_mode must be blacklist or whitelist".to_owned());
+    }
+    if parameters
+        .dns
+        .fake_ip_ttl
+        .is_some_and(|ttl| ttl == 0 || ttl > 86_400)
+    {
+        return Err("dns_fake_ip_ttl must be between 1 and 86400".to_owned());
+    }
+    if parameters.hosts.len() > MAX_ITEMS || parameters.tunnels.len() > 64 {
+        return Err("hosts or tunnels exceeds the supported limit".to_owned());
+    }
+    for (host, address) in &parameters.hosts {
+        if host.trim().is_empty()
+            || host.len() > 253
+            || host
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+            || address.trim().is_empty()
+            || address.len() > MAX_TEXT
+            || address
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+        {
+            return Err("hosts contains an invalid name or address".to_owned());
+        }
+    }
+    for tunnel in &parameters.tunnels {
+        if !valid_tunnel_config(tunnel) {
+            return Err(
+                "tunnels contains an invalid network, address, target, or proxy".to_owned(),
             );
         }
+    }
+    let lists = [
+        &parameters.dns.default_nameserver,
+        &parameters.dns.fake_ip_filter,
+        &parameters.sniffer.force_domain,
+        &parameters.sniffer.skip_domain,
+        &parameters.sniffer.skip_src_address,
+        &parameters.sniffer.skip_dst_address,
+    ];
+    if lists.iter().any(|list| {
+        list.len() > MAX_ITEMS
+            || list.iter().any(|value| {
+                value.trim().is_empty()
+                    || value.len() > MAX_TEXT
+                    || value.chars().any(char::is_control)
+            })
+    }) {
+        return Err("a Mihomo parameter list contains invalid or excessive entries".to_owned());
+    }
+    for policy in [
+        &parameters.dns.nameserver_policy,
+        &parameters.dns.proxy_server_nameserver_policy,
+    ] {
+        if policy.len() > MAX_ITEMS
+            || policy.iter().any(|(name, servers)| {
+                name.trim().is_empty()
+                    || name.len() > 253
+                    || name.chars().any(char::is_control)
+                    || servers.is_empty()
+                    || servers.len() > 16
+                    || servers.iter().any(|server| {
+                        server.trim().is_empty()
+                            || server.len() > MAX_TEXT
+                            || server.chars().any(char::is_control)
+                    })
+            })
+        {
+            return Err("a DNS nameserver policy is invalid or excessive".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn valid_tunnel_config(tunnel: &crate::mihomo_config::TunnelConfig) -> bool {
+    let address = tunnel.address.parse::<std::net::SocketAddr>().ok();
+    !tunnel.network.is_empty()
+        && tunnel.network.len() <= 2
+        && tunnel
+            .network
+            .iter()
+            .all(|network| network == "tcp" || network == "udp")
+        && !tunnel.network[1..].contains(&tunnel.network[0])
+        && address.is_some_and(|address| address.port() != 0 && address.ip().is_loopback())
+        && valid_host_port(&tunnel.target)
+        && tunnel.proxy.as_ref().is_none_or(|proxy| {
+            !proxy.trim().is_empty() && proxy.len() <= 128 && !proxy.chars().any(char::is_control)
+        })
+}
+
+fn valid_host_port(value: &str) -> bool {
+    if value.trim().is_empty()
+        || value.len() > 512
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return false;
+    }
+    if let Ok(address) = value.parse::<std::net::SocketAddr>() {
+        return address.port() != 0;
+    }
+    let Some((host, port)) = value.rsplit_once(':') else {
+        return false;
     };
-    let mut inner = lock(&daemon.inner);
-    inner.state.mihomo_features = features;
-    let _ = persist_state(&daemon.state_path, &inner.state);
-    (
-        200,
-        "application/json",
-        serde_json::to_string(&inner.state.mihomo_features).unwrap_or_else(|_| "{}".to_owned()),
-    )
+    !host.trim().is_empty()
+        && host.len() <= 253
+        && valid_hostname(host)
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
+fn valid_hostname(host: &str) -> bool {
+    host.parse::<IpAddr>().is_ok()
+        || host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+/// Return the strict public Mihomo parameters projection without controller secrets.
+fn handle_mihomo_features_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let (features, controller) = {
+        let inner = lock(&daemon.inner);
+        (
+            inner.state.mihomo_features.clone(),
+            daemon_mihomo_controller(daemon, &inner.state.mihomo_features),
+        )
+    };
+    let connected = controller.is_some_and(|(address, secret)| {
+        mihomo_api_get(&address, secret.as_deref(), "/version").is_ok()
+    });
+    json_response(&mihomo_parameters_response(&features, connected))
+}
+
+/// Replace the retained public parameters and apply them transactionally.
+fn handle_mihomo_features_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request: MihomoParametersUpdateRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid Mihomo parameters JSON: {error}")),
+    };
+    if let Err(error) = validate_mihomo_parameters(&request.parameters) {
+        return json_error(400, &error);
+    }
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    let (previous_features, candidate_features, has_active_profile, previous_runtime) = {
+        let mut inner = lock(&daemon.inner);
+        let previous_features = inner.state.mihomo_features.clone();
+        let mut candidate_features = previous_features.clone();
+        apply_mihomo_parameters(&mut candidate_features, request.parameters);
+        (
+            previous_features,
+            candidate_features,
+            inner.state.active_profile_id.is_some(),
+            capture_activation_runtime(&mut inner),
+        )
+    };
+    let previous_config = match fs::read(&daemon.mihomo_config_path) {
+        Ok(config) => Some(config),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return json_error(500, &format!("read current Mihomo config: {error}")),
+    };
+    if has_active_profile {
+        lock(&daemon.inner).state.mihomo_features = candidate_features.clone();
+        if let Err(error) =
+            activate_current_config_locked(daemon, false, true, GeoBaseProjection::Applied)
+        {
+            lock(&daemon.inner).state.mihomo_features = previous_features;
+            return json_error(500, &format!("{error}; parameters rollback: restored"));
+        }
+    }
+    let persist_result = {
+        let mut inner = lock(&daemon.inner);
+        inner.state.mihomo_features = candidate_features;
+        persist_state(&daemon.state_path, &inner.state)
+    };
+    if let Err(error) = persist_result {
+        let rollback = restore_mihomo_features_runtime_after_persist_failure(
+            daemon,
+            previous_features,
+            previous_config.as_deref(),
+            &previous_runtime,
+        );
+        return json_error(
+            500,
+            &format!("persist state: {error}; parameters rollback: {rollback}"),
+        );
+    }
+    lock(&daemon.inner).dirty = false;
+    handle_mihomo_features_get(daemon)
+}
+
+fn restore_mihomo_features_runtime_after_persist_failure(
+    daemon: &Daemon,
+    previous_features: MihomoFeatures,
+    previous_config: Option<&[u8]>,
+    previous_runtime: &ActivationRuntimeIdentity,
+) -> String {
+    let state = {
+        let mut inner = lock(&daemon.inner);
+        inner.state.mihomo_features = previous_features;
+        inner.state.clone()
+    };
+    let runtime = restore_previous_activation(daemon, previous_config, previous_runtime, &state);
+    format!("memory=restored, disk=unchanged, {runtime}")
 }
 
 // ---------------------------------------------------------------------------
 // Mihomo external-controller API proxy endpoints
 // ---------------------------------------------------------------------------
+
+fn bounded_diagnostic_string(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
+fn bounded_diagnostic_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn redact_diagnostic_url(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Ok(url) = url::Url::parse(trimmed) {
+        if !matches!(url.scheme(), "http" | "https") {
+            return "<redacted-url>".to_owned();
+        }
+        let host = url.host_str().unwrap_or("<redacted>");
+        let port = url
+            .port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        return format!("{}://{host}{port}", url.scheme());
+    }
+    let without_query = trimmed
+        .split_once('?')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(trimmed)
+        .split_once('#')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(trimmed);
+    if let Some((prefix, _)) = without_query.rsplit_once('@')
+        && prefix.contains(':')
+    {
+        return "<redacted-userinfo>".to_owned();
+    }
+    bounded_diagnostic_string(without_query, PROFILE_DIAGNOSTIC_MAX_STRING_CHARS)
+}
+
+fn diagnostic_sensitive_key(value: &str) -> bool {
+    let normalized = value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "proxyauthorization"
+            | "auth"
+            | "authstr"
+            | "password"
+            | "passwd"
+            | "passphrase"
+            | "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "apitoken"
+            | "secret"
+            | "clientsecret"
+            | "credential"
+            | "credentials"
+            | "key"
+            | "apikey"
+            | "privatekey"
+            | "presharedkey"
+            | "psk"
+            | "uuid"
+            | "cookie"
+            | "setcookie"
+            | "session"
+            | "sessionid"
+    ) || normalized.contains("token")
+        || normalized.contains("secret")
+        || normalized.contains("password")
+        || normalized.contains("passwd")
+        || normalized.contains("passphrase")
+        || normalized.contains("credential")
+        || normalized.contains("authorization")
+        || normalized.contains("privatekey")
+        || normalized.contains("presharedkey")
+        || normalized.contains("apikey")
+        || normalized.ends_with("auth")
+        || normalized.ends_with("authstr")
+        || normalized.ends_with("psk")
+}
+
+fn diagnostic_assignment_end(value: &str, start: usize, authorization: bool) -> usize {
+    let bytes = value.as_bytes();
+    if start >= bytes.len() {
+        return start;
+    }
+    if matches!(bytes[start], b'\'' | b'"') {
+        let quote = bytes[start];
+        let mut index = start + 1;
+        while index < bytes.len() {
+            if bytes[index] == b'\\' {
+                index = (index + 2).min(bytes.len());
+            } else if bytes[index] == quote {
+                return index + 1;
+            } else {
+                index += 1;
+            }
+        }
+        return bytes.len();
+    }
+    let mut index = start;
+    while index < bytes.len()
+        && !bytes[index].is_ascii_whitespace()
+        && !matches!(bytes[index], b',' | b';' | b'}' | b']')
+    {
+        index += 1;
+    }
+    if authorization {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && !matches!(bytes[index], b',' | b';' | b'}' | b']')
+        {
+            index += 1;
+        }
+    }
+    index
+}
+
+fn redact_diagnostic_urls(value: &str) -> String {
+    let mut output = String::with_capacity(value.len().min(PROFILE_DIAGNOSTIC_MAX_STRING_CHARS));
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let Some(relative) = value[cursor..].find("://") else {
+            output.push_str(&value[cursor..]);
+            break;
+        };
+        let separator = cursor + relative;
+        let mut start = separator;
+        while start > cursor {
+            let byte = value.as_bytes()[start - 1];
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.') {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        if start == separator {
+            output.push_str(&value[cursor..separator + 3]);
+            cursor = separator + 3;
+            continue;
+        }
+        let mut end = separator + 3;
+        while end < value.len()
+            && !value.as_bytes()[end].is_ascii_whitespace()
+            && !matches!(value.as_bytes()[end], b'\'' | b'"' | b'<' | b'>')
+        {
+            end += 1;
+        }
+        let mut url_end = end;
+        while url_end > separator + 3
+            && matches!(
+                value.as_bytes()[url_end - 1],
+                b',' | b';' | b')' | b']' | b'}'
+            )
+        {
+            url_end -= 1;
+        }
+        output.push_str(&value[cursor..start]);
+        output.push_str(&redact_diagnostic_url(&value[start..url_end]));
+        output.push_str(&value[url_end..end]);
+        cursor = end;
+    }
+    output
+}
+
+fn redact_diagnostic_canaries(value: &str) -> String {
+    value
+        .split_inclusive(char::is_whitespace)
+        .map(|part| {
+            if part.to_ascii_lowercase().contains("secret-canary")
+                || part.to_ascii_lowercase().contains("secret_canary")
+            {
+                "<redacted> "
+            } else {
+                part
+            }
+        })
+        .collect()
+}
+
+fn redact_diagnostic_text_bounded(value: &str, max_chars: usize) -> String {
+    let mut output = String::with_capacity(value.len().min(max_chars));
+    let bytes = value.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' {
+            let key_start = cursor;
+            cursor += 1;
+            while cursor < bytes.len()
+                && (bytes[cursor].is_ascii_alphanumeric() || matches!(bytes[cursor], b'_' | b'-'))
+            {
+                cursor += 1;
+            }
+            let key_end = cursor;
+            if key_start > 0
+                && matches!(bytes[key_start - 1], b'\'' | b'"')
+                && cursor < bytes.len()
+                && bytes[cursor] == bytes[key_start - 1]
+            {
+                cursor += 1;
+            }
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len()
+                && matches!(bytes[cursor], b':' | b'=')
+                && diagnostic_sensitive_key(&value[key_start..key_end])
+            {
+                output.push_str(&value[key_start..=cursor]);
+                cursor += 1;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                    output.push(bytes[cursor] as char);
+                    cursor += 1;
+                }
+                let value_end = diagnostic_assignment_end(
+                    value,
+                    cursor,
+                    value[key_start..key_end].eq_ignore_ascii_case("authorization"),
+                );
+                output.push_str("<redacted>");
+                cursor = value_end;
+                continue;
+            }
+            output.push_str(&value[key_start..key_end]);
+            output.push_str(&value[key_end..cursor]);
+        } else {
+            let character = value[cursor..].chars().next().unwrap_or_default();
+            output.push(character);
+            cursor += character.len_utf8();
+        }
+    }
+    let output = redact_diagnostic_urls(&output);
+    let output = redact_diagnostic_canaries(&output);
+    bounded_diagnostic_string(&output, max_chars)
+}
+
+fn redact_diagnostic_text(value: &str) -> String {
+    redact_diagnostic_text_bounded(value, PROFILE_DIAGNOSTIC_MAX_STRING_CHARS)
+}
+
+fn diagnostic_destination(value: &str) -> String {
+    let value = redact_diagnostic_url(value);
+    if let Ok(url) = url::Url::parse(&value) {
+        return bounded_diagnostic_string(
+            url.host_str().unwrap_or_default(),
+            PROFILE_DIAGNOSTIC_MAX_STRING_CHARS,
+        );
+    }
+    bounded_diagnostic_string(
+        value.trim_matches(|character: char| character.is_ascii_whitespace()),
+        PROFILE_DIAGNOSTIC_MAX_STRING_CHARS,
+    )
+}
+
+fn profile_diagnostic_environment(daemon: &Daemon) -> ProfileDiagnosticEnvironment {
+    let (mihomo_version, core_generation, core_status, firewall_status, ports, mihomo_pid) = {
+        let mut inner = lock(&daemon.inner);
+        (
+            inner.state.mihomo_version.clone(),
+            inner.core_generation,
+            inner.core.status().to_owned(),
+            if inner.firewall.active {
+                "running".to_owned()
+            } else {
+                "stopped".to_owned()
+            },
+            (
+                inner.state.socks_port,
+                inner.state.http_port,
+                inner.state.split_routing.redirect_port,
+            ),
+            inner.core.pid(),
+        )
+    };
+    let (_, available_memory_kb, _) = memory_summary_from_proc();
+    ProfileDiagnosticEnvironment {
+        hincyray_version: env!("CARGO_PKG_VERSION").to_owned(),
+        mihomo_version: mihomo_version.map(|value| bounded_diagnostic_string(&value, 128)),
+        core_generation,
+        core_status,
+        firewall_status,
+        socks_port: ports.0,
+        mixed_port: ports.1,
+        redirect_port: ports.2,
+        tproxy_port: ports.2.saturating_add(1),
+        dns_port: DNS_INBOUND_PORT,
+        memory: ProfileDiagnosticMemory {
+            hincyray_rss_kb: read_process_rss_kb(std::process::id()).unwrap_or(0),
+            mihomo_rss_kb: mihomo_pid.and_then(read_process_rss_kb).unwrap_or(0),
+            system_available_kb: available_memory_kb,
+        },
+    }
+}
+
+fn profile_diagnostic_latest_stats(
+    state: &HincyrayState,
+    profile: &Profile,
+) -> Option<ProfileDiagnosticLatestStats> {
+    let stats = state
+        .stats
+        .iter()
+        .find(|stats| stats.profile_raw == profile.raw)?;
+    Some(ProfileDiagnosticLatestStats {
+        checked_at_unix: stats.last_checked_unix,
+        latency_ms: stats.last_latency_ms,
+        jitter_ms: stats.last_jitter_ms,
+        download_mbps: stats.last_download_mbps,
+        upload_mbps: stats.last_upload_mbps,
+        loss_percent: stats.last_loss_percent,
+        last_service_test_success: stats.last_service_test_success,
+        services: stats
+            .resource_tests
+            .iter()
+            .take(16)
+            .map(|result| ProfileDiagnosticServiceResult {
+                id: bounded_diagnostic_string(&redact_diagnostic_text(&result.id), 64),
+                name: bounded_diagnostic_string(&redact_diagnostic_text(&result.name), 128),
+                attempts: result.attempts,
+                successes: result.successes,
+                reachable: result.reachable,
+                stable: result.stable,
+                avg_ttfb_ms: result.avg_ttfb_ms,
+                error: result.error.as_deref().map(redact_diagnostic_text),
+            })
+            .collect(),
+    })
+}
+
+fn profile_diagnostic_session_status(
+    capture: &ProfileDiagnosticCapture,
+) -> ProfileDiagnosticSessionStatus {
+    ProfileDiagnosticSessionStatus {
+        session_id: capture.session_id.clone(),
+        state: "active".to_owned(),
+        profile_id: capture.profile.id,
+        profile_name: capture.profile.name.clone(),
+        server_ref: capture.profile.server_ref.clone(),
+        source_ip: capture.source_ip.to_string(),
+        started_at_unix: capture.started_at_unix,
+        deadline_unix: capture.deadline_unix,
+        completed_at_unix: None,
+        finalization_reason: None,
+        connection_count: capture.connections.len(),
+        event_count: capture.events.len(),
+    }
+}
+
+fn completed_profile_diagnostic_status(
+    report: &ProfileDiagnosticReport,
+) -> ProfileDiagnosticSessionStatus {
+    ProfileDiagnosticSessionStatus {
+        session_id: report.session_id.clone(),
+        state: "completed".to_owned(),
+        profile_id: report.profile.id,
+        profile_name: report.profile.name.clone(),
+        server_ref: report.profile.server_ref.clone(),
+        source_ip: report.source_ip.clone(),
+        started_at_unix: report.started_at_unix,
+        deadline_unix: report
+            .started_at_unix
+            .saturating_add(report.requested_duration_seconds as u64),
+        completed_at_unix: Some(report.ended_at_unix),
+        finalization_reason: Some(report.finalization_reason.clone()),
+        connection_count: report.connections.len(),
+        event_count: report.events.len(),
+    }
+}
+
+fn profile_diagnostic_report_expired(report: &ProfileDiagnosticReport, now: u64) -> bool {
+    now.saturating_sub(report.ended_at_unix) >= PROFILE_DIAGNOSTIC_COMPLETED_TTL_SECS
+}
+
+fn expire_completed_profile_diagnostic(runtime: &mut ProfileDiagnosticRuntime, now: u64) {
+    if runtime
+        .completed
+        .as_ref()
+        .is_some_and(|report| profile_diagnostic_report_expired(report, now))
+    {
+        runtime.completed = None;
+    }
+}
+
+fn profile_diagnostic_reason(
+    capture: &ProfileDiagnosticCapture,
+    active_server_ref: Option<&str>,
+    core_generation: u64,
+    now: u64,
+) -> Option<&'static str> {
+    if active_server_ref != Some(capture.profile.server_ref.as_str()) {
+        Some("profile_changed")
+    } else if core_generation != capture.core_generation {
+        Some("core_generation_changed")
+    } else if now >= capture.deadline_unix {
+        Some("timeout")
+    } else {
+        None
+    }
+}
+
+fn diagnostic_connection_from_value(
+    connection: &Value,
+    source_filter: IpAddr,
+    now: u64,
+) -> Option<ProfileDiagnosticConnection> {
+    let chains: Vec<String> = connection
+        .get("chains")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .take(16)
+        .map(|chain| bounded_diagnostic_string(&redact_diagnostic_text(chain), 128))
+        .collect();
+    if !chains.iter().any(|chain| chain == PROXY_ACTIVE_NAME) {
+        return None;
+    }
+    let metadata = connection.get("metadata").unwrap_or(&Value::Null);
+    let observed_source = metadata
+        .get("sourceIP")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<IpAddr>().ok());
+    if observed_source != Some(source_filter) {
+        return None;
+    }
+    let domain = metadata
+        .get("host")
+        .and_then(Value::as_str)
+        .filter(|host| !host.is_empty())
+        .or_else(|| metadata.get("sniffHost").and_then(Value::as_str))
+        .unwrap_or_default();
+    let destination_ip = metadata
+        .get("destinationIP")
+        .and_then(Value::as_str)
+        .filter(|ip| !ip.is_empty())
+        .or_else(|| metadata.get("remoteDestination").and_then(Value::as_str))
+        .unwrap_or_default();
+    let destination_port = metadata
+        .get("destinationPort")
+        .and_then(|port| {
+            port.as_str()
+                .and_then(|port| port.parse::<u16>().ok())
+                .or_else(|| port.as_u64().and_then(|port| u16::try_from(port).ok()))
+        })
+        .unwrap_or(0);
+    Some(ProfileDiagnosticConnection {
+        id: String::new(),
+        domain: diagnostic_destination(domain),
+        destination_ip: diagnostic_destination(destination_ip),
+        destination_port,
+        network: bounded_diagnostic_string(
+            metadata
+                .get("network")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            32,
+        ),
+        rule: bounded_diagnostic_string(
+            &redact_diagnostic_text(
+                connection
+                    .get("rule")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            128,
+        ),
+        rule_payload: redact_diagnostic_text(
+            connection
+                .get("rulePayload")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ),
+        chains,
+        upload_bytes: connection
+            .get("upload")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        download_bytes: connection
+            .get("download")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        first_seen_unix: now,
+        last_seen_unix: now,
+        open: true,
+        source_ip: source_filter.to_string(),
+    })
+}
+
+fn merge_profile_diagnostic_connections(
+    capture: &mut ProfileDiagnosticCapture,
+    snapshot: &Value,
+    now: u64,
+) {
+    for connection in &mut capture.connections {
+        connection.open = false;
+    }
+    let Some(connections) = snapshot.get("connections").and_then(Value::as_array) else {
+        capture.poll_errors = capture.poll_errors.saturating_add(1);
+        return;
+    };
+    for value in connections {
+        let raw_id = value.get("id").and_then(Value::as_str).unwrap_or_default();
+        if raw_id.is_empty() || capture.initial_connection_ids.contains(raw_id) {
+            continue;
+        }
+        let Some(next) = diagnostic_connection_from_value(value, capture.source_ip, now) else {
+            continue;
+        };
+        if let Some(index) = capture.connection_raw_ids.get(raw_id).copied()
+            && let Some(existing) = capture.connections.get_mut(index)
+        {
+            existing.domain = next.domain;
+            existing.destination_ip = next.destination_ip;
+            existing.destination_port = next.destination_port;
+            existing.network = next.network;
+            existing.rule = next.rule;
+            existing.rule_payload = next.rule_payload;
+            existing.chains = next.chains;
+            existing.upload_bytes = existing.upload_bytes.max(next.upload_bytes);
+            existing.download_bytes = existing.download_bytes.max(next.download_bytes);
+            existing.last_seen_unix = now;
+            existing.open = true;
+        } else if capture.connections.len() < PROFILE_DIAGNOSTIC_MAX_CONNECTIONS {
+            let index = capture.connections.len();
+            let mut next = next;
+            next.id = format!("connection-{}", index + 1);
+            capture.connection_raw_ids.insert(raw_id.to_owned(), index);
+            capture.connections.push(next);
+        } else {
+            capture.dropped_connections = capture.dropped_connections.saturating_add(1);
+        }
+    }
+}
+
+fn diagnostic_failure_classification(value: &str) -> &'static str {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("deadline") {
+        "timeout"
+    } else if lower.contains("dns") || lower.contains("resolve") {
+        "dns"
+    } else if lower.contains("tls") || lower.contains("certificate") {
+        "tls"
+    } else if lower.contains("auth") || lower.contains("unauthorized") {
+        "authentication"
+    } else if lower.contains("refused") || lower.contains("unreachable") {
+        "network"
+    } else if lower.contains("proxy-active") || lower.contains("dial proxy") {
+        "proxy"
+    } else {
+        "other"
+    }
+}
+
+fn diagnostic_line_contains_ip(line: &str, source_ip: IpAddr) -> bool {
+    line.split(|character: char| {
+        !character.is_ascii_hexdigit() && character != ':' && character != '.'
+    })
+    .filter(|token| !token.is_empty())
+    .any(|token| {
+        token.parse::<IpAddr>().ok() == Some(source_ip)
+            || matches!(source_ip, IpAddr::V4(_))
+                && token
+                    .rsplit_once(':')
+                    .filter(|(_, port)| port.parse::<u16>().is_ok())
+                    .and_then(|(ip, _)| ip.parse::<IpAddr>().ok())
+                    == Some(source_ip)
+    })
+}
+
+fn merge_profile_diagnostic_events(capture: &mut ProfileDiagnosticCapture, text: &str, now: u64) {
+    let mut relevant = vec![
+        "dial proxy".to_owned(),
+        PROXY_ACTIVE_NAME.to_owned(),
+        capture.profile.address.to_ascii_lowercase(),
+    ];
+    for connection in &capture.connections {
+        for value in [&connection.domain, &connection.destination_ip] {
+            if !value.is_empty() {
+                relevant.push(value.to_ascii_lowercase());
+            }
+        }
+    }
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        let severity = if lower.contains("error") {
+            "error"
+        } else if lower.contains("warn") {
+            "warning"
+        } else {
+            continue;
+        };
+        if !diagnostic_line_contains_ip(line, capture.source_ip)
+            || !relevant
+                .iter()
+                .filter(|needle| !needle.is_empty())
+                .any(|needle| lower.contains(needle))
+        {
+            continue;
+        }
+        let message = redact_diagnostic_text(line);
+        if capture
+            .events
+            .last()
+            .is_some_and(|event| event.message == message)
+        {
+            continue;
+        }
+        if capture.events.len() >= PROFILE_DIAGNOSTIC_MAX_EVENTS {
+            capture.dropped_events = capture.dropped_events.saturating_add(1);
+            continue;
+        }
+        capture.events.push(ProfileDiagnosticEvent {
+            timestamp_unix: now,
+            severity: severity.to_owned(),
+            classification: diagnostic_failure_classification(&message).to_owned(),
+            message,
+        });
+    }
+}
+
+fn markdown_cell(value: &str) -> String {
+    bounded_diagnostic_string(&value.replace(['\n', '\r', '|'], " "), 160)
+}
+
+fn render_profile_diagnostic_markdown(report: &ProfileDiagnosticReport) -> String {
+    use std::fmt::Write as _;
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# HincyRay Profile Diagnostic");
+    let _ = writeln!(markdown, "\n## Purpose\n{}", report.purpose);
+    let _ = writeln!(
+        markdown,
+        "\n## Capture\n- Session: `{}`\n- Start: {}\n- End: {}\n- Observed: {}s (requested {}s)\n- Finalization: `{}`",
+        report.session_id,
+        report.started_at_unix,
+        report.ended_at_unix,
+        report.observed_duration_seconds,
+        report.requested_duration_seconds,
+        report.finalization_reason
+    );
+    let _ = writeln!(
+        markdown,
+        "- Source IP filter: `{}`",
+        markdown_cell(&report.source_ip)
+    );
+    let _ = writeln!(
+        markdown,
+        "\n## Profile\n- ID/ref: `{}` / `{}`\n- Name: {}\n- Protocol/transport: `{}` / `{}`\n- Endpoint: `{}`:{}",
+        report.profile.id,
+        report.profile.server_ref,
+        markdown_cell(&report.profile.name),
+        report.profile.protocol,
+        report.profile.transport,
+        markdown_cell(&report.profile.address),
+        report.profile.port.unwrap_or(0)
+    );
+    let start = &report.environment_start;
+    let end = &report.environment_end;
+    let _ = writeln!(
+        markdown,
+        "\n## Environment\n- HincyRay: `{}`; Mihomo: `{}`\n- Core generation: {} -> {}; core/firewall end: `{}` / `{}`\n- Ports: SOCKS {}, mixed {}, redir {}, TPROXY {}, DNS {}\n- RSS KiB HincyRay: {} -> {}; Mihomo: {} -> {}; available memory: {} -> {}",
+        start.hincyray_version,
+        start.mihomo_version.as_deref().unwrap_or("unknown"),
+        start.core_generation,
+        end.core_generation,
+        end.core_status,
+        end.firewall_status,
+        end.socks_port,
+        end.mixed_port.unwrap_or(0),
+        end.redirect_port,
+        end.tproxy_port,
+        end.dns_port,
+        start.memory.hincyray_rss_kb,
+        end.memory.hincyray_rss_kb,
+        start.memory.mihomo_rss_kb,
+        end.memory.mihomo_rss_kb,
+        start.memory.system_available_kb,
+        end.memory.system_available_kb
+    );
+    let _ = writeln!(
+        markdown,
+        "\n## Summary\n- Connections: {} (open {}, closed {}, dropped {})\n- Traffic: upload {} bytes, download {} bytes\n- Relevant warning/error events: {} (dropped {}); poll errors: {}\n- Failure classifications: `{}`",
+        report.summary.connections,
+        report.summary.open_connections,
+        report.summary.closed_connections,
+        report.summary.dropped_connections,
+        report.summary.upload_bytes,
+        report.summary.download_bytes,
+        report.summary.events,
+        report.summary.dropped_events,
+        report.summary.poll_errors,
+        serde_json::to_string(&report.summary.failure_classifications).unwrap_or_default()
+    );
+    markdown.push_str("\n## Connections\n| Destination | IP:port | Net | Rule | Chain | Up | Down | Open |\n|---|---|---:|---|---|---:|---:|---:|\n");
+    for connection in &report.connections {
+        let _ = writeln!(
+            markdown,
+            "| {} | {}:{} | {} | {} {} | {} | {} | {} | {} |",
+            markdown_cell(&connection.domain),
+            markdown_cell(&connection.destination_ip),
+            connection.destination_port,
+            markdown_cell(&connection.network),
+            markdown_cell(&connection.rule),
+            markdown_cell(&connection.rule_payload),
+            markdown_cell(&connection.chains.join(" -> ")),
+            connection.upload_bytes,
+            connection.download_bytes,
+            connection.open
+        );
+    }
+    markdown.push_str("\n## Relevant Events\n");
+    if report.events.is_empty() {
+        markdown.push_str("No relevant warning/error lines captured.\n");
+    } else {
+        for event in &report.events {
+            let _ = writeln!(
+                markdown,
+                "- {} `{}` `{}`: {}",
+                event.timestamp_unix,
+                event.severity,
+                event.classification,
+                markdown_cell(&event.message)
+            );
+        }
+    }
+    markdown.push_str("\n## Latest Service Test\n");
+    if let Some(stats) = report.latest_stats.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "Checked {}: latency {} ms, jitter {} ms, loss {:.2}%, download {:.2} Mbps, upload {:.2} Mbps.",
+            stats.checked_at_unix,
+            stats.latency_ms,
+            stats.jitter_ms,
+            stats.loss_percent,
+            stats.download_mbps,
+            stats.upload_mbps
+        );
+        for service in &stats.services {
+            let _ = writeln!(
+                markdown,
+                "- `{}`: reachable={}, stable={}, successes={}/{}, avg TTFB={} ms{}",
+                markdown_cell(&service.name),
+                service.reachable,
+                service.stable,
+                service.successes,
+                service.attempts,
+                service.avg_ttfb_ms,
+                service
+                    .error
+                    .as_deref()
+                    .map(|error| format!(", error={}", markdown_cell(error)))
+                    .unwrap_or_default()
+            );
+        }
+    } else {
+        markdown.push_str("No benchmark/service result was available for this profile.\n");
+    }
+    let _ = writeln!(
+        markdown,
+        "\n## Redacted Config Summary\n```yaml\n{}\n```\n\n## Redaction\n{}",
+        report.config_summary, report.redaction_note
+    );
+    markdown
+}
+
+fn final_redact_profile_diagnostic_report(report: &mut ProfileDiagnosticReport) {
+    report.session_id = redact_diagnostic_text(&report.session_id);
+    report.purpose = redact_diagnostic_text(&report.purpose);
+    report.state = redact_diagnostic_text(&report.state);
+    report.finalization_reason = redact_diagnostic_text(&report.finalization_reason);
+    report.source_ip = redact_diagnostic_text(&report.source_ip);
+    report.profile.server_ref = redact_diagnostic_text(&report.profile.server_ref);
+    report.profile.name = redact_diagnostic_text(&report.profile.name);
+    report.profile.address = diagnostic_destination(&report.profile.address);
+    report.profile.protocol = redact_diagnostic_text(&report.profile.protocol);
+    report.profile.transport = redact_diagnostic_text(&report.profile.transport);
+    for environment in [&mut report.environment_start, &mut report.environment_end] {
+        environment.hincyray_version = redact_diagnostic_text(&environment.hincyray_version);
+        environment.mihomo_version = environment
+            .mihomo_version
+            .as_deref()
+            .map(redact_diagnostic_text);
+        environment.core_status = redact_diagnostic_text(&environment.core_status);
+        environment.firewall_status = redact_diagnostic_text(&environment.firewall_status);
+    }
+    for connection in &mut report.connections {
+        connection.id = redact_diagnostic_text(&connection.id);
+        connection.domain = diagnostic_destination(&connection.domain);
+        connection.destination_ip = diagnostic_destination(&connection.destination_ip);
+        connection.network = redact_diagnostic_text(&connection.network);
+        connection.rule = redact_diagnostic_text(&connection.rule);
+        connection.rule_payload = redact_diagnostic_text(&connection.rule_payload);
+        for chain in &mut connection.chains {
+            *chain = redact_diagnostic_text(chain);
+        }
+        connection.source_ip = redact_diagnostic_text(&connection.source_ip);
+    }
+    for event in &mut report.events {
+        event.severity = redact_diagnostic_text(&event.severity);
+        event.classification = redact_diagnostic_text(&event.classification);
+        event.message = redact_diagnostic_text(&event.message);
+    }
+    if let Some(stats) = &mut report.latest_stats {
+        for service in &mut stats.services {
+            service.id = redact_diagnostic_text(&service.id);
+            service.name = redact_diagnostic_text(&service.name);
+            service.error = service.error.as_deref().map(redact_diagnostic_text);
+        }
+    }
+    report.summary.failure_classifications = report
+        .summary
+        .failure_classifications
+        .drain()
+        .map(|(classification, count)| (redact_diagnostic_text(&classification), count))
+        .collect();
+    report.config_summary = bounded_diagnostic_bytes(
+        &redact_diagnostic_text_bounded(
+            &report.config_summary,
+            PROFILE_DIAGNOSTIC_MAX_CONFIG_BYTES,
+        ),
+        PROFILE_DIAGNOSTIC_MAX_CONFIG_BYTES,
+    );
+    report.redaction_note = redact_diagnostic_text(&report.redaction_note);
+}
+
+fn recursively_redact_profile_diagnostic_value(value: &mut Value, field: Option<&str>) {
+    match value {
+        Value::String(text) => {
+            let max_chars = match field {
+                Some("markdown") => PROFILE_DIAGNOSTIC_MAX_REPORT_BYTES,
+                Some("config_summary") => PROFILE_DIAGNOSTIC_MAX_CONFIG_BYTES,
+                _ => PROFILE_DIAGNOSTIC_MAX_STRING_CHARS,
+            };
+            *text = redact_diagnostic_text_bounded(text, max_chars);
+        }
+        Value::Array(values) => {
+            for value in values {
+                recursively_redact_profile_diagnostic_value(value, field);
+            }
+        }
+        Value::Object(object) => {
+            for (key, value) in object {
+                recursively_redact_profile_diagnostic_value(value, Some(key));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn recursively_redact_profile_diagnostic_report(report: &mut ProfileDiagnosticReport) {
+    let Ok(mut value) = serde_json::to_value(&*report) else {
+        return;
+    };
+    recursively_redact_profile_diagnostic_value(&mut value, None);
+    if let Ok(redacted) = serde_json::from_value(value) {
+        *report = redacted;
+    }
+}
+
+fn build_profile_diagnostic_report(
+    capture: ProfileDiagnosticCapture,
+    environment_end: ProfileDiagnosticEnvironment,
+    reason: &str,
+    ended_at_unix: u64,
+    state: &str,
+) -> ProfileDiagnosticReport {
+    let mut failure_classifications = HashMap::new();
+    for event in &capture.events {
+        *failure_classifications
+            .entry(event.classification.clone())
+            .or_default() += 1;
+    }
+    let summary = ProfileDiagnosticSummary {
+        connections: capture.connections.len(),
+        open_connections: capture
+            .connections
+            .iter()
+            .filter(|connection| connection.open)
+            .count(),
+        closed_connections: capture
+            .connections
+            .iter()
+            .filter(|connection| !connection.open)
+            .count(),
+        upload_bytes: capture
+            .connections
+            .iter()
+            .map(|connection| connection.upload_bytes)
+            .fold(0_u64, u64::saturating_add),
+        download_bytes: capture
+            .connections
+            .iter()
+            .map(|connection| connection.download_bytes)
+            .fold(0_u64, u64::saturating_add),
+        events: capture.events.len(),
+        poll_errors: capture.poll_errors,
+        dropped_connections: capture.dropped_connections,
+        dropped_events: capture.dropped_events,
+        failure_classifications,
+    };
+    let mut report = ProfileDiagnosticReport {
+        session_id: capture.session_id,
+        purpose: "Bounded evidence for diagnosing the selected active VPN profile while reproducing application traffic such as YouTube playback.".to_owned(),
+        state: state.to_owned(),
+        started_at_unix: capture.started_at_unix,
+        ended_at_unix,
+        requested_duration_seconds: capture.duration_seconds,
+        observed_duration_seconds: ended_at_unix.saturating_sub(capture.started_at_unix),
+        finalization_reason: reason.to_owned(),
+        source_ip: capture.source_ip.to_string(),
+        profile: capture.profile,
+        environment_start: capture.environment_start,
+        environment_end,
+        summary,
+        connections: capture.connections,
+        events: capture.events,
+        latest_stats: capture.latest_stats,
+        config_summary: capture.config_summary,
+        redaction_note: "Secrets, raw share links, subscription URLs, authentication material, URL userinfo/path/query/fragment data, private keys, and tokens are excluded or structurally replaced with <redacted>. The supplied local source IP is retained as the exact capture filter.".to_owned(),
+        markdown: String::new(),
+    };
+    final_redact_profile_diagnostic_report(&mut report);
+    for _ in 0..4 {
+        report.markdown = render_profile_diagnostic_markdown(&report);
+        if serde_json::to_vec(&ProfileDiagnosticReportResponse {
+            report: report.clone(),
+        })
+        .map(|bytes| bytes.len() <= PROFILE_DIAGNOSTIC_MAX_REPORT_BYTES)
+        .unwrap_or(false)
+        {
+            break;
+        }
+        let removed_events = report.events.len().saturating_sub(report.events.len() / 2);
+        report.events.truncate(report.events.len() / 2);
+        report.summary.events = report.events.len();
+        report.summary.dropped_events =
+            report.summary.dropped_events.saturating_add(removed_events);
+        let removed_connections = report
+            .connections
+            .len()
+            .saturating_sub(report.connections.len() / 2);
+        report.connections.truncate(report.connections.len() / 2);
+        report.summary.connections = report.connections.len();
+        report.summary.open_connections = report
+            .connections
+            .iter()
+            .filter(|connection| connection.open)
+            .count();
+        report.summary.closed_connections = report
+            .connections
+            .iter()
+            .filter(|connection| !connection.open)
+            .count();
+        report.summary.dropped_connections = report
+            .summary
+            .dropped_connections
+            .saturating_add(removed_connections);
+        if report.config_summary.len() > 1024 {
+            let mut end = report.config_summary.len() / 2;
+            while end > 0 && !report.config_summary.is_char_boundary(end) {
+                end -= 1;
+            }
+            report.config_summary.truncate(end);
+            report.config_summary.push_str("\n# truncated\n");
+        }
+    }
+    report.markdown = redact_diagnostic_text_bounded(
+        &render_profile_diagnostic_markdown(&report),
+        PROFILE_DIAGNOSTIC_MAX_REPORT_BYTES,
+    );
+    if serde_json::to_vec(&ProfileDiagnosticReportResponse {
+        report: report.clone(),
+    })
+    .map_or(true, |bytes| {
+        bytes.len() > PROFILE_DIAGNOSTIC_MAX_REPORT_BYTES
+    }) {
+        report.connections.clear();
+        report.events.clear();
+        report.config_summary = "# truncated to API limit".to_owned();
+        report.summary.connections = 0;
+        report.summary.open_connections = 0;
+        report.summary.closed_connections = 0;
+        report.summary.events = 0;
+        report.markdown = redact_diagnostic_text_bounded(
+            &render_profile_diagnostic_markdown(&report),
+            PROFILE_DIAGNOSTIC_MAX_REPORT_BYTES,
+        );
+    }
+    recursively_redact_profile_diagnostic_report(&mut report);
+    report
+}
+
+fn profile_diagnostic_current_identity(inner: &DaemonInner) -> (Option<String>, u64) {
+    (
+        inner
+            .state
+            .active_profile_id
+            .and_then(|id| inner.state.profiles.iter().find(|profile| profile.id == id))
+            .map(profile_server_ref),
+        inner.core_generation,
+    )
+}
+
+fn profile_diagnostic_worker_reason(
+    daemon: &Daemon,
+    session_id: &str,
+    cancel: &AtomicBool,
+    stop_reason: &Mutex<Option<String>>,
+) -> Result<ProfileDiagnosticCapture, String> {
+    let inner = lock(&daemon.inner);
+    let Some(capture) = inner
+        .profile_diagnostics
+        .active
+        .as_ref()
+        .filter(|capture| capture.session_id == session_id)
+        .cloned()
+    else {
+        return Err("session_replaced".to_owned());
+    };
+    if cancel.load(Ordering::SeqCst) {
+        return Err(lock(stop_reason)
+            .clone()
+            .unwrap_or_else(|| "manual".to_owned()));
+    }
+    let (active_server_ref, core_generation) = profile_diagnostic_current_identity(&inner);
+    if let Some(reason) = profile_diagnostic_reason(
+        &capture,
+        active_server_ref.as_deref(),
+        core_generation,
+        unix_now(),
+    ) {
+        return Err(reason.to_owned());
+    }
+    Ok(capture)
+}
+
+fn initial_profile_diagnostic_connection_ids(
+    snapshot: &Value,
+    source_ip: IpAddr,
+) -> Result<HashSet<String>, (u16, &'static str, String)> {
+    let Some(connections) = snapshot.get("connections").and_then(Value::as_array) else {
+        return Err(json_error(
+            502,
+            "Mihomo connections snapshot is missing the connections array",
+        ));
+    };
+    let mut ids = HashSet::new();
+    let mut matching_connections = 0_usize;
+    for connection in connections {
+        let observed_source = connection
+            .get("metadata")
+            .and_then(|metadata| metadata.get("sourceIP"))
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<IpAddr>().ok());
+        if observed_source != Some(source_ip) {
+            continue;
+        }
+        matching_connections = matching_connections.saturating_add(1);
+        if matching_connections > PROFILE_DIAGNOSTIC_MAX_INITIAL_CONNECTION_IDS {
+            return Err(json_error(
+                413,
+                "more than 4096 existing connections match source_ip",
+            ));
+        }
+        let Some(id) = connection
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return Err(json_error(
+                502,
+                "Mihomo connections snapshot has a matching connection without an ID",
+            ));
+        };
+        ids.insert(id.to_owned());
+    }
+    Ok(ids)
+}
+
+fn is_lan_client_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private(),
+        IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+    }
+}
+
+fn join_profile_diagnostic_worker(
+    daemon: &Daemon,
+    session_id: Option<&str>,
+    reason: Option<&str>,
+    finished_only: bool,
+) -> Result<bool, (u16, &'static str, String)> {
+    let _join = lock(&daemon.profile_diagnostic_join);
+    let worker = {
+        let mut inner = lock(&daemon.inner);
+        let Some(worker) = inner.profile_diagnostics.worker.as_ref() else {
+            return Ok(false);
+        };
+        if session_id.is_some_and(|session_id| worker.session_id != session_id) {
+            return Err(json_error(
+                409,
+                "session_id does not match the diagnostic worker",
+            ));
+        }
+        if finished_only && !worker.handle.is_finished() {
+            return Ok(false);
+        }
+        if let Some(reason) = reason {
+            *lock(&worker.stop_reason) = Some(reason.to_owned());
+            worker.cancel.store(true, Ordering::SeqCst);
+        }
+        inner.profile_diagnostics.worker.take()
+    };
+    if let Some(worker) = worker {
+        if worker.handle.join().is_err() {
+            let capture = {
+                let mut inner = lock(&daemon.inner);
+                if inner
+                    .profile_diagnostics
+                    .active
+                    .as_ref()
+                    .is_some_and(|capture| capture.session_id == worker.session_id)
+                {
+                    inner.profile_diagnostics.active.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(capture) = capture {
+                let report = build_profile_diagnostic_report(
+                    capture,
+                    profile_diagnostic_environment(daemon),
+                    "worker_panicked",
+                    unix_now(),
+                    "completed",
+                );
+                let mut inner = lock(&daemon.inner);
+                if inner.profile_diagnostics.active.is_none() {
+                    inner.profile_diagnostics.completed = Some(report);
+                }
+            }
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn profile_diagnostic_worker(
+    daemon: Daemon,
+    session_id: String,
+    cancel: Arc<AtomicBool>,
+    stop_reason: Arc<Mutex<Option<String>>>,
+    mihomo_log_path: PathBuf,
+) {
+    let mut exit_guard = ProfileDiagnosticWorkerExitGuard {
+        daemon: daemon.clone(),
+        session_id: session_id.clone(),
+        armed: true,
+    };
+    let mut log_cursor = MihomoLogCursor::start_at_end(&mihomo_log_path);
+    let mut final_reason = loop {
+        if let Err(reason) =
+            profile_diagnostic_worker_reason(&daemon, &session_id, &cancel, &stop_reason)
+        {
+            break reason;
+        }
+        let controller = {
+            let inner = lock(&daemon.inner);
+            daemon_mihomo_controller(&daemon, &inner.state.mihomo_features)
+        };
+
+        let connections = controller.as_ref().map(|(address, secret)| {
+            mihomo_api_get_connections_json_bounded(
+                address,
+                secret.as_deref(),
+                MAX_DIAGNOSTIC_CONNECTIONS_JSON_BYTES,
+            )
+        });
+        if let Err(reason) =
+            profile_diagnostic_worker_reason(&daemon, &session_id, &cancel, &stop_reason)
+        {
+            break reason;
+        }
+        let log_text = log_cursor.read_new_text(&mihomo_log_path).ok();
+        if let Err(reason) =
+            profile_diagnostic_worker_reason(&daemon, &session_id, &cancel, &stop_reason)
+        {
+            break reason;
+        }
+        let now = unix_now();
+        {
+            let mut inner = lock(&daemon.inner);
+            let (active_server_ref, core_generation) = profile_diagnostic_current_identity(&inner);
+            let Some(active) = inner
+                .profile_diagnostics
+                .active
+                .as_mut()
+                .filter(|capture| capture.session_id == session_id)
+            else {
+                return;
+            };
+            if cancel.load(Ordering::SeqCst) {
+                break lock(&stop_reason)
+                    .clone()
+                    .unwrap_or_else(|| "manual".to_owned());
+            }
+            if let Some(reason) = profile_diagnostic_reason(
+                active,
+                active_server_ref.as_deref(),
+                core_generation,
+                now,
+            ) {
+                break reason.to_owned();
+            }
+            match connections {
+                Some(Ok(snapshot)) => merge_profile_diagnostic_connections(active, &snapshot, now),
+                _ => active.poll_errors = active.poll_errors.saturating_add(1),
+            }
+            if let Some(text) = log_text {
+                merge_profile_diagnostic_events(active, &text, now);
+            }
+        }
+        for _ in 0..10 {
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let environment_end = profile_diagnostic_environment(&daemon);
+    if let Err(reason) =
+        profile_diagnostic_worker_reason(&daemon, &session_id, &cancel, &stop_reason)
+    {
+        final_reason = reason;
+    }
+    let ended_at_unix = unix_now();
+    let capture = {
+        let inner = lock(&daemon.inner);
+        let Some(capture) = inner
+            .profile_diagnostics
+            .active
+            .as_ref()
+            .filter(|capture| capture.session_id == session_id)
+            .cloned()
+        else {
+            return;
+        };
+        capture
+    };
+    let mut report = build_profile_diagnostic_report(
+        capture,
+        environment_end,
+        &final_reason,
+        ended_at_unix,
+        "completed",
+    );
+    loop {
+        let mut inner = lock(&daemon.inner);
+        let Some(active) = inner
+            .profile_diagnostics
+            .active
+            .as_ref()
+            .filter(|capture| capture.session_id == session_id)
+        else {
+            return;
+        };
+        let (active_server_ref, core_generation) = profile_diagnostic_current_identity(&inner);
+        let reason = if cancel.load(Ordering::SeqCst) {
+            lock(&stop_reason)
+                .clone()
+                .unwrap_or_else(|| "manual".to_owned())
+        } else {
+            profile_diagnostic_reason(
+                active,
+                active_server_ref.as_deref(),
+                core_generation,
+                unix_now(),
+            )
+            .unwrap_or(&report.finalization_reason)
+            .to_owned()
+        };
+        if reason == report.finalization_reason {
+            inner.profile_diagnostics.active = None;
+            inner.profile_diagnostics.completed = Some(report);
+            exit_guard.armed = false;
+            return;
+        }
+        drop(inner);
+        report.finalization_reason = reason;
+        report.markdown = redact_diagnostic_text_bounded(
+            &render_profile_diagnostic_markdown(&report),
+            PROFILE_DIAGNOSTIC_MAX_REPORT_BYTES,
+        );
+    }
+}
+
+fn handle_profile_diagnostic_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    if let Err(response) = join_profile_diagnostic_worker(daemon, None, None, true) {
+        return response;
+    }
+    let request = match serde_json::from_str::<ProfileDiagnosticStartRequest>(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid request: {error}")),
+    };
+    if !(PROFILE_DIAGNOSTIC_MIN_DURATION_SECS..=PROFILE_DIAGNOSTIC_MAX_DURATION_SECS)
+        .contains(&request.duration_seconds)
+    {
+        return json_error(400, "duration_seconds must be between 60 and 300");
+    }
+    let source_ip = match request.source_ip.trim().parse::<IpAddr>() {
+        Ok(ip) if is_lan_client_ip(ip) => ip,
+        Ok(_) => return json_error(400, "source_ip must be a non-loopback LAN/client address"),
+        Err(_) => return json_error(400, "source_ip must be a valid IPv4 or IPv6 address"),
+    };
+    let now = unix_now();
+    let (state, profile, core_generation) = {
+        let mut inner = lock(&daemon.inner);
+        if inner.profile_diagnostics.starting || inner.profile_diagnostics.active.is_some() {
+            return json_error(409, "a profile diagnostic capture is already active");
+        }
+        expire_completed_profile_diagnostic(&mut inner.profile_diagnostics, now);
+        if inner.profile_diagnostics.completed.is_some() {
+            return json_error(
+                409,
+                "discard the last completed diagnostic before starting a new one",
+            );
+        }
+        let Some(profile) = inner
+            .state
+            .profiles
+            .iter()
+            .find(|profile| profile.id == request.profile_id)
+            .cloned()
+        else {
+            return json_error(404, "profile not found");
+        };
+        if inner.state.active_profile_id != Some(request.profile_id) {
+            return json_error(
+                409,
+                "only the active profile may start a diagnostic capture",
+            );
+        }
+        inner.profile_diagnostics.starting = true;
+        (inner.state.clone(), profile, inner.core_generation)
+    };
+    let profile_projection = ProfileDiagnosticProfile {
+        id: profile.id,
+        server_ref: profile_server_ref(&profile),
+        name: bounded_diagnostic_string(
+            &redact_diagnostic_text(&profile.name),
+            MAX_PROFILE_NAME_CHARS,
+        ),
+        protocol: profile.protocol.to_string(),
+        transport: bounded_diagnostic_string(&profile.transport(), 64),
+        address: diagnostic_destination(&profile.address),
+        port: profile.port,
+    };
+    let config_summary = match build_authoritative_daemon_config(&state, daemon)
+        .and_then(|config| redact_config_yaml(&config))
+    {
+        Ok(config) => bounded_diagnostic_bytes(&config, PROFILE_DIAGNOSTIC_MAX_CONFIG_BYTES),
+        Err(error) => format!(
+            "# redacted config unavailable: {}",
+            redact_diagnostic_text(&error)
+        ),
+    };
+    let environment_start = profile_diagnostic_environment(daemon);
+    let initial_connection_ids = {
+        let controller = {
+            let inner = lock(&daemon.inner);
+            daemon_mihomo_controller(daemon, &inner.state.mihomo_features)
+        };
+        let result = match controller.as_ref().map(|(address, secret)| {
+            mihomo_api_get_connections_json_bounded(
+                address,
+                secret.as_deref(),
+                MAX_DIAGNOSTIC_CONNECTIONS_JSON_BYTES,
+            )
+        }) {
+            Some(Ok(snapshot)) => initial_profile_diagnostic_connection_ids(&snapshot, source_ip),
+            Some(Err(error)) => Err(json_error(
+                502,
+                &format!("Mihomo initial connections snapshot: {error}"),
+            )),
+            None => Err(json_error(502, "Mihomo external controller is unavailable")),
+        };
+        match result {
+            Ok(ids) => ids,
+            Err(response) => {
+                lock(&daemon.inner).profile_diagnostics.starting = false;
+                return response;
+            }
+        }
+    };
+    let session_id = match generate_session_token() {
+        Ok(token) => format!("pd-{}", bounded_diagnostic_string(&token, 64)),
+        Err(error) => {
+            lock(&daemon.inner).profile_diagnostics.starting = false;
+            return json_error(500, &error);
+        }
+    };
+    let capture = ProfileDiagnosticCapture {
+        session_id: session_id.clone(),
+        profile: profile_projection,
+        source_ip,
+        started_at_unix: now,
+        deadline_unix: now.saturating_add(request.duration_seconds as u64),
+        duration_seconds: request.duration_seconds,
+        core_generation,
+        environment_start,
+        config_summary,
+        latest_stats: profile_diagnostic_latest_stats(&state, &profile),
+        initial_connection_ids,
+        connection_raw_ids: HashMap::new(),
+        connections: Vec::new(),
+        events: Vec::new(),
+        poll_errors: 0,
+        dropped_connections: 0,
+        dropped_events: 0,
+    };
+    let status = profile_diagnostic_session_status(&capture);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stop_reason = Arc::new(Mutex::new(None));
+    let worker_daemon = daemon.clone();
+    let worker_session = session_id.clone();
+    let worker_cancel = Arc::clone(&cancel);
+    let worker_stop_reason = Arc::clone(&stop_reason);
+    let (start_tx, start_rx) = mpsc::sync_channel::<bool>(0);
+    let mut handle = Some(
+        match thread::Builder::new()
+            .name(format!("profile-diagnostic-{session_id}"))
+            .spawn(move || {
+                if start_rx.recv().unwrap_or(false) {
+                    profile_diagnostic_worker(
+                        worker_daemon,
+                        worker_session,
+                        worker_cancel,
+                        worker_stop_reason,
+                        resolve_log_dir().join("mihomo.log"),
+                    );
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                lock(&daemon.inner).profile_diagnostics.starting = false;
+                return json_error(500, &format!("spawn diagnostic worker: {error}"));
+            }
+        },
+    );
+    let publish = {
+        let mut inner = lock(&daemon.inner);
+        let (active_ref, generation) = profile_diagnostic_current_identity(&inner);
+        if active_ref.as_deref() != Some(capture.profile.server_ref.as_str())
+            || generation != core_generation
+            || inner.profile_diagnostics.active.is_some()
+        {
+            inner.profile_diagnostics.starting = false;
+            false
+        } else {
+            inner.profile_diagnostics.active = Some(capture);
+            inner.profile_diagnostics.worker = Some(ProfileDiagnosticWorker {
+                session_id: session_id.clone(),
+                cancel,
+                stop_reason,
+                handle: handle.take().expect("diagnostic worker handle"),
+            });
+            inner.profile_diagnostics.starting = false;
+            true
+        }
+    };
+    if !publish {
+        let _ = start_tx.send(false);
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+        return json_error(409, "active profile or core changed while starting capture");
+    }
+    if start_tx.send(true).is_err() {
+        let _ = join_profile_diagnostic_worker(daemon, Some(&session_id), None, false);
+        let mut inner = lock(&daemon.inner);
+        if inner
+            .profile_diagnostics
+            .active
+            .as_ref()
+            .is_some_and(|capture| capture.session_id == session_id)
+        {
+            inner.profile_diagnostics.active = None;
+        }
+        return json_error(500, "diagnostic worker failed its start barrier");
+    }
+    json_response(&ProfileDiagnosticStartResponse { session: status })
+}
+
+fn handle_profile_diagnostic_status(daemon: &Daemon) -> (u16, &'static str, String) {
+    if let Err(response) = join_profile_diagnostic_worker(daemon, None, None, true) {
+        return response;
+    }
+    let now = unix_now();
+    let mut inner = lock(&daemon.inner);
+    if inner.profile_diagnostics.starting {
+        return json_error(409, "a profile diagnostic capture is starting");
+    }
+    expire_completed_profile_diagnostic(&mut inner.profile_diagnostics, now);
+    json_response(&ProfileDiagnosticStatusResponse {
+        active: inner
+            .profile_diagnostics
+            .active
+            .as_ref()
+            .map(profile_diagnostic_session_status),
+        completed: inner
+            .profile_diagnostics
+            .completed
+            .as_ref()
+            .map(completed_profile_diagnostic_status),
+        completed_ttl_seconds: PROFILE_DIAGNOSTIC_COMPLETED_TTL_SECS as u32,
+    })
+}
+
+fn stop_profile_diagnostic(
+    daemon: &Daemon,
+    session_id: &str,
+    reason: &str,
+) -> Result<ProfileDiagnosticReport, (u16, &'static str, String)> {
+    join_profile_diagnostic_worker(daemon, Some(session_id), Some(reason), false)?;
+    {
+        let mut inner = lock(&daemon.inner);
+        expire_completed_profile_diagnostic(&mut inner.profile_diagnostics, unix_now());
+        if let Some(report) = inner.profile_diagnostics.completed.as_ref()
+            && report.session_id == session_id
+        {
+            return Ok(report.clone());
+        }
+        let Some(active) = inner.profile_diagnostics.active.as_ref() else {
+            return Err(json_error(404, "diagnostic session not found"));
+        };
+        if active.session_id != session_id {
+            return Err(json_error(
+                409,
+                "session_id does not match the active capture",
+            ));
+        }
+    }
+    let inner = lock(&daemon.inner);
+    inner
+        .profile_diagnostics
+        .completed
+        .as_ref()
+        .filter(|report| report.session_id == session_id)
+        .cloned()
+        .ok_or_else(|| json_error(500, "diagnostic worker did not finalize the session"))
+}
+
+fn handle_profile_diagnostic_stop(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request = match serde_json::from_str::<ProfileDiagnosticSessionRequest>(body) {
+        Ok(request) if !request.session_id.is_empty() && request.session_id.len() <= 128 => request,
+        Ok(_) => return json_error(400, "session_id is required and bounded to 128 characters"),
+        Err(error) => return json_error(400, &format!("invalid request: {error}")),
+    };
+    match stop_profile_diagnostic(daemon, &request.session_id, "manual") {
+        Ok(report) => json_response(&ProfileDiagnosticReportResponse { report }),
+        Err(response) => response,
+    }
+}
+
+fn handle_profile_diagnostic_report(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request = match serde_json::from_str::<ProfileDiagnosticSessionRequest>(body) {
+        Ok(request) if !request.session_id.is_empty() && request.session_id.len() <= 128 => request,
+        Ok(_) => return json_error(400, "session_id is required and bounded to 128 characters"),
+        Err(error) => return json_error(400, &format!("invalid request: {error}")),
+    };
+    if let Err(response) = join_profile_diagnostic_worker(daemon, None, None, true) {
+        return response;
+    }
+    let (active, completed) = {
+        let mut inner = lock(&daemon.inner);
+        expire_completed_profile_diagnostic(&mut inner.profile_diagnostics, unix_now());
+        (
+            inner.profile_diagnostics.active.clone(),
+            inner.profile_diagnostics.completed.clone(),
+        )
+    };
+    if let Some(capture) = active {
+        if capture.session_id != request.session_id {
+            return json_error(409, "session_id does not match the active capture");
+        }
+        let report = build_profile_diagnostic_report(
+            capture,
+            profile_diagnostic_environment(daemon),
+            "active_snapshot",
+            unix_now(),
+            "active",
+        );
+        return json_response(&ProfileDiagnosticReportResponse { report });
+    }
+    match completed {
+        Some(report) if report.session_id == request.session_id => {
+            json_response(&ProfileDiagnosticReportResponse { report })
+        }
+        Some(_) => json_error(409, "session_id does not match the completed report"),
+        None => json_error(404, "diagnostic report expired or was not found"),
+    }
+}
+
+fn handle_profile_diagnostic_discard(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    if let Err(response) = join_profile_diagnostic_worker(daemon, None, None, true) {
+        return response;
+    }
+    let request = match serde_json::from_str::<ProfileDiagnosticDiscardRequest>(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid request: {error}")),
+    };
+    if request
+        .session_id
+        .as_ref()
+        .is_some_and(|session_id| session_id.is_empty() || session_id.len() > 128)
+    {
+        return json_error(400, "session_id is bounded to 128 characters");
+    }
+    let target = {
+        let mut inner = lock(&daemon.inner);
+        expire_completed_profile_diagnostic(&mut inner.profile_diagnostics, unix_now());
+        request.session_id.clone().or_else(|| {
+            inner
+                .profile_diagnostics
+                .active
+                .as_ref()
+                .map(|capture| capture.session_id.clone())
+                .or_else(|| {
+                    inner
+                        .profile_diagnostics
+                        .completed
+                        .as_ref()
+                        .map(|report| report.session_id.clone())
+                })
+        })
+    };
+    let Some(session_id) = target else {
+        return json_response(&ProfileDiagnosticDiscardResponse {
+            discarded: false,
+            session_id: None,
+        });
+    };
+    if let Err(response) =
+        join_profile_diagnostic_worker(daemon, Some(&session_id), Some("discarded"), false)
+    {
+        return response;
+    }
+    let mut inner = lock(&daemon.inner);
+    let discarded = inner
+        .profile_diagnostics
+        .completed
+        .as_ref()
+        .is_some_and(|report| report.session_id == session_id);
+    if discarded {
+        inner.profile_diagnostics.completed = None;
+    }
+    json_response(&ProfileDiagnosticDiscardResponse {
+        discarded,
+        session_id: Some(session_id),
+    })
+}
+
+fn cancel_and_join_profile_diagnostics(daemon: &Daemon) {
+    let _ = join_profile_diagnostic_worker(daemon, None, Some("shutdown"), false);
+}
 
 /// Forward `GET /proxies` to the Mihomo external controller.
 /// Returns all proxies, proxy groups, and their current state (alive,
@@ -11774,7 +15125,7 @@ fn handle_mihomo_features_set(body: &str, daemon: &Daemon) -> (u16, &'static str
 fn handle_mihomo_api_proxies(daemon: &Daemon) -> (u16, &'static str, String) {
     let (addr, secret) = {
         let inner = lock(&daemon.inner);
-        match mihomo_controller(&inner.state.mihomo_features) {
+        match daemon_mihomo_controller(daemon, &inner.state.mihomo_features) {
             Some(ec) => ec,
             None => {
                 return (
@@ -11801,7 +15152,7 @@ fn handle_mihomo_api_proxies(daemon: &Daemon) -> (u16, &'static str, String) {
 fn handle_mihomo_api_connections(daemon: &Daemon) -> (u16, &'static str, String) {
     let (addr, secret, geo_dir) = {
         let inner = lock(&daemon.inner);
-        let ec = match mihomo_controller(&inner.state.mihomo_features) {
+        let ec = match daemon_mihomo_controller(daemon, &inner.state.mihomo_features) {
             Some(ec) => ec,
             None => {
                 return (
@@ -11813,12 +15164,11 @@ fn handle_mihomo_api_connections(daemon: &Daemon) -> (u16, &'static str, String)
         };
         (ec.0, ec.1, geo_dir_from_state(&inner.state))
     };
-    match mihomo_api_get(&addr, secret.as_deref(), "/connections") {
-        Ok(body) => (
-            200,
-            "application/json",
-            enrich_connections_with_geoip(&body, geo_dir.as_deref().map(Path::new)).unwrap_or(body),
-        ),
+    match mihomo_api_get_connections_json(&addr, secret.as_deref()) {
+        Ok(mut value) => {
+            enrich_connections_with_geoip(&mut value, geo_dir.as_deref().map(Path::new), daemon);
+            json_response(&value)
+        }
         Err(e) => (
             502,
             "application/json",
@@ -11840,40 +15190,30 @@ fn handle_mihomo_api_connections_page(body: &str, daemon: &Daemon) -> (u16, &'st
         .collect();
     let (addr, secret, geo_dir) = {
         let inner = lock(&daemon.inner);
-        let Some((addr, secret)) = mihomo_controller(&inner.state.mihomo_features) else {
+        let Some((addr, secret)) = daemon_mihomo_controller(daemon, &inner.state.mihomo_features)
+        else {
             return json_error(400, "external controller not enabled");
         };
         (addr, secret, geo_dir_from_state(&inner.state))
     };
-    let body = match mihomo_api_get(&addr, secret.as_deref(), "/connections") {
-        Ok(body) => {
-            enrich_connections_with_geoip(&body, geo_dir.as_deref().map(Path::new)).unwrap_or(body)
-        }
+    let value = match mihomo_api_get_connections_json(&addr, secret.as_deref()) {
+        Ok(value) => value,
         Err(error) => return json_error(502, &format!("Mihomo API: {error}")),
     };
-    let value: Value = match serde_json::from_str(&body) {
-        Ok(value) => value,
-        Err(error) => return json_error(502, &format!("Mihomo connections JSON: {error}")),
-    };
-    let all = value
-        .get("connections")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let total = all.len();
-    let filtered_rows: Vec<Value> = all
-        .into_iter()
-        .filter(|connection| {
-            let search_text = connection_search_text(connection);
-            query_terms.iter().all(|term| search_text.contains(term))
-        })
-        .collect();
-    let filtered = filtered_rows.len();
-    let connections = filtered_rows
-        .into_iter()
-        .skip(request.offset)
-        .take(limit)
-        .collect();
+    let (total, filtered, connections) = page_connections(
+        value,
+        &query_terms,
+        request.offset,
+        limit,
+        connection_search_text,
+        |connections| {
+            enrich_connection_items_with_geoip(
+                connections,
+                geo_dir.as_deref().map(Path::new),
+                daemon,
+            );
+        },
+    );
     json_response(&ConnectionPageResponse {
         total,
         filtered,
@@ -11912,18 +15252,15 @@ fn handle_mihomo_api_connections_device_traffic(
     }
     let (addr, secret) = {
         let inner = lock(&daemon.inner);
-        let Some((addr, secret)) = mihomo_controller(&inner.state.mihomo_features) else {
+        let Some((addr, secret)) = daemon_mihomo_controller(daemon, &inner.state.mihomo_features)
+        else {
             return json_error(400, "external controller not enabled");
         };
         (addr, secret)
     };
-    let body = match mihomo_api_get(&addr, secret.as_deref(), "/connections") {
-        Ok(body) => body,
-        Err(error) => return json_error(502, &format!("Mihomo API: {error}")),
-    };
-    let value: Value = match serde_json::from_str(&body) {
+    let value = match mihomo_api_get_connections_json(&addr, secret.as_deref()) {
         Ok(value) => value,
-        Err(error) => return json_error(502, &format!("Mihomo connections JSON: {error}")),
+        Err(error) => return json_error(502, &format!("Mihomo API: {error}")),
     };
     let devices = aggregate_device_traffic(
         value
@@ -12026,11 +15363,58 @@ fn connection_search_text(connection: &Value) -> String {
     fields.to_ascii_lowercase()
 }
 
-fn enrich_connections_with_geoip(body: &str, geo_dir: Option<&Path>) -> Option<String> {
-    let mut value = serde_json::from_str::<Value>(body).ok()?;
-    let db_path = geo_dir?.join("geoip.metadb");
-    let reader = maxminddb::Reader::open_readfile(db_path).ok()?;
-    let connections = value.get_mut("connections")?.as_array_mut()?;
+fn page_connections<F, E>(
+    mut value: Value,
+    query_terms: &[String],
+    offset: usize,
+    limit: usize,
+    mut search_text: F,
+    enrich_page: E,
+) -> (usize, usize, Vec<Value>)
+where
+    F: FnMut(&Value) -> String,
+    E: FnOnce(&mut [Value]),
+{
+    let all = value
+        .get_mut("connections")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let total = all.len();
+    let mut filtered = 0usize;
+    let mut page = Vec::with_capacity(limit.min(total.saturating_sub(offset)));
+    for connection in all {
+        let matches = query_terms.is_empty() || {
+            let text = search_text(&connection);
+            query_terms.iter().all(|term| text.contains(term))
+        };
+        if !matches {
+            continue;
+        }
+        if filtered >= offset && page.len() < limit {
+            page.push(connection);
+        }
+        filtered += 1;
+    }
+    enrich_page(&mut page);
+    (total, filtered, page)
+}
+
+fn enrich_connections_with_geoip(value: &mut Value, geo_dir: Option<&Path>, daemon: &Daemon) {
+    let Some(connections) = value.get_mut("connections").and_then(Value::as_array_mut) else {
+        return;
+    };
+    enrich_connection_items_with_geoip(connections, geo_dir, daemon);
+}
+
+fn enrich_connection_items_with_geoip(
+    connections: &mut [Value],
+    geo_dir: Option<&Path>,
+    daemon: &Daemon,
+) {
+    let Some(reader) = geoip_reader(daemon, geo_dir) else {
+        return;
+    };
     for conn in connections {
         let Some(metadata) = conn.get_mut("metadata").and_then(Value::as_object_mut) else {
             continue;
@@ -12053,7 +15437,43 @@ fn enrich_connections_with_geoip(body: &str, geo_dir: Option<&Path>) -> Option<S
             metadata.insert("destinationCountry".to_owned(), json!(country));
         }
     }
-    Some(value.to_string())
+}
+
+fn geoip_reader(
+    daemon: &Daemon,
+    geo_dir: Option<&Path>,
+) -> Option<Arc<maxminddb::Reader<Vec<u8>>>> {
+    let db_path = geo_dir?.join("geoip.metadb");
+    let key = geoip_cache_key(db_path)?;
+    {
+        let cache = lock(&daemon.geoip_cache);
+        if let Some(entry) = cache.as_ref()
+            && entry.key == key
+        {
+            return Some(Arc::clone(&entry.reader));
+        }
+    }
+    let reader = Arc::new(maxminddb::Reader::open_readfile(&key.path).ok()?);
+    let mut cache = lock(&daemon.geoip_cache);
+    if let Some(entry) = cache.as_ref()
+        && entry.key == key
+    {
+        return Some(Arc::clone(&entry.reader));
+    }
+    *cache = Some(GeoIpCacheEntry {
+        key,
+        reader: Arc::clone(&reader),
+    });
+    Some(reader)
+}
+
+fn geoip_cache_key(path: PathBuf) -> Option<GeoIpCacheKey> {
+    let metadata = fs::metadata(&path).ok()?;
+    Some(GeoIpCacheKey {
+        path,
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
 }
 
 fn geoip_country_code(reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> Option<String> {
@@ -12250,7 +15670,7 @@ fn handle_mihomo_api_connections_close(body: &str, daemon: &Daemon) -> (u16, &'s
     let ids = if let Some(id) = value.get("id").and_then(Value::as_str) {
         vec![id.to_owned()]
     } else {
-        let Ok(conns) = mihomo_api_get_json(&addr, secret.as_deref(), "/connections") else {
+        let Ok(conns) = mihomo_api_get_connections_json(&addr, secret.as_deref()) else {
             return (
                 502,
                 "application/json",
@@ -12313,7 +15733,7 @@ fn mihomo_controller_for_daemon(
     daemon: &Daemon,
 ) -> Result<(String, Option<String>), (u16, &'static str, String)> {
     let inner = lock(&daemon.inner);
-    mihomo_controller(&inner.state.mihomo_features).ok_or_else(|| {
+    daemon_mihomo_controller(daemon, &inner.state.mihomo_features).ok_or_else(|| {
         (
             400,
             "application/json",
@@ -12377,7 +15797,7 @@ fn close_resource_connections(
             };
         }
     };
-    let conns = match mihomo_api_get_json(&addr, secret.as_deref(), "/connections") {
+    let conns = match mihomo_api_get_connections_json(&addr, secret.as_deref()) {
         Ok(value) => value,
         Err(error) => {
             return ResourceCloseResult {
@@ -12414,7 +15834,7 @@ fn close_resource_connections(
 fn handle_mihomo_api_delay(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     let (addr, secret) = {
         let inner = lock(&daemon.inner);
-        match mihomo_controller(&inner.state.mihomo_features) {
+        match daemon_mihomo_controller(daemon, &inner.state.mihomo_features) {
             Some(ec) => ec,
             None => {
                 return (
@@ -12465,7 +15885,7 @@ fn handle_mihomo_api_delay(body: &str, daemon: &Daemon) -> (u16, &'static str, S
 fn handle_mihomo_api_traffic(daemon: &Daemon) -> (u16, &'static str, String) {
     let (addr, secret) = {
         let inner = lock(&daemon.inner);
-        match mihomo_controller(&inner.state.mihomo_features) {
+        match daemon_mihomo_controller(daemon, &inner.state.mihomo_features) {
             Some(ec) => ec,
             None => {
                 return (
@@ -12492,7 +15912,7 @@ fn handle_mihomo_api_memory(daemon: &Daemon) -> (u16, &'static str, String) {
     let (addr, secret, pid) = {
         let inner = lock(&daemon.inner);
         let pid = inner.core.child.as_ref().map(Child::id);
-        match mihomo_controller(&inner.state.mihomo_features) {
+        match daemon_mihomo_controller(daemon, &inner.state.mihomo_features) {
             Some((addr, secret)) => (Some(addr), secret, pid),
             None => {
                 return match pid.and_then(read_process_rss_kb) {
@@ -12663,16 +16083,7 @@ fn handle_memory_guard(daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
-const SAFE_MODE_SUPPRESSED: [&str; 8] = [
-    "rkn-bypass",
-    "managed-geobases",
-    "proxy-providers",
-    "rule-providers",
-    "sub-rules",
-    "raw-rules",
-    "typed-rules",
-    "tunnels-and-smux",
-];
+const SAFE_MODE_SUPPRESSED: [&str; 3] = ["rkn-bypass", "managed-geobases", "tunnels"];
 
 fn handle_safe_mode_get(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
@@ -12779,14 +16190,6 @@ fn handle_memory_estimate(daemon: &Daemon) -> (u16, &'static str, String) {
     };
     let (_, available_kb, usage_pct) = memory_summary_from_proc();
     let current_mihomo_rss_kb = mihomo_pid.and_then(read_process_rss_kb).unwrap_or(0);
-    let mut source_paths = Vec::new();
-    for provider in &state.mihomo_features.rule_providers {
-        if provider.provider_type == "file"
-            && let Some(path) = provider.path.as_deref()
-        {
-            source_paths.push(PathBuf::from(path));
-        }
-    }
     let geobase_entries = manifest
         .applied_bases
         .iter()
@@ -12815,12 +16218,7 @@ fn handle_memory_estimate(daemon: &Daemon) -> (u16, &'static str, String) {
         .filter_map(|metadata| fs::metadata(daemon.geobase_store_root.join(&metadata.file)).ok())
         .map(|metadata| metadata.len())
         .sum::<u64>();
-    let rule_source_bytes = source_paths
-        .iter()
-        .filter_map(|path| fs::metadata(path).ok())
-        .map(|metadata| metadata.len())
-        .sum::<u64>()
-        .saturating_add(geobase_bytes);
+    let rule_source_bytes = geobase_bytes;
     let mut reasons = Vec::new();
     if state.memory_guard.enabled && usage_pct >= state.memory_guard.system_usage_warn_pct {
         reasons.push(format!(
@@ -12846,7 +16244,7 @@ fn handle_memory_estimate(daemon: &Daemon) -> (u16, &'static str, String) {
         current_mihomo_rss_kb,
         available_memory_kb: available_kb,
         user_rules: state.routing_rules.len(),
-        rule_provider_count: state.mihomo_features.rule_providers.len(),
+        rule_provider_count: 0,
         geobase_entries,
         safe_mode_enabled: state.safe_mode_enabled,
         reasons,
@@ -12858,7 +16256,7 @@ fn handle_memory_estimate(daemon: &Daemon) -> (u16, &'static str, String) {
 fn handle_traffic_stats(daemon: &Daemon) -> (u16, &'static str, String) {
     let (total_up, total_down, ec_addr, ec_secret) = {
         let inner = lock(&daemon.inner);
-        let ec = mihomo_controller(&inner.state.mihomo_features);
+        let ec = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
         let (addr, secret) = match ec {
             Some((a, s)) => (Some(a), s),
             None => (None, None),
@@ -13295,6 +16693,11 @@ impl MihomoLogCursor {
         path: &Path,
         parovozik_enabled: bool,
     ) -> Result<Vec<AutoVpnCandidate>, String> {
+        let text = self.read_new_text(path)?;
+        Ok(log_candidate_domains_from_text(&text, parovozik_enabled))
+    }
+
+    fn read_new_text(&mut self, path: &Path) -> Result<String, String> {
         let mut file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let metadata = file
             .metadata()
@@ -13322,14 +16725,11 @@ impl MihomoLogCursor {
             .read_to_end(&mut bytes)
             .map_err(|e| format!("read {}: {e}", path.display()))?;
         let Some(last_newline) = bytes.iter().rposition(|byte| *byte == b'\n') else {
-            return Ok(Vec::new());
+            return Ok(String::new());
         };
         let complete_len = last_newline + 1;
         self.offset = self.offset.saturating_add(complete_len as u64);
-        Ok(log_candidate_domains_from_text(
-            &String::from_utf8_lossy(&bytes[..complete_len]),
-            parovozik_enabled,
-        ))
+        Ok(String::from_utf8_lossy(&bytes[..complete_len]).into_owned())
     }
 }
 
@@ -14113,7 +17513,7 @@ fn start_geobase_job(
     let enabled = existing.as_ref().is_none_or(|record| record.enabled);
     let (controller, source_proxy_url) = {
         let mut inner = lock(&daemon.inner);
-        let controller = mihomo_controller(&inner.state.mihomo_features);
+        let controller = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
         let source_proxy_url = geobase_source_proxy_url(&mut inner);
         (controller, source_proxy_url)
     };
@@ -14951,7 +18351,7 @@ fn handle_dns_diagnostics(daemon: &Daemon) -> (u16, &'static str, String) {
         (
             inner.state.split_routing.enabled,
             1053u16,
-            mihomo_controller(&inner.state.mihomo_features),
+            daemon_mihomo_controller(daemon, &inner.state.mihomo_features),
             inner.state.socks_port,
             inner.core.is_running(),
         )
@@ -15006,7 +18406,7 @@ fn handle_dns_diagnostics_v2(daemon: &Daemon) -> (u16, &'static str, String) {
         (
             inner.state.split_routing.enabled,
             1053u16,
-            mihomo_controller(&inner.state.mihomo_features),
+            daemon_mihomo_controller(daemon, &inner.state.mihomo_features),
             inner.core.is_running(),
             inner.state.dns_settings.remote_servers.clone(),
             inner.state.dns_settings.local_servers.clone(),
@@ -15597,7 +18997,9 @@ fn restart_core_locked(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon) -> 
     let (binary_path, config_path) = regenerate_config(&inner.state, daemon)?;
     inner
         .core
-        .restart(&binary_path, &config_path, geo_dir.as_deref())
+        .restart(&binary_path, &config_path, geo_dir.as_deref())?;
+    let controller = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
+    wait_for_core_readiness_locked(inner, daemon, controller.as_ref())
 }
 
 /// Authenticate a user and return a bounded-lifetime cryptographic session.
@@ -16035,29 +19437,16 @@ fn handle_devices_scan(_daemon: &Daemon) -> (u16, &'static str, String) {
 /// Apply device routing changes: regenerate Mihomo config and restart core.
 fn handle_device_routes_apply(daemon: &Daemon) -> (u16, &'static str, String) {
     let mut inner = lock(&daemon.inner);
-    let geo_dir = geo_dir_from_state(&inner.state);
-    match regenerate_config(&inner.state, daemon) {
-        Ok((binary_path, config_path)) => {
-            match inner
-                .core
-                .restart(&binary_path, &config_path, geo_dir.as_deref())
-            {
-                Ok(()) => (
-                    200,
-                    "application/json",
-                    json!({"status": "applied", "core_status": inner.core.status()}).to_string(),
-                ),
-                Err(e) => (
-                    500,
-                    "application/json",
-                    json!({"error": format!("core restart: {e}")}).to_string(),
-                ),
-            }
-        }
+    match restart_core_locked(&mut inner, daemon) {
+        Ok(()) => (
+            200,
+            "application/json",
+            json!({"status": "applied", "core_status": inner.core.status()}).to_string(),
+        ),
         Err(e) => (
             500,
             "application/json",
-            json!({"error": format!("config regeneration: {e}")}).to_string(),
+            json!({"error": format!("core restart: {e}")}).to_string(),
         ),
     }
 }
@@ -16713,25 +20102,36 @@ fn attempt_verified_failover(
             continue;
         }
 
+        let _apply = match daemon.apply.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                eprintln!(
+                    "hincyray: verified failover aborted because config apply lock is poisoned"
+                );
+                return false;
+            }
+        };
         let mut inner = lock(&daemon.inner);
-        let current_raw = inner
-            .state
-            .active_profile_id
-            .and_then(|id| inner.state.profiles.iter().find(|profile| profile.id == id))
-            .map(|profile| profile.raw.as_str());
-        if current_raw != Some(failed_active_raw) {
-            eprintln!(
-                "hincyray: verified failover aborted because active profile changed concurrently"
-            );
-            return false;
-        }
-        let Some(candidate_id) = inner
-            .state
-            .profiles
-            .iter()
-            .find(|profile| profile.raw == candidate_raw)
-            .map(|profile| profile.id)
-        else {
+        let candidate_id = {
+            let current_raw = inner
+                .state
+                .active_profile_id
+                .and_then(|id| inner.state.profiles.iter().find(|profile| profile.id == id))
+                .map(|profile| profile.raw.as_str());
+            if current_raw != Some(failed_active_raw) {
+                eprintln!(
+                    "hincyray: verified failover aborted because active profile changed concurrently"
+                );
+                return false;
+            }
+            inner
+                .state
+                .profiles
+                .iter()
+                .find(|profile| profile.raw == candidate_raw)
+                .map(|profile| profile.id)
+        };
+        let Some(candidate_id) = candidate_id else {
             eprintln!(
                 "hincyray: verified candidate disappeared during subscription refresh: {candidate_name}"
             );
@@ -16739,7 +20139,7 @@ fn attempt_verified_failover(
             continue;
         };
         eprintln!("hincyray: verified failover to profile {candidate_id} ({candidate_name})");
-        if apply_active_profile(&mut inner, daemon, candidate_id).is_ok() {
+        if apply_active_profile_locked(&mut inner, daemon, candidate_id).is_ok() {
             return true;
         }
         record_profile_health_failure(&mut inner.state, &candidate_raw, unix_now());
@@ -16997,29 +20397,34 @@ fn download_and_install_mihomo(
 /// the same mechanism as `handle_bench_start` but uses the TCP method
 /// (lightweight, no temp Xray processes) and covers all profiles.
 fn start_auto_benchmark(daemon: &Daemon) {
-    let profiles: Vec<Profile> = {
-        let inner = lock(&daemon.inner);
-        if inner.bench.is_running() {
-            return;
-        }
-        inner
-            .state
-            .profiles
-            .iter()
-            .filter(|profile| !profile_is_dead(&inner.state, profile))
-            .cloned()
-            .collect()
-    };
-    if profiles.is_empty() {
-        return;
-    }
-    let job = Arc::new(Mutex::new(BenchJob::default()));
-    let cancel = Arc::new(AtomicBool::new(false));
     let daemon_for_callback = daemon.clone();
     let on_result = Box::new(move |result: BenchResult| {
         apply_bench_result(&daemon_for_callback, result);
     });
-    let handle = run_bench(
+    let mut inner = lock(&daemon.inner);
+    if inner.bench.is_running() {
+        return;
+    }
+    let profiles: Vec<Profile> = inner
+        .state
+        .profiles
+        .iter()
+        .filter(|profile| !profile_is_dead(&inner.state, profile))
+        .cloned()
+        .collect();
+    if profiles.is_empty() {
+        return;
+    }
+    let job = new_bench_job(BenchMethod::Tcp, profiles.len(), 1);
+    let cancel = Arc::new(AtomicBool::new(false));
+    if inner
+        .bench
+        .reserve(Arc::clone(&job), Arc::clone(&cancel))
+        .is_err()
+    {
+        return;
+    }
+    match run_bench(
         profiles,
         BenchMethod::Tcp,
         DEFAULT_PROBE_URL.to_owned(),
@@ -17029,18 +20434,16 @@ fn start_auto_benchmark(daemon: &Daemon) {
         None,
         false,
         false,
-        1,
         Arc::clone(&job),
-        Arc::clone(&cancel),
+        cancel,
         on_result,
-    );
-    let mut inner = lock(&daemon.inner);
-    if let Some(prev) = inner.bench.handle.take() {
-        let _ = prev.join();
+    ) {
+        Ok(handle) => inner.bench.handle = Some(handle),
+        Err(error) => {
+            inner.bench.release_reservation(&job);
+            eprintln!("hincyray: automatic benchmark start failed: {error}");
+        }
     }
-    inner.bench.job = Some(job);
-    inner.bench.cancel = Some(cancel);
-    inner.bench.handle = Some(handle);
 }
 
 enum ActiveProfileApplyError {
@@ -17072,7 +20475,15 @@ impl ActiveProfileApplyError {
 ///
 /// Keep all profile-switching entrypoints behind this helper so that the
 /// persisted profile and Mihomo's live configuration change together.
-fn apply_active_profile(
+fn apply_active_profile(daemon: &Daemon, profile_id: usize) -> Result<(), ActiveProfileApplyError> {
+    let _apply = daemon.apply.lock().map_err(|_| {
+        ActiveProfileApplyError::Runtime("config apply lock is poisoned".to_owned())
+    })?;
+    let mut inner = lock(&daemon.inner);
+    apply_active_profile_locked(&mut inner, daemon, profile_id)
+}
+
+fn apply_active_profile_locked(
     inner: &mut MutexGuard<DaemonInner>,
     daemon: &Daemon,
     profile_id: usize,
@@ -17094,7 +20505,6 @@ fn apply_active_profile(
     }
     let previous_profile_id = inner.state.active_profile_id;
     let active_profile_changed = previous_profile_id != Some(profile_id);
-    let geo_dir = geo_dir_from_state(&inner.state);
 
     inner.state.active_profile_id = Some(profile_id);
     let config_yaml = match build_authoritative_daemon_config(&inner.state, daemon) {
@@ -17105,54 +20515,87 @@ fn apply_active_profile(
         }
     };
 
-    let config_path = daemon.mihomo_config_path.clone();
     let binary_path = inner.state.mihomo_path.clone();
-    let controller = mihomo_controller(&inner.state.mihomo_features);
-    let core_running = inner.core.is_running();
+    let geo_dir = geo_dir_from_state(&inner.state);
+    let validation = validate_mihomo_config_yaml(&binary_path, &config_yaml, geo_dir.as_deref());
+    if validation.get("ok").and_then(Value::as_bool) != Some(true) {
+        inner.state.active_profile_id = previous_profile_id;
+        return Err(ActiveProfileApplyError::InvalidConfig(format!(
+            "config validation failed: {}",
+            validation_error(&validation)
+        )));
+    }
 
-    let apply_result = atomic_write_config(&config_path, config_yaml.as_bytes())
-        .and_then(|()| {
-            if core_running && let Some(controller) = controller.as_ref() {
-                hot_reload_mihomo_config(controller, &config_path)
-            } else {
-                inner
-                    .core
-                    .restart(&binary_path, &config_path, geo_dir.as_deref())
-            }
-        })
-        .and_then(|()| persist_state(&daemon.state_path, &inner.state).map_err(|e| e.to_string()));
+    let config_path = daemon.mihomo_config_path.clone();
+    let previous_config = match fs::read(&config_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            inner.state.active_profile_id = previous_profile_id;
+            return Err(ActiveProfileApplyError::Runtime(format!(
+                "read previous Mihomo config: {error}"
+            )));
+        }
+    };
+    let previous_runtime = capture_activation_runtime(inner);
+    let controller = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
+    let mut persist_attempted = false;
+
+    let apply_result: Result<(), String> = (|| {
+        atomic_write_config(&config_path, config_yaml.as_bytes())?;
+        let state = inner.state.clone();
+        hot_reload_or_restart_core_locked(
+            inner,
+            daemon,
+            &state,
+            controller.as_ref(),
+            &config_path,
+            geo_dir.as_deref(),
+        )?;
+        wait_for_core_readiness_locked(inner, daemon, controller.as_ref())?;
+        persist_attempted = true;
+        persist_state(&daemon.state_path, &inner.state)?;
+        #[cfg(test)]
+        if daemon
+            .fail_active_profile_persist_after_write
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err("injected active profile persist failure after write".to_owned());
+        }
+        Ok(())
+    })();
 
     if let Err(error) = apply_result {
         inner.state.active_profile_id = previous_profile_id;
-        if previous_profile_id.is_some() {
-            let (rollback_binary, rollback_path) = match regenerate_config(&inner.state, daemon) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("hincyray: rollback config regeneration failed: {e}");
-                    return Err(ActiveProfileApplyError::Runtime(error));
-                }
-            };
-            let rollback_result = if core_running && let Some(controller) = controller.as_ref() {
-                hot_reload_mihomo_config(controller, &rollback_path)
-            } else {
-                inner
-                    .core
-                    .restart(&rollback_binary, &rollback_path, geo_dir.as_deref())
-            };
-            if let Err(rollback_error) = rollback_result {
-                eprintln!(
-                    "hincyray: rollback after active profile switch failure failed: {rollback_error}"
-                );
+        let previous_state = inner.state.clone();
+        let (runtime_rollback, runtime_restored) = restore_previous_activation_locked(
+            inner,
+            daemon,
+            previous_config.as_deref(),
+            &previous_runtime,
+            &previous_state,
+        );
+        let state_rollback = if persist_attempted || !runtime_restored {
+            match persist_state(&daemon.state_path, &inner.state) {
+                Ok(()) => "restored".to_owned(),
+                Err(rollback_error) => format!("failed ({rollback_error})"),
             }
+        } else {
+            "unchanged".to_owned()
+        };
+        if !runtime_restored || state_rollback.starts_with("failed") {
+            eprintln!("hincyray: active profile rollback incomplete");
         }
-        return Err(ActiveProfileApplyError::Runtime(error));
+        return Err(ActiveProfileApplyError::Runtime(format!(
+            "active profile apply failed: {error}; rollback: memory=restored, state={state_rollback}, {runtime_rollback}"
+        )));
     }
 
     // A successful Mihomo hot reload affects only new connections. Drop the
     // old ones after the transaction commits so clients reconnect through the
     // newly selected profile instead of retaining the previous exit address.
     if active_profile_changed
-        && core_running
+        && previous_runtime.core_running
         && let Some((addr, secret)) = controller.as_ref()
         && let Err(error) = mihomo_api_delete(addr, secret.as_deref(), "/connections")
     {
@@ -17164,10 +20607,9 @@ fn apply_active_profile(
     Ok(())
 }
 
-/// Switch the active profile, regenerate Mihomo config, and restart the
-/// core. Caller must hold the lock.
-fn switch_active_profile(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon, profile_id: usize) {
-    if let Err(error) = apply_active_profile(inner, daemon, profile_id) {
+/// Switch the active profile, regenerate Mihomo config, and restart the core.
+fn switch_active_profile(daemon: &Daemon, profile_id: usize) {
+    if let Err(error) = apply_active_profile(daemon, profile_id) {
         eprintln!(
             "hincyray: active profile switch failed: {}",
             error.message()
@@ -17224,7 +20666,6 @@ fn start_watchdog(
                 auto_update_interval_hours,
                 last_update_check,
                 mihomo_path,
-                proxy_group_enabled,
                 ec_addr,
                 ec_secret,
                 auto_refresh_enabled,
@@ -17237,7 +20678,7 @@ fn start_watchdog(
                 deep_bench_due_now,
             ) = {
                 let mut inner = lock(&daemon.inner);
-                let ec = mihomo_controller(&inner.state.mihomo_features);
+                let ec = daemon_mihomo_controller(&daemon, &inner.state.mihomo_features);
                 let (ec_addr, ec_secret) = match ec {
                     Some((a, s)) => (Some(a), s),
                     None => (None, None),
@@ -17261,7 +20702,6 @@ fn start_watchdog(
                     inner.state.auto_update_interval_hours,
                     inner.state.last_update_check_unix,
                     inner.state.mihomo_path.clone(),
-                    inner.state.mihomo_features.proxy_group.enabled,
                     ec_addr,
                     ec_secret,
                     inner.state.auto_refresh_enabled,
@@ -17370,38 +20810,7 @@ fn start_watchdog(
             // DIRECT when the upstream proxy is unreachable, preventing
             // connection storms.
             if !bench_running && !deep_bench_running && core_running {
-                // When proxy groups are enabled, Mihomo handles failover
-                // natively via url-test / fallback / load-balance groups.
-                // The daemon must NOT restart the core or switch profiles —
-                // that would destroy the group's internal state (latency
-                // history, selected node, sticky sessions) and cause a
-                // traffic blip. Instead, we just log and skip.
-                if proxy_group_enabled {
-                    // Optionally query the API for group health display.
-                    // No action needed — Mihomo url-test runs on its own
-                    // interval and switches nodes automatically.
-                    if let Some(ref addr) = ec_addr
-                        && let Ok(proxies) =
-                            mihomo_api_get_json(addr, ec_secret.as_deref(), "/proxies/proxy")
-                    {
-                        let alive = proxies
-                            .get("alive")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        let now_name = proxies.get("now").and_then(Value::as_str).unwrap_or("?");
-                        if !alive {
-                            eprintln!("hincyray: proxy group not alive (Mihomo handling failover)");
-                        } else {
-                            // Reset fail counter — group is healthy.
-                            let mut inner = lock(&daemon.inner);
-                            if inner.failover_fail_count > 0 {
-                                eprintln!("hincyray: proxy group healthy (now={now_name})");
-                            }
-                            inner.failover_fail_count = 0;
-                            failover_rejected_profiles.clear();
-                        }
-                    }
-                } else if let Some(ref addr) = ec_addr {
+                if let Some(ref addr) = ec_addr {
                     // v0.19.9: External controller enabled — read Mihomo
                     // fallback group state instead of triggering our own
                     // delay test. Rationale: the auto-generated fallback
@@ -17616,12 +21025,14 @@ fn start_watchdog(
             // --- Phase 5: Auto-select after benchmark ---
             if bench_was_running && !bench_running && auto_select {
                 eprintln!("hincyray: benchmark finished, auto-selecting lowest-latency profile");
-                let mut inner = lock(&daemon.inner);
-                if let Some(best_id) = find_best_profile(&inner.state, &HashSet::new())
-                    && Some(best_id) != inner.state.active_profile_id
-                {
+                let best_id = {
+                    let inner = lock(&daemon.inner);
+                    find_best_profile(&inner.state, &HashSet::new())
+                        .filter(|best_id| Some(*best_id) != inner.state.active_profile_id)
+                };
+                if let Some(best_id) = best_id {
                     eprintln!("hincyray: auto-switching to profile {best_id}");
-                    switch_active_profile(&mut inner, &daemon, best_id);
+                    switch_active_profile(&daemon, best_id);
                 }
             }
 
@@ -17650,11 +21061,22 @@ fn start_watchdog(
                                     Ok(new_version) => {
                                         let mut inner = lock(&daemon.inner);
                                         let geo_dir = geo_dir_from_state(&inner.state);
-                                        if let Err(e) = inner.core.restart(
+                                        let restart = inner.core.restart(
                                             &mihomo_path,
                                             &daemon.mihomo_config_path,
                                             geo_dir.as_deref(),
-                                        ) {
+                                        );
+                                        let controller = daemon_mihomo_controller(
+                                            &daemon,
+                                            &inner.state.mihomo_features,
+                                        );
+                                        if let Err(e) = restart.and_then(|()| {
+                                            wait_for_core_readiness_locked(
+                                                &mut inner,
+                                                &daemon,
+                                                controller.as_ref(),
+                                            )
+                                        }) {
                                             eprintln!(
                                                 "hincyray: core restart after auto-update failed: {e}"
                                             );
@@ -17708,32 +21130,41 @@ fn start_watchdog(
                     // After refresh, check if the active profile was
                     // removed (its raw link no longer exists). If so,
                     // auto-select the best available profile.
-                    let mut inner = lock(&daemon.inner);
-                    let active_removed = inner
-                        .state
-                        .active_profile_id
-                        .is_some_and(|id| !inner.state.profiles.iter().any(|p| p.id == id));
+                    let replacement = {
+                        let inner = lock(&daemon.inner);
+                        let active_removed = inner
+                            .state
+                            .active_profile_id
+                            .is_some_and(|id| !inner.state.profiles.iter().any(|p| p.id == id));
+                        if active_removed || inner.state.active_profile_id.is_none() {
+                            find_best_profile(&inner.state, &HashSet::new())
+                                .or_else(|| inner.state.profiles.first().map(|profile| profile.id))
+                        } else {
+                            None
+                        }
+                    };
 
-                    if active_removed || inner.state.active_profile_id.is_none() {
-                        if let Some(best_id) = find_best_profile(&inner.state, &HashSet::new()) {
+                    if let Some(profile_id) = replacement {
+                        let has_tested_profile = {
+                            let inner = lock(&daemon.inner);
+                            find_best_profile(&inner.state, &HashSet::new()) == Some(profile_id)
+                        };
+                        if has_tested_profile {
                             eprintln!(
-                                "hincyray: auto-refresh: active profile removed, switching to best #{best_id}"
+                                "hincyray: auto-refresh: active profile removed, switching to best #{profile_id}"
                             );
-                            switch_active_profile(&mut inner, &daemon, best_id);
-                        } else if let Some(first) = inner.state.profiles.first() {
-                            let first_id = first.id;
-                            eprintln!(
-                                "hincyray: auto-refresh: no tested profiles, switching to first #{first_id}"
-                            );
-                            switch_active_profile(&mut inner, &daemon, first_id);
                         } else {
                             eprintln!(
-                                "hincyray: auto-refresh: no profiles available after refresh"
+                                "hincyray: auto-refresh: no tested profiles, switching to first #{profile_id}"
                             );
-                            inner.state.active_profile_id = None;
                         }
+                        switch_active_profile(&daemon, profile_id);
+                    } else if lock(&daemon.inner).state.profiles.is_empty() {
+                        eprintln!("hincyray: auto-refresh: no profiles available after refresh");
+                        lock(&daemon.inner).state.active_profile_id = None;
                     }
 
+                    let mut inner = lock(&daemon.inner);
                     inner.state.last_auto_refresh_unix = now;
                     inner.dirty = true;
                 }
@@ -17776,7 +21207,7 @@ fn start_watchdog(
             if core_running
                 && watchdog_tick.is_multiple_of(3)
                 && let Some(ref addr) = ec_addr
-                && let Ok(conns) = mihomo_api_get_json(addr, ec_secret.as_deref(), "/connections")
+                && let Ok(conns) = mihomo_api_get_connections_json(addr, ec_secret.as_deref())
             {
                 let now = unix_now();
                 let mut new_entries: Vec<ConnectionLogEntry> = Vec::new();
@@ -18308,9 +21739,11 @@ fn run_deep_bench(
         completed: 0,
         current_profile_id: None,
         current_profile_name: None,
+        active_profiles: Vec::new(),
         last_updated: started_unix,
         cancel_requested: false,
         results: Vec::new(),
+        worker_count: 1,
     }));
     let on_result: Box<dyn Fn(crate::benchmark::BenchResult) + Send + Sync> = Box::new(|_| {});
     // Update status to Phase A.
@@ -18335,11 +21768,18 @@ fn run_deep_bench(
         None,
         /* test_download */ true,
         /* test_upload */ false,
-        /* concurrency */ 1,
         job.clone(),
         cancel.clone(),
         on_result,
     );
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("hincyray: deep bench phase A start failed: {error}");
+            finish_deep_bench_failed_to_start(&daemon, started_unix, error);
+            return;
+        }
+    };
     if let Err(error) = handle.join() {
         eprintln!("hincyray: deep bench phase A worker panicked: {error:?}");
     }
@@ -18510,6 +21950,19 @@ fn finish_deep_bench_cancelled(daemon: &Daemon, started_unix: u64) {
         started_unix,
         eta_secs: 0,
         last_error: String::new(),
+    };
+    inner.dirty = true;
+}
+
+fn finish_deep_bench_failed_to_start(daemon: &Daemon, started_unix: u64, error: String) {
+    let mut inner = lock(&daemon.inner);
+    inner.deep_bench_status = DeepBenchStatus {
+        state: "failed".to_owned(),
+        phase_progress: 0,
+        phase_detail: "phase A worker did not start".to_owned(),
+        started_unix,
+        eta_secs: 0,
+        last_error: error,
     };
     inner.dirty = true;
 }
@@ -18798,6 +22251,7 @@ fn status_text(code: u16) -> &'static str {
         429 => "Too Many Requests",
         409 => "Conflict",
         413 => "Payload Too Large",
+        502 => "Bad Gateway",
         500 => "Internal Server Error",
         _ => "OK",
     }
@@ -18806,6 +22260,7 @@ fn status_text(code: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mihomo_config::TunnelConfig;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
@@ -18823,6 +22278,69 @@ mod tests {
         };
         let daemon = Daemon::new(state, state_path, mihomo_config_path);
         (dir, daemon)
+    }
+
+    fn diagnostic_controller(daemon: &Daemon, responses: Vec<Value>) -> JoinHandle<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("diagnostic controller");
+        daemon.set_mihomo_controller_override(
+            listener
+                .local_addr()
+                .expect("diagnostic controller address")
+                .to_string(),
+        );
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("diagnostic controller request");
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).expect("read controller request");
+                let body = response.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write controller response");
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    fn runnable_active_profile_test_daemon() -> (TempDir, Daemon, JoinHandle<()>) {
+        let dir = TempDir::new().expect("temp dir");
+        let script = dir.path().join("fake-mihomo.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then exit 0; fi\nsleep 30\n",
+        )
+        .expect("fake mihomo");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let daemon = Daemon::new(
+            HincyrayState {
+                mihomo_path: script.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            dir.path().join("state.json"),
+            dir.path().join("mihomo-config.yaml"),
+        );
+        let controller = TcpListener::bind("127.0.0.1:0").expect("controller");
+        daemon.set_mihomo_controller_override(
+            controller
+                .local_addr()
+                .expect("controller address")
+                .to_string(),
+        );
+        let controller_worker = thread::spawn(move || {
+            let (mut stream, _) = controller.accept().expect("readiness request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read readiness request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .expect("readiness response");
+        });
+        (dir, daemon, controller_worker)
     }
 
     fn wait_for_geobase(daemon: &Daemon) -> GeoBaseRuntimeStatus {
@@ -18859,6 +22377,220 @@ mod tests {
         client.read_to_string(&mut response).expect("read response");
         worker.join().expect("server thread");
         response
+    }
+
+    #[test]
+    fn socket_inode_and_proc_net_parsers_are_strict() {
+        assert_eq!(parse_socket_inode("socket:[12345]"), Some(12345));
+        assert_eq!(parse_socket_inode("pipe:[12345]"), None);
+        assert_eq!(parse_socket_inode("socket:12345"), None);
+
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                     0: 0100007F:2382 00000000:0000 0A 00000000:00000000 00:00000000 00000000  0  0 111 1 0000000000000000\n\
+                     1: 0100007F:2A38 0100007F:C350 01 00000000:00000000 00:00000000 00000000  0  0 222 1 0000000000000000\n\
+                     2: 00000000:2A3A 00000000:0000 07 00000000:00000000 00:00000000 00000000  0  0 333 2 0000000000000000\n";
+        let owned = HashSet::from([111, 222, 333]);
+        let tcp = parse_proc_net_sockets(table, SocketProtocol::Tcp, &owned);
+        assert_eq!(
+            tcp,
+            HashSet::from([ExpectedSocket {
+                protocol: SocketProtocol::Tcp,
+                port: 9090,
+            }])
+        );
+        let udp = parse_proc_net_sockets(table, SocketProtocol::Udp, &owned);
+        assert!(udp.contains(&ExpectedSocket {
+            protocol: SocketProtocol::Udp,
+            port: 10810,
+        }));
+    }
+
+    #[test]
+    fn socket_contract_tracks_router_listener_modes() {
+        let mut state = HincyrayState {
+            socks_port: 12080,
+            ..HincyrayState::default()
+        };
+        state.split_routing.enabled = true;
+        state.split_routing.redirect_port = 12090;
+        state.split_routing.tproxy_available = false;
+        let controller = ("127.0.0.1:19090".to_owned(), None);
+        let contract = CoreSocketContract::from_state(&state, Some(&controller)).expect("contract");
+        for expected in [
+            ExpectedSocket {
+                protocol: SocketProtocol::Tcp,
+                port: 12080,
+            },
+            ExpectedSocket {
+                protocol: SocketProtocol::Udp,
+                port: 12080,
+            },
+            ExpectedSocket {
+                protocol: SocketProtocol::Tcp,
+                port: DNS_INBOUND_PORT,
+            },
+            ExpectedSocket {
+                protocol: SocketProtocol::Udp,
+                port: DNS_INBOUND_PORT,
+            },
+            ExpectedSocket {
+                protocol: SocketProtocol::Tcp,
+                port: 12090,
+            },
+            ExpectedSocket {
+                protocol: SocketProtocol::Tcp,
+                port: 19090,
+            },
+        ] {
+            assert!(contract.sockets.contains(&expected), "missing {expected:?}");
+        }
+        assert!(!contract.sockets.contains(&ExpectedSocket {
+            protocol: SocketProtocol::Udp,
+            port: 12091,
+        }));
+
+        state.split_routing.tproxy_available = true;
+        let contract = CoreSocketContract::from_state(&state, Some(&controller)).expect("contract");
+        assert!(contract.sockets.contains(&ExpectedSocket {
+            protocol: SocketProtocol::Udp,
+            port: 12091,
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_socket_ownership_matches_only_the_listener_process() {
+        let tcp = TcpListener::bind("127.0.0.1:0").expect("TCP listener");
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("UDP listener");
+        let expected = [
+            ExpectedSocket {
+                protocol: SocketProtocol::Tcp,
+                port: tcp.local_addr().expect("TCP address").port(),
+            },
+            ExpectedSocket {
+                protocol: SocketProtocol::Udp,
+                port: udp.local_addr().expect("UDP address").port(),
+            },
+        ];
+        assert!(
+            tracked_process_owns_sockets(std::process::id(), &expected)
+                .expect("current process sockets")
+        );
+        let unrelated = Command::new("sleep").arg("30").spawn().expect("sleep");
+        let unrelated_pid = unrelated.id();
+        let mut unrelated = CoreManager {
+            child: Some(unrelated),
+        };
+        assert!(
+            !tracked_process_owns_sockets(unrelated_pid, &expected).expect("unrelated sockets")
+        );
+        unrelated.stop().expect("stop unrelated process");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readiness_rejects_live_controller_not_owned_by_tracked_child() {
+        let controller = TcpListener::bind("127.0.0.1:0").expect("fake controller");
+        let address = controller.local_addr().expect("controller address");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = controller.accept().expect("version request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .expect("version response");
+        });
+        let mut core = CoreManager {
+            child: Some(
+                Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("tracked child"),
+            ),
+        };
+        let contract = CoreSocketContract {
+            sockets: vec![ExpectedSocket {
+                protocol: SocketProtocol::Tcp,
+                port: address.port(),
+            }],
+        };
+        let descriptor = (address.to_string(), None);
+        let error = observe_core_readiness_until(
+            Some(&descriptor),
+            || core_matches_runtime_contract(&mut core, &contract, true),
+            Duration::ZERO,
+            Duration::from_millis(150),
+            Duration::from_millis(10),
+        )
+        .expect_err("foreign controller must not satisfy readiness");
+        assert!(error.contains("does not own"), "{error}");
+        core.stop().expect("stop tracked child");
+        worker.join().expect("controller worker");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_pdeathsig_helper() {
+        let Ok(pid_path) = std::env::var("HINCYRAY_PDEATHSIG_HELPER_PID") else {
+            return;
+        };
+        let script = std::env::var("HINCYRAY_PDEATHSIG_HELPER_SCRIPT").expect("helper script");
+        let config = std::env::var("HINCYRAY_PDEATHSIG_HELPER_CONFIG").expect("helper config");
+        let mut core = CoreManager::new();
+        core.start(&script, Path::new(&config), None)
+            .expect("start protected child");
+        fs::write(pid_path, core.pid().expect("child PID").to_string()).expect("write child PID");
+        loop {
+            thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tracked_child_exits_when_daemon_parent_dies() {
+        let dir = TempDir::new().expect("temp dir");
+        let script = dir.path().join("exec-sleep.sh");
+        let config = dir.path().join("config.yaml");
+        let pid_path = dir.path().join("child.pid");
+        fs::write(&script, "#!/bin/sh\nexec sleep 30\n").expect("helper script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::write(&config, "test\n").expect("config");
+        let mut parent = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("hincyray::tests::linux_pdeathsig_helper")
+            .arg("--nocapture")
+            .env("HINCYRAY_PDEATHSIG_HELPER_PID", &pid_path)
+            .env("HINCYRAY_PDEATHSIG_HELPER_SCRIPT", &script)
+            .env("HINCYRAY_PDEATHSIG_HELPER_CONFIG", &config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("helper parent");
+        let child_pid = (0..100)
+            .find_map(|_| {
+                let pid = fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i32>().ok());
+                if pid.is_none() {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                pid
+            })
+            .expect("protected child PID");
+        parent.kill().expect("kill helper parent");
+        parent.wait().expect("reap helper parent");
+        let exited = (0..100).any(|_| {
+            // SAFETY: signal 0 only checks whether this numeric PID still exists.
+            let gone = unsafe { libc::kill(child_pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            if !gone {
+                thread::sleep(Duration::from_millis(20));
+            }
+            gone
+        });
+        assert!(exited, "PDEATHSIG child {child_pid} survived its parent");
     }
 
     #[test]
@@ -19483,12 +23215,30 @@ mod tests {
             dir.path().join("state.json"),
             dir.path().join("mihomo-config.yaml"),
         );
+        let controller = TcpListener::bind("127.0.0.1:0").expect("controller");
+        daemon.set_mihomo_controller_override(
+            controller
+                .local_addr()
+                .expect("controller address")
+                .to_string(),
+        );
+        let controller_worker = thread::spawn(move || {
+            let (mut stream, _) = controller.accept().expect("readiness request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read readiness request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .expect("readiness response");
+        });
         create_geobase_config_generation(&daemon, "authoritative", true);
         let desired = geobase_store(&daemon)
             .load_manifest()
             .expect("desired manifest")
             .generation;
         assert_eq!(handle_routing_apply(&daemon).0, 200);
+        controller_worker.join().expect("controller worker");
         let applied = geobase_store(&daemon)
             .load_manifest()
             .expect("applied manifest");
@@ -20071,6 +23821,138 @@ mod tests {
     }
 
     #[test]
+    fn load_state_sanitizes_removed_mihomo_fields_and_forces_exposed_legacy_auth_loopback() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let mut value = serde_json::to_value(HincyrayState {
+            listen_host: "0.0.0.0".to_owned(),
+            ..HincyrayState::default()
+        })
+        .expect("state JSON");
+        value["mihomo_features"]["authentication"] = json!(["admin:legacy-secret"]);
+        value["mihomo_features"]["skip_auth_prefixes"] = json!(["192.168.1.0/24"]);
+        value["mihomo_features"]["proxy_providers"] = json!([{
+            "name": "legacy",
+            "url": "https://provider.example/sub/private-token"
+        }]);
+        value["mihomo_features"]["removed_future_field"] =
+            json!({"url": "https://provider.example/rules/private-token"});
+        value["mihomo_features"]["per_proxy"]["smux"] = json!({"enabled": true});
+        value["mihomo_features"]["external_controller"]["address"] = json!("0.0.0.0:9999");
+        value["mihomo_features"]["tunnels"] = json!([{
+            "network": ["tcp"],
+            "address": "127.0.0.1:5353",
+            "target": "dns.example:53",
+            "dialer_proxy": "legacy-secret"
+        }]);
+        fs::write(&state_path, value.to_string()).expect("legacy state");
+
+        let loaded = load_state(&state_path);
+
+        assert_eq!(loaded.listen_host, "127.0.0.1");
+        let persisted = fs::read_to_string(&state_path).expect("sanitized state");
+        for removed in [
+            "authentication",
+            "skip_auth_prefixes",
+            "proxy_providers",
+            "removed_future_field",
+            "smux",
+            "0.0.0.0:9999",
+            "legacy-secret",
+            "private-token",
+        ] {
+            assert!(!persisted.contains(removed), "persisted {removed}");
+        }
+    }
+
+    #[test]
+    fn restore_deserializer_forces_exposed_legacy_auth_listener_to_loopback() {
+        let mut value = serde_json::to_value(HincyrayState {
+            listen_host: "192.168.1.1".to_owned(),
+            ..HincyrayState::default()
+        })
+        .expect("state JSON");
+        value["mihomo_features"]["authentication"] = json!(["admin:legacy-secret"]);
+        value["mihomo_features"]["skip_auth_prefixes"] = json!(["192.168.1.0/24"]);
+
+        let restored = deserialize_persisted_state(&value.to_string()).expect("restore state");
+
+        assert_eq!(restored.listen_host, "127.0.0.1");
+        let serialized = serde_json::to_string(&restored).expect("sanitized state");
+        assert!(!serialized.contains("authentication"));
+        assert!(!serialized.contains("skip_auth_prefixes"));
+        assert!(!serialized.contains("legacy-secret"));
+    }
+
+    #[test]
+    fn load_state_keeps_loopback_listener_when_removing_legacy_auth() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let mut value = serde_json::to_value(HincyrayState {
+            listen_host: "::1".to_owned(),
+            ..HincyrayState::default()
+        })
+        .expect("state JSON");
+        value["mihomo_features"]["authentication"] = json!([]);
+        fs::write(&state_path, value.to_string()).expect("legacy state");
+
+        let loaded = load_state(&state_path);
+
+        assert_eq!(loaded.listen_host, "::1");
+        assert!(
+            !fs::read_to_string(&state_path)
+                .expect("sanitized state")
+                .contains("authentication")
+        );
+    }
+
+    #[test]
+    fn load_state_removes_unsafe_and_malformed_legacy_tunnels_but_keeps_valid_loopback() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let mut value = serde_json::to_value(HincyrayState::default()).expect("state JSON");
+        value["mihomo_features"]["tunnels"] = json!([
+            {
+                "network": ["tcp"],
+                "address": "0.0.0.0:5353",
+                "target": "unsafe.example:53"
+            },
+            {
+                "network": ["tcp", "tcp"],
+                "address": "127.0.0.1:0",
+                "target": "missing-port"
+            },
+            {
+                "network": ["tcp", "udp"],
+                "address": "127.0.0.1:5353",
+                "target": "dns.example:53",
+                "proxy": "proxy"
+            }
+        ]);
+        fs::write(&state_path, value.to_string()).expect("legacy state");
+
+        let loaded = load_state(&state_path);
+
+        assert_eq!(
+            loaded.mihomo_features.tunnels,
+            vec![TunnelConfig {
+                network: vec!["tcp".to_owned(), "udp".to_owned()],
+                address: "127.0.0.1:5353".to_owned(),
+                target: "dns.example:53".to_owned(),
+                proxy: Some("proxy".to_owned()),
+            }]
+        );
+        let persisted = load_state(&state_path);
+        assert_eq!(
+            persisted.mihomo_features.tunnels,
+            loaded.mihomo_features.tunnels
+        );
+        let persisted_bytes = fs::read_to_string(&state_path).expect("sanitized state");
+        assert!(!persisted_bytes.contains("0.0.0.0:5353"));
+        assert!(!persisted_bytes.contains("missing-port"));
+    }
+
+    #[test]
     fn load_state_returns_default_when_missing() {
         let loaded = load_state(Path::new("/nonexistent/hincyray-state-test.json"));
         assert!(loaded.profiles.is_empty());
@@ -20169,13 +24051,15 @@ mod tests {
         assert_eq!(inner.state.profiles.len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn set_active_profile_writes_mihomo_config() {
-        let (_dir, daemon) = test_daemon();
+        let (_dir, daemon, controller_worker) = runnable_active_profile_test_daemon();
         let body = "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&security=reality&sni=www.example.com&fp=chrome&pbk=0123456789abcdef0123456789abcdef0123456789a&sid=abcd#XHTTP";
         handle_import(body, &daemon);
 
         let (status, _, response_text) = handle_set_active(r#"{"profile_id":0}"#, &daemon);
+        controller_worker.join().expect("controller worker");
         assert_eq!(status, 200);
         let response: Value = serde_json::from_str(&response_text).expect("parse response");
         assert_eq!(response["active_profile_id"], 0);
@@ -20186,6 +24070,7 @@ mod tests {
         assert_eq!(config["socks-port"], 10808);
         assert_eq!(config["proxies"][0]["type"], "vless");
         assert_eq!(config["proxies"][0]["network"], "xhttp");
+        let _ = lock(&daemon.inner).core.stop();
     }
 
     #[test]
@@ -20524,14 +24409,797 @@ mod tests {
             &daemon,
         );
 
-        let (status, _, body) =
-            handle_profile_update(r#"{"profile_id":0,"name":"NewName"}"#, &daemon);
+        let expected_server_ref = {
+            let inner = lock(&daemon.inner);
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        let body = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "name": "NewName",
+        })
+        .to_string();
+        let (status, _, body) = handle_profile_update(&body, &daemon);
         assert_eq!(status, 200);
         let resp: Value = serde_json::from_str(&body).expect("parse response");
-        assert_eq!(resp["name"], "NewName");
+        assert_eq!(resp["profile"]["name"], "NewName");
+        assert!(resp["profile"].get("raw").is_none());
 
         let inner = lock(&daemon.inner);
         assert_eq!(inner.state.profiles[0].name, "NewName");
+    }
+
+    #[test]
+    fn profile_detail_requires_auth_and_raw_stays_out_of_list() {
+        let (_dir, daemon) = test_daemon();
+        let raw = "vless://11111111-1111-1111-1111-111111111111@example.com:443#Sensitive";
+        let token = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(raw).expect("profile");
+            profile.id = 0;
+            inner.state.profiles.push(profile);
+            inner.state.favorites.push(raw.to_owned());
+            inner.state.web_ui_auth.enabled = true;
+            let token = generate_session_token().expect("token");
+            inner
+                .sessions
+                .insert(token.clone(), WebSession::new(unix_now()));
+            token
+        };
+
+        let unauthorized = http_request(
+            daemon.clone(),
+            "GET /api/profiles/0 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(unauthorized.starts_with("HTTP/1.1 401"));
+        let authorized = http_request(
+            daemon.clone(),
+            &format!(
+                "GET /api/profiles/0 HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\r\n"
+            ),
+        );
+        assert!(authorized.starts_with("HTTP/1.1 200"));
+        assert!(authorized.contains("Cache-Control: no-store"));
+        let detail: Value = serde_json::from_str(
+            authorized
+                .split_once("\r\n\r\n")
+                .expect("HTTP response body")
+                .1,
+        )
+        .expect("detail JSON");
+        assert_eq!(detail["profile"]["raw"], raw);
+        assert_eq!(detail["profile"]["favorite"], true);
+        assert_eq!(detail["profile"]["subscription_managed"], false);
+
+        let (_, _, list_body) = dispatch("GET", "/api/profiles", "", &daemon);
+        let list: Value = serde_json::from_str(&list_body).expect("list JSON");
+        assert!(list["profiles"][0].get("raw").is_none());
+        assert!(!list_body.contains(raw));
+    }
+
+    #[test]
+    fn profile_detail_rejects_unbounded_or_malformed_id() {
+        let (_dir, daemon) = test_daemon();
+        assert_eq!(dispatch("GET", "/api/profiles/nope", "", &daemon).0, 400);
+        assert_eq!(
+            dispatch("GET", "/api/profiles/999999999999999999999", "", &daemon).0,
+            400
+        );
+    }
+
+    #[test]
+    fn manual_profile_raw_edit_preserves_requested_name_and_returns_safe_fields() {
+        let (_dir, daemon) = test_daemon();
+        let old_raw = "vless://11111111-1111-1111-1111-111111111111@old.example:443#OldFragment";
+        let new_raw =
+            "vless://22222222-2222-2222-2222-222222222222@new.example:8443?type=ws#NewFragment";
+        let expected_server_ref = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(old_raw).expect("old profile");
+            profile.id = 0;
+            profile.name = "Displayed".to_owned();
+            inner.state.profiles.push(profile);
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "name": "Requested name",
+            "raw": new_raw,
+        });
+
+        let (status, _, body) = handle_profile_update(&request.to_string(), &daemon);
+
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("response");
+        assert_eq!(response["profile"]["name"], "Requested name");
+        assert_eq!(response["profile"]["address"], "new.example");
+        assert_eq!(response["profile"]["port"], 8443);
+        assert_eq!(response["profile"]["transport"], "ws");
+        assert!(response["profile"].get("raw").is_none());
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles[0].id, 0);
+        assert_eq!(inner.state.profiles[0].name, "Requested name");
+        assert_eq!(inner.state.profiles[0].raw, new_raw);
+    }
+
+    #[test]
+    fn subscription_profile_allows_name_but_rejects_raw_edit() {
+        let (_dir, daemon) = test_daemon();
+        let subscription_url = "https://provider.example/sub/token";
+        let expected_server_ref = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(
+                "vless://11111111-1111-1111-1111-111111111111@old.example:443#Managed",
+            )
+            .expect("profile");
+            profile.id = 0;
+            profile.group = Some(subscription_url.to_owned());
+            inner.state.profiles.push(profile);
+            inner.state.subscriptions.push(StoredSubscription {
+                url: subscription_url.to_owned(),
+                ..Default::default()
+            });
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        let rename = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "name": "Renamed managed profile",
+        });
+        assert_eq!(handle_profile_update(&rename.to_string(), &daemon).0, 200);
+        let raw_edit = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "raw": "vless://22222222-2222-2222-2222-222222222222@new.example:443#Replacement",
+        });
+        let (status, _, body) = handle_profile_update(&raw_edit.to_string(), &daemon);
+        assert_eq!(status, 400);
+        assert!(body.contains("manual copy"));
+        assert!(!body.contains(subscription_url));
+        assert_eq!(
+            lock(&daemon.inner).state.profiles[0].name,
+            "Renamed managed profile"
+        );
+    }
+
+    #[test]
+    fn subscription_profile_detection_normalizes_url_without_leaking_source() {
+        let (_dir, daemon) = test_daemon();
+        let source = "https://provider.example/sub/secret-token";
+        let expected_server_ref = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(
+                "vless://11111111-1111-1111-1111-111111111111@old.example:443#Managed",
+            )
+            .expect("profile");
+            profile.id = 0;
+            profile.group = Some(format!("  {source}#client-fragment  "));
+            inner.state.profiles.push(profile);
+            inner.state.subscriptions.push(StoredSubscription {
+                url: format!("{source}#stored-fragment"),
+                ..Default::default()
+            });
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "raw": "vless://22222222-2222-2222-2222-222222222222@new.example:443#Replacement",
+        });
+
+        let (status, _, body) = handle_profile_update(&request.to_string(), &daemon);
+
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("manual copy"));
+        assert!(!body.contains(source));
+    }
+
+    #[test]
+    fn profile_update_rejects_stale_expected_server_ref() {
+        let (_dir, daemon) = test_daemon();
+        let mut profile = parse_single_profile(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443#Current",
+        )
+        .expect("profile");
+        profile.id = 0;
+        lock(&daemon.inner).state.profiles.push(profile);
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": lifecycle_ref_for_canonical("different"),
+            "name": "Must not apply",
+        });
+
+        let (status, _, body) = handle_profile_update(&request.to_string(), &daemon);
+
+        assert_eq!(status, 409);
+        assert!(body.contains("refresh"));
+        assert_eq!(lock(&daemon.inner).state.profiles[0].name, "Current");
+    }
+
+    #[test]
+    fn active_profile_raw_edit_applies_config_transactionally() {
+        let (_dir, daemon) = test_daemon();
+        let old_raw = "vless://11111111-1111-1111-1111-111111111111@old.example:443#Active";
+        let new_raw =
+            "vless://22222222-2222-2222-2222-222222222222@new.example:443?security=tls#Changed";
+        let expected_server_ref = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(old_raw).expect("profile");
+            profile.id = 0;
+            inner.state.profiles.push(profile);
+            inner.state.active_profile_id = Some(0);
+            persist_state(&daemon.state_path, &inner.state).expect("baseline state");
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "raw": new_raw,
+        });
+
+        let (status, _, body) = handle_profile_update(&request.to_string(), &daemon);
+
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("response");
+        assert_eq!(response["dataplane_applied"], true);
+        assert_eq!(lock(&daemon.inner).state.profiles[0].raw, new_raw);
+        let config = fs::read_to_string(&daemon.mihomo_config_path).expect("applied config");
+        assert!(config.contains("new.example"));
+        assert_eq!(load_state(&daemon.state_path).profiles[0].raw, new_raw);
+    }
+
+    #[test]
+    fn active_profile_raw_edit_rolls_back_on_validation_failure() {
+        let (_dir, daemon) = test_daemon();
+        let old_raw = "vless://11111111-1111-1111-1111-111111111111@old.example:443#Active";
+        let expected_server_ref = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(old_raw).expect("profile");
+            profile.id = 0;
+            inner.state.profiles.push(profile);
+            inner.state.active_profile_id = Some(0);
+            inner.state.mihomo_path = "/usr/bin/false".to_owned();
+            persist_state(&daemon.state_path, &inner.state).expect("baseline state");
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        atomic_write_config(&daemon.mihomo_config_path, b"OLD exact config\n")
+            .expect("baseline config");
+        let before_disk = fs::read(&daemon.state_path).expect("baseline state bytes");
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "raw": "vless://22222222-2222-2222-2222-222222222222@new.example:443#Changed",
+        });
+
+        let (status, _, body) = handle_profile_update(&request.to_string(), &daemon);
+
+        assert_eq!(status, 500, "{body}");
+        assert_eq!(lock(&daemon.inner).state.profiles[0].raw, old_raw);
+        assert_eq!(fs::read(&daemon.state_path).expect("state"), before_disk);
+        assert_eq!(
+            fs::read(&daemon.mihomo_config_path).expect("config"),
+            b"OLD exact config\n"
+        );
+    }
+
+    #[cfg(unix)]
+    fn concurrent_profile_update_case(validation_succeeds: bool) {
+        let (dir, daemon) = test_daemon();
+        let validator = dir.path().join("slow-mihomo.sh");
+        fs::write(
+            &validator,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then sleep 1; exit {}; fi\nsleep 30\n",
+                if validation_succeeds { 0 } else { 1 }
+            ),
+        )
+        .expect("validator script");
+        fs::set_permissions(&validator, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let old_raw = "vless://11111111-1111-1111-1111-111111111111@old.example:443#Concurrent";
+        let expected_server_ref = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(old_raw).expect("profile");
+            profile.id = 0;
+            inner.state.profiles.push(profile);
+            inner.state.active_profile_id = Some(0);
+            inner.state.mihomo_path = validator.to_string_lossy().into_owned();
+            persist_state(&daemon.state_path, &inner.state).expect("baseline state");
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "raw": "vless://22222222-2222-2222-2222-222222222222@new.example:443#Concurrent",
+        })
+        .to_string();
+        let update_daemon = daemon.clone();
+        let update = thread::spawn(move || handle_profile_update(&request, &update_daemon));
+
+        let started = Instant::now();
+        while daemon.inner.try_lock().is_ok() {
+            assert!(started.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mutation_daemon = daemon.clone();
+        let mutation = thread::spawn(move || {
+            let mut inner = lock(&mutation_daemon.inner);
+            inner.state.favorites.push("concurrent-favorite".to_owned());
+            inner.state.safe_mode_enabled = true;
+            inner.dirty = true;
+            persist_state(&mutation_daemon.state_path, &inner.state)
+                .expect("persist concurrent mutation");
+        });
+
+        let (status, _, body) = update.join().expect("profile update");
+        mutation.join().expect("concurrent mutation");
+        assert_eq!(
+            status,
+            if validation_succeeds { 200 } else { 500 },
+            "{body}"
+        );
+        let inner = lock(&daemon.inner);
+        assert!(
+            inner
+                .state
+                .favorites
+                .contains(&"concurrent-favorite".to_owned())
+        );
+        assert!(inner.state.safe_mode_enabled);
+        assert!(
+            inner.dirty,
+            "profile transaction cleared unrelated dirty state"
+        );
+        drop(inner);
+        let persisted = load_state(&daemon.state_path);
+        assert!(
+            persisted
+                .favorites
+                .contains(&"concurrent-favorite".to_owned())
+        );
+        assert!(persisted.safe_mode_enabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_unrelated_state_survives_profile_update_success() {
+        concurrent_profile_update_case(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_unrelated_state_survives_profile_update_rollback() {
+        concurrent_profile_update_case(false);
+    }
+
+    #[test]
+    fn profile_identity_change_treats_missing_quality_history_as_empty() {
+        let (_dir, daemon) = test_daemon();
+        let old_raw = "vless://11111111-1111-1111-1111-111111111111@old.example:443#Missing";
+        let expected_server_ref = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(old_raw).expect("profile");
+            profile.id = 0;
+            inner.state.profiles.push(profile);
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "raw": "vless://22222222-2222-2222-2222-222222222222@new.example:443#Missing",
+        });
+
+        let (status, _, body) = handle_profile_update(&request.to_string(), &daemon);
+
+        assert_eq!(status, 200, "{body}");
+        assert!(!quality_history_path(&daemon.state_path).exists());
+    }
+
+    #[test]
+    fn malformed_quality_history_aborts_profile_identity_change_before_mutation() {
+        let (_dir, daemon) = test_daemon();
+        let old_raw = "vless://11111111-1111-1111-1111-111111111111@old.example:443#Malformed";
+        let expected_server_ref = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(old_raw).expect("profile");
+            profile.id = 0;
+            inner.state.profiles.push(profile);
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        fs::write(quality_history_path(&daemon.state_path), b"{not-json")
+            .expect("malformed history");
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "raw": "vless://22222222-2222-2222-2222-222222222222@new.example:443#Malformed",
+        });
+
+        let (status, _, body) = handle_profile_update(&request.to_string(), &daemon);
+
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("parse quality history JSON"));
+        assert_eq!(lock(&daemon.inner).state.profiles[0].raw, old_raw);
+    }
+
+    #[test]
+    fn unreadable_quality_history_aborts_profile_identity_change_before_mutation() {
+        let (_dir, daemon) = test_daemon();
+        let old_raw = "vless://11111111-1111-1111-1111-111111111111@old.example:443#Unreadable";
+        let expected_server_ref = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(old_raw).expect("profile");
+            profile.id = 0;
+            inner.state.profiles.push(profile);
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        fs::create_dir(quality_history_path(&daemon.state_path)).expect("history directory");
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "raw": "vless://22222222-2222-2222-2222-222222222222@new.example:443#Unreadable",
+        });
+
+        let (status, _, body) = handle_profile_update(&request.to_string(), &daemon);
+
+        assert_eq!(status, 500, "{body}");
+        assert!(body.contains("read quality history"));
+        assert_eq!(lock(&daemon.inner).state.profiles[0].raw, old_raw);
+    }
+
+    #[test]
+    fn profile_history_rollback_restores_exact_previous_bytes() {
+        let (_dir, daemon) = test_daemon();
+        let old_raw = "vless://11111111-1111-1111-1111-111111111111@old.example:443#History";
+        let expected_server_ref = {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(old_raw).expect("profile");
+            profile.id = 0;
+            inner.state.profiles.push(profile);
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        let history_bytes = format!(
+            "[  {{\"server_ref\":\"{expected_server_ref}\",\"profile_name\":\"History\",\"date\":0,\"phase_a_success\":false,\"stability\":null,\"unlock\":null}}  ]\n"
+        )
+        .into_bytes();
+        fs::write(quality_history_path(&daemon.state_path), &history_bytes).expect("history");
+        daemon.fail_next_profile_history_persist_after_write();
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "raw": "vless://22222222-2222-2222-2222-222222222222@new.example:443#History",
+        });
+
+        let (status, _, body) = handle_profile_update(&request.to_string(), &daemon);
+
+        assert_eq!(status, 500, "{body}");
+        assert_eq!(
+            fs::read(quality_history_path(&daemon.state_path)).expect("restored history"),
+            history_bytes
+        );
+        assert_eq!(lock(&daemon.inner).state.profiles[0].raw, old_raw);
+    }
+
+    #[test]
+    fn ungrouped_revalidation_updates_stale_parsed_fields_and_preserves_metadata() {
+        let (_dir, daemon) = test_daemon();
+        let raw =
+            "vless://11111111-1111-1111-1111-111111111111@correct.example:8443?type=ws#Fragment";
+        {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(raw).expect("profile");
+            profile.id = 0;
+            profile.name = "Explicit name".to_owned();
+            profile.address = "stale.example".to_owned();
+            profile.port = Some(1);
+            profile.group = None;
+            profile.block_quic = true;
+            inner.state.favorites.push(raw.to_owned());
+            inner.state.profiles.push(profile);
+        }
+
+        let (status, _, body) = handle_profiles_revalidate_ungrouped(&daemon);
+
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("response");
+        assert_eq!(response["checked"], 1);
+        assert_eq!(response["updated"], 1);
+        assert_eq!(response["unchanged"], 0);
+        assert_eq!(response["errors"], json!([]));
+        let inner = lock(&daemon.inner);
+        let profile = &inner.state.profiles[0];
+        assert_eq!(profile.address, "correct.example");
+        assert_eq!(profile.port, Some(8443));
+        assert_eq!(profile.name, "Explicit name");
+        assert!(profile.group.is_none());
+        assert!(profile.block_quic);
+        assert!(inner.state.favorites.contains(&raw.to_owned()));
+    }
+
+    #[test]
+    fn ungrouped_revalidation_empty_set_is_a_successful_noop() {
+        let (_dir, daemon) = test_daemon();
+        let mut grouped = parse_single_profile(
+            "vless://11111111-1111-1111-1111-111111111111@grouped.example:443#Grouped",
+        )
+        .expect("profile");
+        grouped.group = Some("Imported group".to_owned());
+        lock(&daemon.inner).state.profiles.push(grouped);
+
+        let (status, _, body) = handle_profiles_revalidate_ungrouped(&daemon);
+
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("response");
+        assert_eq!(response["checked"], 0);
+        assert_eq!(response["updated"], 0);
+        assert_eq!(response["unchanged"], 0);
+        assert_eq!(response["dataplane_applied"], false);
+        assert_eq!(response["errors"], json!([]));
+    }
+
+    #[test]
+    fn whitespace_group_is_revalidated_as_no_group() {
+        let (_dir, daemon) = test_daemon();
+        let raw = "vless://11111111-1111-1111-1111-111111111111@correct.example:443#Whitespace";
+        {
+            let mut inner = lock(&daemon.inner);
+            let mut profile = parse_single_profile(raw).expect("profile");
+            profile.address = "stale.example".to_owned();
+            profile.group = Some("  \t ".to_owned());
+            inner.state.profiles.push(profile);
+        }
+
+        let (status, _, body) = handle_profiles_revalidate_ungrouped(&daemon);
+
+        assert_eq!(status, 200, "{body}");
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles[0].address, "correct.example");
+        assert!(inner.state.profiles[0].group.is_none());
+    }
+
+    #[test]
+    fn revalidation_allows_unchanged_pre_existing_duplicate_identities() {
+        let (_dir, daemon) = test_daemon();
+        let raw = "vless://11111111-1111-1111-1111-111111111111@same.example:443#Duplicate";
+        {
+            let mut inner = lock(&daemon.inner);
+            for id in 0..3 {
+                let mut profile = parse_single_profile(raw).expect("profile");
+                profile.id = id;
+                profile.name = format!("Duplicate {id}");
+                profile.group = match id {
+                    0 => Some("Imported group".to_owned()),
+                    1 => None,
+                    _ => Some(" ".to_owned()),
+                };
+                inner.state.profiles.push(profile);
+            }
+        }
+
+        let (status, _, body) = handle_profiles_revalidate_ungrouped(&daemon);
+
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("response");
+        assert_eq!(response["checked"], 2);
+        assert_eq!(response["updated"], 0);
+        assert_eq!(response["unchanged"], 2);
+        assert_eq!(response["errors"], json!([]));
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.profiles[0].raw, raw);
+        assert_eq!(inner.state.profiles[1].raw, raw);
+        assert_eq!(inner.state.profiles[2].raw, raw);
+    }
+
+    #[test]
+    fn revalidation_rejects_changed_identity_collision_without_mutation() {
+        let (_dir, daemon) = test_daemon();
+        let duplicate_raw = "vless://11111111-1111-1111-1111-111111111111@same.example:443";
+        let other_raw = "vless://22222222-2222-2222-2222-222222222222@correct.example:443#Other";
+        let before = {
+            let mut inner = lock(&daemon.inner);
+            let mut existing = parse_single_profile(duplicate_raw).expect("existing profile");
+            existing.id = 0;
+            existing.group = Some("Imported group".to_owned());
+
+            let mut colliding = parse_single_profile(duplicate_raw).expect("colliding profile");
+            colliding.id = 1;
+            colliding.name = "Colliding".to_owned();
+            colliding.raw = format!("{duplicate_raw})");
+
+            let mut other = parse_single_profile(other_raw).expect("other profile");
+            other.id = 2;
+            other.address = "stale.example".to_owned();
+
+            inner.state.profiles = vec![existing, colliding, other];
+            serde_json::to_value(&inner.state).expect("state snapshot")
+        };
+
+        let (status, _, body) = handle_profiles_revalidate_ungrouped(&daemon);
+
+        assert_eq!(status, 409, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("response");
+        assert_eq!(response["checked"], 2);
+        assert_eq!(response["updated"], 0);
+        assert_eq!(response["unchanged"], 2);
+        assert_eq!(response["errors"].as_array().expect("errors").len(), 1);
+        assert_eq!(response["errors"][0]["profile_id"], 1);
+        assert_eq!(
+            serde_json::to_value(&lock(&daemon.inner).state).expect("state after rejection"),
+            before
+        );
+    }
+
+    #[test]
+    fn revalidation_rejects_two_changed_profiles_that_converge_without_mutation() {
+        let (_dir, daemon) = test_daemon();
+        let raw = "vless://11111111-1111-1111-1111-111111111111@same.example:443";
+        let before = {
+            let mut inner = lock(&daemon.inner);
+            for (id, suffix) in [")", "}"].into_iter().enumerate() {
+                let stored_raw = format!("{raw}{suffix}");
+                let mut profile = parse_single_profile(raw).expect("profile");
+                profile.id = id;
+                profile.name = format!("Converging {id}");
+                profile.raw = stored_raw;
+                inner.state.profiles.push(profile);
+            }
+            serde_json::to_value(&inner.state).expect("state snapshot")
+        };
+
+        let (status, _, body) = handle_profiles_revalidate_ungrouped(&daemon);
+
+        assert_eq!(status, 409, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("response");
+        assert_eq!(response["updated"], 0);
+        assert_eq!(response["errors"].as_array().expect("errors").len(), 2);
+        assert_eq!(response["errors"][0]["profile_id"], 0);
+        assert_eq!(response["errors"][1]["profile_id"], 1);
+        assert_eq!(
+            serde_json::to_value(&lock(&daemon.inner).state).expect("state after rejection"),
+            before
+        );
+    }
+
+    #[test]
+    fn ungrouped_revalidation_is_all_or_none() {
+        let (_dir, daemon) = test_daemon();
+        let valid_raw = "vless://11111111-1111-1111-1111-111111111111@correct.example:443#Valid";
+        {
+            let mut inner = lock(&daemon.inner);
+            let mut valid = parse_single_profile(valid_raw).expect("valid profile");
+            valid.id = 0;
+            valid.address = "stale.example".to_owned();
+            valid.group = None;
+            inner.state.profiles.push(valid);
+            inner.state.profiles.push(Profile {
+                id: 1,
+                name: "Broken".to_owned(),
+                protocol: crate::profiles::Protocol::Vless,
+                address: "broken.example".to_owned(),
+                port: Some(443),
+                raw: "not-a-share-link".to_owned(),
+                selected: true,
+                block_quic: false,
+                group: None,
+            });
+        }
+
+        let (status, _, body) = handle_profiles_revalidate_ungrouped(&daemon);
+
+        assert_eq!(status, 400, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("response");
+        assert_eq!(response["checked"], 2);
+        assert_eq!(response["updated"], 0);
+        assert_eq!(response["errors"][0]["profile_id"], 1);
+        assert_eq!(
+            lock(&daemon.inner).state.profiles[0].address,
+            "stale.example"
+        );
+    }
+
+    #[test]
+    fn profile_identity_edit_migrates_dead_deep_stats_and_pinned_route_intent() {
+        let (_dir, daemon) = test_daemon();
+        let old_raw = "vless://11111111-1111-1111-1111-111111111111@old.example:443#Pinned";
+        let new_raw = "vless://22222222-2222-2222-2222-222222222222@new.example:443#NewFragment";
+        let (expected_server_ref, old_routing_ref) = {
+            let mut inner = lock(&daemon.inner);
+            let mut active = parse_single_profile(
+                "vless://aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa@active.example:443#Active",
+            )
+            .expect("active");
+            active.id = 0;
+            let mut pinned = parse_single_profile(old_raw).expect("pinned");
+            pinned.id = 1;
+            pinned.name = "Pinned display".to_owned();
+            inner.state.profiles = vec![active, pinned];
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = true;
+            sync_server_route_registry(&mut inner.state);
+            let old_routing_ref = inner
+                .state
+                .server_route_registry
+                .iter()
+                .find(|entry| entry.canonical_raw == canonical_profile_raw_from_raw(old_raw))
+                .expect("routing registry")
+                .server_ref
+                .clone();
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "Pinned route".to_owned(),
+                target: format!("server:{old_routing_ref}"),
+                domains: vec!["pinned.example".to_owned()],
+                ..Default::default()
+            });
+            let lifecycle_ref = profile_server_ref(&inner.state.profiles[1]);
+            inner.state.dead_server_refs.insert(lifecycle_ref.clone());
+            inner
+                .state
+                .dead_promoted_at
+                .insert(lifecycle_ref.clone(), 123);
+            inner.state.deep_bench.profile_filter =
+                ProfileFilter::Explicit(vec![lifecycle_ref.clone()]);
+            inner.state.favorites.push(old_raw.to_owned());
+            inner.state.stats.push(ProfileStats {
+                profile_raw: old_raw.to_owned(),
+                success_count: 7,
+                ..Default::default()
+            });
+            inner.state.quality_history.push(DailyQualitySnapshot {
+                server_ref: lifecycle_ref.clone(),
+                profile_name: "Pinned display".to_owned(),
+                ..Default::default()
+            });
+            persist_state(&daemon.state_path, &inner.state).expect("baseline state");
+            persist_quality_history(
+                &quality_history_path(&daemon.state_path),
+                &inner.state.quality_history,
+            )
+            .expect("baseline history");
+            (lifecycle_ref, old_routing_ref)
+        };
+        let request = json!({
+            "profile_id": 1,
+            "expected_server_ref": expected_server_ref,
+            "raw": new_raw,
+        });
+
+        let (status, _, body) = handle_profile_update(&request.to_string(), &daemon);
+
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("response");
+        assert_eq!(response["dataplane_applied"], true);
+        let inner = lock(&daemon.inner);
+        let profile = &inner.state.profiles[1];
+        let new_lifecycle_ref = profile_server_ref(profile);
+        assert_eq!(profile.name, "Pinned display");
+        assert!(profile.group.is_none());
+        assert!(inner.state.dead_server_refs.contains(&new_lifecycle_ref));
+        assert_eq!(inner.state.dead_promoted_at[&new_lifecycle_ref], 123);
+        assert!(!inner.state.dead_server_refs.contains(&expected_server_ref));
+        assert_eq!(
+            inner.state.deep_bench.profile_filter,
+            ProfileFilter::Explicit(vec![new_lifecycle_ref.clone()])
+        );
+        assert!(inner.state.favorites.contains(&new_raw.to_owned()));
+        assert_eq!(inner.state.stats[0].profile_raw, new_raw);
+        assert_eq!(inner.state.stats[0].success_count, 7);
+        assert_eq!(inner.state.quality_history[0].server_ref, new_lifecycle_ref);
+        let RoutingTarget::Server(new_routing_ref) =
+            RoutingTarget::parse(&inner.state.routing_rules[0].target).expect("routing target")
+        else {
+            panic!("expected pinned server target");
+        };
+        assert_ne!(new_routing_ref, old_routing_ref);
+        assert!(inner.state.server_route_registry.iter().any(|entry| {
+            entry.server_ref == new_routing_ref
+                && entry.canonical_raw == canonical_profile_raw(profile)
+        }));
+        drop(inner);
+        let history = load_quality_history(&daemon.state_path, &[]);
+        assert_eq!(
+            history[0].server_ref,
+            profile_server_ref(&lock(&daemon.inner).state.profiles[1])
+        );
     }
 
     #[test]
@@ -20562,85 +25230,48 @@ mod tests {
         assert!(!response_text.contains("Hysteria2"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn set_active_accepts_legacy_id_field() {
-        let (_dir, daemon) = test_daemon();
+        let (_dir, daemon, controller_worker) = runnable_active_profile_test_daemon();
         handle_import(
             "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
             &daemon,
         );
         let (status, _, _) = handle_set_active(r#"{"id":0}"#, &daemon);
+        controller_worker.join().expect("controller worker");
         assert_eq!(status, 200);
+        let _ = lock(&daemon.inner).core.stop();
     }
 
     #[cfg(unix)]
     #[test]
-    fn active_profile_hot_reload_closes_existing_mihomo_connections() {
-        let (dir, daemon) = test_daemon();
+    fn active_profile_switch_waits_for_config_apply_lock() {
+        let (_dir, daemon, controller_worker) = runnable_active_profile_test_daemon();
         handle_import(
-            "vless://11111111-1111-1111-1111-111111111111@one.example:443?security=tls#One\n\
-             vless://22222222-2222-2222-2222-222222222222@two.example:443?security=tls#Two",
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
             &daemon,
         );
-        let script = dir.path().join("fake-mihomo.sh");
-        fs::write(&script, b"#!/bin/sh\nsleep 30\n").expect("fake Mihomo");
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("external controller");
-        let controller_address = listener.local_addr().expect("controller address");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&requests);
-        let controller = thread::spawn(move || {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept().expect("controller request");
-                let mut request = Vec::new();
-                let mut byte = [0_u8; 1];
-                while !request.ends_with(b"\r\n\r\n") {
-                    stream.read_exact(&mut byte).expect("request header");
-                    request.push(byte[0]);
-                }
-                let text = String::from_utf8_lossy(&request);
-                let request_line = text.lines().next().expect("request line").to_owned();
-                observed
-                    .lock()
-                    .expect("observed requests")
-                    .push(request_line);
-                stream
-                    .write_all(
-                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .expect("controller response");
-            }
+        let apply = lock(&daemon.apply);
+        let request_daemon = daemon.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let request = thread::spawn(move || {
+            result_tx
+                .send(handle_set_active(r#"{"profile_id":0}"#, &request_daemon))
+                .expect("send active profile result");
         });
-        {
-            let mut inner = lock(&daemon.inner);
-            inner.state.active_profile_id = Some(0);
-            inner.state.mihomo_path = script.to_string_lossy().into_owned();
-            inner.state.mihomo_features.external_controller.enabled = true;
-            inner.state.mihomo_features.external_controller.address =
-                controller_address.to_string();
-            atomic_write_config(&daemon.mihomo_config_path, b"old config").expect("old config");
-            inner
-                .core
-                .start(
-                    script.to_str().expect("script path"),
-                    &daemon.mihomo_config_path,
-                    None,
-                )
-                .expect("running fake Mihomo");
-        }
 
-        let (status, _, _) = handle_set_active(r#"{"profile_id":1}"#, &daemon);
-        assert_eq!(status, 200);
-        controller.join().expect("controller thread");
-        assert_eq!(
-            *requests.lock().expect("observed requests"),
-            [
-                "PUT /configs?force=true HTTP/1.1",
-                "DELETE /connections HTTP/1.1"
-            ]
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "profile switch bypassed daemon.apply"
         );
-        assert_eq!(lock(&daemon.inner).state.active_profile_id, Some(1));
-        assert_eq!(load_state(&daemon.state_path).active_profile_id, Some(1));
+        drop(apply);
+        let (status, _, response) = result_rx
+            .recv_timeout(Duration::from_secs(4))
+            .expect("profile switch completes after apply lock release");
+        controller_worker.join().expect("controller worker");
+        assert_eq!(status, 200, "{response}");
+        request.join().expect("active profile request");
         let _ = lock(&daemon.inner).core.stop();
     }
 
@@ -20658,18 +25289,21 @@ mod tests {
         assert_eq!(status, 400);
     }
 
+    #[cfg(unix)]
     #[test]
     fn get_mihomo_config_returns_config_after_activation() {
-        let (_dir, daemon) = test_daemon();
+        let (_dir, daemon, controller_worker) = runnable_active_profile_test_daemon();
         handle_import(
             "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
             &daemon,
         );
         handle_set_active(r#"{"profile_id":0}"#, &daemon);
+        controller_worker.join().expect("controller worker");
         let (status, content_type, body) = handle_get_mihomo_config(&daemon);
         assert_eq!(status, 200);
         assert_eq!(content_type, "text/yaml; charset=utf-8");
         assert!(body.contains("socks-port: 10808"));
+        let _ = lock(&daemon.inner).core.stop();
     }
 
     #[test]
@@ -20977,6 +25611,36 @@ mod tests {
         assert_eq!(response["total"], 0);
         assert_eq!(response["completed"], 0);
         assert_eq!(response["cancel_requested"], false);
+        assert_eq!(response["active_profiles"], json!([]));
+    }
+
+    #[test]
+    fn bench_status_preserves_current_profile_and_bounds_active_profiles() {
+        let (_dir, daemon) = test_daemon();
+        let job: SharedJob = Arc::new(Mutex::new(BenchJob {
+            running: true,
+            current_profile_id: Some(4),
+            current_profile_name: Some("Server 4".to_owned()),
+            active_profiles: (1..=7)
+                .map(|id| crate::benchmark::ActiveBenchProfile {
+                    id,
+                    name: format!("Server {id}"),
+                })
+                .collect(),
+            ..Default::default()
+        }));
+        lock(&daemon.inner).bench.job = Some(job);
+
+        let (status, _, body) = dispatch("GET", "/api/bench/status", "", &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parse status");
+        assert_eq!(response["current_profile_id"], 4);
+        assert_eq!(response["current_profile_name"], "Server 4");
+        let active = response["active_profiles"]
+            .as_array()
+            .expect("active array");
+        assert_eq!(active.len(), 6);
+        assert_eq!(active[0], json!({"id": 1, "name": "Server 1"}));
     }
 
     #[test]
@@ -21064,6 +25728,47 @@ mod tests {
             dispatch("POST", "/api/bench/start", r#"{"method":"tcp"}"#, &daemon);
         assert_eq!(status, 409);
         assert!(body.contains("already running"));
+    }
+
+    #[test]
+    fn simultaneous_bench_starts_admit_exactly_one_bounded_job() {
+        use std::sync::Barrier;
+
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@192.0.2.1:443?security=tls#Demo",
+            &daemon,
+        );
+        let barrier = Arc::new(Barrier::new(3));
+        let mut starters = Vec::new();
+        for _ in 0..2 {
+            let daemon = daemon.clone();
+            let barrier = Arc::clone(&barrier);
+            starters.push(thread::spawn(move || {
+                barrier.wait();
+                dispatch(
+                    "POST",
+                    "/api/bench/start",
+                    r#"{"method":"tcp","concurrency":6}"#,
+                    &daemon,
+                )
+            }));
+        }
+        barrier.wait();
+        let mut statuses = starters
+            .into_iter()
+            .map(|starter| starter.join().expect("starter thread").0)
+            .collect::<Vec<_>>();
+        statuses.sort_unstable();
+
+        assert_eq!(statuses, [200, 409]);
+        let inner = lock(&daemon.inner);
+        let snapshot = inner.bench.snapshot();
+        assert!(snapshot.running);
+        assert_eq!(snapshot.total, 1);
+        assert!(snapshot.active_profiles.len() <= 6);
+        assert!(snapshot.worker_count <= 6);
+        inner.bench.request_cancel();
     }
 
     #[test]
@@ -22369,13 +27074,10 @@ mod tests {
     fn dead_membership_activation_failure_rolls_back_only_lifecycle_fields() {
         let dir = TempDir::new().expect("temp dir");
         let script = dir.path().join("fake-mihomo.sh");
-        let marker = dir.path().join("new-config-started");
+        let marker = dir.path().join("hot-reload-started");
         fs::write(
             &script,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then exit 0; fi\nwhile [ $# -gt 0 ]; do if [ \"$1\" = \"-f\" ]; then shift; cfg=$1; fi; shift; done\nif grep -q OLD \"$cfg\"; then sleep 30; else touch '{}'; sleep 1; exit 1; fi\n",
-                marker.display()
-            ),
+            "#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then exit 0; fi\nsleep 30\n",
         )
         .expect("fake mihomo");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -22409,6 +27111,35 @@ mod tests {
             dir.path().join("state.json"),
             dir.path().join("mihomo-config.yaml"),
         );
+        let controller = TcpListener::bind("127.0.0.1:0").expect("controller");
+        daemon.set_mihomo_controller_override(
+            controller
+                .local_addr()
+                .expect("controller address")
+                .to_string(),
+        );
+        let controller_marker = marker.clone();
+        let controller_worker = thread::spawn(move || {
+            for status in [500, 204] {
+                let (mut stream, _) = controller.accept().expect("hot reload request");
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).expect("request header");
+                    request.push(byte[0]);
+                }
+                if status == 500 {
+                    fs::write(&controller_marker, b"started").expect("marker");
+                    thread::sleep(Duration::from_millis(250));
+                }
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("controller response");
+            }
+        });
         atomic_write_config(&daemon.mihomo_config_path, b"OLD exact bytes\n").expect("old config");
         {
             let mut inner = lock(&daemon.inner);
@@ -22457,6 +27188,7 @@ mod tests {
             None => result_rx.recv().expect("receive request result"),
         };
         request.join().expect("request thread");
+        controller_worker.join().expect("controller worker");
         assert_eq!(status, 500, "{body}");
         assert!(body.contains("state rollback: restored"), "{body}");
         assert_eq!(
@@ -22867,6 +27599,538 @@ mod tests {
     }
 
     #[test]
+    fn mihomo_parameters_get_omits_secret_and_removed_fields() {
+        let (_dir, daemon) = test_daemon();
+        lock(&daemon.inner)
+            .state
+            .mihomo_features
+            .external_controller
+            .secret = Some("internal-secret".to_owned());
+        let (status, _, body) = handle_mihomo_features_get(&daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parameters response");
+        assert_eq!(response["runtime"]["external_controller"]["enabled"], true);
+        assert_eq!(
+            response["runtime"]["external_controller"]["address"],
+            "127.0.0.1:9090"
+        );
+        assert_eq!(response["runtime"]["store_fake_ip"], true);
+        assert_eq!(response["runtime"]["udp"], true);
+        for removed in [
+            "secret",
+            "proxy_group",
+            "proxy_providers",
+            "rule_providers",
+            "raw_rules",
+            "typed_rules",
+            "ntp",
+            "authentication",
+        ] {
+            assert!(
+                !body.contains(&format!("\"{removed}\"")),
+                "leaked {removed}"
+            );
+        }
+        assert!(!body.contains("internal-secret"));
+    }
+
+    #[test]
+    fn mihomo_parameters_get_derives_connected_from_injected_controller() {
+        let (_dir, daemon) = test_daemon();
+        lock(&daemon.inner)
+            .state
+            .mihomo_features
+            .external_controller
+            .secret = Some("internal-secret".to_owned());
+        let controller = TcpListener::bind("127.0.0.1:0").expect("controller");
+        daemon.set_mihomo_controller_override(
+            controller
+                .local_addr()
+                .expect("controller address")
+                .to_string(),
+        );
+        let worker = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = controller.accept().expect("version request");
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream
+                        .read_exact(&mut byte)
+                        .expect("read version request header");
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.starts_with("GET /version "));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer internal-secret")
+                );
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .expect("version response");
+            }
+        });
+
+        let (address, secret) = {
+            let inner = lock(&daemon.inner);
+            daemon_mihomo_controller(&daemon, &inner.state.mihomo_features).expect("controller")
+        };
+        mihomo_api_get(&address, secret.as_deref(), "/version")
+            .expect("injected controller health");
+
+        let (status, _, body) = handle_mihomo_features_get(&daemon);
+
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("parameters response");
+        assert_eq!(
+            response["runtime"]["external_controller"]["connected"],
+            true
+        );
+        assert!(!body.contains("internal-secret"));
+        worker.join().expect("controller worker");
+    }
+
+    #[test]
+    fn mihomo_parameters_post_rejects_unknown_and_invalid_fields() {
+        let (_dir, daemon) = test_daemon();
+        persist_state(&daemon.state_path, &lock(&daemon.inner).state).expect("baseline state");
+        let before_disk = fs::read(&daemon.state_path).expect("baseline bytes");
+        let before_memory = lock(&daemon.inner).state.mihomo_features.clone();
+        let parameters = mihomo_parameters(&MihomoFeatures::default());
+        let mut request =
+            serde_json::to_value(MihomoParametersUpdateRequest { parameters }).expect("request");
+        request["relay"] = json!(true);
+        assert_eq!(
+            handle_mihomo_features_set(&request.to_string(), &daemon).0,
+            400
+        );
+        assert_eq!(lock(&daemon.inner).state.mihomo_features, before_memory);
+        assert_eq!(
+            fs::read(&daemon.state_path).expect("state bytes"),
+            before_disk
+        );
+
+        request
+            .as_object_mut()
+            .expect("request object")
+            .remove("relay");
+        request["parameters"]["per_proxy"]["ip_version"] = json!("automatic");
+        assert_eq!(
+            handle_mihomo_features_set(&request.to_string(), &daemon).0,
+            400
+        );
+        request["parameters"]["per_proxy"]["ip_version"] = json!("dual");
+        request["parameters"]["tunnels"] = json!([{
+            "network": ["icmp"],
+            "address": "not-an-address",
+            "target": "missing-port"
+        }]);
+        assert_eq!(
+            handle_mihomo_features_set(&request.to_string(), &daemon).0,
+            400
+        );
+    }
+
+    #[test]
+    fn mihomo_parameters_validation_rejects_unsafe_or_malformed_tunnels() {
+        let mut parameters = mihomo_parameters(&MihomoFeatures::default());
+        for tunnel in [
+            TunnelConfig {
+                network: vec!["tcp".to_owned()],
+                address: "127.0.0.1:5353".to_owned(),
+                target: String::new(),
+                proxy: None,
+            },
+            TunnelConfig {
+                network: vec!["udp".to_owned()],
+                address: "0.0.0.0:5353".to_owned(),
+                target: "dns.example:53".to_owned(),
+                proxy: None,
+            },
+            TunnelConfig {
+                network: vec!["tcp".to_owned(), "tcp".to_owned()],
+                address: "127.0.0.1:5353".to_owned(),
+                target: "dns.example:0".to_owned(),
+                proxy: None,
+            },
+        ] {
+            parameters.tunnels = vec![tunnel];
+            assert!(validate_mihomo_parameters(&parameters).is_err());
+        }
+    }
+
+    #[test]
+    fn mihomo_parameters_activation_failure_leaves_memory_disk_and_config_unchanged() {
+        let (dir, daemon) = test_daemon();
+        let mut state = lock(&daemon.inner).state.clone();
+        state
+            .profiles
+            .push(sample_profile(0, "Active", "active.example"));
+        state.active_profile_id = Some(0);
+        state.mihomo_path = "/usr/bin/false".to_owned();
+        lock(&daemon.inner).state = state;
+        persist_state(&daemon.state_path, &lock(&daemon.inner).state).expect("baseline state");
+        atomic_write_config(&daemon.mihomo_config_path, b"OLD exact config\n")
+            .expect("baseline config");
+        let before_disk = fs::read(&daemon.state_path).expect("baseline state bytes");
+        let before_memory = lock(&daemon.inner).state.mihomo_features.clone();
+        let mut parameters = mihomo_parameters(&before_memory);
+        parameters.unified_delay = false;
+        let body =
+            serde_json::to_string(&MihomoParametersUpdateRequest { parameters }).expect("request");
+
+        let (status, _, response) = handle_mihomo_features_set(&body, &daemon);
+
+        assert_eq!(status, 500, "{response}");
+        assert_eq!(lock(&daemon.inner).state.mihomo_features, before_memory);
+        assert_eq!(
+            fs::read(&daemon.state_path).expect("state bytes"),
+            before_disk
+        );
+        assert_eq!(
+            fs::read(&daemon.mihomo_config_path).expect("config bytes"),
+            b"OLD exact config\n"
+        );
+        drop(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_active_profile_persist_failure_restores_memory_disk_config_and_runtime() {
+        let dir = TempDir::new().expect("temp dir");
+        let script = dir.path().join("fake-mihomo.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then exit 0; fi\nsleep 30\n",
+        )
+        .expect("fake mihomo");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let daemon = Daemon::new(
+            HincyrayState {
+                mihomo_path: script.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            dir.path().join("state.json"),
+            dir.path().join("mihomo-config.yaml"),
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner
+                .state
+                .profiles
+                .push(sample_profile(0, "First", "first.example"));
+            persist_state(&daemon.state_path, &inner.state).expect("baseline state");
+        }
+        let before_disk = fs::read(&daemon.state_path).expect("baseline state bytes");
+        assert!(!daemon.mihomo_config_path.exists());
+        let controller = TcpListener::bind("127.0.0.1:0").expect("controller");
+        daemon.set_mihomo_controller_override(
+            controller
+                .local_addr()
+                .expect("controller address")
+                .to_string(),
+        );
+        let controller_worker = thread::spawn(move || {
+            let (mut stream, _) = controller.accept().expect("readiness request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).expect("read readiness request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .expect("readiness response");
+        });
+        daemon.fail_next_active_profile_persist_after_write();
+
+        let error = apply_active_profile(&daemon, 0).expect_err("persist failure");
+        controller_worker.join().expect("controller worker");
+
+        assert!(
+            error.message().contains("state=restored"),
+            "{}",
+            error.message()
+        );
+        let mut inner = lock(&daemon.inner);
+        assert_eq!(inner.state.active_profile_id, None);
+        assert!(!inner.core.is_running());
+        assert!(!inner.firewall.is_running());
+        drop(inner);
+        assert_eq!(
+            fs::read(&daemon.state_path).expect("rolled back state"),
+            before_disk
+        );
+        assert!(!daemon.mihomo_config_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_active_profile_persist_failure_restores_memory_disk_config_and_runtime() {
+        let dir = TempDir::new().expect("temp dir");
+        let script = dir.path().join("fake-mihomo.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then exit 0; fi\nsleep 30\n",
+        )
+        .expect("fake mihomo");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let daemon = Daemon::new(
+            HincyrayState {
+                mihomo_path: script.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            dir.path().join("state.json"),
+            dir.path().join("mihomo-config.yaml"),
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![
+                sample_profile(0, "Previous", "previous.example"),
+                sample_profile(1, "Candidate", "candidate.example"),
+            ];
+            inner.state.active_profile_id = Some(0);
+            persist_state(&daemon.state_path, &inner.state).expect("baseline state");
+        }
+        atomic_write_config(&daemon.mihomo_config_path, b"OLD exact profile config\n")
+            .expect("baseline config");
+        {
+            let mut inner = lock(&daemon.inner);
+            inner
+                .core
+                .start(
+                    script.to_str().expect("script path"),
+                    &daemon.mihomo_config_path,
+                    None,
+                )
+                .expect("previous runtime");
+        }
+        let controller = TcpListener::bind("127.0.0.1:0").expect("controller");
+        daemon.set_mihomo_controller_override(
+            controller
+                .local_addr()
+                .expect("controller address")
+                .to_string(),
+        );
+        let controller_worker = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = controller.accept().expect("controller request");
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).expect("request header");
+                    request.push(byte[0]);
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("controller response");
+            }
+        });
+        let before_disk = fs::read(&daemon.state_path).expect("baseline state bytes");
+        daemon.fail_next_active_profile_persist_after_write();
+
+        let error = apply_active_profile(&daemon, 1).expect_err("persist failure");
+        controller_worker.join().expect("controller worker");
+
+        assert!(
+            error.message().contains("state=restored"),
+            "{}",
+            error.message()
+        );
+        let mut inner = lock(&daemon.inner);
+        assert_eq!(inner.state.active_profile_id, Some(0));
+        assert!(inner.core.is_running());
+        assert!(!inner.firewall.is_running());
+        let _ = inner.core.stop();
+        drop(inner);
+        assert_eq!(
+            fs::read(&daemon.state_path).expect("rolled back state"),
+            before_disk
+        );
+        assert_eq!(
+            fs::read(&daemon.mihomo_config_path).expect("rolled back config"),
+            b"OLD exact profile config\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_profile_readiness_failure_rolls_back_before_persist() {
+        let dir = TempDir::new().expect("temp dir");
+        let script = dir.path().join("fake-mihomo.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then exit 0; fi\nexit 1\n",
+        )
+        .expect("fake mihomo");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let daemon = Daemon::new(
+            HincyrayState {
+                profiles: vec![sample_profile(0, "Candidate", "candidate.example")],
+                mihomo_path: script.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            dir.path().join("state.json"),
+            dir.path().join("mihomo-config.yaml"),
+        );
+        persist_state(&daemon.state_path, &lock(&daemon.inner).state).expect("baseline state");
+        let before_disk = fs::read(&daemon.state_path).expect("baseline state bytes");
+        let unavailable = TcpListener::bind("127.0.0.1:0").expect("ephemeral controller");
+        let address = unavailable.local_addr().expect("controller address");
+        drop(unavailable);
+        daemon.set_mihomo_controller_override(address.to_string());
+
+        let error = apply_active_profile(&daemon, 0).expect_err("readiness failure");
+
+        assert!(
+            matches!(error, ActiveProfileApplyError::Runtime(_)),
+            "unexpected activation error"
+        );
+        assert!(
+            error.message().contains("readiness observation"),
+            "{}",
+            error.message()
+        );
+        let mut inner = lock(&daemon.inner);
+        assert_eq!(inner.state.active_profile_id, None);
+        assert!(!inner.core.is_running());
+        drop(inner);
+        assert_eq!(
+            fs::read(&daemon.state_path).expect("unchanged state"),
+            before_disk
+        );
+        assert!(!daemon.mihomo_config_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_profile_config_validation_failure_restores_active_id_without_writes() {
+        let dir = TempDir::new().expect("temp dir");
+        let script = dir.path().join("rejecting-mihomo.sh");
+        fs::write(&script, "#!/bin/sh\necho invalid-config >&2\nexit 1\n").expect("fake mihomo");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let daemon = Daemon::new(
+            HincyrayState {
+                profiles: vec![
+                    sample_profile(0, "Previous", "previous.example"),
+                    sample_profile(1, "Candidate", "candidate.example"),
+                ],
+                active_profile_id: Some(0),
+                mihomo_path: script.to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            dir.path().join("state.json"),
+            dir.path().join("mihomo-config.yaml"),
+        );
+        persist_state(&daemon.state_path, &lock(&daemon.inner).state).expect("baseline state");
+        atomic_write_config(&daemon.mihomo_config_path, b"OLD exact profile config\n")
+            .expect("baseline config");
+        let before_disk = fs::read(&daemon.state_path).expect("baseline state bytes");
+
+        let error = apply_active_profile(&daemon, 1).expect_err("validation failure");
+
+        assert!(
+            matches!(error, ActiveProfileApplyError::InvalidConfig(_)),
+            "unexpected activation error"
+        );
+        assert!(
+            error.message().contains("invalid-config"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(lock(&daemon.inner).state.active_profile_id, Some(0));
+        assert_eq!(
+            fs::read(&daemon.state_path).expect("unchanged state"),
+            before_disk
+        );
+        assert_eq!(
+            fs::read(&daemon.mihomo_config_path).expect("unchanged config"),
+            b"OLD exact profile config\n"
+        );
+    }
+
+    #[test]
+    fn mihomo_parameters_post_updates_retained_fields_and_preserves_secret() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.mihomo_features.external_controller.secret =
+                Some("internal-secret".to_owned());
+        }
+        let mut parameters = mihomo_parameters(&MihomoFeatures::default());
+        parameters.unified_delay = false;
+        parameters.tcp_concurrent = true;
+        parameters.per_proxy.ip_version = "ipv4-prefer".to_owned();
+        parameters
+            .hosts
+            .insert("router.test".to_owned(), "192.0.2.1".to_owned());
+        let body =
+            serde_json::to_string(&MihomoParametersUpdateRequest { parameters }).expect("request");
+        let (status, _, response) = handle_mihomo_features_set(&body, &daemon);
+        assert_eq!(status, 200, "{response}");
+        let inner = lock(&daemon.inner);
+        assert!(!inner.state.mihomo_features.unified_delay);
+        assert!(inner.state.mihomo_features.tcp_concurrent);
+        assert_eq!(
+            inner.state.mihomo_features.per_proxy.ip_version,
+            "ipv4-prefer"
+        );
+        assert_eq!(
+            inner
+                .state
+                .mihomo_features
+                .external_controller
+                .secret
+                .as_deref(),
+            Some("internal-secret")
+        );
+        drop(inner);
+        let persisted = load_state(&daemon.state_path);
+        assert!(!persisted.mihomo_features.unified_delay);
+        assert_eq!(
+            persisted
+                .mihomo_features
+                .external_controller
+                .secret
+                .as_deref(),
+            Some("internal-secret")
+        );
+    }
+
+    #[test]
+    fn mihomo_parameters_persist_failure_restores_memory_and_authoritative_config() {
+        let (dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner
+                .state
+                .profiles
+                .push(sample_profile(0, "Active", "active.example"));
+            inner.state.active_profile_id = Some(0);
+        }
+        atomic_write_config(&daemon.mihomo_config_path, b"OLD exact config\n")
+            .expect("baseline config");
+        fs::create_dir(&daemon.state_path).expect("block state file path");
+        let mut parameters = mihomo_parameters(&MihomoFeatures::default());
+        parameters.unified_delay = false;
+        let body =
+            serde_json::to_string(&MihomoParametersUpdateRequest { parameters }).expect("request");
+        let (status, _, response) = handle_mihomo_features_set(&body, &daemon);
+        assert_eq!(status, 500, "{response}");
+        assert!(lock(&daemon.inner).state.mihomo_features.unified_delay);
+        assert_eq!(
+            fs::read(&daemon.mihomo_config_path).expect("restored config"),
+            b"OLD exact config\n"
+        );
+        assert!(!lock(&daemon.inner).core.is_running());
+        drop(dir);
+    }
+
+    #[test]
     fn legacy_state_without_update_fields_loads_with_defaults() {
         let dir = TempDir::new().expect("temp dir");
         let state_path = dir.path().join("state.json");
@@ -22892,53 +28156,57 @@ mod tests {
     // ── Mihomo external-controller API proxy tests ─────────────────
 
     #[test]
-    fn mihomo_controller_returns_none_when_disabled() {
+    fn mihomo_controller_is_always_available() {
         let features = MihomoFeatures::default();
-        assert!(mihomo_controller(&features).is_none());
+        assert!(mihomo_controller(&features).is_some());
     }
 
     #[test]
-    fn mihomo_controller_returns_some_when_enabled() {
-        let mut features = MihomoFeatures::default();
-        features.external_controller.enabled = true;
-        features.external_controller.address = "127.0.0.1:9090".to_owned();
+    fn mihomo_controller_returns_fixed_endpoint() {
+        let features = MihomoFeatures::default();
         let ec = mihomo_controller(&features).expect("ec");
         assert_eq!(ec.0, "127.0.0.1:9090");
     }
 
     #[test]
-    fn api_proxies_returns_400_when_ec_disabled() {
+    fn api_proxies_returns_502_when_fixed_ec_is_unavailable() {
         let (_dir, daemon) = test_daemon();
+        let unavailable = TcpListener::bind("127.0.0.1:0").expect("ephemeral controller");
+        let address = unavailable.local_addr().expect("controller address");
+        drop(unavailable);
+        daemon.set_mihomo_controller_override(address.to_string());
         let (code, _, body) = handle_mihomo_api_proxies(&daemon);
-        assert_eq!(code, 400);
-        assert!(body.contains("not enabled"));
+        assert_eq!(code, 502);
+        assert!(body.contains("Mihomo API"));
     }
 
     #[test]
-    fn api_connections_returns_400_when_ec_disabled() {
+    fn api_connections_returns_502_when_fixed_ec_is_unavailable() {
         let (_dir, daemon) = test_daemon();
+        let unavailable = TcpListener::bind("127.0.0.1:0").expect("ephemeral controller");
+        let address = unavailable.local_addr().expect("controller address");
+        drop(unavailable);
+        daemon.set_mihomo_controller_override(address.to_string());
         let (code, _, body) = handle_mihomo_api_connections(&daemon);
-        assert_eq!(code, 400);
-        assert!(body.contains("not enabled"));
+        assert_eq!(code, 502);
+        assert!(body.contains("Mihomo API"));
     }
 
     #[test]
-    fn api_delay_returns_400_when_ec_disabled() {
+    fn api_delay_returns_502_when_fixed_ec_is_unavailable() {
         let (_dir, daemon) = test_daemon();
+        let unavailable = TcpListener::bind("127.0.0.1:0").expect("ephemeral controller");
+        let address = unavailable.local_addr().expect("controller address");
+        drop(unavailable);
+        daemon.set_mihomo_controller_override(address.to_string());
         let (code, _, body) = handle_mihomo_api_delay(r#"{"name":"proxy"}"#, &daemon);
-        assert_eq!(code, 400);
-        assert!(body.contains("not enabled"));
+        assert_eq!(code, 502);
+        assert!(body.contains("delay test failed"));
     }
 
     #[test]
     fn api_delay_returns_400_on_invalid_json() {
         let (_dir, daemon) = test_daemon();
-        // Enable EC so we pass the first check, then test JSON parsing.
-        {
-            let mut inner = lock(&daemon.inner);
-            inner.state.mihomo_features.external_controller.enabled = true;
-            inner.state.mihomo_features.external_controller.address = "127.0.0.1:9090".to_owned();
-        }
         let (code, _, body) = handle_mihomo_api_delay("not json", &daemon);
         assert_eq!(code, 400);
         assert!(body.contains("invalid JSON"));
@@ -22947,11 +28215,6 @@ mod tests {
     #[test]
     fn api_delay_empty_body_uses_defaults() {
         let (_dir, daemon) = test_daemon();
-        {
-            let mut inner = lock(&daemon.inner);
-            inner.state.mihomo_features.external_controller.enabled = true;
-            inner.state.mihomo_features.external_controller.address = "127.0.0.1:9090".to_owned();
-        }
         // Empty body should not return 400 "invalid JSON" — it should
         // fall through to the delay test (which will fail because no
         // Mihomo is running, but the error is a connection error, not
@@ -22962,12 +28225,11 @@ mod tests {
     }
 
     #[test]
-    fn status_includes_proxy_group_and_ec_flags() {
+    fn status_includes_ec_flag() {
         let (_dir, daemon) = test_daemon();
         let (code, _, body) = dispatch("GET", "/api/status", "", &daemon);
         assert_eq!(code, 200);
         let json: Value = serde_json::from_str(&body).expect("parse status");
-        assert!(json.get("proxy_group_enabled").is_some());
         assert!(json.get("ec_enabled").is_some());
     }
 
@@ -23797,8 +29059,12 @@ proxies:
       short-id: SECRET_REALITY_SHORT_ID
     xhttp-opts:
       path: /diagnostic
+      headers:
+        X-Diagnostic: SECRET_XHTTP_HEADER
+        Harmless-Looking: SECRET_XHTTP_CUSTOM_HEADER
       x-padding-key: SECRET_X_PADDING_KEY
       session-key: SECRET_SESSION_KEY
+      session-table: SECRET_SESSION_TABLE
       seq-key: SECRET_SEQ_KEY
       uplink-data-key: SECRET_UPLINK_DATA_KEY
   - name: VMess diagnostic
@@ -23933,6 +29199,39 @@ rules:
             );
         }
         assert!(redacted.matches("<redacted>").count() >= 35);
+    }
+
+    #[test]
+    fn config_redaction_hides_all_xhttp_header_values_and_session_material() {
+        let yaml = r#"
+proxies:
+  - name: XHTTP diagnostic
+    type: vless
+    server: xhttp.example
+    port: 443
+    xhttp-opts:
+      headers:
+        Authorization: SECRET_AUTH_HEADER
+        X-Custom-Shape: SECRET_CUSTOM_HEADER
+      session-key: SECRET_SESSION_KEY
+      session-table: SECRET_SESSION_TABLE
+      session-length: 16-32
+"#;
+        let redacted = redact_config_yaml(yaml).expect("redact");
+
+        for secret in [
+            "SECRET_AUTH_HEADER",
+            "SECRET_CUSTOM_HEADER",
+            "SECRET_SESSION_KEY",
+            "SECRET_SESSION_TABLE",
+        ] {
+            assert!(!redacted.contains(secret), "leaked {secret}: {redacted}");
+        }
+        let value: serde_yaml::Value = serde_yaml::from_str(&redacted).expect("redacted YAML");
+        let headers = &value["proxies"][0]["xhttp-opts"]["headers"];
+        assert_eq!(headers["Authorization"].as_str(), Some("<redacted>"));
+        assert_eq!(headers["X-Custom-Shape"].as_str(), Some("<redacted>"));
+        assert!(redacted.contains("session-length: 16-32"));
     }
 
     #[test]
@@ -24098,13 +29397,6 @@ ntp:
             safe_mode_enabled: true,
             ..HincyrayState::default()
         };
-        state.mihomo_features.raw_rules = vec!["DOMAIN,example.com,DIRECT".to_owned()];
-        state.mihomo_features.typed_rules = vec![crate::mihomo_config::MihomoRuleConfig {
-            rule_type: "DOMAIN".to_owned(),
-            value: "example.net".to_owned(),
-            target: "DIRECT".to_owned(),
-            options: Vec::new(),
-        }];
         state
             .mihomo_features
             .tunnels
@@ -24115,11 +29407,7 @@ ntp:
                 proxy: None,
             });
         let effective = effective_mihomo_features(&state);
-        assert!(effective.raw_rules.is_empty());
-        assert!(effective.typed_rules.is_empty());
         assert!(effective.tunnels.is_empty());
-        assert_eq!(state.mihomo_features.raw_rules.len(), 1);
-        assert_eq!(state.mihomo_features.typed_rules.len(), 1);
         assert_eq!(state.mihomo_features.tunnels.len(), 1);
     }
 
@@ -24239,6 +29527,69 @@ ntp:
     }
 
     #[test]
+    fn connections_page_preserves_total_filtered_order_and_applies_offset() {
+        let value = json!({
+            "downloadTotal": 123,
+            "connections": [
+                {"id":"first","metadata":{"host":"alpha.example"}},
+                {"id":"second","metadata":{"host":"beta.example"}},
+                {"id":"third","metadata":{"host":"alpha.test"}},
+                {"id":"fourth","metadata":{"host":"alpha.example"}}
+            ]
+        });
+        let terms = vec!["alpha".to_owned(), "example".to_owned()];
+        let (total, filtered, page) =
+            page_connections(value, &terms, 1, 2, connection_search_text, |_| {});
+
+        assert_eq!(total, 4);
+        assert_eq!(filtered, 2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]["id"], "fourth");
+    }
+
+    #[test]
+    fn connections_page_enriches_only_selected_items() {
+        let value = json!({
+            "connections": [
+                {"id":"first","metadata":{"host":"match.example"}},
+                {"id":"second","metadata":{"host":"skip.example"}},
+                {"id":"third","metadata":{"host":"match.example"}},
+                {"id":"fourth","metadata":{"host":"match.example"}}
+            ]
+        });
+        let terms = vec!["match".to_owned()];
+        let mut enriched_ids = Vec::new();
+        let (total, filtered, page) =
+            page_connections(value, &terms, 1, 1, connection_search_text, |connections| {
+                enriched_ids.extend(
+                    connections
+                        .iter()
+                        .filter_map(|connection| connection["id"].as_str().map(str::to_owned)),
+                );
+            });
+
+        assert_eq!((total, filtered), (4, 3));
+        assert_eq!(enriched_ids, ["third"]);
+        assert_eq!(page[0]["id"], "third");
+    }
+
+    #[test]
+    fn geoip_cache_key_invalidates_on_file_metadata_change() {
+        let dir = TempDir::new().expect("temp dir");
+        let geo_dir = dir.path().join("geo");
+        fs::create_dir(&geo_dir).expect("geo dir");
+        let db_path = geo_dir.join("geoip.metadb");
+        fs::write(&db_path, b"first").expect("write db");
+        let first = geoip_cache_key(db_path.clone()).expect("first key");
+        let cached = geoip_cache_key(db_path.clone()).expect("cached key");
+        assert_eq!(first, cached);
+
+        fs::write(&db_path, b"replacement").expect("replace db");
+        let replacement = geoip_cache_key(db_path).expect("replacement key");
+        assert_ne!(first, replacement);
+    }
+
+    #[test]
     fn device_traffic_projection_aggregates_only_requested_sources() {
         let connections = vec![
             json!({"metadata":{"sourceIP":"192.168.2.2"},"upload":10,"download":20}),
@@ -24279,6 +29630,539 @@ ntp:
             block_quic: false,
             group: Some("sub".to_owned()),
         }
+    }
+
+    fn diagnostic_test_environment(generation: u64) -> ProfileDiagnosticEnvironment {
+        ProfileDiagnosticEnvironment {
+            hincyray_version: env!("CARGO_PKG_VERSION").to_owned(),
+            mihomo_version: Some("Mihomo Meta test".to_owned()),
+            core_generation: generation,
+            core_status: "running".to_owned(),
+            firewall_status: "running".to_owned(),
+            socks_port: 10808,
+            mixed_port: Some(10809),
+            redirect_port: 10810,
+            tproxy_port: 10811,
+            dns_port: DNS_INBOUND_PORT,
+            memory: ProfileDiagnosticMemory::default(),
+        }
+    }
+
+    fn diagnostic_test_capture() -> ProfileDiagnosticCapture {
+        ProfileDiagnosticCapture {
+            session_id: "pd-test-session".to_owned(),
+            profile: ProfileDiagnosticProfile {
+                id: 0,
+                server_ref: "srv-v2-test".to_owned(),
+                name: "Active Test".to_owned(),
+                protocol: "VLESS".to_owned(),
+                transport: "tcp".to_owned(),
+                address: "vpn.example".to_owned(),
+                port: Some(443),
+            },
+            source_ip: "192.168.2.35".parse().expect("source IP"),
+            started_at_unix: 1_000,
+            deadline_unix: 1_060,
+            duration_seconds: 60,
+            core_generation: 7,
+            environment_start: diagnostic_test_environment(7),
+            config_summary: "proxies:\n- name: proxy-active\n  password: <redacted>\n".to_owned(),
+            latest_stats: None,
+            initial_connection_ids: HashSet::new(),
+            connection_raw_ids: HashMap::new(),
+            connections: Vec::new(),
+            events: Vec::new(),
+            poll_errors: 0,
+            dropped_connections: 0,
+            dropped_events: 0,
+        }
+    }
+
+    #[test]
+    fn profile_diagnostic_start_requires_active_profile_and_enforces_bounds() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![
+                sample_profile(0, "Active", "active.example"),
+                sample_profile(1, "Other", "other.example"),
+            ];
+            inner.state.active_profile_id = Some(0);
+        }
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/profile-diagnostics/start",
+            r#"{"profile_id":1,"duration_seconds":60,"source_ip":"192.168.2.35"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 409, "{body}");
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/profile-diagnostics/start",
+            r#"{"profile_id":0,"duration_seconds":59,"source_ip":"192.168.2.35"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 400, "{body}");
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/profile-diagnostics/start",
+            r#"{"profile_id":0,"duration_seconds":60}"#,
+            &daemon,
+        );
+        assert_eq!(status, 400, "{body}");
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/profile-diagnostics/start",
+            r#"{"profile_id":0,"duration_seconds":60,"source_ip":"127.0.0.1"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 400, "{body}");
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/profile-diagnostics/start",
+            r#"{"profile_id":0,"duration_seconds":301,"source_ip":"192.168.2.35"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 400, "{body}");
+    }
+
+    #[test]
+    fn profile_diagnostic_source_filter_and_proxy_chain_are_mandatory() {
+        let matching = json!({
+            "id": "one",
+            "metadata": {
+                "host": "https://video.example/watch?token=known-secret",
+                "destinationIP": "203.0.113.10",
+                "destinationPort": "443",
+                "sourceIP": "192.168.2.35",
+                "network": "tcp"
+            },
+            "chains": ["proxy-active", "proxy"],
+            "rule": "MATCH",
+            "rulePayload": "https://rule.example/path?token=known-secret",
+            "upload": 10,
+            "download": 20
+        });
+        let captured = diagnostic_connection_from_value(
+            &matching,
+            "192.168.2.35".parse().expect("source IP"),
+            100,
+        )
+        .expect("matching connection");
+        assert_eq!(captured.source_ip, "192.168.2.35");
+        assert!(!captured.domain.contains("known-secret"));
+        assert!(!captured.rule_payload.contains("known-secret"));
+        assert!(
+            diagnostic_connection_from_value(
+                &matching,
+                "192.168.2.99".parse().expect("source IP"),
+                100,
+            )
+            .is_none()
+        );
+        let direct = json!({
+            "id": "direct",
+            "metadata": {"sourceIP": "192.168.2.35"},
+            "chains": ["DIRECT"]
+        });
+        assert!(
+            diagnostic_connection_from_value(
+                &direct,
+                "192.168.2.35".parse().expect("source IP"),
+                100,
+            )
+            .is_none()
+        );
+
+        let expanded_ipv6 = json!({
+            "id": "ipv6",
+            "metadata": {"sourceIP": "2001:0DB8:0:0:0:0:0:1"},
+            "chains": ["proxy-active"]
+        });
+        assert!(
+            diagnostic_connection_from_value(
+                &expanded_ipv6,
+                "2001:db8::1".parse().expect("IPv6 source"),
+                100,
+            )
+            .is_some()
+        );
+        assert!(diagnostic_line_contains_ip(
+            "WARN [2001:0DB8:0:0:0:0:0:1]:443 dial proxy",
+            "2001:db8::1".parse().expect("IPv6 source"),
+        ));
+        assert!(diagnostic_line_contains_ip(
+            "WARN 2001:DB8::1 dial proxy",
+            "2001:db8::1".parse().expect("IPv6 source"),
+        ));
+    }
+
+    #[test]
+    fn profile_diagnostic_initial_baseline_is_exact_bounded_and_required() {
+        let source: IpAddr = "2001:db8::1".parse().expect("source IP");
+        let snapshot = json!({"connections": [
+            {"id": "existing", "metadata": {"sourceIP": "2001:0DB8:0:0:0:0:0:1"}},
+            {"id": "other", "metadata": {"sourceIP": "2001:db8::2"}}
+        ]});
+        assert_eq!(
+            initial_profile_diagnostic_connection_ids(&snapshot, source).expect("baseline"),
+            HashSet::from(["existing".to_owned()])
+        );
+        assert_eq!(
+            initial_profile_diagnostic_connection_ids(&json!({}), source)
+                .expect_err("missing connections")
+                .0,
+            502
+        );
+        let too_many = (0..=PROFILE_DIAGNOSTIC_MAX_INITIAL_CONNECTION_IDS)
+            .map(|id| json!({"id": format!("id-{id}"), "metadata": {"sourceIP": source.to_string()}}))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            initial_profile_diagnostic_connection_ids(&json!({"connections": too_many}), source,)
+                .expect_err("bounded baseline")
+                .0,
+            413
+        );
+    }
+
+    #[test]
+    fn profile_diagnostic_start_fails_closed_without_baseline() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![sample_profile(0, "Active", "active.example")];
+            inner.state.active_profile_id = Some(0);
+        }
+        let (status, _, _) = dispatch(
+            "POST",
+            "/api/profile-diagnostics/start",
+            r#"{"profile_id":0,"duration_seconds":60,"source_ip":"192.168.2.35"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 502);
+        let inner = lock(&daemon.inner);
+        assert!(!inner.profile_diagnostics.starting);
+        assert!(inner.profile_diagnostics.active.is_none());
+        assert!(inner.profile_diagnostics.worker.is_none());
+    }
+
+    #[test]
+    fn profile_diagnostic_excludes_initial_connections_and_unscoped_logs() {
+        let mut capture = diagnostic_test_capture();
+        capture.initial_connection_ids.insert("existing".to_owned());
+        let connection = |id: &str| {
+            json!({
+                "id": id,
+                "metadata": {
+                    "host": "video.example",
+                    "destinationIP": "203.0.113.10",
+                    "destinationPort": "443",
+                    "sourceIP": "192.168.2.35",
+                    "network": "tcp"
+                },
+                "chains": ["proxy-active"]
+            })
+        };
+        merge_profile_diagnostic_connections(
+            &mut capture,
+            &json!({"connections": [connection("existing"), connection("new")]}),
+            1_001,
+        );
+        assert_eq!(capture.connections.len(), 1);
+        assert_eq!(capture.connections[0].id, "connection-1");
+
+        merge_profile_diagnostic_events(
+            &mut capture,
+            "WARN dial proxy proxy-active video.example timeout\nWARN 192.168.2.35 unrelated timeout\nWARN 192.168.2.35 dial proxy proxy-active video.example timeout",
+            1_002,
+        );
+        assert_eq!(capture.events.len(), 1);
+    }
+
+    #[test]
+    fn diagnostic_redaction_handles_structured_canaries_and_urls() {
+        let canary = "PROFILE-DIAGNOSTIC-SECRET-CANARY";
+        let input = format!(
+            r#""authorization": "Bearer {canary}", PASSWORD='{canary}' api_token = "{canary}" accessToken={canary} refresh-token={canary} apiKey={canary} client_secret={canary} Proxy-Authorization="Basic {canary}" auth-str={canary} passphrase={canary} private-key-passphrase={canary} psk={canary} clientCredential={canary} Cookie="sid={canary}" secret={canary} key:{canary} uuid={canary} private-key={canary} url=https://user:{canary}@example.test/private/path?token={canary}#frag"#
+        );
+        let redacted = redact_diagnostic_text_bounded(&input, 4096);
+        assert!(!redacted.contains(canary), "{redacted}");
+        assert!(!redacted.contains("/private/path"), "{redacted}");
+        assert!(!redacted.contains("user:"), "{redacted}");
+        for key in [
+            "authorization\": <redacted>",
+            "PASSWORD=",
+            "api_token =",
+            "accessToken=",
+            "refresh-token=",
+            "apiKey=",
+            "client_secret=",
+            "Proxy-Authorization=",
+            "auth-str=",
+            "passphrase=",
+            "private-key-passphrase=",
+            "psk=",
+            "clientCredential=",
+            "Cookie=",
+            "secret=",
+            "key:",
+            "uuid=",
+            "private-key=",
+        ] {
+            assert!(redacted.contains(key), "missing {key}: {redacted}");
+        }
+    }
+
+    #[test]
+    fn profile_diagnostic_retention_and_event_redaction_are_bounded() {
+        let mut capture = diagnostic_test_capture();
+        let connections = (0..300)
+            .map(|id| {
+                json!({
+                    "id": format!("connection-{id}"),
+                    "metadata": {
+                        "host": format!("video-{id}.example"),
+                        "destinationIP": "203.0.113.10",
+                        "destinationPort": "443",
+                        "sourceIP": "192.168.2.35",
+                        "network": "tcp"
+                    },
+                    "chains": ["proxy-active"],
+                    "upload": id,
+                    "download": id * 2
+                })
+            })
+            .collect::<Vec<_>>();
+        merge_profile_diagnostic_connections(
+            &mut capture,
+            &json!({"connections": connections}),
+            1_001,
+        );
+        assert_eq!(
+            capture.connections.len(),
+            PROFILE_DIAGNOSTIC_MAX_CONNECTIONS
+        );
+        assert_eq!(capture.dropped_connections, 44);
+
+        let lines = (0..300)
+            .map(|id| {
+                format!(
+                    "WARN 192.168.2.35 dial proxy proxy-active vpn.example error: timeout https://user:known-secret@service.example/watch?token=known-secret line={id}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        merge_profile_diagnostic_events(&mut capture, &lines, 1_002);
+        assert_eq!(capture.events.len(), PROFILE_DIAGNOSTIC_MAX_EVENTS);
+        assert_eq!(capture.dropped_events, 44);
+        let serialized = serde_json::to_string(&capture.events).expect("events");
+        assert!(!serialized.contains("known-secret"), "{serialized}");
+    }
+
+    #[test]
+    fn profile_diagnostic_timeout_and_identity_change_reasons_are_deterministic() {
+        let capture = diagnostic_test_capture();
+        assert_eq!(
+            profile_diagnostic_reason(&capture, Some("srv-v2-test"), 7, 1_060),
+            Some("timeout")
+        );
+        assert_eq!(
+            profile_diagnostic_reason(&capture, Some("srv-v2-other"), 7, 1_001),
+            Some("profile_changed")
+        );
+        assert_eq!(
+            profile_diagnostic_reason(&capture, Some("srv-v2-test"), 8, 1_001),
+            Some("core_generation_changed")
+        );
+    }
+
+    #[test]
+    fn profile_diagnostic_profile_switch_auto_finalizes_worker() {
+        let (_dir, daemon) = test_daemon();
+        let controller = diagnostic_controller(&daemon, vec![json!({"connections": []})]);
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![
+                sample_profile(0, "Active", "active.example"),
+                sample_profile(1, "Other", "other.example"),
+            ];
+            inner.state.active_profile_id = Some(0);
+        }
+        let (status, _, body) = dispatch(
+            "POST",
+            "/api/profile-diagnostics/start",
+            r#"{"profile_id":0,"duration_seconds":60,"source_ip":"192.168.2.35"}"#,
+            &daemon,
+        );
+        assert_eq!(status, 200, "{body}");
+        lock(&daemon.inner).state.active_profile_id = Some(1);
+        join_profile_diagnostic_worker(&daemon, None, None, false).expect("join worker");
+        let inner = lock(&daemon.inner);
+        let report = inner
+            .profile_diagnostics
+            .completed
+            .as_ref()
+            .expect("completed report");
+        assert_eq!(report.finalization_reason, "profile_changed");
+        drop(inner);
+        controller.join().expect("diagnostic controller");
+    }
+
+    #[test]
+    fn profile_diagnostic_report_requires_session_cas_and_shared_ttl_boundary() {
+        let (_dir, daemon) = test_daemon();
+        let ended_at = unix_now();
+        let report = build_profile_diagnostic_report(
+            diagnostic_test_capture(),
+            diagnostic_test_environment(7),
+            "manual",
+            ended_at,
+            "completed",
+        );
+        assert!(!profile_diagnostic_report_expired(
+            &report,
+            ended_at + PROFILE_DIAGNOSTIC_COMPLETED_TTL_SECS - 1
+        ));
+        assert!(profile_diagnostic_report_expired(
+            &report,
+            ended_at + PROFILE_DIAGNOSTIC_COMPLETED_TTL_SECS
+        ));
+        lock(&daemon.inner).profile_diagnostics.completed = Some(report);
+        let (status, _, _) =
+            handle_profile_diagnostic_report(r#"{"session_id":"wrong-session"}"#, &daemon);
+        assert_eq!(status, 409);
+        let (status, _, body) =
+            handle_profile_diagnostic_report(r#"{"session_id":"pd-test-session"}"#, &daemon);
+        assert_eq!(status, 200, "{body}");
+        let response: Value = serde_json::from_str(&body).expect("report response");
+        assert_eq!(response["report"]["session_id"], "pd-test-session");
+    }
+
+    #[test]
+    fn profile_diagnostic_report_is_ai_contextual_redacted_and_capped() {
+        let mut capture = diagnostic_test_capture();
+        capture.config_summary = format!(
+            "server: vpn.example\npassword: <redacted>\nnotes: {}",
+            "safe-config-line\n".repeat(8_000)
+        );
+        for id in 0..PROFILE_DIAGNOSTIC_MAX_CONNECTIONS {
+            capture.connections.push(ProfileDiagnosticConnection {
+                id: format!("id-{id}"),
+                domain: format!("video-{id}.example"),
+                destination_ip: "203.0.113.10".to_owned(),
+                destination_port: 443,
+                network: "tcp".to_owned(),
+                rule: "MATCH".to_owned(),
+                rule_payload: "safe".repeat(100),
+                chains: vec!["proxy-active".to_owned()],
+                upload_bytes: 10,
+                download_bytes: 20,
+                first_seen_unix: 1_000,
+                last_seen_unix: 1_001,
+                open: false,
+                source_ip: "192.168.2.35".to_owned(),
+            });
+        }
+        let report = build_profile_diagnostic_report(
+            capture,
+            diagnostic_test_environment(7),
+            "manual",
+            1_030,
+            "completed",
+        );
+        let response = ProfileDiagnosticReportResponse { report };
+        let bytes = serde_json::to_vec(&response).expect("report JSON");
+        assert!(
+            bytes.len() <= PROFILE_DIAGNOSTIC_MAX_REPORT_BYTES,
+            "{}",
+            bytes.len()
+        );
+        let text = String::from_utf8(bytes).expect("UTF-8");
+        for context in [
+            "HincyRay Profile Diagnostic",
+            "Finalization",
+            "Active Test",
+            "Redaction",
+        ] {
+            assert!(text.contains(context), "missing {context}");
+        }
+        assert!(!text.contains("known-secret"));
+        assert!(!text.contains("vless://"));
+    }
+
+    #[test]
+    fn profile_diagnostic_final_redaction_covers_all_report_strings_and_external_ids() {
+        let canary = "PROFILE-DIAGNOSTIC-SECRET-CANARY";
+        let mut capture = diagnostic_test_capture();
+        capture.profile.name = format!("name-{canary}");
+        capture.profile.server_ref = format!("server-{canary}");
+        capture.config_summary = format!("note={canary}");
+        capture.connections.push(ProfileDiagnosticConnection {
+            id: "connection-1".to_owned(),
+            domain: format!("domain-{canary}"),
+            destination_ip: format!("ip-{canary}"),
+            destination_port: 443,
+            network: format!("network-{canary}"),
+            rule: format!("rule-{canary}"),
+            rule_payload: format!("payload-{canary}"),
+            chains: vec![format!("chain-{canary}")],
+            upload_bytes: 1,
+            download_bytes: 2,
+            first_seen_unix: 1_000,
+            last_seen_unix: 1_001,
+            open: true,
+            source_ip: "192.168.2.35".to_owned(),
+        });
+        capture.events.push(ProfileDiagnosticEvent {
+            timestamp_unix: 1_001,
+            severity: format!("severity-{canary}"),
+            classification: format!("class-{canary}"),
+            message: format!("message-{canary}"),
+        });
+        capture.latest_stats = Some(ProfileDiagnosticLatestStats {
+            checked_at_unix: 1_001,
+            latency_ms: 1,
+            jitter_ms: 1,
+            download_mbps: 1.0,
+            upload_mbps: 1.0,
+            loss_percent: 0.0,
+            last_service_test_success: Some(false),
+            services: vec![ProfileDiagnosticServiceResult {
+                id: format!("service-id-{canary}"),
+                name: format!("service-name-{canary}"),
+                attempts: 1,
+                successes: 0,
+                reachable: false,
+                stable: false,
+                avg_ttfb_ms: 0,
+                error: Some(format!("error-{canary}")),
+            }],
+        });
+        let mut end = diagnostic_test_environment(7);
+        end.core_status = format!("status-{canary}");
+        let report = build_profile_diagnostic_report(capture, end, canary, 1_030, "completed");
+        let serialized = serde_json::to_string(&report).expect("report");
+        assert!(!serialized.contains(canary), "{serialized}");
+        assert_eq!(report.connections[0].id, "connection-1");
+    }
+
+    #[test]
+    fn profile_diagnostic_session_is_not_persisted_or_exposed_as_raw_list() {
+        let (dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![sample_profile(0, "Active", "active.example")];
+            inner.state.active_profile_id = Some(0);
+            inner.profile_diagnostics.active = Some(diagnostic_test_capture());
+            persist_state(&daemon.state_path, &inner.state).expect("persist state");
+        }
+        let persisted = fs::read_to_string(dir.path().join("state.json")).expect("state");
+        assert!(!persisted.contains("pd-test-session"));
+        assert!(!persisted.contains("profile_diagnostics"));
+        let openapi = openapi_document().to_string();
+        assert!(openapi.contains("ProfileDiagnosticConnection"));
+        assert!(!openapi.contains("profile_raw"));
+        assert!(!openapi.contains("share_link"));
     }
 
     #[test]
@@ -25081,7 +30965,6 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
                 domains: vec!["custom.com".to_owned()],
                 ..Default::default()
             });
-            inner.state.mihomo_features.raw_rules = vec!["DOMAIN-SUFFIX,test.com,proxy".to_owned()];
         }
         let (status, _, _body) = handle_routing_reset("{}", &daemon);
         assert_eq!(status, 200);
@@ -25120,11 +31003,6 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
                 "should have exactly 1 rule (QUIC Block)"
             );
             assert_eq!(inner.state.routing_rules[0].name, "QUIC Block");
-            // Raw rules should be cleared.
-            assert!(
-                inner.state.mihomo_features.raw_rules.is_empty(),
-                "raw_rules should be cleared"
-            );
         }
     }
 

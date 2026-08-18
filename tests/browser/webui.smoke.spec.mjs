@@ -30,7 +30,7 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.2.2');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.0');
 });
 
 test('profile table shows compact service status and configurable metric columns', async ({ page }) => {
@@ -56,8 +56,8 @@ test('profile technical columns are optional and row actions stay beside the nam
   await expect(page.locator('#profilesTable thead [data-profile-metric="transport"]')).toBeHidden();
   await expect(page.locator('#profilesTable thead [data-profile-metric="address"]')).toBeHidden();
   await expect(row.locator('.profile-name-cell .profile-row-actions')).toContainText('Активен');
-  await expect(row.locator('.profile-name-cell').getByTitle('Quick Test')).toBeVisible();
-  await expect(row.locator('.profile-name-cell').getByTitle('Переименовать')).toBeVisible();
+  await expect(row.locator('[data-bench-scope="single"]')).toHaveAttribute('title', 'Quick Test только этого сервера');
+  await expect(row.locator('.profile-row-actions').getByTitle('Редактировать профиль')).toBeVisible();
   await expect(row.locator('.profile-name-cell').getByTitle('Удалить')).toBeVisible();
   const starCell = row.locator('td').first();
   await expect(starCell.locator('.star')).toBeVisible();
@@ -128,7 +128,7 @@ test('profiles use the available desktop width and long-operation scanner moves'
   await page.evaluate(() => endLongOperation('/test-operation'));
 });
 
-test('profile quick and global full tests send bounded concurrency', async ({ page }) => {
+test('persisted concurrency survives reload and group/global tests send four workers', async ({ page }) => {
   await openFixture(page);
   await navigateTo(page, 'profiles');
   await page.getByText('Настройки тестирования').click();
@@ -138,7 +138,26 @@ test('profile quick and global full tests send bounded concurrency', async ({ pa
     enhanced: select.dataset.customSelectEnhanced || null,
     wrapped: select.parentElement?.classList.contains('custom-select') || false,
   }))).toEqual({ native: '1', enhanced: null, wrapped: false });
-  await page.locator('#benchConcurrency').selectOption('6');
+  await page.locator('#benchConcurrency').selectOption('4');
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('hr_bench_concurrency'))).toBe('4');
+
+  await page.reload();
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Profile');
+  await navigateTo(page, 'profiles');
+  await expect(page.locator('#benchConcurrency')).toHaveValue('4');
+
+  const groupRequest = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/bench/start'
+  );
+  await page.locator('.profile-group-row').filter({ hasText: 'Fixture VPN' }).locator('[data-bench-scope="group"]').click();
+  expect((await groupRequest).postDataJSON()).toEqual(expect.objectContaining({
+    method: 'quick',
+    concurrency: 4,
+    subscription_url: 'https://provider.example/sub/fixture-token',
+  }));
+
+  await page.evaluate(() => api('POST','/api/bench/stop',{}));
+  await page.getByText('Настройки тестирования').click();
 
   const fullRequest = page.waitForRequest(request =>
     request.method() === 'POST' && new URL(request.url()).pathname === '/api/bench/start'
@@ -146,20 +165,50 @@ test('profile quick and global full tests send bounded concurrency', async ({ pa
   await page.locator('#benchFullAll').click();
   expect((await fullRequest).postDataJSON()).toEqual(expect.objectContaining({
     method: 'full',
-    concurrency: 6,
+    concurrency: 4,
     test_download: false,
     test_upload: false,
   }));
+});
 
-  await page.evaluate(() => api('POST','/api/bench/stop',{}));
-  const quickRequest = page.waitForRequest(request =>
-    request.method() === 'POST' && new URL(request.url()).pathname === '/api/bench/start'
-  );
-  await page.locator('#profilesBody [title="Quick Test"]').first().click();
-  expect((await quickRequest).postDataJSON()).toEqual(expect.objectContaining({
+test('benchmark help and stable scope titles explain single versus parallel tests in RU and EN', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  await page.getByText('Настройки тестирования').click();
+  await expect(page.locator('#benchSemanticsHelp')).toContainText('⚡ в строке проверяет только один сервер');
+  await expect(page.locator('#benchConcurrencyHelp')).toContainText('строка ⚡ всегда одна');
+  await expect(page.locator('[data-bench-scope="single"]').first()).toHaveAttribute('title', 'Quick Test только этого сервера');
+  await expect(page.locator('[data-bench-scope="group"]').first()).toHaveAttribute('title', /до настроенного числа серверов параллельно/);
+  await expect(page.locator('#benchFullAll')).toHaveAttribute('title', 'Full Test всех серверов, до выбранного числа параллельно');
+
+  await page.evaluate(() => toggleLang());
+  await expect(page.locator('#benchSemanticsHelp')).toContainText('A row ⚡ tests only one server');
+  await expect(page.locator('#benchConcurrencyHelp')).toContainText('a row ⚡ always tests one');
+  await expect(page.locator('#benchConcurrency')).toHaveAttribute('title', 'From 1 to 6; a row test always checks one server');
+  await expect(page.locator('#benchFullAll')).toHaveAttribute('title', 'Full Test all servers, up to the selected parallel count');
+});
+
+test('benchmark status renders all bounded active profile names', async ({ page }) => {
+  await openFixture(page);
+  await page.request.post('/__fixture/bench-status', { data: {
+    running: true,
     method: 'quick',
-    concurrency: 6,
-  }));
+    total: 6,
+    completed: 2,
+    current_profile_id: 104,
+    current_profile_name: 'Worker Four',
+    active_profiles: [
+      { id: 101, name: 'Worker One' },
+      { id: 102, name: 'Worker Two' },
+      { id: 103, name: 'Worker Three' },
+      { id: 104, name: 'Worker Four' },
+    ],
+    results: [],
+  }});
+  await page.evaluate(() => pollBenchStatus());
+
+  await expect(page.locator('#benchCurrent')).toHaveText('В работе: 4 · Worker One, Worker Two, Worker Three, Worker Four');
+  await expect(page.locator('#benchCounter')).toHaveText('2/6');
 });
 
 test('Dead Servers supports single and bulk diagnostics, restore, and clear', async ({ page }) => {
@@ -404,6 +453,151 @@ test('DNS save persists settings and applies routing', async ({ page }) => {
   expect((await applyPost).postDataJSON()).toEqual({});
 });
 
+test('Mihomo parameters auto-load runtime and save one reduced payload by stable IDs in English', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('hr_lang', 'EN');
+    window.__fixturePromptCalled = false;
+    window.prompt = () => {
+      window.__fixturePromptCalled = true;
+      return null;
+    };
+  });
+  await page.goto('/');
+  await expect(page).toHaveTitle(/HincyRay/);
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Profile');
+  await expect(page.locator('.nav-sub-item[data-section="features"]')).toContainText('Parameters');
+  await page.request.post('/__fixture/reset');
+
+  const loaded = page.waitForRequest(request =>
+    request.method() === 'GET' && new URL(request.url()).pathname === '/api/mihomo-features'
+  );
+  await expect(page.locator('#featSave')).toBeDisabled();
+  await navigateTo(page, 'features');
+  await loaded;
+
+  await expect(page.locator('#featSave')).toBeEnabled();
+  await expect(page.locator('#featRuntimeGeoLoader')).toHaveText('memconservative');
+  await expect(page.locator('#featRuntimeStoreFakeIp')).toHaveText('enabled');
+  await expect(page.locator('#featRuntimeUdp')).toHaveText('enabled');
+  await expect(page.locator('#featRuntimeEcAddress')).toHaveText('127.0.0.1:9090');
+  await expect(page.locator('#featRuntimeEcConnected')).toHaveText('Connected');
+  await expect(page.locator('#featDnsFakeIpFilterMode option').first()).toHaveText('Not set');
+  await expect(page.locator('#featDnsFakeIpTtl')).toHaveAttribute('placeholder', 'Not set');
+
+  await expect(page.locator('#featPgEnabled, #featEcSecret, #featNtpEnabled, #featAuth, #proxyProvidersList, #ruleProvidersList, #featRawRules')).toHaveCount(0);
+  await expect(page.locator('.section-panel[data-section="features"] #dnsSniffOverride')).toHaveCount(0);
+
+  await page.locator('#featUnifiedDelay').evaluate(control => { control.checked = false; });
+  await page.locator('#featKaInterval').fill('45');
+  await page.locator('#featPerProxyTfo').evaluate(control => { control.checked = true; });
+  await page.locator('#featPerProxyIpVersion').selectOption('ipv4-prefer');
+  await page.locator('#featDnsPreferH3').evaluate(control => { control.checked = true; });
+  await page.locator('#featDnsDefaultNameserver').fill('9.9.9.9\n1.1.1.1');
+  await page.locator('#featDnsNameserverPolicy').fill('geosite:private = 192.168.1.1, 192.168.1.2');
+  await page.locator('#featSnifferForceDomain').fill('+.fixture.test');
+  await page.locator('#featHosts').fill('fixture.test=192.0.2.5');
+
+  const posted = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/mihomo-features'
+  );
+  await page.locator('#featSave').click();
+  const body = (await posted).postDataJSON();
+  expect(body).toEqual({
+    parameters: {
+      unified_delay: false,
+      store_selected: true,
+      keep_alive_interval: 45,
+      keep_alive_idle: 120,
+      disable_keep_alive: false,
+      tcp_concurrent: true,
+      per_proxy: { tfo: true, mptcp: false, ip_version: 'ipv4-prefer' },
+      dns: {
+        prefer_h3: true,
+        respect_rules: true,
+        default_nameserver: ['9.9.9.9', '1.1.1.1'],
+        nameserver_policy: { 'geosite:private': ['192.168.1.1', '192.168.1.2'] },
+        proxy_server_nameserver_policy: { 'provider.example': ['1.0.0.1'] },
+        direct_nameserver_follow_policy: true,
+        fake_ip_filter_mode: 'blacklist',
+        fake_ip_filter: ['*.lan', '*.local'],
+        fake_ip_ttl: 60,
+      },
+      sniffer: {
+        force_domain: ['+.fixture.test'],
+        skip_domain: ['+.apple.com'],
+        skip_src_address: ['192.168.0.0/16'],
+        skip_dst_address: ['127.0.0.1/8'],
+      },
+      tunnels: [{ network: ['tcp'], address: '127.0.0.1:8080', target: 'fixture.test:80', proxy: null }],
+      hosts: { 'fixture.test': '192.0.2.5' },
+      experimental: { quic_go_disable_gso: false, quic_go_disable_ecn: true },
+    },
+  });
+
+  const requests = await page.request.get('/__fixture/requests').then(response => response.json());
+  const featureRequests = requests.requests.filter(request => request.path === '/api/mihomo-features');
+  expect(featureRequests.filter(request => request.method === 'GET')).toHaveLength(1);
+  expect(featureRequests.filter(request => request.method === 'POST')).toHaveLength(1);
+  expect(featureRequests.at(-1).body.runtime).toBeUndefined();
+  expect(featureRequests.at(-1).body.parameters.proxy_group).toBeUndefined();
+  expect(requests.requests.filter(request => request.path === '/api/routing/apply')).toHaveLength(0);
+});
+
+for (const invalid of [
+  {
+    name: 'malformed host',
+    edit: async page => page.locator('#featHosts').fill('fixture.test=192.0.2.5\nmalformed-host'),
+    error: /Hosts.*(некорректная строка|invalid line)/,
+  },
+  {
+    name: 'malformed policy',
+    edit: async page => page.locator('#featDnsNameserverPolicy').fill('geosite:private = 192.168.1.1\nmalformed-policy'),
+    error: /(Nameserver policy).*(некорректная строка|invalid line)/,
+  },
+  {
+    name: 'incomplete tunnel',
+    edit: async page => page.getByRole('button', { name: /Добавить tunnel|Add Tunnel/ }).click(),
+    error: /Tunnels.*(заполните address и target|fill address and target)/,
+  },
+  {
+    name: 'empty required number',
+    edit: async page => page.locator('#featKaInterval').evaluate(control => {
+      control.value = '';
+      control.dispatchEvent(new Event('input', { bubbles: true }));
+    }),
+    error: /обязательные числовые поля|required numeric fields/,
+  },
+]) {
+  test(`Mihomo parameters reject ${invalid.name} without a request`, async ({ page }) => {
+    await openFixture(page);
+    await navigateTo(page, 'features');
+    await expect(page.locator('#featSave')).toBeEnabled();
+    await page.request.post('/__fixture/reset');
+
+    await invalid.edit(page);
+    await page.locator('#featSave').click();
+
+    await expect(page.locator('#msgBar')).toHaveText(invalid.error);
+    const requests = await page.request.get('/__fixture/requests').then(response => response.json());
+    expect(requests.requests.filter(request => request.method === 'POST' && request.path === '/api/mihomo-features')).toHaveLength(0);
+  });
+}
+
+test('Mihomo parameters retain dirty drafts across navigation without reloading', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'features');
+  await expect(page.locator('#featSave')).toBeEnabled();
+  await page.request.post('/__fixture/reset');
+
+  await page.locator('#featHosts').fill('draft.test=192.0.2.88');
+  await navigateTo(page, 'config');
+  await navigateTo(page, 'features');
+
+  await expect(page.locator('#featHosts')).toHaveValue('draft.test=192.0.2.88');
+  const requests = await page.request.get('/__fixture/requests').then(response => response.json());
+  expect(requests.requests.filter(request => request.method === 'GET' && request.path === '/api/mihomo-features')).toHaveLength(0);
+});
+
 test('profile import posts pasted subscription text', async ({ page }) => {
   await openFixture(page);
   await navigateTo(page, 'import');
@@ -426,18 +620,313 @@ test('mobile bottom navigation opens routing without horizontal table dependence
   await expect(page.locator('table.responsive-cards').first()).toHaveCount(1);
 });
 
-test('profile rename uses a modal instead of window.prompt', async ({ page }) => {
+test('manual profile editor loads detail on demand, protects raw, and posts stable bounded fields', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
   await openFixture(page);
-  const modal = page.getByTestId('profile-rename-modal');
-  test.skip(
-    await modal.count() === 0,
-    'WebUI has no data-testid="profile-rename-modal" marker yet; enable after the modal implementation lands.',
-  );
-
   await navigateTo(page, 'profiles');
-  const profileRow = page.locator('#profilesBody tr').filter({ hasText: 'Fixture Profile' });
-  await profileRow.getByTitle('Переименовать').click();
+  const modal = page.getByTestId('profile-editor-modal');
+  const profileRow = page.locator('#profilesBody tr').filter({ hasText: 'Fixture Manual' });
+  const detailRequest = page.waitForRequest(request =>
+    request.method() === 'GET' && new URL(request.url()).pathname === '/api/profiles/102'
+  );
+  await profileRow.locator('.profile-name-edit').click();
+  await detailRequest;
 
   await expect(modal).toBeVisible();
+  await expect(modal.locator('#profileEditorName')).toHaveValue('Fixture Manual');
+  await expect(modal.locator('#profileEditorProtocol')).toHaveText('VLESS');
+  await expect(modal.locator('#profileEditorTransport')).toHaveText('ws');
+  await expect(modal.locator('#profileEditorAddress')).toHaveText('192.0.2.44');
+  await expect(modal.locator('#profileEditorPort')).toHaveText('8443');
+  await expect(modal.locator('#profileEditorGroup')).toHaveText('Без группы');
+  await expect(modal.locator('#profileEditorActive')).toHaveText('нет');
+  await expect(modal.locator('#profileEditorDead')).toHaveText('нет');
+  const raw = modal.locator('#profileEditorRaw');
+  await expect(raw).toHaveValue(/manual-key.*host=hidden\.example.*path=%2Fsecret/);
+  await expect(raw).toHaveClass(/profile-secret-mask/);
+  await expect(raw).not.toHaveClass(/revealed/);
+  await expect(modal.locator('#profileEditorReveal')).toHaveAttribute('aria-pressed', 'false');
+  expect(await page.evaluate(() => JSON.stringify({ mock: window.MOCK.profiles, localStorage: { ...localStorage } }))).not.toContain('manual-key');
+
+  await modal.locator('#profileEditorReveal').click();
+  await expect(raw).toHaveClass(/revealed/);
+  await expect(modal.locator('#profileEditorReveal')).toHaveAttribute('aria-pressed', 'true');
+  await modal.locator('#profileEditorName').fill('Fixture Manual Updated');
+  await raw.fill('vless://new-manual-key@192.0.2.45:9443?security=tls&type=ws&host=new-hidden.example#Updated');
+  const updateRequest = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/profiles/update'
+  );
+  await modal.locator('#profileEditorSave').click();
+  expect((await updateRequest).postDataJSON()).toEqual({
+    profile_id: 102,
+    expected_server_ref: 'srv-v2-fixture-manual',
+    name: 'Fixture Manual Updated',
+    raw: 'vless://new-manual-key@192.0.2.45:9443?security=tls&type=ws&host=new-hidden.example#Updated',
+  });
+
+  await expect(modal).toBeHidden();
+  await expect(raw).toHaveValue('');
+  expect(await page.evaluate(() => profileEditorState)).toBeNull();
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Manual Updated');
   expect(await page.evaluate(() => window.__fixturePromptCalled)).toBe(false);
+});
+
+test('subscription profile raw is read-only while rename remains available', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const modal = page.getByTestId('profile-editor-modal');
+  await page.locator('#profilesBody tr').filter({ hasText: 'Fixture Profile' }).locator('.profile-name-edit').click();
+
+  await expect(modal.locator('#profileEditorRaw')).toBeDisabled();
+  await expect(modal.locator('#profileEditorRaw')).toHaveValue(/subscription-secret/);
+  await expect(modal.locator('#profileEditorManagedNote')).toBeVisible();
+  await modal.locator('#profileEditorName').fill('Fixture Subscription Renamed');
+  const updateRequest = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/profiles/update'
+  );
+  await modal.locator('#profileEditorSave').click();
+  expect((await updateRequest).postDataJSON()).toEqual({
+    profile_id: 101,
+    expected_server_ref: 'srv-v2-fixture-subscription',
+    name: 'Fixture Subscription Renamed',
+  });
+  await expect(modal).toBeHidden();
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Subscription Renamed');
+});
+
+test('profile editor sends nothing before detail loads and clears raw on cancel', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await page.route('**/api/profiles/102', async route => {
+    await new Promise(resolve => setTimeout(resolve, 300));
+    await route.continue();
+  });
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const modal = page.getByTestId('profile-editor-modal');
+  await page.locator('#profilesBody tr').filter({ hasText: 'Fixture Manual' }).locator('.profile-name-edit').click();
+  await expect(modal.locator('#profileEditorSave')).toBeDisabled();
+  await modal.locator('#profileEditorSave').click({ force: true });
+  await expect(modal.locator('#profileEditorRaw')).toHaveValue(/manual-key/);
+  await modal.getByRole('button', { name: 'Отмена' }).click();
+  await expect(modal).toBeHidden();
+  await expect(modal.locator('#profileEditorRaw')).toHaveValue('');
+  const requests = await page.request.get('/__fixture/requests').then(response => response.json());
+  expect(requests.requests.filter(request => request.method === 'POST' && request.path === '/api/profiles/update')).toHaveLength(0);
+});
+
+test('profile editor clears sensitive raw generation-safely on auth and page lifecycle events', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await page.route('**/api/profiles/102', async route => {
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await route.continue();
+  });
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const modal = page.getByTestId('profile-editor-modal');
+  const raw = modal.locator('#profileEditorRaw');
+  const manualRow = page.locator('#profilesBody tr').filter({ hasText: 'Fixture Manual' });
+
+  await manualRow.locator('.profile-name-edit').click();
+  await page.evaluate(() => showLoginOverlay());
+  await page.waitForTimeout(300);
+  await expect(modal).toBeHidden();
+  await expect(raw).toHaveValue('');
+  expect(await page.evaluate(() => profileEditorState)).toBeNull();
+
+  await page.evaluate(() => { document.getElementById('loginOverlay').style.display = 'none'; });
+  await manualRow.locator('.profile-name-edit').click();
+  await expect(raw).toHaveValue(/manual-key/);
+  await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+  await expect(modal).toBeHidden();
+  await expect(raw).toHaveValue('');
+  expect(await page.evaluate(() => profileEditorState)).toBeNull();
+});
+
+test('whitespace profile group is rendered as No group', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.addEventListener('DOMContentLoaded', () => {
+      const profile = window.MOCK?.profiles?.find(item => item.id === 102);
+      if (profile) profile.group = '   ';
+    });
+  });
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+
+  const noGroup = page.locator('#profilesBody .profile-group-row').filter({ hasText: 'Без группы' });
+  await expect(noGroup).toHaveCount(1);
+  await expect(noGroup.getByTestId('revalidate-ungrouped')).toBeVisible();
+});
+
+test('profile update errors preserve the editor draft and do not mutate the list', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const modal = page.getByTestId('profile-editor-modal');
+  await page.locator('#profilesBody tr').filter({ hasText: 'Fixture Manual' }).locator('.profile-name-edit').click();
+  await modal.locator('#profileEditorName').fill('Fixture rejected name');
+  const originalRaw = await modal.locator('#profileEditorRaw').inputValue();
+  await modal.locator('#profileEditorSave').click();
+
+  await expect(page.locator('#msgBar')).toHaveText('fixture rejected profile update');
+  await expect(modal).toBeVisible();
+  await expect(modal.locator('#profileEditorName')).toBeEnabled();
+  await expect(modal.locator('#profileEditorName')).toHaveValue('Fixture rejected name');
+  await expect(modal.locator('#profileEditorRaw')).toHaveValue(originalRaw);
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Manual');
+  await expect(page.locator('#profilesBody')).not.toContainText('Fixture rejected name');
+});
+
+test('No group revalidates local links while subscription groups refresh their source', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const noGroup = page.locator('#profilesBody .profile-group-row').filter({ hasText: 'Без группы' });
+  const revalidateRequest = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/profiles/revalidate-ungrouped'
+  );
+  await noGroup.getByTestId('revalidate-ungrouped').click();
+  expect((await revalidateRequest).postDataJSON()).toEqual({});
+  await expect(page.locator('#msgBar')).toContainText('Локальная проверка завершена');
+  await expect(page.locator('#msgBar')).toContainText('обновлено 1');
+
+  const subscriptionGroup = page.locator('#profilesBody .profile-group-row').filter({ hasText: 'Fixture VPN' });
+  const refreshRequest = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/subscriptions/refresh-one'
+  );
+  await subscriptionGroup.getByTitle('Обновить эту подписку из источника').click();
+  expect((await refreshRequest).postDataJSON()).toEqual({ url: 'https://provider.example/sub/fixture-token' });
+});
+
+test('No group revalidation errors leave profile rows unchanged', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await page.route('**/api/profiles/revalidate-ungrouped', route => route.fulfill({
+    status: 400,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      checked: 1,
+      updated: 0,
+      unchanged: 1,
+      dataplane_applied: false,
+      errors: [{ profile_id: 102, name: 'Fixture Manual', error: 'invalid local share link' }],
+    }),
+  }));
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const before = await page.locator('#profilesBody').textContent();
+  await page.getByTestId('revalidate-ungrouped').click();
+
+  await expect(page.locator('#msgBar')).toContainText('Fixture Manual: invalid local share link');
+  await expect(page.locator('#profilesBody')).toHaveText(before);
+  const requests = await page.request.get('/__fixture/requests').then(response => response.json());
+  expect(requests.requests.filter(request => request.path === '/api/subscriptions/refresh-one')).toHaveLength(0);
+});
+
+test('English No group is selected by null source and keeps local revalidation wording', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('hr_lang', 'EN'));
+  await page.request.post('/__fixture/reset');
+  await page.goto('/');
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Manual');
+  await navigateTo(page, 'profiles');
+  const noGroup = page.locator('#profilesBody .profile-group-row').filter({ hasText: 'No group' });
+  await expect(noGroup.getByTestId('revalidate-ungrouped')).toContainText('Revalidate local profiles');
+  await expect(noGroup.getByTestId('revalidate-ungrouped')).toHaveAttribute('title', /No subscription or network fetch/);
+});
+
+test('Profile Logger starts only the active profile with bounded duration and source IP', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await openFixture(page);
+  await navigateTo(page, 'profile-logger');
+
+  const options = page.locator('#profileLoggerProfile option');
+  await expect(options).toHaveCount(2);
+  await expect(options.nth(0)).toBeEnabled();
+  await expect(options.nth(0)).toContainText('Fixture Profile (#101)');
+  await expect(options.nth(1)).toBeDisabled();
+  await expect(page.locator('#profileLoggerActiveIdentity')).toHaveText('Fixture Profile · ID 101');
+  await expect(page.locator('#profileLoggerStart')).toBeDisabled();
+
+  await page.locator('#profileLoggerDuration').selectOption('120');
+  await page.locator('#profileLoggerSourceIp').fill('192.168.2.10');
+  await expect(page.locator('#profileLoggerStart')).toBeEnabled();
+  const started = page.waitForRequest(request => request.method() === 'POST' && new URL(request.url()).pathname === '/api/profile-diagnostics/start');
+  await page.locator('#profileLoggerStart').click();
+  expect((await started).postDataJSON()).toEqual({
+    profile_id: 101,
+    duration_seconds: 120,
+    source_ip: '192.168.2.10',
+  });
+  await expect(page.locator('#profileLoggerState')).toContainText('Запись активна');
+  await expect(page.locator('#profileLoggerStop')).toBeEnabled();
+});
+
+test('Profile Logger polls without overlap, stops by session, and uses exact safe report Markdown', async ({ page, context }) => {
+  await page.request.post('/__fixture/reset');
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  let activeStatusRequests = 0;
+  let maxConcurrentStatusRequests = 0;
+  let concurrentStatusRequests = 0;
+  await page.route('**/api/profile-diagnostics/status', async route => {
+    activeStatusRequests += 1;
+    concurrentStatusRequests += 1;
+    maxConcurrentStatusRequests = Math.max(maxConcurrentStatusRequests, concurrentStatusRequests);
+    await new Promise(resolve => setTimeout(resolve, 250));
+    await route.continue();
+    concurrentStatusRequests -= 1;
+  });
+  await openFixture(page);
+  await navigateTo(page, 'profile-logger');
+  await page.locator('#profileLoggerSourceIp').fill('192.168.2.10');
+  await page.locator('#profileLoggerStart').click();
+  await page.waitForTimeout(4300);
+  expect(activeStatusRequests).toBeGreaterThanOrEqual(3);
+  expect(maxConcurrentStatusRequests).toBe(1);
+
+  const stopped = page.waitForRequest(request => request.method() === 'POST' && new URL(request.url()).pathname === '/api/profile-diagnostics/stop');
+  await page.locator('#profileLoggerStop').click();
+  expect((await stopped).postDataJSON()).toEqual({ session_id: 'diag-fixture-session' });
+  await expect(page.locator('#profileLoggerMarkdown')).toHaveValue(/# Profile diagnostic: Fixture Profile/);
+  await expect(page.locator('#profileLoggerMarkdown')).toHaveValue(/Fixture TLS timeout while watching YouTube\./);
+  await expect(page.locator('#profileLoggerTruncation')).toBeVisible();
+  await page.locator('#profileLoggerCopy').click();
+  const rendered = await page.locator('#profileLoggerMarkdown').inputValue();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(rendered);
+
+  const requests = await page.request.get('/__fixture/requests').then(response => response.json());
+  expect(requests.requests.filter(request => request.path === '/api/profile-diagnostics/report')).toHaveLength(0);
+  const repeated = await page.request.post('/api/profile-diagnostics/report', { data: { session_id: 'diag-fixture-session' } });
+  expect(repeated.ok()).toBe(true);
+  expect((await repeated.json()).report.session_id).toBe('diag-fixture-session');
+  const mismatched = await page.request.post('/api/profile-diagnostics/report', { data: { session_id: 'wrong-session' } });
+  expect(mismatched.status()).toBe(409);
+  const statusAfterReads = await page.request.get('/api/profile-diagnostics/status').then(response => response.json());
+  expect(statusAfterReads.active).toBeNull();
+  expect(statusAfterReads.completed.session_id).toBe('diag-fixture-session');
+  expect(rendered).not.toContain('PROFILE-DIAGNOSTIC-SECRET-CANARY');
+  expect(await page.locator('body').innerText()).not.toContain('PROFILE-DIAGNOSTIC-SECRET-CANARY');
+});
+
+test('Profile Logger discard clears report and English workflow is complete', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('hr_lang', 'EN'));
+  await page.request.post('/__fixture/reset');
+  await page.goto('/');
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Profile');
+  await navigateTo(page, 'profile-logger');
+  await expect(page.locator('#contextSection')).toHaveText('Profile Logger');
+  await expect(page.locator('#profileLoggerWorkflow')).toContainText('new connections created after Start');
+  await expect(page.locator('#profileLoggerPrivacy')).toContainText('contains no keys or subscription URLs');
+  await expect(page.locator('#profileLoggerPrivacy')).toContainText('exact specified client');
+  await page.locator('#profileLoggerSourceIp').fill('192.168.2.10');
+  await page.locator('#profileLoggerStart').click();
+  await page.locator('#profileLoggerStop').click();
+  await expect(page.locator('#profileLoggerReportPanel')).toBeVisible();
+
+  const discarded = page.waitForRequest(request => request.method() === 'POST' && new URL(request.url()).pathname === '/api/profile-diagnostics/discard');
+  await page.locator('#profileLoggerDiscard').click();
+  expect((await discarded).postDataJSON()).toEqual({ session_id: 'diag-fixture-session' });
+  await expect(page.locator('#profileLoggerReportPanel')).toBeHidden();
+  await expect(page.locator('#profileLoggerMarkdown')).toHaveValue('');
+  await expect(page.locator('#profileLoggerStart')).toBeDisabled();
+  await page.locator('#profileLoggerSourceIp').fill('192.168.2.10');
+  await expect(page.locator('#profileLoggerStart')).toBeEnabled();
 });

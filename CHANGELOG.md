@@ -1,5 +1,44 @@
 # Changelog
 
+## v1.3.0 - 2026-08-18
+
+### Profile diagnostics
+
+- Added a transient, daemon-owned Profile Logger for the active server. Sessions run for 1–5 minutes and require an explicit LAN client IP so unrelated devices and pre-existing connections are excluded.
+- Capture is bounded to 256 new `proxy-active` connections, 256 source-correlated warning/error events, a 4 MiB controller snapshot, a 64 KiB structurally redacted config summary, and a 256 KiB report.
+- Reports include safe profile metadata, routing rules/chains, destination and traffic summaries, process/system memory, core/firewall identity, the latest service result, truncation markers, and finalization reason.
+- Added a repeatable 15-minute JSON/Markdown report designed for direct AI troubleshooting, with typed API contracts, session-ID matching, manual stop/discard, timeout, and automatic finalization on profile or core-generation changes.
+- Hardened report privacy with fail-closed source baselining, semantic IPv4/IPv6 matching, generated connection IDs, allowlisted config fields, URL stripping, recursive output redaction, and broad credential-key canaries. Share links, subscription URLs, tokens, passwords, cookies, private keys, and authorization values are excluded.
+
+### Profiles and subscriptions
+
+- Replaced the rename-only action with an on-demand profile editor that exposes the complete manual share link only in the detail endpoint and shows parsed protocol, transport, address, port, lifecycle state, and subscription provenance.
+- Manual connection edits preserve profile IDs and user intent while migrating lifecycle refs, Dead Servers timestamps, Deep Bench selectors, quality history, favorites, statistics, and enabled routing targets. Active or pinned edits validate and apply transactionally with exact state/config/runtime rollback.
+- Subscription-managed share links remain read-only while their display names can be changed.
+- Added local atomic revalidation for `No group` profiles. The full batch is parsed before mutation; malformed links and newly introduced lifecycle collisions leave state unchanged, while pre-existing equivalent identities remain valid.
+
+### Mihomo Parameters
+
+- Replaced the full `MihomoFeatures` replacement API with a strict bounded `{parameters, runtime}` contract and stable-ID Web UI controls that load automatically and work in both languages.
+- Kept router-relevant Expert controls for transport, keep-alive, TCP concurrency, sniffer lists, loopback tunnels, hosts, QUIC troubleshooting, and a limited advanced DNS surface.
+- Removed relay, NTP, SMUX, arbitrary dialers, Mihomo listener authentication, user proxy/rule providers, parallel raw/typed/sub-rules, and ignored DNS ECS/disable fields from the Parameters path.
+- Fixed GEO loader, fake-IP persistence, UDP, the canonical fallback group, and External Controller at `127.0.0.1:9090` as router invariants; controller credentials are never returned by the API.
+- Added strict validation, atomic config activation/persistence, rollback on runtime or disk failure, and safe migration that removes obsolete secrets/URLs and forces legacy authenticated LAN listeners to loopback.
+
+### Core lifecycle and memory
+
+- Fixed a live split-brain where an orphaned old Mihomo owned all VPN listeners while a new child remained alive without a dataplane. Readiness now proves that every required TCP/UDP listener belongs to the tracked child before accepting its External Controller.
+- Added Linux `PR_SET_PDEATHSIG`, parent-race protection, deterministic stop/reap semantics, hot-reload ownership checks, and shutdown ordering that terminates Mihomo before a potentially slow GeoBase join.
+- Made active-profile and Parameters activation validate generated config, wait for owned runtime readiness, serialize through one apply lock, and restore exact previous config/state/core/firewall identity on failure.
+- Bounded `/connections` reads to 16 MiB, removed duplicate full JSON parse/serialize/clone passes, pages before GeoIP enrichment, and caches `geoip.metadb` by file identity. This reduced observed HincyRay RSS from approximately 120 MiB to the 20–40 MiB range after orphan cleanup.
+
+### Diagnostics and compatibility
+
+- Added bounded parsing of Happ/Xray XHTTP `extra` JSON with typed support for padding obfuscation, headers, session/sequence/uplink placement, range values, reuse/XMUX settings, and structural redaction.
+- Fixed `xPaddingObfsMode` boolean generation and added the Xray-compatible `uplink-chunk-size: 3000-4000` default for header/cookie packet uplinks, working around Mihomo v1.19.29's omitted-range failure. The previously failing `n-eu1 Yandex CDN WARP device-2` profile passed ICMP, TCP, proxy HTTPS, YouTube, Telegram, and AI Studio live checks with zero packet loss.
+- Fixed benchmark concurrency persistence after page reload, made benchmark admission atomic, displayed all active workers, and clarified that a row lightning action tests one server while group/selected/Full scopes use up to the configured 1–6 workers. Live verification observed four active profile workers simultaneously.
+- Preserved the serialized external YouTube and Telegram service boundaries while profile-level ping/runtime pipelines continue concurrently.
+
 ## v1.2.2 - 2026-08-16
 
 - Restored the benchmark concurrency control as a native accessible selector with the supported 1–6 range instead of a custom menu clipped by its settings panel.
