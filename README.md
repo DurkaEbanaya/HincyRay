@@ -1,4 +1,4 @@
-# HincyRay v1.3.1
+# HincyRay v1.3.2
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,10 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v1.3.2
+
+v1.3.2 restores sidebar scanner movement when the client OS or browser requests reduced motion. The scanner remains deliberately slower in that mode, while unrelated decorative animations stay disabled. Details: [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.3.2.md`](docs/releases/v1.3.2.md).
 
 ### v1.3.1
 
@@ -400,7 +404,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.1 release evidence is recorded in [`docs/releases/v1.3.1.md`](docs/releases/v1.3.1.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.2 release evidence is recorded in [`docs/releases/v1.3.2.md`](docs/releases/v1.3.2.md).
 
 ## Installation
 

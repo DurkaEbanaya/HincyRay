@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.2 - 2026-08-19
+
+- Restored sidebar scanner movement under `prefers-reduced-motion: reduce`. The accessibility mode keeps a slower 3.4-second scanner cycle while continuing to suppress unrelated decorative animations.
+- Added a Playwright regression assertion for the computed scanner animation name and duration in reduced-motion mode.
+
 ## v1.3.1 - 2026-08-19
 
 ### Profiles and activation

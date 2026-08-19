@@ -30,7 +30,7 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.0');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.2');
 });
 
 test('profile table shows compact service status and configurable metric columns', async ({ page }) => {
@@ -124,6 +124,11 @@ test('profiles use the available desktop width and long-operation scanner moves'
   expect(await page.locator('#longOperationScanner').evaluate(element =>
     getComputedStyle(element).animationName
   )).not.toBe('none');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect.poll(() => page.locator('#longOperationScanner').evaluate(element => ({
+    name: getComputedStyle(element).animationName,
+    duration: getComputedStyle(element).animationDuration,
+  }))).toEqual({ name: 'bench-kitt-scan', duration: '3.4s' });
   await page.evaluate(token => endLongOperation(token), token);
 });
 
