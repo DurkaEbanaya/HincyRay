@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.3.1 - 2026-08-19
+
+### Profiles and activation
+
+- Added structured XHTTP upload tuning for manual VLESS XHTTP profiles in the profile editor. `scMaxEachPostBytes` and `scMinPostsIntervalMs` remain inside the existing share-link `extra` object, preserve unrelated keys, and can be removed to restore Mihomo defaults.
+- Added bounded active-profile apply status with real preparation, generation, validation, write, core apply/readiness, persistence, connection-close, and rollback stages.
+- Repeated active-profile clicks no longer queue configuration applies: the UI disables competing selection controls and the daemon returns `409` when another apply owns the lock.
+
+### Benchmark cancellation and memory
+
+- Quick Test cancellation now interrupts and reaps its current benchmark-owned `ping`, `curl`, and temporary Mihomo processes; Telegram and serialized YouTube waits also observe cancellation. Cancelled profile results are not persisted.
+- The stop endpoint waits for the benchmark worker to finish instead of reporting completion after only setting a flag.
+- Temporary-core benchmark concurrency is reduced according to `MemAvailable`, preserving an 80 MiB router reserve and avoiding multi-Mihomo memory pressure on 512 MiB Keenetic hardware.
+
+### Web UI responsiveness
+
+- Replaced 30 ms JavaScript scanner timers with compositor-friendly CSS animation.
+- Made active-profile and benchmark status polling single-flight and self-scheduling. Late responses cannot resurrect completed indicators, and completed benchmark progress is hidden after a bounded terminal display.
+- Long operations now use unique instance tokens, so concurrent calls to the same endpoint finish independently instead of orphaning or prematurely hiding the sidebar indicator.
+- Added request timeouts, coalesced dashboard/system/status refreshes, and avoided benchmark table rerenders when cumulative results are unchanged.
+
 ## v1.3.0 - 2026-08-18
 
 ### Profile diagnostics

@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Builder;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIA_CHUNK_BYTES: i32 = 256 * 1024;
@@ -177,14 +178,24 @@ pub fn probe_media(
     session_path: &Path,
     config: &TelegramProbeConfig,
     socks_port: u16,
+    cancel: &AtomicBool,
 ) -> Result<MediaProbeResult, String> {
-    let _guard = session_lock()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("benchmark cancelled".to_owned());
+        }
+        match session_lock().try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Err(std::sync::TryLockError::Poisoned(poison)) => break poison.into_inner(),
+        }
+    };
     run_async(async {
         let started = Instant::now();
         let (client, handle, runner) = connect(session_path, config.api_id, socks_port).await?;
-        let result = timeout(OPERATION_TIMEOUT, async {
+        let operation = async {
             if !client
                 .is_authorized()
                 .await
@@ -226,9 +237,21 @@ pub fn probe_media(
                 elapsed_ms: started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32,
                 bytes: bytes.len() as u64,
             })
-        })
-        .await
-        .map_err(|_| "Telegram media probe timed out".to_owned())?;
+        };
+        tokio::pin!(operation);
+        let operation_started = Instant::now();
+        let result = loop {
+            if cancel.load(Ordering::Relaxed) {
+                break Err("benchmark cancelled".to_owned());
+            }
+            if operation_started.elapsed() >= OPERATION_TIMEOUT {
+                break Err("Telegram media probe timed out".to_owned());
+            }
+            tokio::select! {
+                result = &mut operation => break result,
+                () = sleep(Duration::from_millis(40)) => {}
+            }
+        };
         disconnect(handle, runner, session_path).await;
         result
     })

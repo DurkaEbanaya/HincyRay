@@ -476,6 +476,7 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .profile-secret-mask:not(.revealed){-webkit-text-security:disc;color:var(--muted)}
 .profile-secret-mask:not(.revealed)::selection{background:transparent;color:transparent}
 .profile-editor-explanation{margin:7px 0 0!important;font-size:12px!important;color:var(--muted)!important}
+.profile-editor-tuning-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .result-table{width:100%;border-collapse:collapse;font-size:13px}
 .result-table td{padding:6px 10px;border-bottom:1px solid var(--border)}
 .result-table td:first-child{color:var(--muted);white-space:nowrap;width:40%}
@@ -850,7 +851,7 @@ body::before{opacity:.58;background:radial-gradient(520px 420px at 40px 70px,col
 .btn-accent.v2-reveal-hot{background-image:radial-gradient(150px circle at var(--rx,50%) var(--ry,50%),color-mix(in srgb,var(--bg) 32%,transparent),transparent 66%)!important}
 .reveal-wave{position:absolute;z-index:4;pointer-events:none;border:1px solid color-mix(in srgb,var(--fg) 52%,transparent);border-radius:50%;transform:scale(.05);opacity:.7;transition:transform .36s ease,opacity .36s ease}
 .progress,.progress-fill{border-radius:0}.dead-server-bulk{position:sticky;bottom:12px;z-index:9;border-radius:0;background:color-mix(in srgb,var(--surface) 84%,transparent);backdrop-filter:blur(24px);box-shadow:var(--shadow-md)}
-.bench-kitt{display:none;position:relative;height:10px;margin:14px 10px 6px;overflow:visible;background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--danger) 6%,var(--bg)) 10% 90%,transparent);border-top:1px solid color-mix(in srgb,var(--danger) 18%,var(--border));border-bottom:1px solid color-mix(in srgb,var(--danger) 14%,var(--border))}.bench-kitt-scanner{position:absolute;z-index:2;top:2px;left:0;width:24%;height:4px;will-change:left}.bench-kitt-scanner::before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent 0%,color-mix(in srgb,var(--danger) 20%,transparent) 18%,var(--danger) 42%,#fff 50%,var(--danger) 58%,color-mix(in srgb,var(--danger) 20%,transparent) 82%,transparent 100%);box-shadow:0 0 4px #fff,0 0 9px var(--danger),0 0 18px color-mix(in srgb,var(--danger) 88%,transparent)}.bench-kitt-scanner::after{content:'';position:absolute;left:50%;top:50%;width:180%;height:32px;transform:translate(-50%,-50%);pointer-events:none;background:radial-gradient(ellipse at center,color-mix(in srgb,var(--danger) 38%,transparent) 0%,color-mix(in srgb,var(--danger) 16%,transparent) 38%,transparent 72%);filter:blur(3px)}.bench-kitt-reveal{position:absolute;z-index:1;top:-9px;left:0;width:24%;height:28px;pointer-events:none;will-change:left}.bench-kitt-reveal::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at center,color-mix(in srgb,var(--danger) 30%,transparent),transparent 70%);filter:blur(4px)}.bench-kitt-reveal::after{content:'';position:absolute;left:18%;right:18%;top:8px;height:12px;border-top:1px solid color-mix(in srgb,#fff 55%,var(--danger));border-bottom:1px solid color-mix(in srgb,var(--danger) 70%,transparent);box-shadow:0 -3px 10px color-mix(in srgb,var(--danger) 52%,transparent),0 3px 10px color-mix(in srgb,var(--danger) 40%,transparent)}.bench-kitt.running{display:block}
+.bench-kitt{display:none;position:relative;height:10px;margin:14px 10px 6px;overflow:hidden;background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--danger) 6%,var(--bg)) 10% 90%,transparent);border-top:1px solid color-mix(in srgb,var(--danger) 18%,var(--border));border-bottom:1px solid color-mix(in srgb,var(--danger) 14%,var(--border))}.bench-kitt-scanner{position:absolute;z-index:2;top:2px;left:-24%;width:24%;height:4px;will-change:transform}.bench-kitt-scanner::before{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent 0%,color-mix(in srgb,var(--danger) 20%,transparent) 18%,var(--danger) 42%,#fff 50%,var(--danger) 58%,color-mix(in srgb,var(--danger) 20%,transparent) 82%,transparent 100%);box-shadow:0 0 4px #fff,0 0 9px var(--danger),0 0 18px color-mix(in srgb,var(--danger) 88%,transparent)}.bench-kitt-scanner::after{content:'';position:absolute;left:50%;top:50%;width:180%;height:32px;transform:translate(-50%,-50%);pointer-events:none;background:radial-gradient(ellipse at center,color-mix(in srgb,var(--danger) 38%,transparent) 0%,color-mix(in srgb,var(--danger) 16%,transparent) 38%,transparent 72%);filter:blur(3px)}.bench-kitt-reveal{position:absolute;z-index:1;top:-9px;left:-24%;width:24%;height:28px;pointer-events:none;will-change:transform}.bench-kitt-reveal::before{content:'';position:absolute;inset:0;background:radial-gradient(ellipse at center,color-mix(in srgb,var(--danger) 30%,transparent),transparent 70%);filter:blur(4px)}.bench-kitt-reveal::after{content:'';position:absolute;left:18%;right:18%;top:8px;height:12px;border-top:1px solid color-mix(in srgb,#fff 55%,var(--danger));border-bottom:1px solid color-mix(in srgb,var(--danger) 70%,transparent);box-shadow:0 -3px 10px color-mix(in srgb,var(--danger) 52%,transparent),0 3px 10px color-mix(in srgb,var(--danger) 40%,transparent)}.bench-kitt.running{display:block}.bench-kitt.running .bench-kitt-scanner,.bench-kitt.running .bench-kitt-reveal{animation:bench-kitt-scan 1.85s ease-in-out infinite alternate}@keyframes bench-kitt-scan{from{transform:translateX(0)}to{transform:translateX(516%)}}@media(prefers-reduced-motion:reduce){.bench-kitt.running .bench-kitt-scanner,.bench-kitt.running .bench-kitt-reveal{animation-duration:3.4s}}
 ::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--muted);border:2px solid var(--bg);border-radius:0}::-webkit-scrollbar-thumb:hover{background:var(--fg)}
 .section-header h2{line-height:1.15;letter-spacing:-.015em}.section-body>p,.feature-card>p{max-width:65ch}.card-label,.tbl th,.context-group{font-family:var(--font);font-weight:600;letter-spacing:.05em}.btn,.custom-select-trigger,.nav-sub-item,.sub-tab{letter-spacing:.02em}
 .btn,.custom-select-trigger,.nav-group-header,.nav-sub-item,.sub-tab,.bottom-nav-item{transition:color .1s ease,background-color .15s ease,border-color .15s ease,box-shadow .15s ease,opacity .15s ease}
@@ -864,7 +865,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
 @keyframes v2-spin{to{transform:rotate(360deg)}}@keyframes v2-shimmer{to{transform:translateX(100%)}}
 @media(max-width:1024px){.context-heading{min-width:170px}.main-content{padding:18px 20px 72px}}
 @media(max-width:640px){.sub-tabs{min-height:52px;padding:0 8px}.context-heading{display:none}.main-content{padding:14px 12px 78px}.section-header h2{font-size:22px}.cards{grid-template-columns:1fr}.card{border-right:0;border-bottom:1px solid var(--border)}.feature-grid{grid-template-columns:1fr}.bottom-nav-item{min-height:52px}.sidebar.open{box-shadow:var(--shadow-md)}.btn,.custom-select-trigger,.nav-group-header,.nav-sub-item,.sub-tab{min-height:44px}.routing-visual-commandbar{align-items:stretch}.routing-visual-actions{width:100%}.routing-visual-actions .btn{flex:1}.modal{min-width:0;width:calc(100vw - 24px);max-height:calc(100vh - 24px);overflow:auto}.login-box{width:calc(100vw - 24px);padding:24px}table.responsive-cards tr{border-radius:0;box-shadow:none;background:transparent}}
-@media(max-width:640px){.profile-editor-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.profile-secret-tools .btn{flex:1}.profile-editor .modal-actions{position:sticky;bottom:-28px;margin:18px -28px -28px;padding:12px 28px;background:var(--surface);border-top:1px solid var(--border)}}
+@media(max-width:640px){.profile-editor-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.profile-editor-tuning-grid{grid-template-columns:1fr}.profile-secret-tools .btn{flex:1}.profile-editor .modal-actions{position:sticky;bottom:-28px;margin:18px -28px -28px;padding:12px 28px;background:var(--surface);border-top:1px solid var(--border)}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}.reveal-wave,.skeleton::after{display:none}}
 @media(forced-colors:active){.sidebar,.sub-tabs,.bottom-nav,.dead-server-bulk{background:Canvas;backdrop-filter:none}.nav-sub-item.active,.sub-tab.active{outline:2px solid Highlight}.nav-group-header::before,.nav-sub-item::before,.tbl tbody tr::after{display:none}.v2-reveal-hot{background-image:none!important;outline:1px solid Highlight}}
 </style>
@@ -944,6 +945,14 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
           </div>
           <p id="profileEditorManagedNote" class="profile-editor-explanation" hidden>Ссылка управляется подпиской и доступна только для просмотра. Имя можно изменить.</p>
         </div>
+        <div id="profileEditorXhttpTuning" hidden>
+          <h4 style="margin:4px 0 8px">XHTTP upload tuning</h4>
+          <div class="profile-editor-tuning-grid">
+            <div class="form-group"><label for="profileEditorScMaxEachPostBytes">Размер uplink-блока, bytes/range</label><input id="profileEditorScMaxEachPostBytes" maxlength="64" placeholder="Mihomo default: 1000000"></div>
+            <div class="form-group"><label for="profileEditorScMinPostsIntervalMs">Интервал отправки, ms/range</label><input id="profileEditorScMinPostsIntervalMs" maxlength="64" placeholder="Mihomo default: 30"></div>
+          </div>
+          <p class="profile-editor-explanation">Например: 4096-4096 и 15-15. Пустое поле удаляет override.</p>
+        </div>
       </fieldset>
       <div class="modal-actions">
         <button class="btn" type="button" onclick="closeProfileEditor()">Отмена</button>
@@ -976,7 +985,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   <nav class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="sidebar-brand" style="border-radius: 0px;">
       <svg class="brand-icon" viewBox="0 0 1024 1024" role="img" aria-label="HincyRay"><defs><radialGradient id="brand-bg" cx="50%" cy="46%" r="62%"><stop stop-color="#172b3d"/><stop offset=".55" stop-color="#0b1018"/><stop offset="1" stop-color="#05070b"/></radialGradient><linearGradient id="brand-phone" x1="250" y1="100" x2="760" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#3b424d"/><stop offset=".45" stop-color="#151a21"/><stop offset="1" stop-color="#050608"/></linearGradient><linearGradient id="brand-screen" x1="310" y1="150" x2="690" y2="850" gradientUnits="userSpaceOnUse"><stop stop-color="#1f3146"/><stop offset="1" stop-color="#070a0f"/></linearGradient></defs><rect width="1024" height="1024" rx="220" fill="url(#brand-bg)"/><path d="M130 740 40 820M190 820 95 930M845 170l115-92M820 790l130 92M93 276l112 52" stroke="#0078d7" stroke-width="18" stroke-linecap="round" opacity=".65"/><g transform="rotate(-8 512 512)"><rect x="290" y="92" width="444" height="840" rx="78" fill="url(#brand-phone)" stroke="#737b87" stroke-width="14"/><rect x="328" y="138" width="368" height="748" rx="48" fill="url(#brand-screen)" stroke="#0e1620" stroke-width="10"/><circle cx="512" cy="176" r="16" fill="#080b10" stroke="#4d5663" stroke-width="5"/><path d="M510 132 455 292l68-30-42 172 106-238-72 34z" fill="#f4d03f" stroke="#fff2a4" stroke-width="8"/><path d="M496 432 365 536l112 8-74 204 214-260-102 14 75-134z" fill="#ff453a" stroke="#ffb2ab" stroke-width="9"/><path d="M520 398 660 496l-92 22 70 188-198-238 92 18z" fill="#60cdff" stroke="#b8efff" stroke-width="8"/><path d="M445 308 340 248M444 309l-96 102M521 264l118-98M514 436l-160 44M514 437l120 152M477 546l-112 188M566 515l104 166" stroke="#d8e6f3" stroke-width="10" stroke-linecap="round" opacity=".8"/><path d="M336 610 238 660l87 36-142 98 238-62-62-42 98-38zM664 300l150-50-72 102 160 10-228 68 38-78z" fill="#1f8fff" opacity=".88"/><text x="512" y="760" text-anchor="middle" font-family="Arial Black,Arial,sans-serif" font-size="76" fill="#f2f6fb" stroke="#05070b" stroke-width="7" paint-order="stroke">POCO</text></g></svg>
-      <div><div class="logo">HincyRay</div><div class="version">v1.3.0</div></div>
+      <div><div class="logo">HincyRay</div><div class="version">v1.3.1</div></div>
     </div>
     <div class="brightness-row">
       <svg class="brightness-icon" onclick="toggleTheme()" title="Переключить тему" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9L14 6M5.9 14l-1.1 1.1"></path></svg>
@@ -1087,7 +1096,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
         <div id="benchProgress" style="display:none;margin:10px 0 0;padding:10px 0 2px;border-top:1px solid var(--border)" aria-live="polite">
           <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:var(--fs-sm);color:var(--muted)">
             <span id="benchCurrent" data-title-ru="Активные серверы текущего теста" data-title-en="Servers active in the current test" title="Активные серверы текущего теста" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</span>
-            <span style="display:flex;align-items:center;white-space:nowrap"><span id="benchCounter">0/0</span> <button class="btn btn-danger btn-sm" id="benchStop" onclick="apiAction('POST','/api/bench/stop',null,'Бенчмарк остановлен')" style="display:none;margin-left:8px">■ Остановить</button></span>
+            <span style="display:flex;align-items:center;white-space:nowrap"><span id="benchCounter">0/0</span> <button class="btn btn-danger btn-sm" id="benchStop" onclick="stopBench(this)" style="display:none;margin-left:8px">■ Остановить</button></span>
           </div>
           <div class="progress" style="margin-top:6px"><div class="progress-fill accent" id="benchBar" style="width:0%"></div></div>
           <div class="bench-kitt" id="benchKitt" aria-label="Идёт быстрая проверка серверов"><i class="bench-kitt-reveal" id="benchKittReveal"></i><i class="bench-kitt-scanner" id="benchKittScanner"></i></div>
@@ -1095,6 +1104,11 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
         <div id="longOperationProgress" style="display:none;margin:10px 0 0;padding:10px 0 2px;border-top:1px solid var(--border)" aria-live="polite" aria-busy="true">
           <div id="longOperationLabel" style="font-size:var(--fs-sm);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Выполняется операция…</div>
           <div class="bench-kitt running" id="longOperationKitt" aria-hidden="true"><i class="bench-kitt-reveal" id="longOperationReveal"></i><i class="bench-kitt-scanner" id="longOperationScanner"></i></div>
+        </div>
+        <div id="serverSwitchProgress" style="display:none;margin:10px 0 0;padding:10px 0 2px;border-top:1px solid var(--border)" aria-live="polite" aria-busy="true">
+          <div id="serverSwitchProfile" style="font-size:var(--fs-sm);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</div>
+          <div id="serverSwitchStage" style="font-size:var(--fs-sm);color:var(--muted);margin-top:3px">Подготовка…</div>
+          <div class="bench-kitt" id="serverSwitchKitt" aria-hidden="true"><i class="bench-kitt-reveal"></i><i class="bench-kitt-scanner"></i></div>
         </div>
       </div>
     </div>
@@ -2426,17 +2440,31 @@ function previewApi(method, path, body) {
 localStorage.removeItem('hincyray_token');
 async function api(method, path, body, silent=false) {
   const operation = longOperationFor(method, path);
-  if (operation) beginLongOperation(path, operation);
+  const operationToken = operation ? beginLongOperation(path, operation) : null;
   try {
     if (PREVIEW_MODE) return await previewApi(method, path, body);
-    const opts = { method, headers: {} };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), operation ? 120000 : 30000);
+    const opts = { method, headers: {}, signal:controller.signal };
     if (body !== undefined) {
       opts.headers['Content-Type'] = 'application/json';
       opts.body = typeof body === 'string' ? body : JSON.stringify(body);
     }
     const token = sessionStorage.getItem('hincyray_token');
     if (token) opts.headers.Authorization = 'Bearer ' + token;
-    const resp = await fetch(path, opts);
+    let resp;
+    try {
+      resp = await fetch(path, opts);
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        const message = t('Превышено время ожидания ответа роутера');
+        if (!silent) showToast('error',message);
+        throw new Error(message);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
     const contentType = resp.headers.get('Content-Type') || '';
     const text = await resp.text();
     let data = text;
@@ -2459,7 +2487,7 @@ async function api(method, path, body, silent=false) {
     }
     return data;
   } finally {
-    if (operation) endLongOperation(path);
+    if (operationToken !== null) endLongOperation(operationToken);
   }
 }
 
@@ -2481,26 +2509,28 @@ const LONG_OPERATIONS = [
   [/^\/api\/substore-lite\/apply$/, 'Применение Sub-Store…'],
 ];
 const activeLongOperations = new Map();
-let longOperationFrame = null;
 let longOperationHideTimer = null;
+let longOperationSequence = 0;
 function longOperationFor(method, path) {
   if (String(method).toUpperCase() === 'GET') return null;
   return LONG_OPERATIONS.find(([pattern]) => pattern.test(path))?.[1] || null;
 }
 function beginLongOperation(path, label) {
-  activeLongOperations.set(path, {label:t(label),started:performance.now()});
+  const token = ++longOperationSequence;
+  activeLongOperations.set(token, {path,label:t(label),started:performance.now()});
   clearTimeout(longOperationHideTimer);
   const box = document.getElementById('longOperationProgress');
   const text = document.getElementById('longOperationLabel');
   if (box) box.style.display = 'block';
   if (text) text.textContent = t(label);
   setLongOperationBeamRunning(true);
+  return token;
 }
-function endLongOperation(path) {
-  const entry = activeLongOperations.get(path);
+function endLongOperation(token) {
+  const entry = activeLongOperations.get(token);
   const elapsed = entry ? performance.now() - entry.started : 900;
   setTimeout(() => {
-    activeLongOperations.delete(path);
+    activeLongOperations.delete(token);
     const latest = [...activeLongOperations.values()].at(-1);
     if (latest) {
       const text = document.getElementById('longOperationLabel');
@@ -2516,19 +2546,7 @@ function endLongOperation(path) {
 }
 function setLongOperationBeamRunning(running) {
   const el = document.getElementById('longOperationKitt');
-  const scanner = document.getElementById('longOperationScanner');
-  const reveal = document.getElementById('longOperationReveal');
-  if (!el || !scanner || !reveal) return;
-  if (longOperationFrame) { clearInterval(longOperationFrame); longOperationFrame = null; }
-  if (!running) return;
-  let position = -24, direction = 1;
-  scanner.style.left = reveal.style.left = position + '%';
-  longOperationFrame = setInterval(() => {
-    position += direction * 2.4;
-    if (position >= 100) { position = 100; direction = -1; }
-    if (position <= -24) { position = -24; direction = 1; }
-    scanner.style.left = reveal.style.left = position + '%';
-  }, 30);
+  if (el) el.classList.toggle('running', running);
 }
 
 // ─── TOAST / MESSAGE BAR ─────────────────────────────────────────────
@@ -2563,6 +2581,80 @@ function apiAction(method, path, body, successMsg, reloadFn) {
     if (reloadFn) reloadFn();
     return r;
   }).catch(() => {});
+}
+
+let activeProfileSelection = null;
+let activeProfileStatusTimer = null;
+let activeProfileHideTimer = null;
+let activeProfileSelectionGeneration = 0;
+const ACTIVE_PROFILE_STAGES = {
+  'preparing':'Подготовка переключения…',
+  'generating-config':'Генерация конфигурации…',
+  'validating-config':'Проверка конфигурации…',
+  'writing-config':'Запись конфигурации…',
+  'applying-core':'Применение в ядре…',
+  'waiting-core':'Ожидание готовности ядра…',
+  'saving-state':'Сохранение состояния…',
+  'closing-connections':'Закрытие старых соединений…',
+  'rolling-back':'Откат после ошибки…',
+  'completed':'Сервер выбран',
+  'failed':'Переключение не выполнено',
+};
+function setProfileSelectionDisabled(disabled) {
+  document.querySelectorAll('[data-profile-select]').forEach(button => { button.disabled = disabled; });
+}
+function renderActiveProfileStatus(status, fallbackName) {
+  const box = document.getElementById('serverSwitchProgress');
+  if (!box) return;
+  box.style.display = 'block';
+  const beam = document.getElementById('serverSwitchKitt');
+  if (beam) beam.classList.add('running');
+  safeSet('serverSwitchProfile',status?.profile_name || fallbackName || t('Смена сервера'));
+  safeSet('serverSwitchStage',t(ACTIVE_PROFILE_STAGES[status?.stage] || 'Подготовка переключения…'));
+}
+function stopActiveProfileStatusPolling() {
+  if (activeProfileStatusTimer) clearTimeout(activeProfileStatusTimer);
+  activeProfileStatusTimer = null;
+}
+function pollActiveProfileStatus(selection) {
+  if (!selection || activeProfileSelection !== selection) return Promise.resolve();
+  return api('GET','/api/active-profile/status',undefined,true).then(status => {
+    if (activeProfileSelection !== selection) return;
+    if (status?.state !== 'idle') renderActiveProfileStatus(status,selection.profileName);
+  }).catch(()=>{}).finally(() => {
+    if (activeProfileSelection === selection && !selection.finished) {
+      activeProfileStatusTimer = setTimeout(() => pollActiveProfileStatus(selection),500);
+    }
+  });
+}
+function selectActiveProfile(profileId, profileName, button) {
+  if (activeProfileSelection) return;
+  clearTimeout(activeProfileHideTimer);
+  const selection = {profileId,profileName,generation:++activeProfileSelectionGeneration,finished:false};
+  activeProfileSelection = selection;
+  setButtonPending(button,true,t('Переключение сервера…'));
+  setProfileSelectionDisabled(true);
+  renderActiveProfileStatus({stage:'preparing'},profileName);
+  stopActiveProfileStatusPolling();
+  pollActiveProfileStatus(selection);
+  return api('POST','/api/active-profile',{profile_id:profileId}).then(() => {
+    showToast('success',t('Профиль выбран'));
+  }).catch(()=>{}).finally(() => {
+    selection.finished = true;
+    stopActiveProfileStatusPolling();
+    setButtonPending(button,false);
+    if (activeProfileSelection === selection) activeProfileSelection = null;
+    setProfileSelectionDisabled(false);
+    activeProfileHideTimer = setTimeout(() => {
+      if (activeProfileSelection) return;
+      const box = document.getElementById('serverSwitchProgress');
+      const beam = document.getElementById('serverSwitchKitt');
+      if (box) box.style.display = 'none';
+      if (beam) beam.classList.remove('running');
+    },900);
+    loadProfiles().catch(()=>{});
+    refreshStatus();
+  });
 }
 
 // ─── LOG ACTIONS ─────────────────────────────────────────────────────
@@ -3328,6 +3420,9 @@ const I18N = {
   'Группы прокси':'Proxy Groups','Лог подключений':'Connection Log',
   'Добавить один профиль':'Add single profile','Добавить профиль':'Add profile','Share link':'Share link','Группа':'Group','Без группы':'No group','Переименовать':'Rename','Редактировать профиль':'Edit profile','Refresh':'Refresh','Избранные профили':'Favorite profiles','Нет избранных профилей':'No favorite profiles',
   'Загрузка профиля…':'Loading profile…','Не удалось загрузить профиль':'Could not load profile','Полная share-ссылка':'Full share link','Разобранные параметры профиля':'Parsed profile fields','Дохлый сервер':'Dead server','Показать секрет':'Show secret','Скрыть секрет':'Hide secret','Копировать ссылку':'Copy link','Ссылка скопирована':'Link copied','Ссылка управляется подпиской и доступна только для просмотра. Имя можно изменить.':'This link is managed by its subscription and is read-only. You can still edit the name.','Имя и share-ссылка не должны быть пустыми':'Name and share link must not be empty','Имя не должно быть пустым':'Name must not be empty','Профиль обновлён':'Profile updated','да':'yes','нет':'no',
+  'Размер uplink-блока, bytes/range':'Uplink block size, bytes/range','Интервал отправки, ms/range':'Send interval, ms/range','Например: 4096-4096 и 15-15. Пустое поле удаляет override.':'Example: 4096-4096 and 15-15. An empty field removes the override.',
+  'Смена сервера':'Switching server','Переключение сервера…':'Switching server…','Подготовка переключения…':'Preparing switch…','Генерация конфигурации…':'Generating configuration…','Проверка конфигурации…':'Validating configuration…','Запись конфигурации…':'Writing configuration…','Применение в ядре…':'Applying to core…','Ожидание готовности ядра…':'Waiting for core readiness…','Сохранение состояния…':'Saving state…','Закрытие старых соединений…':'Closing old connections…','Откат после ошибки…':'Rolling back after error…','Сервер выбран':'Server selected','Переключение не выполнено':'Switch failed','Останавливается…':'Stopping…','Остановка запрошена':'Stop requested',
+  'Превышено время ожидания ответа роутера':'Router response timed out',
   'Проверить локальные профили':'Revalidate local profiles','Повторно разобрать локально сохранённые share-ссылки профилей без группы. Подписки и сеть не используются.':'Reparse locally stored share links for ungrouped profiles. No subscription or network fetch is performed.','Локальная проверка профилей…':'Revalidating local profiles…','Локальная проверка завершена':'Local revalidation complete','проверено':'checked','обновлено':'updated','без изменений':'unchanged','ошибок':'errors','Локальная проверка не изменила профили':'Local revalidation did not change profiles','Обновить эту подписку из источника':'Refresh this subscription from its source',
   'Geo asset path':'Geo asset path','Обновить каталог':'Refresh catalog','Добавить правило':'Add rule','Быстрая строка':'Quick row','Домены':'Domains','IPs':'IPs','Порты':'Ports','Популярные сервисы':'Popular services',  'Редактировать':'Edit','Удалить':'Delete','Правила сохранены':'Rules saved','Отмена':'Cancel','Редактировать правило':'Edit rule','Сохранить':'Save',
   'Активные соединения (max 50)':'Active connections (max 50)','Disable rules':'Disable rules','Auto-refresh subscriptions':'Auto-refresh subscriptions','Auto-refresh interval (ч)':'Auto-refresh interval (h)',
@@ -4069,7 +4164,7 @@ function renderProfileRow(p, groupKey, display) {
   return `<tr data-profile-row="${attrEscape(groupKey)}" class="${p.dead?'dead-server-row':''}" style="display:${display};${p.active?'background:var(--accent-soft)':''}">
     <td><span class="star ${p.favorite?'on':''}" onclick="toggleFav(${p.id})" title="${t('Избранное')}">★</span></td>
     <td data-profile-metric="id" class="mono" style="${profileMetricStyle('id')};color:var(--muted)">${p.id}</td>
-    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><button class="profile-name profile-name-edit" onclick="openProfileEditor(${p.id})" title="${attrEscape(t('Редактировать профиль'))}">${htmlEscape(p.name)}</button>${provenance}${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions"><input class="profile-select" type="checkbox" data-server-ref="${attrEscape(p.server_ref || '')}" ${selectedServerRefs.has(p.server_ref)?'checked':''} ${disabled?'disabled':''} onchange="toggleServerSelection(this.dataset.serverRef,this.checked)" aria-label="${attrEscape(t('Выбрать сервер'))}">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" data-bench-scope="single" data-title-ru="Quick Test только этого сервера" data-title-en="Quick Test this server only" onclick="benchOne(${p.id})" title="${attrEscape(t('Quick Test только этого сервера'))}">⚡</button><button class="btn-icon btn-sm" onclick="openProfileEditor(${p.id})" title="${t('Редактировать профиль')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
+    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><button class="profile-name profile-name-edit" onclick="openProfileEditor(${p.id})" title="${attrEscape(t('Редактировать профиль'))}">${htmlEscape(p.name)}</button>${provenance}${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions"><input class="profile-select" type="checkbox" data-server-ref="${attrEscape(p.server_ref || '')}" ${selectedServerRefs.has(p.server_ref)?'checked':''} ${disabled?'disabled':''} onchange="toggleServerSelection(this.dataset.serverRef,this.checked)" aria-label="${attrEscape(t('Выбрать сервер'))}">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" data-profile-select onclick="selectActiveProfile(${p.id},${jsStringAttr(p.name)},this)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" data-bench-scope="single" data-title-ru="Quick Test только этого сервера" data-title-en="Quick Test this server only" onclick="benchOne(${p.id})" title="${attrEscape(t('Quick Test только этого сервера'))}">⚡</button><button class="btn-icon btn-sm" onclick="openProfileEditor(${p.id})" title="${t('Редактировать профиль')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
     <td data-profile-metric="protocol" data-label="${attrEscape(t('Протокол'))}" style="${profileMetricStyle('protocol')}"><span class="badge badge-info" style="font-size:10px">${htmlEscape(p.protocol)}</span></td>
     <td data-profile-metric="latency" data-label="${attrEscape(t('Задержка'))}" class="mono" style="${profileMetricStyle('latency')}">${p.last_latency_ms != null ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
     <td data-profile-metric="loss" data-label="${attrEscape(t('Потери'))}" class="mono" style="${profileMetricStyle('loss')}">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
@@ -4127,7 +4222,7 @@ function renderFavorites(data) {
   body.innerHTML = favorites.map(p => `<tr style="${p.active?'background:var(--accent-soft)':''}">
     <td><span class="star on" onclick="toggleFav(${p.id})" title="${t('Избранное')}">★</span></td>
     <td data-profile-metric="id" class="mono" style="${profileMetricStyle('id')};color:var(--muted)">${p.id}</td>
-    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><button class="profile-name profile-name-edit" onclick="openProfileEditor(${p.id})" title="${attrEscape(t('Редактировать профиль'))}">${htmlEscape(p.name)}</button>${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" onclick="apiAction('POST','/api/active-profile',{profile_id:${p.id}},t('Профиль выбран'),refreshDashboard)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" data-bench-scope="single" data-title-ru="Quick Test только этого сервера" data-title-en="Quick Test this server only" onclick="benchOne(${p.id})" title="${attrEscape(t('Quick Test только этого сервера'))}">⚡</button><button class="btn-icon btn-sm" onclick="openProfileEditor(${p.id})" title="${t('Редактировать профиль')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
+    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><button class="profile-name profile-name-edit" onclick="openProfileEditor(${p.id})" title="${attrEscape(t('Редактировать профиль'))}">${htmlEscape(p.name)}</button>${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" data-profile-select onclick="selectActiveProfile(${p.id},${jsStringAttr(p.name)},this)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" data-bench-scope="single" data-title-ru="Quick Test только этого сервера" data-title-en="Quick Test this server only" onclick="benchOne(${p.id})" title="${attrEscape(t('Quick Test только этого сервера'))}">⚡</button><button class="btn-icon btn-sm" onclick="openProfileEditor(${p.id})" title="${t('Редактировать профиль')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
     <td data-profile-metric="protocol" style="${profileMetricStyle('protocol')}"><span class="badge badge-info" style="font-size:10px">${htmlEscape(p.protocol)}</span></td>
     <td data-profile-metric="latency" class="mono" style="${profileMetricStyle('latency')}">${p.last_latency_ms != null ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
     <td data-profile-metric="loss" class="mono" style="${profileMetricStyle('loss')}">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
@@ -4206,6 +4301,10 @@ let profileEditorGeneration = 0;
 function resetProfileEditorFields() {
   safeValue('profileEditorName','');
   safeValue('profileEditorRaw','');
+  safeValue('profileEditorScMaxEachPostBytes','');
+  safeValue('profileEditorScMinPostsIntervalMs','');
+  const xhttpTuning = document.getElementById('profileEditorXhttpTuning');
+  if (xhttpTuning) xhttpTuning.hidden = true;
   ['Protocol','Transport','Address','Port','Group','Active','Dead','BlockQuic'].forEach(field => safeSet(`profileEditor${field}`,'—'));
   const raw = document.getElementById('profileEditorRaw');
   raw?.classList.remove('revealed');
@@ -4236,7 +4335,8 @@ function openProfileEditor(profileId) {
     if (!profileEditorState || profileEditorState.generation !== generation) return;
     const detail = data?.profile;
     if (!detail || detail.id !== profileId || !detail.server_ref) throw new Error(t('Не удалось загрузить профиль'));
-    profileEditorState = {profileId:detail.id,expectedServerRef:String(detail.server_ref),subscriptionManaged:detail.subscription_managed === true,loaded:false,saving:false,generation};
+    const xhttpTuning = detail.xhttp_tuning && typeof detail.xhttp_tuning === 'object' ? detail.xhttp_tuning : null;
+    profileEditorState = {profileId:detail.id,expectedServerRef:String(detail.server_ref),subscriptionManaged:detail.subscription_managed === true,xhttpTuning:!!xhttpTuning,loaded:false,saving:false,generation};
     safeValue('profileEditorName',detail.name || '');
     safeValue('profileEditorRaw',String(detail.raw || ''));
     safeSet('profileEditorProtocol',detail.protocol || '—');
@@ -4247,6 +4347,12 @@ function openProfileEditor(profileId) {
     safeSet('profileEditorActive',t(detail.active ? 'да' : 'нет'));
     safeSet('profileEditorDead',t(detail.dead ? 'да' : 'нет'));
     safeSet('profileEditorBlockQuic',t(detail.block_quic ? 'да' : 'нет'));
+    safeValue('profileEditorScMaxEachPostBytes',xhttpTuning?.sc_max_each_post_bytes || '');
+    safeValue('profileEditorScMinPostsIntervalMs',xhttpTuning?.sc_min_posts_interval_ms || '');
+    const tuningFields = document.getElementById('profileEditorXhttpTuning');
+    if (tuningFields) tuningFields.hidden = !xhttpTuning;
+    document.getElementById('profileEditorScMaxEachPostBytes').disabled = profileEditorState.subscriptionManaged;
+    document.getElementById('profileEditorScMinPostsIntervalMs').disabled = profileEditorState.subscriptionManaged;
     const raw = document.getElementById('profileEditorRaw');
     raw.disabled = profileEditorState.subscriptionManaged;
     const note = document.getElementById('profileEditorManagedNote');
@@ -4289,6 +4395,10 @@ function saveProfileEditor() {
   if (!state.subscriptionManaged && !raw) return showToast('error',t('Имя и share-ссылка не должны быть пустыми'));
   const payload = {profile_id:state.profileId,expected_server_ref:state.expectedServerRef,name};
   if (!state.subscriptionManaged) payload.raw = raw;
+  if (!state.subscriptionManaged && state.xhttpTuning) payload.xhttp_tuning = {
+    sc_max_each_post_bytes: document.getElementById('profileEditorScMaxEachPostBytes').value.trim() || null,
+    sc_min_posts_interval_ms: document.getElementById('profileEditorScMinPostsIntervalMs').value.trim() || null,
+  };
   state.saving = true;
   document.getElementById('profileEditorFields').disabled = true;
   document.getElementById('profileEditorSave').disabled = true;
@@ -4941,6 +5051,7 @@ let geobaseFileReader = null;
 let geobaseFileGeneration = 0;
 let geobasePollTimer = null;
 let geobaseJobExpected = false;
+let geobaseLongOperationToken = null;
 let geobaseRuntimeRunning = false;
 let geobasePollFailures = 0;
 let geobaseLastError = '';
@@ -5129,8 +5240,11 @@ function updateGeoBaseRuntime(runtime) {
   const phase = String(runtime.phase || 'idle');
   const terminal = ['complete','cancelled','error'].includes(phase);
   geobaseRuntimeRunning = running;
-  if (running && !activeLongOperations.has('geobase-job')) beginLongOperation('geobase-job', 'Обработка GeoBase…');
-  if (!running && terminal && activeLongOperations.has('geobase-job')) endLongOperation('geobase-job');
+  if (running && geobaseLongOperationToken === null) geobaseLongOperationToken = beginLongOperation('geobase-job', 'Обработка GeoBase…');
+  if (!running && terminal && geobaseLongOperationToken !== null) {
+    endLongOperation(geobaseLongOperationToken);
+    geobaseLongOperationToken = null;
+  }
   if (running) geobaseJobExpected = true;
   if (!running && terminal) geobaseJobExpected = false;
   const box = document.getElementById('geobaseRuntime');
@@ -5677,54 +5791,33 @@ function renderBackups(data) {
 }
 
 // ─── BENCHMARK ───────────────────────────────────────────────────────
-let benchPoll = null;
-let kittFrame = null;
+let benchPollTimer = null;
+let benchPollInFlight = false;
+let benchWasRunning = false;
+let benchResultFingerprint = '';
+let benchTerminalHideTimer = null;
 function setKittRunning(running) {
   const el = document.getElementById('benchKitt');
-  const scanner = document.getElementById('benchKittScanner');
-  const reveal = document.getElementById('benchKittReveal');
-  if (!el || !scanner || !reveal) return;
-  el.classList.toggle('running', running);
-  if (!running) {
-    if (kittFrame) clearInterval(kittFrame);
-    kittFrame = null;
-    scanner.style.left = '-24%';
-    reveal.style.left = '-24%';
-    return;
-  }
-  if (kittFrame) return;
-  let position = -24;
-  let direction = 1;
-  scanner.style.left = position + '%';
-  reveal.style.left = position + '%';
-  kittFrame = setInterval(() => {
-    if (!el.classList.contains('running')) {
-      clearInterval(kittFrame);
-      kittFrame = null;
-      return;
-    }
-    position += direction * 2.4;
-    if (position >= 100) { position = 100; direction = -1; }
-    if (position <= -24) { position = -24; direction = 1; }
-    scanner.style.left = position + '%';
-    reveal.style.left = position + '%';
-  }, 30);
+  if (el) el.classList.toggle('running', running);
 }
 function updateBenchStatus(data) {
   const running = !!(data && data.running);
   const total = Number(data && (data.total || data.profile_count || 0)) || 0;
   const done = Number(data && (data.completed || data.done || (data.results && data.results.length) || 0)) || 0;
   const activeProfiles = data && Array.isArray(data.active_profiles) ? data.active_profiles.slice(0, 6) : [];
-  const current = activeProfiles.length
+  const current = data?.cancel_requested ? t('Останавливается…') : activeProfiles.length
     ? `${t('В работе')}: ${activeProfiles.length} · ${activeProfiles.map(profile => profile.name).filter(Boolean).join(', ')}`
     : (data && (data.current_profile || data.current_profile_name || data.current || '—')) || '—';
   const pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
   const progressEl = document.getElementById('benchProgress');
   const kittEl = document.getElementById('benchKitt');
   const stopEl = document.getElementById('benchStop');
-  if (progressEl) progressEl.style.display = running || done ? 'block' : 'none';
+  if (progressEl) progressEl.style.display = running ? 'block' : 'none';
   setKittRunning(running && (data.method === 'quick' || data.method === 'full' || data.quick === true));
-  if (stopEl) stopEl.style.display = running ? 'inline-flex' : 'none';
+  if (stopEl) {
+    stopEl.style.display = running ? 'inline-flex' : 'none';
+    stopEl.disabled = !!data?.cancel_requested;
+  }
   const barEl = document.getElementById('benchBar');
   if (barEl) barEl.style.width = pct + '%';
   const counterEl = document.getElementById('benchCounter');
@@ -5755,7 +5848,20 @@ function updateBenchStatus(data) {
   // EWMA and cooldown are updated by the backend (apply_bench_result) and
   // will appear after the final refreshDashboard() below.
   mergeBenchResultsIntoProfiles(results);
-  if (!running && benchPoll) { clearInterval(benchPoll); benchPoll = null; refreshDashboard(); }
+  if (!running && benchWasRunning) {
+    benchWasRunning = false;
+    clearTimeout(benchPollTimer);
+    benchPollTimer = null;
+    clearTimeout(benchTerminalHideTimer);
+    if (progressEl && done) {
+      progressEl.style.display = 'block';
+      benchTerminalHideTimer = setTimeout(() => { progressEl.style.display = 'none'; },1200);
+    }
+    loadProfiles().catch(()=>{});
+    refreshStatus();
+  } else if (running) {
+    benchWasRunning = true;
+  }
 }
 
 /// Update MOCK.profiles in place with the latest bench results and
@@ -5764,6 +5870,9 @@ function updateBenchStatus(data) {
 /// sliders are updated — disabled metrics keep their previous value.
 function mergeBenchResultsIntoProfiles(results) {
   if (!results || !results.length) return;
+  const fingerprint = results.map(r => `${r.profile_id}:${r.timestamp || ''}:${r.success}:${r.latency_ms || 0}`).join('|');
+  if (fingerprint === benchResultFingerprint) return;
+  benchResultFingerprint = fingerprint;
   let changed = false;
   for (const r of results) {
     const p = MOCK.profiles.find(p => p.id === r.profile_id);
@@ -5782,7 +5891,25 @@ function mergeBenchResultsIntoProfiles(results) {
   }
   if (changed) renderProfiles(MOCK.profiles);
 }
-function pollBenchStatus() { api('GET','/api/bench/status').then(updateBenchStatus).catch(()=>{}); }
+function scheduleBenchPoll(delay=1000) {
+  clearTimeout(benchPollTimer);
+  benchPollTimer = setTimeout(pollBenchStatus,delay);
+}
+function pollBenchStatus() {
+  if (benchPollInFlight) return Promise.resolve();
+  benchPollInFlight = true;
+  return api('GET','/api/bench/status',undefined,true).then(data => {
+    updateBenchStatus(data);
+    if (data?.running) scheduleBenchPoll();
+  }).catch(()=>{}).finally(() => { benchPollInFlight = false; });
+}
+function stopBench(button) {
+  setButtonPending(button,true,t('Останавливается…'));
+  return api('POST','/api/bench/stop',null).then(result => {
+    showToast('info',result.stopped ? t('Бенчмарк остановлен') : t('Остановка запрошена'));
+    pollBenchStatus();
+  }).catch(()=>setButtonPending(button,false));
+}
 
 function benchConcurrency() {
   const value = Number(document.getElementById('benchConcurrency')?.value);
@@ -5851,10 +5978,10 @@ function startBenchScope(scope, isGroup) {
   const progressEl = document.getElementById('benchProgress');
   if (progressEl) progressEl.style.display = 'block';
   api('POST','/api/bench/start', body).then(() => {
-    if (benchPoll) clearInterval(benchPoll);
+    benchResultFingerprint = '';
+    benchWasRunning = true;
     pollBenchStatus();
-    benchPoll = setInterval(pollBenchStatus, 1000);
-  });
+  }).catch(() => { if (progressEl) progressEl.style.display = 'none'; });
 }
 
 // ─── DNS ─────────────────────────────────────────────────────────────
@@ -6839,13 +6966,24 @@ function updateMemoryGuardUI(memGuard) {
   safeSet('sysMihomoRam', mihomoRss ? fmtBytes(mihomoRss * 1024) : '—');
 }
 
+let systemRefreshPromise = null;
+let statusRefreshPromise = null;
 function refreshSystem() {
-  api('GET','/api/system',undefined,true).then(updateSystemUI).catch(()=>{});
-  api('GET','/api/memory-guard',undefined,true).then(updateMemoryGuardUI).catch(()=>{});
+  if (systemRefreshPromise) return systemRefreshPromise;
+  systemRefreshPromise = Promise.all([
+    api('GET','/api/system',undefined,true).then(updateSystemUI).catch(()=>{}),
+    api('GET','/api/memory-guard',undefined,true).then(updateMemoryGuardUI).catch(()=>{}),
+  ]).finally(() => { systemRefreshPromise = null; });
+  return systemRefreshPromise;
 }
 
 function refreshStatus() {
-  api('GET','/api/status',undefined,true).then(updateStatusUI).catch(()=>{});
+  if (statusRefreshPromise) return statusRefreshPromise;
+  statusRefreshPromise = api('GET','/api/status',undefined,true)
+    .then(updateStatusUI)
+    .catch(()=>{})
+    .finally(() => { statusRefreshPromise = null; });
+  return statusRefreshPromise;
 }
 
 function memorySummaryRows(sys, guard) {
@@ -7063,10 +7201,17 @@ function webdavDownload() {
 function loadDns() { return api('GET','/api/dns').then(d => { const dns = d.dns || d.settings || d; safeChecked('dnsEnabled', dns.enabled); safeValue('dnsStrategy', dns.query_strategy || 'UseIPv4'); safeValue('dnsRemote', Array.isArray(dns.remote_servers) ? dns.remote_servers.join('\n') : ''); safeValue('dnsLocal', Array.isArray(dns.local_servers) ? dns.local_servers.join('\n') : ''); safeChecked('dnsSniffOverride', d.sniffer_override_destination !== false); refreshCustomSelects(); }); }
 function loadHwid() { return api('GET','/api/hwid').then(d => { const h = d.hwid || d; safeValue('hwidVal', h.hwid); safeValue('hwidOs', h.os_version); safeValue('hwidModel', h.device_model); safeValue('hwidDeviceOs', h.device_os); safeValue('hwidApp', h.app_version); safeValue('hwidBundle', h.bundle_id); safeValue('hwidApi', h.api_version); }); }
 function loadAuthSettings() { return api('GET','/api/auth-settings').then(d => { const a = d.auth || d; safeChecked('authEnabled', a.enabled); safeValue('authUser', a.username || 'admin'); if (a.enabled && !sessionStorage.getItem('hincyray_token')) showLoginOverlay(); }); }
+let dashboardRefreshPromise = null;
 function refreshDashboard() {
-  refreshStatus();
-  refreshSystem();
-  loadProfiles().catch(()=>{}); loadRouting().catch(()=>{}); loadSubscriptions().catch(()=>{}); loadBackups().catch(()=>{}); loadTrafficAndConnections(); loadDns().catch(()=>{}); loadHwid().catch(()=>{}); loadAuthSettings().catch(()=>{}); loadTelegramProbeStatus().catch(()=>{}); loadUpdateStatus().catch(()=>{}); loadOperationalSafety().catch(()=>{}); pollBenchStatus(); loadGeoStatus().catch(()=>{}); loadGeoBases();
+  if (dashboardRefreshPromise) return dashboardRefreshPromise;
+  const tasks = [
+    refreshStatus(), refreshSystem(), loadProfiles(), loadRouting(), loadSubscriptions(), loadBackups(),
+    loadDns(), loadHwid(), loadAuthSettings(), loadTelegramProbeStatus(), loadUpdateStatus(),
+    loadOperationalSafety(), pollBenchStatus(), loadGeoStatus(), loadGeoBases(),
+  ];
+  loadTrafficAndConnections();
+  dashboardRefreshPromise = Promise.allSettled(tasks).finally(() => { dashboardRefreshPromise = null; });
+  return dashboardRefreshPromise;
 }
 
 function startAutoRefreshLoops() {
@@ -7218,6 +7363,7 @@ function init() {
 let DB_EXPLICIT_SELECTED = new Set();
 let DB_EXPLICIT_PROFILES = [];
 let DB_STATUS_POLL = null;
+let deepBenchLongOperationToken = null;
 
 function dbSelectedDays() {
   let mask = 0;
@@ -7386,8 +7532,11 @@ function pollDeepBenchStatus() {
     const eta = s.eta_secs ? ` · ETA ${Math.floor(s.eta_secs/60)}м` : '';
     const phase = s.state || 'idle';
     const running = phase === 'phase_a' || phase === 'phase_b';
-    if (running && !activeLongOperations.has('deep-bench-job')) beginLongOperation('deep-bench-job', 'Глубокая проверка серверов…');
-    if (!running && activeLongOperations.has('deep-bench-job')) endLongOperation('deep-bench-job');
+    if (running && deepBenchLongOperationToken === null) deepBenchLongOperationToken = beginLongOperation('deep-bench-job', 'Глубокая проверка серверов…');
+    if (!running && deepBenchLongOperationToken !== null) {
+      endLongOperation(deepBenchLongOperationToken);
+      deepBenchLongOperationToken = null;
+    }
     const progress = (s.phase_progress || 0);
     el.innerHTML = `Статус: <b>${escapeHtml(phase)}</b> (${progress}%) — ${escapeHtml(s.phase_detail || '')}${eta}`;
     if (s.last_error) {

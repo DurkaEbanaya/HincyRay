@@ -46,21 +46,22 @@ use crate::geobase::{
     GeoBaseUpsertRequest, StaticRouteEntry,
 };
 use crate::hincyray_api::{
-    ApiContractDescriptor, ConnectionPageResponse, ConnectionQueryRequest, DeviceTrafficRequest,
-    DeviceTrafficResponse, DeviceTrafficSummary, MemoryEstimateResponse, MihomoDnsParameters,
-    MihomoExperimentalParameters, MihomoExternalControllerRuntime, MihomoParameters,
-    MihomoParametersResponse, MihomoParametersRuntime, MihomoParametersUpdateRequest,
-    MihomoPerProxyParameters, MihomoSnifferParameters, OnboardingStatusResponse, ProfileDetail,
-    ProfileDetailResponse, ProfileDiagnosticConnection, ProfileDiagnosticDiscardRequest,
-    ProfileDiagnosticDiscardResponse, ProfileDiagnosticEnvironment, ProfileDiagnosticEvent,
-    ProfileDiagnosticLatestStats, ProfileDiagnosticMemory, ProfileDiagnosticProfile,
-    ProfileDiagnosticReport, ProfileDiagnosticReportResponse, ProfileDiagnosticServiceResult,
+    ActiveProfileApplyStatusResponse, ApiContractDescriptor, ConnectionPageResponse,
+    ConnectionQueryRequest, DeviceTrafficRequest, DeviceTrafficResponse, DeviceTrafficSummary,
+    MemoryEstimateResponse, MihomoDnsParameters, MihomoExperimentalParameters,
+    MihomoExternalControllerRuntime, MihomoParameters, MihomoParametersResponse,
+    MihomoParametersRuntime, MihomoParametersUpdateRequest, MihomoPerProxyParameters,
+    MihomoSnifferParameters, OnboardingStatusResponse, ProfileDetail, ProfileDetailResponse,
+    ProfileDiagnosticConnection, ProfileDiagnosticDiscardRequest, ProfileDiagnosticDiscardResponse,
+    ProfileDiagnosticEnvironment, ProfileDiagnosticEvent, ProfileDiagnosticLatestStats,
+    ProfileDiagnosticMemory, ProfileDiagnosticProfile, ProfileDiagnosticReport,
+    ProfileDiagnosticReportResponse, ProfileDiagnosticServiceResult,
     ProfileDiagnosticSessionRequest, ProfileDiagnosticSessionStatus, ProfileDiagnosticStartRequest,
     ProfileDiagnosticStartResponse, ProfileDiagnosticStatusResponse, ProfileDiagnosticSummary,
     ProfileRevalidationError, ProfileSafeFields, ProfileUpdateRequest, ProfileUpdateResponse,
     ProfilesRevalidateResponse, ReadinessCheck, RoutingConnectionContextResponse,
     RoutingPreviewDiff, RoutingPreviewResponse, RoutingServerSummary, RoutingSummaryResponse,
-    SafeModeRequest, SafeModeResponse, api_endpoint_contracts, openapi_document,
+    SafeModeRequest, SafeModeResponse, XhttpTuning, api_endpoint_contracts, openapi_document,
 };
 use crate::hincyray_mihomo_api::{
     MAX_DIAGNOSTIC_CONNECTIONS_JSON_BYTES, mihomo_api_delay, mihomo_api_delete, mihomo_api_get,
@@ -81,6 +82,7 @@ use crate::hincyray_webui::index_html;
 use crate::mihomo_config::{
     DIRECT_NAME, MihomoFeatures, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME, PROXY_NAME,
     PinnedServerRoute, REJECT_NAME, build_mihomo_config, build_mihomo_router_config,
+    read_xhttp_tuning, update_xhttp_tuning,
 };
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionMetadata, SubscriptionSource,
@@ -118,6 +120,8 @@ const MIHOMO_VALIDATE_GOGC: &str = "20";
 const COMMAND_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024;
 const MAX_PROFILE_NAME_CHARS: usize = 256;
 const MAX_PROFILE_RAW_BYTES: usize = 64 * 1024;
+const BENCH_MEMORY_RESERVE_KB: u64 = 80 * 1024;
+const BENCH_WORKER_MEMORY_BUDGET_KB: u64 = 48 * 1024;
 const MAX_PROFILE_REVALIDATION_ERRORS: usize = 100;
 const PROFILE_DIAGNOSTIC_MIN_DURATION_SECS: u32 = 60;
 const PROFILE_DIAGNOSTIC_MAX_DURATION_SECS: u32 = 300;
@@ -372,6 +376,7 @@ fn cli_doctor() -> Result<(), String> {
 pub struct Daemon {
     inner: Arc<Mutex<DaemonInner>>,
     apply: Arc<Mutex<()>>,
+    active_profile_apply: Arc<Mutex<ActiveProfileApplyProgress>>,
     profile_diagnostic_join: Arc<Mutex<()>>,
     geoip_cache: Arc<Mutex<Option<GeoIpCacheEntry>>>,
     password_work: Arc<PasswordWorkLimiter>,
@@ -385,6 +390,29 @@ pub struct Daemon {
     fail_active_profile_persist_after_write: Arc<AtomicBool>,
     #[cfg(test)]
     fail_profile_history_persist_after_write: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct ActiveProfileApplyProgress {
+    generation: u64,
+    state: &'static str,
+    profile_id: Option<usize>,
+    profile_name: Option<String>,
+    stage: &'static str,
+    updated_at_unix: u64,
+}
+
+impl Default for ActiveProfileApplyProgress {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            state: "idle",
+            profile_id: None,
+            profile_name: None,
+            stage: "idle",
+            updated_at_unix: unix_now(),
+        }
+    }
 }
 
 struct DaemonInner {
@@ -690,6 +718,10 @@ impl BenchRuntime {
                 state.cancel_requested = true;
             }
         }
+    }
+
+    fn take_handle(&mut self) -> Option<JoinHandle<()>> {
+        self.handle.take()
     }
 
     fn snapshot(&self) -> BenchJob {
@@ -2201,6 +2233,7 @@ impl Daemon {
                 core_generation: 0,
             })),
             apply: Arc::new(Mutex::new(())),
+            active_profile_apply: Arc::new(Mutex::new(ActiveProfileApplyProgress::default())),
             profile_diagnostic_join: Arc::new(Mutex::new(())),
             geoip_cache: Arc::new(Mutex::new(None)),
             password_work: Arc::new(PasswordWorkLimiter::new(MAX_CONCURRENT_PASSWORD_OPS)),
@@ -5176,6 +5209,7 @@ fn dispatch_from(
         ("GET", "/api/contracts") => handle_api_contracts(),
         ("GET", "/api/openapi.json") => json_response(&openapi_document()),
         ("GET", "/api/onboarding/status") => handle_onboarding_status(daemon),
+        ("GET", "/api/active-profile/status") => handle_active_profile_status(daemon),
         ("GET", "/api/profiles") => {
             let inner = lock(&daemon.inner);
             let active_id = inner.state.active_profile_id;
@@ -5572,24 +5606,33 @@ fn handle_set_active(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
     };
     let id = id as usize;
 
-    let profile = {
-        let inner = lock(&daemon.inner);
-        inner
-            .state
-            .profiles
-            .iter()
-            .find(|profile| profile.id == id)
-            .cloned()
+    let _apply = match daemon.apply.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return json_error(409, "another configuration apply is already running");
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return json_error(500, "config apply lock is poisoned");
+        }
     };
-    let Some(profile) = profile else {
+    let mut inner = lock(&daemon.inner);
+    let Some(profile) = inner
+        .state
+        .profiles
+        .iter()
+        .find(|profile| profile.id == id)
+        .cloned()
+    else {
         return (
             404,
             "application/json",
             json!({"error": "profile not found", "profile_id": id}).to_string(),
         );
     };
-
-    if let Err(error) = apply_active_profile(daemon, id) {
+    begin_active_profile_apply(daemon, id, profile.name.clone());
+    let apply_result = apply_active_profile_locked(&mut inner, daemon, id);
+    finish_active_profile_apply(daemon, id, apply_result.is_ok());
+    if let Err(error) = apply_result {
         return (
             error.http_status(),
             "application/json",
@@ -5603,6 +5646,18 @@ fn handle_set_active(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
         "mihomo_config_path": daemon.mihomo_config_path.to_string_lossy(),
     });
     (200, "application/json", response.to_string())
+}
+
+fn handle_active_profile_status(daemon: &Daemon) -> (u16, &'static str, String) {
+    let progress = lock(&daemon.active_profile_apply).clone();
+    json_response(&ActiveProfileApplyStatusResponse {
+        generation: progress.generation,
+        state: progress.state.to_owned(),
+        profile_id: progress.profile_id,
+        profile_name: progress.profile_name,
+        stage: progress.stage.to_owned(),
+        updated_at_unix: progress.updated_at_unix,
+    })
 }
 
 fn handle_get_mihomo_config(daemon: &Daemon) -> (u16, &'static str, String) {
@@ -7219,7 +7274,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         .get("test_upload")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let concurrency = match value.get("concurrency") {
+    let requested_concurrency = match value.get("concurrency") {
         None => 1,
         Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
             Some(value @ 1..=6) => value,
@@ -7291,6 +7346,16 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             return json_error(400, "no profiles to benchmark; import first");
         }
         let core_path = benchmark_mihomo_path(&inner.state.mihomo_path);
+        let concurrency = if benchmark_uses_temporary_core(method, test_download, test_upload) {
+            let mihomo_pid = inner.core.pid().unwrap_or(0);
+            if !memory_gate_allows_bench(mihomo_pid) {
+                return json_error(503, "not enough memory to start benchmark safely");
+            }
+            let (_, available_kb, _) = memory_summary_from_proc();
+            memory_bounded_bench_concurrency(requested_concurrency, available_kb)
+        } else {
+            requested_concurrency
+        };
         let job = new_bench_job(method, profiles.len(), concurrency);
         let cancel = Arc::new(AtomicBool::new(false));
         if inner
@@ -7328,8 +7393,30 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         "method": method.as_str(),
         "total": snapshot.total,
         "running": snapshot.running,
+        "requested_concurrency": requested_concurrency,
+        "concurrency": snapshot.worker_count,
     });
     (200, "application/json", response.to_string())
+}
+
+fn benchmark_uses_temporary_core(
+    method: BenchMethod,
+    test_download: bool,
+    test_upload: bool,
+) -> bool {
+    !matches!(method, BenchMethod::Tcp) || test_download || test_upload
+}
+
+fn memory_bounded_bench_concurrency(requested: usize, available_kb: u64) -> usize {
+    if available_kb == 0 {
+        return requested;
+    }
+    let workers = available_kb
+        .saturating_sub(BENCH_MEMORY_RESERVE_KB)
+        .checked_div(BENCH_WORKER_MEMORY_BUDGET_KB)
+        .unwrap_or(0)
+        .max(1) as usize;
+    requested.min(workers)
 }
 
 fn select_profiles_for_quick_bench(
@@ -7383,17 +7470,26 @@ fn select_profiles_for_quick_bench(
 }
 
 fn handle_bench_stop(daemon: &Daemon) -> (u16, &'static str, String) {
-    let inner = lock(&daemon.inner);
-    let running = inner.bench.is_running();
-    if running {
-        inner.bench.request_cancel();
+    let (running, handle) = {
+        let mut inner = lock(&daemon.inner);
+        let running = inner.bench.is_running();
+        if running {
+            inner.bench.request_cancel();
+        }
+        (
+            running,
+            running.then(|| inner.bench.take_handle()).flatten(),
+        )
+    };
+    if let Some(handle) = handle {
+        let _ = handle.join();
     }
     (
         200,
         "application/json",
         json!({
             "stopped": running,
-            "cancel_requested": running,
+            "cancel_requested": false,
         })
         .to_string(),
     )
@@ -8062,6 +8158,12 @@ fn handle_profile_detail(raw_id: &str, daemon: &Daemon) -> (u16, &'static str, S
         );
     };
     let safe = profile_safe_fields(&inner.state, profile);
+    let xhttp_tuning = read_xhttp_tuning(&profile.raw).ok().flatten().map(
+        |(sc_max_each_post_bytes, sc_min_posts_interval_ms)| XhttpTuning {
+            sc_max_each_post_bytes,
+            sc_min_posts_interval_ms,
+        },
+    );
     json_response(&ProfileDetailResponse {
         profile: ProfileDetail {
             id: safe.id,
@@ -8078,6 +8180,7 @@ fn handle_profile_detail(raw_id: &str, daemon: &Daemon) -> (u16, &'static str, S
             dead: safe.dead,
             block_quic: safe.block_quic,
             subscription_managed: safe.subscription_managed,
+            xhttp_tuning,
         },
     })
 }
@@ -8374,8 +8477,15 @@ fn handle_profile_update(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
         Ok(request) => request,
         Err(error) => return json_error(400, &format!("invalid profile update JSON: {error}")),
     };
-    if request.name.is_none() && request.raw.is_none() && request.block_quic.is_none() {
-        return json_error(400, "provide at least one of name, raw, or block_quic");
+    if request.name.is_none()
+        && request.raw.is_none()
+        && request.block_quic.is_none()
+        && request.xhttp_tuning.is_none()
+    {
+        return json_error(
+            400,
+            "provide at least one of name, raw, block_quic, or xhttp_tuning",
+        );
     }
     if !valid_lifecycle_ref(&request.expected_server_ref) {
         return json_error(400, "expected_server_ref is malformed");
@@ -8387,7 +8497,7 @@ fn handle_profile_update(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
     {
         return json_error(400, "profile name exceeds 256 characters");
     }
-    let parsed_raw = match request.raw.as_deref() {
+    let mut parsed_raw = match request.raw.as_deref() {
         Some(raw) => match parse_single_profile(raw) {
             Ok(profile) => Some(profile),
             Err(error) => return json_error(400, &error),
@@ -8432,6 +8542,30 @@ fn handle_profile_update(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
             400,
             "subscription-managed profile raw links cannot be edited; create a manual copy instead",
         );
+    }
+    if request.xhttp_tuning.is_some() && profile_is_subscription_managed(&previous_state, &old) {
+        return json_error(
+            400,
+            "subscription-managed XHTTP tuning cannot be edited; create a manual copy instead",
+        );
+    }
+    if let Some(tuning) = request.xhttp_tuning.as_ref() {
+        let source_raw = parsed_raw
+            .as_ref()
+            .map(|profile| profile.raw.as_str())
+            .unwrap_or(&old.raw);
+        let updated_raw = match update_xhttp_tuning(
+            source_raw,
+            tuning.sc_max_each_post_bytes.as_deref(),
+            tuning.sc_min_posts_interval_ms.as_deref(),
+        ) {
+            Ok(raw) => raw,
+            Err(error) => return json_error(400, &error),
+        };
+        parsed_raw = match parse_single_profile(&updated_raw) {
+            Ok(profile) => Some(profile),
+            Err(error) => return json_error(400, &error),
+        };
     }
 
     let mut replacement = parsed_raw.unwrap_or_else(|| old.clone());
@@ -20480,7 +20614,45 @@ fn apply_active_profile(daemon: &Daemon, profile_id: usize) -> Result<(), Active
         ActiveProfileApplyError::Runtime("config apply lock is poisoned".to_owned())
     })?;
     let mut inner = lock(&daemon.inner);
-    apply_active_profile_locked(&mut inner, daemon, profile_id)
+    let profile_name = inner
+        .state
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+        .map(|profile| profile.name.clone());
+    if let Some(profile_name) = profile_name {
+        begin_active_profile_apply(daemon, profile_id, profile_name);
+    }
+    let result = apply_active_profile_locked(&mut inner, daemon, profile_id);
+    finish_active_profile_apply(daemon, profile_id, result.is_ok());
+    result
+}
+
+fn begin_active_profile_apply(daemon: &Daemon, profile_id: usize, profile_name: String) {
+    let mut progress = lock(&daemon.active_profile_apply);
+    progress.generation = progress.generation.saturating_add(1);
+    progress.state = "running";
+    progress.profile_id = Some(profile_id);
+    progress.profile_name = Some(profile_name);
+    progress.stage = "preparing";
+    progress.updated_at_unix = unix_now();
+}
+
+fn set_active_profile_apply_stage(daemon: &Daemon, profile_id: usize, stage: &'static str) {
+    let mut progress = lock(&daemon.active_profile_apply);
+    if progress.state == "running" && progress.profile_id == Some(profile_id) {
+        progress.stage = stage;
+        progress.updated_at_unix = unix_now();
+    }
+}
+
+fn finish_active_profile_apply(daemon: &Daemon, profile_id: usize, succeeded: bool) {
+    let mut progress = lock(&daemon.active_profile_apply);
+    if progress.state == "running" && progress.profile_id == Some(profile_id) {
+        progress.state = if succeeded { "completed" } else { "failed" };
+        progress.stage = if succeeded { "completed" } else { "failed" };
+        progress.updated_at_unix = unix_now();
+    }
 }
 
 fn apply_active_profile_locked(
@@ -20507,6 +20679,7 @@ fn apply_active_profile_locked(
     let active_profile_changed = previous_profile_id != Some(profile_id);
 
     inner.state.active_profile_id = Some(profile_id);
+    set_active_profile_apply_stage(daemon, profile_id, "generating-config");
     let config_yaml = match build_authoritative_daemon_config(&inner.state, daemon) {
         Ok(yaml) => yaml,
         Err(error) => {
@@ -20517,6 +20690,7 @@ fn apply_active_profile_locked(
 
     let binary_path = inner.state.mihomo_path.clone();
     let geo_dir = geo_dir_from_state(&inner.state);
+    set_active_profile_apply_stage(daemon, profile_id, "validating-config");
     let validation = validate_mihomo_config_yaml(&binary_path, &config_yaml, geo_dir.as_deref());
     if validation.get("ok").and_then(Value::as_bool) != Some(true) {
         inner.state.active_profile_id = previous_profile_id;
@@ -20542,8 +20716,10 @@ fn apply_active_profile_locked(
     let mut persist_attempted = false;
 
     let apply_result: Result<(), String> = (|| {
+        set_active_profile_apply_stage(daemon, profile_id, "writing-config");
         atomic_write_config(&config_path, config_yaml.as_bytes())?;
         let state = inner.state.clone();
+        set_active_profile_apply_stage(daemon, profile_id, "applying-core");
         hot_reload_or_restart_core_locked(
             inner,
             daemon,
@@ -20552,8 +20728,10 @@ fn apply_active_profile_locked(
             &config_path,
             geo_dir.as_deref(),
         )?;
+        set_active_profile_apply_stage(daemon, profile_id, "waiting-core");
         wait_for_core_readiness_locked(inner, daemon, controller.as_ref())?;
         persist_attempted = true;
+        set_active_profile_apply_stage(daemon, profile_id, "saving-state");
         persist_state(&daemon.state_path, &inner.state)?;
         #[cfg(test)]
         if daemon
@@ -20566,6 +20744,7 @@ fn apply_active_profile_locked(
     })();
 
     if let Err(error) = apply_result {
+        set_active_profile_apply_stage(daemon, profile_id, "rolling-back");
         inner.state.active_profile_id = previous_profile_id;
         let previous_state = inner.state.clone();
         let (runtime_rollback, runtime_restored) = restore_previous_activation_locked(
@@ -20597,11 +20776,13 @@ fn apply_active_profile_locked(
     if active_profile_changed
         && previous_runtime.core_running
         && let Some((addr, secret)) = controller.as_ref()
-        && let Err(error) = mihomo_api_delete(addr, secret.as_deref(), "/connections")
     {
-        eprintln!(
-            "hincyray: active profile switched, but closing old Mihomo connections failed: {error}"
-        );
+        set_active_profile_apply_stage(daemon, profile_id, "closing-connections");
+        if let Err(error) = mihomo_api_delete(addr, secret.as_deref(), "/connections") {
+            eprintln!(
+                "hincyray: active profile switched, but closing old Mihomo connections failed: {error}"
+            );
+        }
     }
 
     Ok(())
@@ -24430,6 +24611,50 @@ mod tests {
     }
 
     #[test]
+    fn manual_xhttp_tuning_is_exposed_and_updated_through_structured_fields() {
+        let (_dir, daemon) = test_daemon();
+        let raw = "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%2C%22scMaxEachPostBytes%22%3A%222048-2048%22%7D#XHTTP";
+        handle_import(raw, &daemon);
+        let expected_server_ref = {
+            let inner = lock(&daemon.inner);
+            profile_server_ref(&inner.state.profiles[0])
+        };
+        let (_, _, detail_body) = handle_profile_detail("0", &daemon);
+        let detail: Value = serde_json::from_str(&detail_body).expect("detail");
+        assert_eq!(
+            detail["profile"]["xhttp_tuning"]["sc_max_each_post_bytes"],
+            "2048"
+        );
+        assert_eq!(
+            detail["profile"]["xhttp_tuning"]["sc_min_posts_interval_ms"],
+            Value::Null
+        );
+
+        let request = json!({
+            "profile_id": 0,
+            "expected_server_ref": expected_server_ref,
+            "xhttp_tuning": {
+                "sc_max_each_post_bytes": "4096-4096",
+                "sc_min_posts_interval_ms": "15-15"
+            }
+        });
+        let (status, _, response) = handle_profile_update(&request.to_string(), &daemon);
+        assert_eq!(status, 200, "{response}");
+        let raw = lock(&daemon.inner).state.profiles[0].raw.clone();
+        assert_eq!(
+            read_xhttp_tuning(&raw).expect("read tuning"),
+            Some((Some("4096".to_owned()), Some("15".to_owned())))
+        );
+        let extra = url::Url::parse(&raw)
+            .expect("URL")
+            .query_pairs()
+            .find(|(key, _)| key == "extra")
+            .map(|(_, value)| value.into_owned())
+            .expect("extra");
+        assert!(extra.contains("xPaddingBytes"));
+    }
+
+    #[test]
     fn profile_detail_requires_auth_and_raw_stays_out_of_list() {
         let (_dir, daemon) = test_daemon();
         let raw = "vless://11111111-1111-1111-1111-111111111111@example.com:443#Sensitive";
@@ -25246,33 +25471,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn active_profile_switch_waits_for_config_apply_lock() {
-        let (_dir, daemon, controller_worker) = runnable_active_profile_test_daemon();
+    fn active_profile_switch_rejects_busy_config_apply_without_queueing() {
+        let (_dir, daemon) = test_daemon();
         handle_import(
             "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Demo",
             &daemon,
         );
         let apply = lock(&daemon.apply);
-        let request_daemon = daemon.clone();
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let request = thread::spawn(move || {
-            result_tx
-                .send(handle_set_active(r#"{"profile_id":0}"#, &request_daemon))
-                .expect("send active profile result");
-        });
-
-        assert!(
-            result_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "profile switch bypassed daemon.apply"
-        );
+        let started = Instant::now();
+        let (status, _, response) = handle_set_active(r#"{"profile_id":0}"#, &daemon);
+        assert_eq!(status, 409, "{response}");
+        assert!(response.contains("already running"));
+        assert!(started.elapsed() < Duration::from_millis(100));
         drop(apply);
-        let (status, _, response) = result_rx
-            .recv_timeout(Duration::from_secs(4))
-            .expect("profile switch completes after apply lock release");
-        controller_worker.join().expect("controller worker");
-        assert_eq!(status, 200, "{response}");
-        request.join().expect("active profile request");
-        let _ = lock(&daemon.inner).core.stop();
     }
 
     #[test]
@@ -25664,6 +25875,25 @@ mod tests {
     }
 
     #[test]
+    fn temporary_core_bench_concurrency_preserves_router_memory_reserve() {
+        assert_eq!(memory_bounded_bench_concurrency(6, 160 * 1024), 1);
+        assert_eq!(memory_bounded_bench_concurrency(6, 224 * 1024), 3);
+        assert_eq!(memory_bounded_bench_concurrency(4, 512 * 1024), 4);
+        assert_eq!(memory_bounded_bench_concurrency(3, 0), 3);
+        assert!(benchmark_uses_temporary_core(
+            BenchMethod::Quick,
+            false,
+            false
+        ));
+        assert!(!benchmark_uses_temporary_core(
+            BenchMethod::Tcp,
+            false,
+            false
+        ));
+        assert!(benchmark_uses_temporary_core(BenchMethod::Tcp, true, false));
+    }
+
+    #[test]
     fn benchmark_empty_mihomo_path_uses_path_lookup() {
         assert_eq!(benchmark_mihomo_path(""), "mihomo");
         assert_eq!(benchmark_mihomo_path("  "), "mihomo");
@@ -25768,7 +25998,9 @@ mod tests {
         assert_eq!(snapshot.total, 1);
         assert!(snapshot.active_profiles.len() <= 6);
         assert!(snapshot.worker_count <= 6);
-        inner.bench.request_cancel();
+        drop(inner);
+        let (status, _, response) = handle_bench_stop(&daemon);
+        assert_eq!(status, 200, "{response}");
     }
 
     #[test]

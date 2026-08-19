@@ -1469,6 +1469,109 @@ fn parse_xhttp_extra(url: &Url) -> Result<serde_json::Map<String, Value>, String
     }
 }
 
+pub(crate) fn read_xhttp_tuning(raw: &str) -> Result<Option<XhttpTuningValues>, String> {
+    let url = Url::parse(raw).map_err(|error| format!("invalid profile URL: {error}"))?;
+    if !url.scheme().eq_ignore_ascii_case("vless")
+        || query_value(&url, "type").as_deref() != Some("xhttp")
+    {
+        return Ok(None);
+    }
+    let extra = parse_xhttp_extra(&url)?;
+    let read = |query_names: &[&str], extra_key: &str| -> Result<Option<String>, String> {
+        let value = query_value_multi(&url, query_names)
+            .map(Ok)
+            .or_else(|| {
+                extra
+                    .get(extra_key)
+                    .map(|value| xhttp_json_range(extra_key, value))
+            })
+            .transpose()?;
+        value
+            .map(|value| checked_xhttp_range(extra_key, &value, 1))
+            .transpose()
+    };
+    Ok(Some((
+        read(
+            &["scMaxEachPostBytes", "sc_max_each_post_bytes"],
+            "scMaxEachPostBytes",
+        )?,
+        read(
+            &["scMinPostsIntervalMs", "sc_min_posts_interval_ms"],
+            "scMinPostsIntervalMs",
+        )?,
+    )))
+}
+
+pub(crate) type XhttpTuningValues = (Option<String>, Option<String>);
+
+pub(crate) fn update_xhttp_tuning(
+    raw: &str,
+    sc_max_each_post_bytes: Option<&str>,
+    sc_min_posts_interval_ms: Option<&str>,
+) -> Result<String, String> {
+    let mut url = Url::parse(raw).map_err(|error| format!("invalid profile URL: {error}"))?;
+    if !url.scheme().eq_ignore_ascii_case("vless")
+        || query_value(&url, "type").as_deref() != Some("xhttp")
+    {
+        return Err("XHTTP tuning is available only for VLESS XHTTP profiles".to_owned());
+    }
+    let mut extra = parse_xhttp_extra(&url)?;
+    for key in ["scMaxEachPostBytes", "scMinPostsIntervalMs"] {
+        extra.remove(key);
+    }
+    let normalized = [
+        (
+            "scMaxEachPostBytes",
+            sc_max_each_post_bytes,
+            "scMaxEachPostBytes",
+        ),
+        (
+            "scMinPostsIntervalMs",
+            sc_min_posts_interval_ms,
+            "scMinPostsIntervalMs",
+        ),
+    ];
+    for (field, value, extra_key) in normalized {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            extra.insert(
+                extra_key.to_owned(),
+                Value::String(checked_xhttp_range(field, value, 1)?),
+            );
+        }
+    }
+
+    let retained: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_ref(),
+                "extra"
+                    | "scMaxEachPostBytes"
+                    | "sc_max_each_post_bytes"
+                    | "scMinPostsIntervalMs"
+                    | "sc_min_posts_interval_ms"
+            )
+        })
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        query.extend_pairs(retained);
+        if !extra.is_empty() {
+            let encoded = serde_json::to_string(&extra)
+                .map_err(|error| format!("serialize VLESS XHTTP extra: {error}"))?;
+            if encoded.len() > MAX_XHTTP_EXTRA_BYTES {
+                return Err(format!(
+                    "VLESS XHTTP extra exceeds the {MAX_XHTTP_EXTRA_BYTES}-byte limit"
+                ));
+            }
+            query.append_pair("extra", &encoded);
+        }
+    }
+    Ok(url.to_string())
+}
+
 fn copy_xhttp_query_string(
     output: &mut Value,
     url: &Url,
@@ -3155,6 +3258,7 @@ mod tests {
         build_shadowsocksr_proxy, build_snell_proxy, build_socks_proxy, build_ssh_proxy,
         build_tailscale_proxy, build_trojan_proxy, build_tuic_proxy, build_vless_proxy,
         build_vmess_proxy, build_wireguard_proxy, domain_rule_body, ip_rule_body,
+        parse_xhttp_extra, read_xhttp_tuning, update_xhttp_tuning,
     };
     use crate::profiles::parse_profiles;
     use crate::xray_config::{
@@ -3163,6 +3267,7 @@ mod tests {
     };
     use base64::Engine as _;
     use serde_json::{Value, json};
+    use url::Url;
 
     #[test]
     fn build_vless_proxy_has_correct_fields() {
@@ -5015,6 +5120,41 @@ mod tests {
                 "value leaked: {error}"
             );
         }
+    }
+
+    #[test]
+    fn xhttp_tuning_update_preserves_unknown_extra_and_supports_removal() {
+        let raw = "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%2C%22scMaxEachPostBytes%22%3A%222048-2048%22%7D#Demo";
+        let updated =
+            update_xhttp_tuning(raw, Some("4096-4096"), Some("15-15")).expect("update tuning");
+        let tuning = read_xhttp_tuning(&updated)
+            .expect("read tuning")
+            .expect("XHTTP profile");
+        assert_eq!(tuning, (Some("4096".to_owned()), Some("15".to_owned())));
+        let extra =
+            parse_xhttp_extra(&Url::parse(&updated).expect("updated URL")).expect("extra JSON");
+        assert_eq!(extra["xPaddingBytes"], "100-200");
+        assert_eq!(extra["scMaxEachPostBytes"], "4096");
+        assert_eq!(extra["scMinPostsIntervalMs"], "15");
+
+        let defaults = update_xhttp_tuning(&updated, None, None).expect("remove tuning");
+        assert_eq!(
+            read_xhttp_tuning(&defaults).expect("read defaults"),
+            Some((None, None))
+        );
+        let remaining = parse_xhttp_extra(&Url::parse(&defaults).expect("defaults URL"))
+            .expect("remaining extra");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining["xPaddingBytes"], "100-200");
+    }
+
+    #[test]
+    fn xhttp_tuning_rejects_wrong_transport_and_invalid_ranges() {
+        let ws = "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=ws#Demo";
+        assert!(update_xhttp_tuning(ws, Some("4096"), None).is_err());
+        let xhttp = "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=xhttp#Demo";
+        assert!(update_xhttp_tuning(xhttp, Some("4096-2048"), None).is_err());
+        assert!(update_xhttp_tuning(xhttp, None, Some("0")).is_err());
     }
 
     #[test]

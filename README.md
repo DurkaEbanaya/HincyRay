@@ -1,4 +1,4 @@
-# HincyRay v1.3.0
+# HincyRay v1.3.1
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,12 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v1.3.1
+
+v1.3.1 adds editable XHTTP upload tuning to manual profile settings, reports real daemon stages while switching the active server, makes Quick Test cancellation interrupt in-flight benchmark-owned processes, and prevents repeated server selections from queueing configuration applies. Benchmark concurrency is now bounded by available router memory.
+
+The sidebar activity indicators no longer use high-frequency JavaScript animation timers or overlapping status polls. Operation instances are tracked independently, stale responses cannot resurrect completed indicators, refresh fanout is coalesced, and benchmark rows rerender only when results change. Details: [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.3.1.md`](docs/releases/v1.3.1.md).
 
 ### v1.3.0
 
@@ -394,7 +400,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.0 release evidence is recorded in [`docs/releases/v1.3.0.md`](docs/releases/v1.3.0.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.1 release evidence is recorded in [`docs/releases/v1.3.1.md`](docs/releases/v1.3.1.md).
 
 ## Installation
 

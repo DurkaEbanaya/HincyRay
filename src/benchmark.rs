@@ -265,7 +265,17 @@ pub fn run_bench(
                                 quick_probe.as_ref(),
                                 test_download,
                                 test_upload,
+                                &cancel,
                             );
+
+                            if cancel.load(Ordering::Relaxed) {
+                                let mut state =
+                                    job.lock().unwrap_or_else(|poison| poison.into_inner());
+                                state
+                                    .active_profiles
+                                    .retain(|active| active.id != profile.id);
+                                continue;
+                            }
 
                             on_result(result.clone());
                             let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -318,6 +328,7 @@ fn benchmark_profile(
     quick_probe: Option<&QuickProbeConfig>,
     test_download: bool,
     test_upload: bool,
+    cancel: &AtomicBool,
 ) -> BenchResult {
     let timestamp = unix_now();
     let base = || BenchResult {
@@ -343,7 +354,7 @@ fn benchmark_profile(
     let latency_outcome = match method {
         BenchMethod::Tcp => run_tcp(profile),
         BenchMethod::Quick | BenchMethod::Full => {
-            run_service_resources(profile, method, probe_url, core_path, quick_probe).map(
+            run_service_resources(profile, method, probe_url, core_path, quick_probe, cancel).map(
                 |(metrics, tests)| {
                     resource_tests = tests;
                     metrics
@@ -466,6 +477,7 @@ fn unavailable_service_resource_results(error: &str) -> Vec<ResourceTestResult> 
 /// sample succeeds; a partially working profile would recreate user-visible
 /// flapping immediately after the switch.
 pub fn verify_profile_for_failover(profile: &Profile, mihomo_path: &str) -> BenchResult {
+    let cancel = AtomicBool::new(false);
     let result = benchmark_profile(
         profile,
         BenchMethod::Head,
@@ -476,6 +488,7 @@ pub fn verify_profile_for_failover(profile: &Profile, mihomo_path: &str) -> Benc
         None,
         false,
         false,
+        &cancel,
     );
     strict_failover_result(result)
 }
@@ -528,11 +541,16 @@ fn run_service_resources(
     probe_url: &str,
     mihomo_path: &str,
     quick_probe: Option<&QuickProbeConfig>,
+    cancel: &AtomicBool,
 ) -> Result<(Metrics, Vec<ResourceTestResult>), String> {
-    let mut tests = vec![run_icmp_ping_probe(profile), run_tcp_ping_probe(profile)];
-    let runtime = spawn_bench_mihomo_with_path(profile, mihomo_path);
+    ensure_not_cancelled(cancel)?;
+    let mut tests = vec![
+        run_icmp_ping_probe(profile, cancel)?,
+        run_tcp_ping_probe(profile, cancel)?,
+    ];
+    let runtime = spawn_bench_mihomo_with_path(profile, mihomo_path, Some(cancel));
     match runtime.as_ref() {
-        Ok((port, _guard)) => tests.push(run_proxy_ping_probe(*port, probe_url)),
+        Ok((port, _guard)) => tests.push(run_proxy_ping_probe(*port, probe_url, cancel)?),
         Err(error) => tests.push(failed_resource_result(
             "ping_proxy",
             "Proxy HTTPS ping",
@@ -540,7 +558,7 @@ fn run_service_resources(
         )),
     };
     if let Ok((port, _guard)) = runtime.as_ref() {
-        let youtube = run_youtube_playback_probe(*port);
+        let youtube = run_youtube_playback_probe(*port, cancel)?;
         let youtube_passed = youtube.stable;
         tests.push(youtube);
         if method == BenchMethod::Quick && !youtube_passed {
@@ -549,7 +567,7 @@ fn run_service_resources(
                 "skipped after YouTube failed",
             ));
         } else {
-            let telegram = run_telegram_media_probe(*port, quick_probe);
+            let telegram = run_telegram_media_probe(*port, quick_probe, cancel)?;
             let telegram_passed = telegram.stable;
             tests.push(telegram);
             if method == BenchMethod::Quick && !telegram_passed {
@@ -558,7 +576,7 @@ fn run_service_resources(
                     "skipped after Telegram failed",
                 ));
             } else {
-                tests.push(run_ai_studio_probe(*port));
+                tests.push(run_ai_studio_probe(*port, cancel)?);
             }
         }
     } else {
@@ -606,15 +624,22 @@ fn ping_metrics(tests: &[ResourceTestResult]) -> Metrics {
     }
 }
 
-fn run_icmp_ping_probe(profile: &Profile) -> ResourceTestResult {
+fn run_icmp_ping_probe(
+    profile: &Profile,
+    cancel: &AtomicBool,
+) -> Result<ResourceTestResult, String> {
     if profile.address.trim().is_empty() {
-        return failed_resource_result("ping_icmp", "ICMP ping", "profile has empty address");
+        return Ok(failed_resource_result(
+            "ping_icmp",
+            "ICMP ping",
+            "profile has empty address",
+        ));
     }
     let started = Instant::now();
-    let output = Command::new("ping")
-        .args(["-c", "1", "-W", "2", profile.address.as_str()])
-        .output();
-    match output {
+    let mut command = Command::new("ping");
+    command.args(["-c", "1", "-W", "2", profile.address.as_str()]);
+    let output = run_cancellable_command(&mut command, cancel);
+    Ok(match output {
         Ok(output) if output.status.success() => {
             successful_resource_result("ping_icmp", "ICMP ping", started.elapsed())
         }
@@ -626,27 +651,38 @@ fn run_icmp_ping_probe(profile: &Profile) -> ResourceTestResult {
         Err(error) => {
             failed_resource_result("ping_icmp", "ICMP ping", &format!("ping spawn: {error}"))
         }
-    }
+    })
 }
 
-fn run_tcp_ping_probe(profile: &Profile) -> ResourceTestResult {
+fn run_tcp_ping_probe(
+    profile: &Profile,
+    cancel: &AtomicBool,
+) -> Result<ResourceTestResult, String> {
+    ensure_not_cancelled(cancel)?;
     let port = profile.port.unwrap_or(443);
     let (latencies, failures) = tcp_probe(&profile.address, port, 1);
-    match latencies.first() {
+    ensure_not_cancelled(cancel)?;
+    Ok(match latencies.first() {
         Some(latency) => successful_resource_result("ping_tcp", "TCP ping", *latency),
         None => failed_resource_result(
             "ping_tcp",
             "TCP ping",
             &format!("tcp connect {}:{port} failed {failures}/1", profile.address),
         ),
-    }
+    })
 }
 
-fn run_proxy_ping_probe(port: u16, probe_url: &str) -> ResourceTestResult {
-    match curl_probe(port, probe_url, BenchMethod::Head) {
-        Ok(latency) => successful_resource_result("ping_proxy", "Proxy HTTPS ping", latency),
-        Err(error) => failed_resource_result("ping_proxy", "Proxy HTTPS ping", &error),
-    }
+fn run_proxy_ping_probe(
+    port: u16,
+    probe_url: &str,
+    cancel: &AtomicBool,
+) -> Result<ResourceTestResult, String> {
+    Ok(
+        match curl_probe(port, probe_url, BenchMethod::Head, Some(cancel)) {
+            Ok(latency) => successful_resource_result("ping_proxy", "Proxy HTTPS ping", latency),
+            Err(error) => failed_resource_result("ping_proxy", "Proxy HTTPS ping", &error),
+        },
+    )
 }
 
 fn successful_resource_result(id: &str, name: &str, latency: Duration) -> ResourceTestResult {
@@ -760,19 +796,19 @@ fn service_resource_error(tests: &[ResourceTestResult]) -> String {
     failures.join(", ")
 }
 
-fn run_youtube_playback_probe(port: u16) -> ResourceTestResult {
+fn run_youtube_playback_probe(
+    port: u16,
+    cancel: &AtomicBool,
+) -> Result<ResourceTestResult, String> {
     // Concurrent anonymous Innertube bootstraps from one router IP trigger
     // throttling and TLS resets. Keep the user-selected profile concurrency,
     // but serialize this narrow external-service boundary.
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = lock_cancellable(LOCK.get_or_init(|| Mutex::new(())), cancel)?;
     let mut successes = Vec::new();
     let mut errors = Vec::new();
     for attempt in 0..YOUTUBE_ATTEMPTS {
-        match youtube_playback_attempt(port) {
+        match youtube_playback_attempt(port, cancel) {
             Ok(success) => {
                 successes.push(success);
                 break;
@@ -786,14 +822,14 @@ fn run_youtube_playback_probe(port: u16) -> ResourceTestResult {
             }
         }
     }
-    aggregate_quick_resource_probe(
+    Ok(aggregate_quick_resource_probe(
         "youtube",
         "YouTube",
         successes.len() as u32 + errors.len() as u32,
         &successes,
         &errors,
         true,
-    )
+    ))
 }
 
 fn youtube_error_is_transient(error: &str) -> bool {
@@ -815,7 +851,9 @@ fn youtube_error_is_transient(error: &str) -> bool {
 fn run_telegram_media_probe(
     port: u16,
     quick_probe: Option<&QuickProbeConfig>,
-) -> ResourceTestResult {
+    cancel: &AtomicBool,
+) -> Result<ResourceTestResult, String> {
+    ensure_not_cancelled(cancel)?;
     let mut successes = Vec::new();
     let mut errors = Vec::new();
     let result = quick_probe
@@ -826,37 +864,56 @@ fn run_telegram_media_probe(
                 .as_ref()
                 .ok_or_else(|| "Telegram probe is not configured".to_owned())
                 .and_then(|config| {
-                    probe_media(Path::new(&quick_probe.telegram_session_path), config, port).map(
-                        |result| QuickResourceAttempt {
-                            ttfb_ms: result.elapsed_ms,
-                            total_ms: result.elapsed_ms.max(1),
-                            bytes: result.bytes,
-                        },
+                    probe_media(
+                        Path::new(&quick_probe.telegram_session_path),
+                        config,
+                        port,
+                        cancel,
                     )
+                    .map(|result| QuickResourceAttempt {
+                        ttfb_ms: result.elapsed_ms,
+                        total_ms: result.elapsed_ms.max(1),
+                        bytes: result.bytes,
+                    })
                 })
         });
     match result {
         Ok(attempt) => successes.push(attempt),
         Err(error) => errors.push(error),
     }
-    aggregate_quick_resource_probe("telegram", "Telegram", 1, &successes, &errors, false)
+    ensure_not_cancelled(cancel)?;
+    Ok(aggregate_quick_resource_probe(
+        "telegram", "Telegram", 1, &successes, &errors, false,
+    ))
 }
 
-fn run_ai_studio_probe(port: u16) -> ResourceTestResult {
-    let (successes, errors) = match ipregion_ai_studio_attempt(port) {
+fn run_ai_studio_probe(port: u16, cancel: &AtomicBool) -> Result<ResourceTestResult, String> {
+    let (successes, errors) = match ipregion_ai_studio_attempt(port, cancel) {
         Ok(attempt) => (vec![attempt], Vec::new()),
         Err(error) => (Vec::new(), vec![error]),
     };
-    aggregate_quick_resource_probe("ai", "AI Studio", 1, &successes, &errors, false)
+    ensure_not_cancelled(cancel)?;
+    Ok(aggregate_quick_resource_probe(
+        "ai",
+        "AI Studio",
+        1,
+        &successes,
+        &errors,
+        false,
+    ))
 }
 
-fn ipregion_ai_studio_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
+fn ipregion_ai_studio_attempt(
+    port: u16,
+    cancel: &AtomicBool,
+) -> Result<QuickResourceAttempt, String> {
     // Based on vernette/ipregion's Google + Gemini Supported lookups.
     let (google_page, google_metrics) = curl_bounded_text_via_socks(
         port,
         IPREGION_GOOGLE_URL,
         IPREGION_GOOGLE_MAX_BYTES,
         "ipregion Google",
+        cancel,
     )?;
     let country_code = google_region_code(&google_page)
         .ok_or_else(|| "ipregion Google response has no region".to_owned())?;
@@ -865,6 +922,7 @@ fn ipregion_ai_studio_attempt(port: u16) -> Result<QuickResourceAttempt, String>
         &format!("{IPREGION_COUNTRY_URL}{country_code}"),
         IPREGION_RESPONSE_MAX_BYTES,
         "ipregion country",
+        cancel,
     )?;
     let country_name = serde_json::from_str::<serde_json::Value>(&country_json)
         .map_err(|error| format!("parse ipregion country response: {error}"))?
@@ -879,6 +937,7 @@ fn ipregion_ai_studio_attempt(port: u16) -> Result<QuickResourceAttempt, String>
         IPREGION_GEMINI_REGIONS_URL,
         IPREGION_RESPONSE_MAX_BYTES,
         "ipregion Gemini regions",
+        cancel,
     )?;
     if !gemini_region_supported(&regions, &country_code, &country_name) {
         return Err(format!(
@@ -900,9 +959,11 @@ fn curl_bounded_text_via_socks(
     url: &str,
     max_bytes: u64,
     label: &str,
+    cancel: &AtomicBool,
 ) -> Result<(String, CurlMetrics), String> {
     let response = NamedTempFile::new().map_err(|error| format!("{label} response: {error}"))?;
-    let output = Command::new("curl")
+    let mut command = Command::new("curl");
+    command
         .arg("--socks5-hostname")
         .arg(format!("127.0.0.1:{port}"))
         .arg("-L")
@@ -920,9 +981,14 @@ fn curl_bounded_text_via_socks(
         .arg(response.path())
         .arg("--write-out")
         .arg("%{http_code} %{size_download} %{time_starttransfer} %{time_total}")
-        .arg(url)
-        .output()
-        .map_err(|error| format!("{label} curl: {error}"))?;
+        .arg(url);
+    let output = run_cancellable_command(&mut command, cancel).map_err(|error| {
+        if error == "benchmark cancelled" {
+            error
+        } else {
+            format!("{label} curl: {error}")
+        }
+    })?;
     let metrics = parse_curl_metrics(&output.stdout)?;
     if !output.status.success() || !(200..300).contains(&metrics.http_status) {
         return Err(format!(
@@ -1010,11 +1076,15 @@ fn aggregate_quick_resource_probe(
     }
 }
 
-fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
+fn youtube_playback_attempt(
+    port: u16,
+    cancel: &AtomicBool,
+) -> Result<QuickResourceAttempt, String> {
     let cookie_file = NamedTempFile::new().map_err(|error| format!("YouTube cookies: {error}"))?;
     let watch_file =
         NamedTempFile::new().map_err(|error| format!("YouTube watch page: {error}"))?;
-    let watch = Command::new("curl")
+    let mut watch_command = Command::new("curl");
+    watch_command
         .arg("--socks5-hostname")
         .arg(format!("127.0.0.1:{port}"))
         .arg("-L")
@@ -1034,9 +1104,14 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
         .arg(watch_file.path())
         .arg("--write-out")
         .arg("%{http_code}")
-        .arg(YOUTUBE_WATCH_URL)
-        .output()
-        .map_err(|error| format!("YouTube bootstrap curl: {error}"))?;
+        .arg(YOUTUBE_WATCH_URL);
+    let watch = run_cancellable_command(&mut watch_command, cancel).map_err(|error| {
+        if error == "benchmark cancelled" {
+            error
+        } else {
+            format!("YouTube bootstrap curl: {error}")
+        }
+    })?;
     if !watch.status.success() {
         return Err(format!(
             "YouTube bootstrap rc={}: {}",
@@ -1082,7 +1157,8 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
     })
     .to_string();
     let player_file = NamedTempFile::new().map_err(|error| format!("YouTube player: {error}"))?;
-    let player = Command::new("curl")
+    let mut player_command = Command::new("curl");
+    player_command
         .arg("--socks5-hostname")
         .arg(format!("127.0.0.1:{port}"))
         .arg("--connect-timeout")
@@ -1115,9 +1191,14 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
         .arg(player_file.path())
         .arg("--write-out")
         .arg("%{http_code}")
-        .arg(YOUTUBE_PLAYER_URL)
-        .output()
-        .map_err(|error| format!("YouTube player curl: {error}"))?;
+        .arg(YOUTUBE_PLAYER_URL);
+    let player = run_cancellable_command(&mut player_command, cancel).map_err(|error| {
+        if error == "benchmark cancelled" {
+            error
+        } else {
+            format!("YouTube player curl: {error}")
+        }
+    })?;
     if !player.status.success() {
         return Err(format!(
             "YouTube player rc={}: {}",
@@ -1154,7 +1235,7 @@ fn youtube_playback_attempt(port: u16) -> Result<QuickResourceAttempt, String> {
     }
     let mut errors = Vec::new();
     for media_url in media_urls {
-        match curl_youtube_range(port, media_url, cookie_file.path()) {
+        match curl_youtube_range(port, media_url, cookie_file.path(), cancel) {
             Ok(attempt) => return Ok(attempt),
             Err(error) => errors.push(error),
         }
@@ -1245,10 +1326,12 @@ fn curl_youtube_range(
     port: u16,
     media_url: &str,
     cookie_file: &Path,
+    cancel: &AtomicBool,
 ) -> Result<QuickResourceAttempt, String> {
     let output_file =
         NamedTempFile::new().map_err(|error| format!("temp YouTube media: {error}"))?;
-    let output = Command::new("curl")
+    let mut command = Command::new("curl");
+    command
         .arg("--socks5-hostname")
         .arg(format!("127.0.0.1:{port}"))
         .arg("-L")
@@ -1270,9 +1353,8 @@ fn curl_youtube_range(
         .arg(output_file.path())
         .arg("--write-out")
         .arg("%{http_code} %{size_download} %{time_starttransfer} %{time_total}")
-        .arg(media_url)
-        .output()
-        .map_err(|error| format!("curl spawn: {error}"))?;
+        .arg(media_url);
+    let output = run_cancellable_command(&mut command, cancel)?;
     let metrics = parse_curl_metrics(&output.stdout)?;
     if !output.status.success() || !(200..300).contains(&metrics.http_status) || metrics.bytes == 0
     {
@@ -1503,12 +1585,12 @@ fn run_via_temp_mihomo(
         .map_err(|error| format!("Mihomo spawn ({mihomo_path}): {error}"))?;
     let mut guard = ChildGuard { child: Some(child) };
 
-    wait_until_socks_ready(port, guard.as_mut(), process_log.path())?;
+    wait_until_socks_ready(port, guard.as_mut(), process_log.path(), None)?;
 
     let mut latencies = Vec::new();
     let mut failures = 0usize;
     for _ in 0..PROBE_ATTEMPTS {
-        match curl_probe(port, probe_url, method) {
+        match curl_probe(port, probe_url, method, None) {
             Ok(d) => latencies.push(d),
             Err(_) => failures += 1,
         }
@@ -1577,7 +1659,7 @@ fn run_speed_via_mihomo(
             .map_err(|e| format!("spawn Mihomo at {mihomo_path}: {e}"))?;
         let mut guard = ChildGuard { child: Some(child) };
 
-        wait_until_socks_ready(port, guard.as_mut(), process_log.path())?;
+        wait_until_socks_ready(port, guard.as_mut(), process_log.path(), None)?;
         Ok((port, config_file, process_log, guard))
     };
 
@@ -1661,9 +1743,13 @@ fn wait_until_socks_ready(
     port: u16,
     child: &mut Child,
     process_log_path: &Path,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), String> {
     let started = Instant::now();
     while started.elapsed() < XRAY_READY_TIMEOUT {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err("benchmark cancelled".to_owned());
+        }
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             let process_log_tail = read_tail(process_log_path, 500);
             return Err(format!(
@@ -1689,7 +1775,12 @@ fn wait_until_socks_ready(
     ))
 }
 
-fn curl_probe(port: u16, url: &str, method: BenchMethod) -> Result<Duration, String> {
+fn curl_probe(
+    port: u16,
+    url: &str,
+    method: BenchMethod,
+    cancel: Option<&AtomicBool>,
+) -> Result<Duration, String> {
     if url.trim().is_empty() {
         return Err("probe url is empty".to_owned());
     }
@@ -1710,7 +1801,10 @@ fn curl_probe(port: u16, url: &str, method: BenchMethod) -> Result<Duration, Str
         cmd.arg("--head");
     }
     cmd.arg(url);
-    let output = cmd.output().map_err(|e| format!("curl spawn: {e}"))?;
+    let output = match cancel {
+        Some(cancel) => run_cancellable_command(&mut cmd, cancel)?,
+        None => cmd.output().map_err(|e| format!("curl spawn: {e}"))?,
+    };
     let http_code = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let ok = output.status.success() && http_code.starts_with('2');
     if ok {
@@ -1893,6 +1987,53 @@ fn read_tail(path: &Path, limit: usize) -> String {
     chars[start..].iter().collect()
 }
 
+fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        Err("benchmark cancelled".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn lock_cancellable<'a, T>(
+    mutex: &'a Mutex<T>,
+    cancel: &AtomicBool,
+) -> Result<std::sync::MutexGuard<'a, T>, String> {
+    loop {
+        ensure_not_cancelled(cancel)?;
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                thread::sleep(Duration::from_millis(40));
+            }
+            Err(std::sync::TryLockError::Poisoned(poison)) => return Ok(poison.into_inner()),
+        }
+    }
+}
+
+fn run_cancellable_command(
+    command: &mut Command,
+    cancel: &AtomicBool,
+) -> Result<std::process::Output, String> {
+    ensure_not_cancelled(cancel)?;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("benchmark cancelled".to_owned());
+        }
+        match child.try_wait().map_err(|error| error.to_string())? {
+            Some(_) => return child.wait_with_output().map_err(|error| error.to_string()),
+            None => thread::sleep(Duration::from_millis(40)),
+        }
+    }
+}
+
 /// RAII guard that kills and reaps the temporary Xray child on drop,
 /// even when the benchmark returns early or is cancelled.
 struct ChildGuard {
@@ -1964,12 +2105,13 @@ struct StabilityAggregationInput {
 /// the guard alive for the duration of the tests. Returns `None` if
 /// mihomo cannot be started (config error, port exhaustion, etc.).
 fn spawn_bench_mihomo(profile: &Profile) -> Option<(u16, ChildGuard)> {
-    spawn_bench_mihomo_with_path(profile, "mihomo").ok()
+    spawn_bench_mihomo_with_path(profile, "mihomo", None).ok()
 }
 
 fn spawn_bench_mihomo_with_path(
     profile: &Profile,
     mihomo_path: &str,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(u16, ChildGuard), String> {
     let port = reserve_local_port()?;
     let config_yaml = build_mihomo_bench_config(profile, "127.0.0.1", port)?;
@@ -1985,7 +2127,7 @@ fn spawn_bench_mihomo_with_path(
     let child = spawn_mihomo_with_combined_log(mihomo_path, config_file.path(), &process_log)
         .map_err(|error| format!("Mihomo spawn ({mihomo_path}): {error}"))?;
     let mut guard = ChildGuard { child: Some(child) };
-    wait_until_socks_ready(port, guard.as_mut(), process_log.path())?;
+    wait_until_socks_ready(port, guard.as_mut(), process_log.path(), cancel)?;
     Ok((port, guard))
 }
 
@@ -2022,7 +2164,7 @@ pub fn run_stability_and_unlock(
         if elapsed >= u64::from(observation_secs) {
             break;
         }
-        match curl_probe(port, DEFAULT_PROBE_URL, BenchMethod::Head) {
+        match curl_probe(port, DEFAULT_PROBE_URL, BenchMethod::Head, None) {
             Ok(dur) => latency_samples.push(dur.as_millis().min(u32::MAX as u128) as u32),
             Err(_) => drop_count += 1,
         }
@@ -2064,7 +2206,7 @@ fn warmup_bench_proxy(port: u16, cancel: &AtomicBool) -> bool {
         if cancel.load(Ordering::Relaxed) {
             return false;
         }
-        if curl_probe(port, DEFAULT_PROBE_URL, BenchMethod::Head).is_ok() {
+        if curl_probe(port, DEFAULT_PROBE_URL, BenchMethod::Head, None).is_ok() {
             return true;
         }
         if attempt < 2 {
@@ -2390,6 +2532,7 @@ mod tests {
             group: None,
         };
 
+        let cancel = AtomicBool::new(false);
         let result = benchmark_profile(
             &profile,
             BenchMethod::Quick,
@@ -2400,6 +2543,7 @@ mod tests {
             None,
             true,
             true,
+            &cancel,
         );
 
         assert!(!result.success);
@@ -2622,6 +2766,7 @@ mod tests {
             block_quic: false,
             group: None,
         };
+        let cancel = AtomicBool::new(false);
         let result = benchmark_profile(
             &profile,
             BenchMethod::Head,
@@ -2632,6 +2777,7 @@ mod tests {
             None,
             false,
             false,
+            &cancel,
         );
         assert!(!result.success);
         let err = result.error.expect("error message");
@@ -2654,6 +2800,7 @@ mod tests {
             block_quic: false,
             group: None,
         };
+        let cancel = AtomicBool::new(false);
         let result = benchmark_profile(
             &profile,
             BenchMethod::Tcp,
@@ -2664,10 +2811,32 @@ mod tests {
             None,
             false,
             false,
+            &cancel,
         );
         assert!(!result.success);
         assert!(result.error.is_some());
         assert_eq!(result.profile_id, 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_command_kills_and_reaps_the_owned_child() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = thread::spawn(move || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 5"]);
+            run_cancellable_command(&mut command, &worker_cancel)
+        });
+        thread::sleep(Duration::from_millis(80));
+        let started = Instant::now();
+        cancel.store(true, Ordering::Relaxed);
+        let error = worker
+            .join()
+            .expect("cancellable command worker")
+            .expect_err("command must be cancelled");
+        assert_eq!(error, "benchmark cancelled");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -2685,6 +2854,7 @@ mod tests {
             block_quic: false,
             group: None,
         };
+        let cancel = AtomicBool::new(false);
         let result = benchmark_profile(
             &profile,
             BenchMethod::Tcp,
@@ -2695,6 +2865,7 @@ mod tests {
             None,
             true,
             true,
+            &cancel,
         );
         assert!(result.success, "TCP latency should succeed");
         assert_eq!(result.download_mbps, None);

@@ -157,6 +157,7 @@ pub struct ProfileDetail {
     pub dead: bool,
     pub block_quic: bool,
     pub subscription_managed: bool,
+    pub xhttp_tuning: Option<XhttpTuning>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -172,6 +173,24 @@ pub struct ProfileUpdateRequest {
     pub name: Option<String>,
     pub raw: Option<String>,
     pub block_quic: Option<bool>,
+    pub xhttp_tuning: Option<XhttpTuning>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct XhttpTuning {
+    pub sc_max_each_post_bytes: Option<String>,
+    pub sc_min_posts_interval_ms: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ActiveProfileApplyStatusResponse {
+    pub generation: u64,
+    pub state: String,
+    pub profile_id: Option<usize>,
+    pub profile_name: Option<String>,
+    pub stage: String,
+    pub updated_at_unix: u64,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -586,6 +605,14 @@ pub fn api_endpoint_contracts() -> Vec<ApiEndpointContract> {
             mutates_state: true,
         },
         ApiEndpointContract {
+            method: "GET",
+            path: "/api/active-profile/status",
+            request_schema: None,
+            response_schema: "ActiveProfileApplyStatusResponse",
+            bounded: true,
+            mutates_state: false,
+        },
+        ApiEndpointContract {
             method: "POST",
             path: "/api/profiles/revalidate-ungrouped",
             request_schema: None,
@@ -765,6 +792,8 @@ pub fn openapi_document() -> Value {
         "ProfileDetailResponse": schema_value::<ProfileDetailResponse>(),
         "ProfileUpdateRequest": schema_value::<ProfileUpdateRequest>(),
         "ProfileUpdateResponse": schema_value::<ProfileUpdateResponse>(),
+        "XhttpTuning": schema_value::<XhttpTuning>(),
+        "ActiveProfileApplyStatusResponse": schema_value::<ActiveProfileApplyStatusResponse>(),
         "ProfileSafeFields": schema_value::<ProfileSafeFields>(),
         "ProfileRevalidationError": schema_value::<ProfileRevalidationError>(),
         "ProfilesRevalidateResponse": schema_value::<ProfilesRevalidateResponse>(),

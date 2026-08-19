@@ -118,14 +118,28 @@ test('profiles use the available desktop width and long-operation scanner moves'
   await page.setViewportSize({ width: 800, height: 900 });
   expect(await page.locator('#profilesBody').evaluate(body => getComputedStyle(body).gridTemplateColumns.split(' ').length)).toBeGreaterThan(1);
 
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.evaluate(() => beginLongOperation('/test-operation', 'Тестовая операция'));
-  const scanner = page.locator('#longOperationScanner');
-  const start = await scanner.evaluate(element => element.style.left);
-  await page.waitForTimeout(120);
-  const moved = await scanner.evaluate(element => element.style.left);
-  expect(moved).not.toBe(start);
-  await page.evaluate(() => endLongOperation('/test-operation'));
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  const token = await page.evaluate(() => beginLongOperation('/test-operation', 'Тестовая операция'));
+  await expect(page.locator('#longOperationKitt')).toHaveClass(/running/);
+  expect(await page.locator('#longOperationScanner').evaluate(element =>
+    getComputedStyle(element).animationName
+  )).not.toBe('none');
+  await page.evaluate(token => endLongOperation(token), token);
+});
+
+test('same-path long operations finish independently without a stuck sidebar event', async ({ page }) => {
+  await openFixture(page);
+  const tokens = await page.evaluate(() => [
+    beginLongOperation('/api/routing/apply', 'Первое применение'),
+    beginLongOperation('/api/routing/apply', 'Второе применение'),
+  ]);
+  await expect(page.locator('#longOperationProgress')).toBeVisible();
+  await page.evaluate(token => endLongOperation(token), tokens[0]);
+  await page.waitForTimeout(1000);
+  await expect(page.locator('#longOperationProgress')).toBeVisible();
+  await expect(page.locator('#longOperationLabel')).toHaveText('Второе применение');
+  await page.evaluate(token => endLongOperation(token), tokens[1]);
+  await expect(page.locator('#longOperationProgress')).toBeHidden();
 });
 
 test('persisted concurrency survives reload and group/global tests send four workers', async ({ page }) => {
@@ -693,6 +707,67 @@ test('subscription profile raw is read-only while rename remains available', asy
   });
   await expect(modal).toBeHidden();
   await expect(page.locator('#profilesBody')).toContainText('Fixture Subscription Renamed');
+});
+
+test('manual XHTTP editor exposes reusable tuning without replacing the share-link editor', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await openFixture(page);
+  const modal = page.getByTestId('profile-editor-modal');
+  await page.evaluate(() => openProfileEditor(103));
+  await expect(modal).toBeVisible();
+  await expect(modal.locator('#profileEditorXhttpTuning')).toBeVisible();
+  await expect(modal.locator('#profileEditorScMaxEachPostBytes')).toHaveValue('2048');
+  await modal.locator('#profileEditorScMaxEachPostBytes').fill('4096-4096');
+  await modal.locator('#profileEditorScMinPostsIntervalMs').fill('15-15');
+  const updateRequest = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/profiles/update'
+  );
+  await modal.locator('#profileEditorSave').click();
+  expect((await updateRequest).postDataJSON()).toMatchObject({
+    profile_id: 103,
+    expected_server_ref: 'srv-v2-fixture-xhttp',
+    xhttp_tuning: {
+      sc_max_each_post_bytes: '4096-4096',
+      sc_min_posts_interval_ms: '15-15',
+    },
+  });
+});
+
+test('repeated active-profile clicks create one request and show real daemon stage', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await page.route('**/api/active-profile', async route => {
+    await new Promise(resolve => setTimeout(resolve, 350));
+    await route.continue();
+  });
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  await page.evaluate(() => {
+    const button = document.querySelector('[data-profile-select]');
+    selectActiveProfile(102, 'Fixture Manual', button);
+    selectActiveProfile(102, 'Fixture Manual', button);
+  });
+  await expect(page.locator('#serverSwitchProgress')).toBeVisible();
+  await expect(page.locator('#serverSwitchStage')).toHaveText('Ожидание готовности ядра…');
+  await page.waitForTimeout(500);
+  const requests = await page.request.get('/__fixture/requests').then(response => response.json());
+  expect(requests.requests.filter(request => request.method === 'POST' && request.path === '/api/active-profile')).toHaveLength(1);
+});
+
+test('late active-profile status response cannot resurrect a completed indicator', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  let statusRequests = 0;
+  await page.route('**/api/active-profile/status', async route => {
+    statusRequests += 1;
+    if (statusRequests === 1) await new Promise(resolve => setTimeout(resolve, 700));
+    await route.continue();
+  });
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  await page.locator('[data-profile-select]').first().click();
+  await expect(page.locator('#serverSwitchProgress')).toBeHidden({ timeout: 3000 });
+  await page.waitForTimeout(900);
+  await expect(page.locator('#serverSwitchProgress')).toBeHidden();
+  expect(statusRequests).toBeLessThanOrEqual(2);
 });
 
 test('profile editor sends nothing before detail loads and clears raw on cancel', async ({ page }) => {

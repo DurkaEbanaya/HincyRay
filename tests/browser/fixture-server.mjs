@@ -117,6 +117,13 @@ const initialProfileRaws = new Map([
 const profileDetails = new Map([
   [profile.id, { ...profile, raw: initialProfileRaws.get(profile.id), subscription_managed: true }],
   [manualProfile.id, { ...manualProfile, raw: initialProfileRaws.get(manualProfile.id), subscription_managed: false }],
+  [103, {
+    id: 103, server_ref: 'srv-v2-fixture-xhttp', name: 'Fixture XHTTP', protocol: 'VLESS',
+    transport: 'xhttp', address: 'xhttp.fixture.test', port: 443, active: false, favorite: false,
+    group: null, dead: false, block_quic: false, subscription_managed: false,
+    raw: 'vless://fixture-xhttp@xhttp.fixture.test:443?type=xhttp&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%2C%22scMaxEachPostBytes%22%3A%222048-2048%22%7D#Fixture-XHTTP',
+    xhttp_tuning: { sc_max_each_post_bytes: '2048', sc_min_posts_interval_ms: null },
+  }],
 ]);
 const deadServerRef = 'srv-v2-fixture-dead';
 let mihomoFeatures = {
@@ -323,6 +330,7 @@ const responses = new Map([
   ['/api/auth-settings', { enabled: false, username: 'admin' }],
   ['/api/update/status', { current_version: 'fixture', auto_update_enabled: false }],
   ['/api/bench/status', { running: false, results: [] }],
+  ['/api/active-profile/status', { generation: 1, state: 'running', profile_id: 102, profile_name: 'Fixture Manual', stage: 'waiting-core', updated_at_unix: 1719900000 }],
   ['/api/trash', { count: 1, trash: [{
     server_ref: deadServerRef,
     name: 'Fixture Dead',
@@ -576,7 +584,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/profiles/update') {
-      const allowedKeys = body && Object.keys(body).every(key => ['profile_id', 'expected_server_ref', 'name', 'raw', 'block_quic'].includes(key));
+      const allowedKeys = body && Object.keys(body).every(key => ['profile_id', 'expected_server_ref', 'name', 'raw', 'block_quic', 'xhttp_tuning'].includes(key));
       const detail = profileDetails.get(body?.profile_id);
       if (!allowedKeys || !detail || body.expected_server_ref !== detail.server_ref || JSON.stringify(body).length > 66_000) {
         sendJson(response, 400, { error: 'fixture rejected unbounded or unstable profile update payload' });
