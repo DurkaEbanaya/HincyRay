@@ -9,6 +9,7 @@ const webUi = await readFile(webUiPath);
 const port = Number(process.env.PLAYWRIGHT_FIXTURE_PORT || 4173);
 
 const fixtureSubscriptionUrl = 'https://provider.example/sub/fixture-token';
+const fixtureSecondSubscriptionUrl = 'https://provider.example/sub/second-token';
 const profile = {
   id: 101,
   server_ref: 'srv-v2-fixture-subscription',
@@ -36,6 +37,13 @@ const manualProfile = {
   group: null,
   dead: false,
   block_quic: true,
+};
+const secondSubscriptionProfile = {
+  ...manualProfile,
+  id: 104,
+  server_ref: 'srv-v2-fixture-second-subscription',
+  name: 'Fixture Second Subscription',
+  group: fixtureSecondSubscriptionUrl,
 };
 const profileDiagnosticSecretCanary = 'PROFILE-DIAGNOSTIC-SECRET-CANARY';
 let profileDiagnostic = { active: null, completed: null, statusPolls: 0 };
@@ -302,7 +310,7 @@ const responses = new Map([
     { contract_version: 6, id: 'telegram', name: 'Telegram', attempts: 1, successes: 0, stable: false, avg_ttfb_ms: 240 },
     { contract_version: 6, id: 'ai', name: 'AI Studio', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 180 },
   ] }] }],
-  ['/api/profiles', { profiles: [profile, manualProfile] }],
+  ['/api/profiles', { profiles: [profile, manualProfile, secondSubscriptionProfile] }],
   ['/api/routing', routing],
   ['/api/routing/connection-context', { servers: routing.servers }],
   ['/api/routing/preview', { requires_apply: true, core_restart: true, firewall_reload: true, desired_config_sha256: 'desired', applied_config_sha256: 'applied', changes: ['fixture change'], warnings: [] }],
@@ -314,6 +322,12 @@ const responses = new Map([
     title: 'Fixture VPN',
     announcement: '🍿 Streaming servers\n🎮 Low-latency servers',
     profile_count: 1,
+    last_loaded_unix: 1719900000,
+    last_error: null,
+  }, {
+    url: fixtureSecondSubscriptionUrl,
+    title: 'Fixture Second VPN',
+    profile_count: 0,
     last_loaded_unix: 1719900000,
     last_error: null,
   }] }],
@@ -607,6 +621,14 @@ const server = http.createServer(async (request, response) => {
       const listProfile = body.profile_id === profile.id ? profile : manualProfile;
       listProfile.name = detail.name;
       sendJson(response, 200, { profile: { ...detail, raw: undefined }, dataplane_applied: false });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/subscriptions/move') {
+      if (![fixtureSubscriptionUrl,fixtureSecondSubscriptionUrl].includes(body?.url) || ![fixtureSubscriptionUrl,fixtureSecondSubscriptionUrl].includes(body?.adjacent_url) || !['up','down'].includes(body.direction)) {
+        sendJson(response, 400, { error: 'fixture rejected subscription move' });
+        return;
+      }
+      sendJson(response, 200, { url: body.url, moved: true });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/profiles/revalidate-ungrouped') {

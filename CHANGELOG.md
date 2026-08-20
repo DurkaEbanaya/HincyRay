@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.3.3 - 2026-08-20
+
+### Web UI
+
+- Removed the raw EC API controls from Proxy Status while retaining the bounded proxy, connection, traffic, and memory views.
+- Added persistent subscription-group ordering with arrows on subscription headers. One click moves against the adjacent visible subscription, skipping hidden empty sources, and the pending button prevents duplicate operations.
+- Sidebar benchmark, server-switch, and long-operation indicators now navigate to their owning section.
+- Moved GeoData/GeoBase and the default-collapsed Split Routing controls to the bottom of the Xkeen routing page.
+
+### Diagnostics
+
+- Fixed DNS Diagnostics rendering of the structured TCP DNS listener response and removed the unsupported Mihomo EC `/dns/query` check.
+- YouTube Unlock Check now uses the same bounded Innertube and media-range playback probe as Quick Test instead of `youtube.com/generate_204`.
+
+### Documentation
+
+- Added `docs/android-version-options.md` with the evaluated ClashMetaForAndroid fork strategy, GPLv3 implications, architecture boundary, phases, and risks.
+
 ## v1.3.2 - 2026-08-19
 
 - Restored sidebar scanner movement under `prefers-reduced-motion: reduce`. The accessibility mode keeps a slower 3.4-second scanner cycle while continuing to suppress unrelated decorative animations.

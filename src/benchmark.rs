@@ -832,6 +832,12 @@ fn run_youtube_playback_probe(
     ))
 }
 
+pub(crate) fn probe_youtube_via_socks(port: u16) -> ResourceTestResult {
+    let cancel = AtomicBool::new(false);
+    run_youtube_playback_probe(port, &cancel)
+        .unwrap_or_else(|error| failed_resource_result("youtube", "YouTube", &error))
+}
+
 fn youtube_error_is_transient(error: &str) -> bool {
     let transient_curl = [5, 6, 7, 28, 35, 52, 55, 56].iter().any(|code| {
         error.contains(&format!("rc={code}:")) || error.contains(&format!("rc={code},"))

@@ -1,4 +1,4 @@
-# HincyRay v1.3.2
+# HincyRay v1.3.3
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -42,6 +42,10 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v1.3.3
+
+v1.3.3 streamlines the router Web UI and diagnostics. Subscription groups can be reordered with one-click arrows, sidebar operation indicators navigate to their owning page, secondary routing/GeoBase controls move to the bottom, and raw EC controls are removed from Proxy Status. DNS diagnostics now render the real listener result, while YouTube Unlock Check reuses the native playback probe instead of a misleading `generate_204` request. Details: [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.3.3.md`](docs/releases/v1.3.3.md).
 
 ### v1.3.2
 
@@ -404,7 +408,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.2 release evidence is recorded in [`docs/releases/v1.3.2.md`](docs/releases/v1.3.2.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.3 release evidence is recorded in [`docs/releases/v1.3.3.md`](docs/releases/v1.3.3.md).
 
 ## Installation
 

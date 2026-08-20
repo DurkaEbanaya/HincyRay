@@ -30,7 +30,7 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.2');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.3');
 });
 
 test('profile table shows compact service status and configurable metric columns', async ({ page }) => {
@@ -738,6 +738,80 @@ test('manual XHTTP editor exposes reusable tuning without replacing the share-li
   });
 });
 
+test('subscription arrows persist a bounded group move request', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const group = page.locator('#profilesBody .profile-group-row').filter({ hasText: 'Fixture Second VPN' });
+  const moved = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/subscriptions/move'
+  );
+  await group.getByTitle('Переместить подписку выше').click();
+  expect((await moved).postDataJSON()).toEqual({
+    url: 'https://provider.example/sub/second-token',
+    adjacent_url: 'https://provider.example/sub/fixture-token',
+    direction: 'up',
+  });
+  await expect(page.locator('#profilesBody tr').filter({ hasText:'Fixture Manual' }).getByTitle('Переместить подписку выше')).toHaveCount(0);
+});
+
+test('profile groups follow subscription order instead of profile insertion order', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  const order = await page.locator('#profilesBody .profile-group-row').evaluateAll(rows => rows.map(row => row.textContent));
+  expect(order.findIndex(text => text.includes('Fixture VPN'))).toBeLessThan(order.findIndex(text => text.includes('Fixture Second VPN')));
+  await page.evaluate(() => {
+    MOCK.subscriptions.reverse();
+    renderProfiles(MOCK.profiles);
+  });
+  const reversed = await page.locator('#profilesBody .profile-group-row').evaluateAll(rows => rows.map(row => row.textContent));
+  expect(reversed.findIndex(text => text.includes('Fixture Second VPN'))).toBeLessThan(reversed.findIndex(text => text.includes('Fixture VPN')));
+});
+
+test('sidebar operation navigates to its owning section', async ({ page }) => {
+  await openFixture(page);
+  await page.evaluate(() => beginLongOperation('/api/geobases/sync', 'Обработка GeoBase…'));
+  await page.locator('#longOperationProgress').click();
+  await expect(page.locator('.section-panel[data-section="routing"]')).toHaveClass(/open/);
+});
+
+test('routing keeps GeoBase and collapsed Split Routing at the bottom', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'routing');
+  await expect(page.locator('#splitRoutingSection')).not.toHaveAttribute('open', '');
+  const order = await page.locator('.section-panel[data-section="routing"] .section-body').evaluate(body => {
+    const children = [...body.children];
+    return {
+      geo: children.indexOf(document.querySelector('#geoBaseSection')),
+      split: children.indexOf(document.querySelector('#splitRoutingSection')),
+      total: children.length,
+      geoHasConstructor: document.querySelector('#geoBaseSectionBody')?.contains(document.querySelector('#geobaseConstructor')),
+    };
+  });
+  expect(order.geo).toBe(order.total - 2);
+  expect(order.split).toBe(order.total - 1);
+  expect(order.geoHasConstructor).toBe(true);
+});
+
+test('proxy status omits raw EC controls and DNS diagnostics renders structured listener result', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'ov-proxy');
+  await expect(page.locator('.section-panel[data-section="ov-proxy"]')).not.toContainText('EC API');
+  await page.route('**/api/dns/diagnostics', route => route.fulfill({
+    contentType: 'application/json',
+    body: JSON.stringify({
+      split_routing_enabled: true,
+      dns_listener_port: 1053,
+      local_dns: { ok:true, rcode:0, answers:['93.184.216.34'] },
+      direct_dns: { stdout:'Name: example.com' },
+      proxy_trace_sample: [],
+    }),
+  }));
+  await page.evaluate(() => dnsDiagnostics());
+  await expect(page.locator('#resultModal')).toContainText('93.184.216.34');
+  await expect(page.locator('#resultModal')).not.toContainText('Mihomo API');
+});
+
 test('repeated active-profile clicks create one request and show real daemon stage', async ({ page }) => {
   await page.request.post('/__fixture/reset');
   await page.route('**/api/active-profile', async route => {
@@ -919,7 +993,7 @@ test('Profile Logger starts only the active profile with bounded duration and so
   await navigateTo(page, 'profile-logger');
 
   const options = page.locator('#profileLoggerProfile option');
-  await expect(options).toHaveCount(2);
+  await expect(options).toHaveCount(3);
   await expect(options.nth(0)).toBeEnabled();
   await expect(options.nth(0)).toContainText('Fixture Profile (#101)');
   await expect(options.nth(1)).toBeDisabled();

@@ -55,7 +55,7 @@ REQUIRED_MARKERS = [
     "/api/telegram-probe/request-code",
     "/api/telegram-probe/confirm",
     "/api/telegram-probe/delete",
-    "v1.3.2",
+    "v1.3.3",
     "/api/memory-guard",
     "/api/subscriptions/refresh-report",
     "/api/undo",
@@ -231,7 +231,7 @@ REQUIRED_MARKERS = [
     "deadServerBulk",
     "const DEAD_SERVERS_GROUP_KEY = 'virtual:dead-servers';",
     "const selectedServerRefs = new Set();",
-    "function profileGroupDescriptors(data)",
+    "function profileGroupDescriptors(data, subscriptions",
     "if (profile.dead)",
     "groups.push({key:DEAD_SERVERS_GROUP_KEY",
     "data-server-ref=",
@@ -565,7 +565,7 @@ def verify_dead_server_projection(html_text: str) -> str | None:
     try:
         projection = "\n".join(
             js_function(html_text, name)
-            for name in ("normalizedProfileGroup", "profileGroupDescriptors")
+            for name in ("normalizedProfileGroup", "normalizedSubscriptionUrl", "profileGroupDescriptors")
         )
     except ValueError as error:
         return str(error)

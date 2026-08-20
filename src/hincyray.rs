@@ -38,7 +38,8 @@ use tempfile::NamedTempFile;
 
 use crate::benchmark::{
     BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL,
-    DEFAULT_UPLOAD_URL, QuickProbeConfig, ResourceTestResult, SharedJob, new_bench_job, run_bench,
+    DEFAULT_UPLOAD_URL, QuickProbeConfig, ResourceTestResult, SharedJob, new_bench_job,
+    probe_youtube_via_socks, run_bench,
 };
 use crate::geobase::{
     self, Classification, DomainClassification, GeoBaseArtifactKind, GeoBaseGenerationInput,
@@ -61,7 +62,8 @@ use crate::hincyray_api::{
     ProfileRevalidationError, ProfileSafeFields, ProfileUpdateRequest, ProfileUpdateResponse,
     ProfilesRevalidateResponse, ReadinessCheck, RoutingConnectionContextResponse,
     RoutingPreviewDiff, RoutingPreviewResponse, RoutingServerSummary, RoutingSummaryResponse,
-    SafeModeRequest, SafeModeResponse, XhttpTuning, api_endpoint_contracts, openapi_document,
+    SafeModeRequest, SafeModeResponse, SubscriptionMoveRequest, SubscriptionMoveResponse,
+    XhttpTuning, api_endpoint_contracts, openapi_document,
 };
 use crate::hincyray_mihomo_api::{
     MAX_DIAGNOSTIC_CONNECTIONS_JSON_BYTES, mihomo_api_delay, mihomo_api_delete, mihomo_api_get,
@@ -5298,6 +5300,7 @@ fn dispatch_from(
         }
         ("GET", "/api/subscriptions") => handle_subscriptions_list(daemon),
         ("POST", "/api/subscriptions/delete") => handle_subscriptions_delete(body, daemon),
+        ("POST", "/api/subscriptions/move") => handle_subscription_move(body, daemon),
         ("GET", "/api/undo") => handle_undo_list(daemon),
         ("POST", "/api/undo/restore") => handle_undo_restore(body, daemon),
         ("GET", "/api/routing") => handle_routing_get(daemon),
@@ -8655,6 +8658,78 @@ fn handle_profile_update(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
     json_response(&ProfileUpdateResponse {
         profile: profile_safe_fields(&inner.state, profile),
         dataplane_applied,
+    })
+}
+
+fn handle_subscription_move(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request: SubscriptionMoveRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid subscription move JSON: {error}")),
+    };
+    if !matches!(request.direction.as_str(), "up" | "down") {
+        return json_error(400, "direction must be up or down");
+    }
+    let url = request.url.trim();
+    let adjacent_url = request.adjacent_url.trim();
+    if url.is_empty()
+        || adjacent_url.is_empty()
+        || url == adjacent_url
+        || url.len() > MAX_PROFILE_RAW_BYTES
+        || adjacent_url.len() > MAX_PROFILE_RAW_BYTES
+    {
+        return json_error(400, "subscription url is empty or too long");
+    }
+
+    let mut inner = lock(&daemon.inner);
+    let Some(index) = inner
+        .state
+        .subscriptions
+        .iter()
+        .position(|subscription| subscription.url == url)
+    else {
+        return json_error(404, "subscription not found");
+    };
+    let Some(adjacent) = inner
+        .state
+        .subscriptions
+        .iter()
+        .position(|subscription| subscription.url == adjacent_url)
+    else {
+        return json_error(
+            409,
+            "adjacent subscription changed; reload subscriptions and retry",
+        );
+    };
+    let valid_direction = match request.direction.as_str() {
+        "up" => adjacent < index,
+        "down" => adjacent > index,
+        _ => unreachable!(),
+    };
+    if !valid_direction {
+        return json_error(409, "adjacent subscription order changed; reload and retry");
+    }
+
+    let moved = inner.state.subscriptions.remove(index);
+    let target = inner
+        .state
+        .subscriptions
+        .iter()
+        .position(|subscription| subscription.url == adjacent_url)
+        .expect("validated adjacent subscription remains");
+    let insert_at = if request.direction == "up" {
+        target
+    } else {
+        target + 1
+    };
+    inner.state.subscriptions.insert(insert_at, moved);
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        let moved = inner.state.subscriptions.remove(insert_at);
+        inner.state.subscriptions.insert(index, moved);
+        return json_error(500, &format!("persist subscription order: {error}"));
+    }
+    json_response(&SubscriptionMoveResponse {
+        url: url.to_owned(),
+        moved: true,
     })
 }
 
@@ -16593,13 +16668,14 @@ fn handle_speed_test(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
 }
 
 fn handle_unlock_check(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
-    let (socks_url, core_running) = {
+    let (socks_url, socks_port, core_running) = {
         let mut inner = lock(&daemon.inner);
         (
             format!(
                 "socks5h://{}:{}",
                 inner.state.listen_host, inner.state.socks_port
             ),
+            inner.state.socks_port,
             inner.core.is_running(),
         )
     };
@@ -16645,7 +16721,11 @@ fn handle_unlock_check(body: &str, daemon: &Daemon) -> (u16, &'static str, Strin
             continue;
         }
         let direct = run_unlock_probe(&direct_client, &probe);
-        let proxy = run_unlock_probe(&proxy_client, &probe);
+        let proxy = if probe.id == "youtube" {
+            unlock_probe_from_resource_test(probe_youtube_via_socks(socks_port))
+        } else {
+            run_unlock_probe(&proxy_client, &probe)
+        };
         results.push(json!({
             "id": probe.id,
             "name": probe.name,
@@ -16660,6 +16740,18 @@ fn handle_unlock_check(body: &str, daemon: &Daemon) -> (u16, &'static str, Strin
         "application/json",
         json!({"results": results}).to_string(),
     )
+}
+
+fn unlock_probe_from_resource_test(result: ResourceTestResult) -> Value {
+    json!({
+        "reachable": result.stable,
+        "elapsed_ms": result.avg_ttfb_ms,
+        "attempts": result.attempts,
+        "successes": result.successes,
+        "download_kbps": result.avg_download_kbps,
+        "error": result.error,
+        "method": "youtube-playback",
+    })
 }
 
 struct UnlockProbe {
@@ -18480,25 +18572,17 @@ fn reassign_profile_ids(profiles: &mut [Profile]) {
 }
 
 fn handle_dns_diagnostics(daemon: &Daemon) -> (u16, &'static str, String) {
-    let (split_enabled, dns_port, ec, socks_port, core_running) = {
+    let (split_enabled, dns_port, socks_port, core_running) = {
         let mut inner = lock(&daemon.inner);
         (
             inner.state.split_routing.enabled,
             1053u16,
-            daemon_mihomo_controller(daemon, &inner.state.mihomo_features),
             inner.state.socks_port,
             inner.core.is_running(),
         )
     };
     let local_dns = dns_query_tcp("127.0.0.1", dns_port, "example.com");
     let direct_dns = run_nslookup("example.com", None);
-    let mihomo_query = ec.as_ref().map(|(addr, secret)| {
-        mihomo_api_get_json(
-            addr,
-            secret.as_deref(),
-            "/dns/query?name=example.com&type=A",
-        )
-    });
     let proxy_trace = if core_running {
         Command::new("curl")
             .args([
@@ -18523,11 +18607,6 @@ fn handle_dns_diagnostics(daemon: &Daemon) -> (u16, &'static str, String) {
             "dns_listener_port": dns_port,
             "local_dns": local_dns,
             "direct_dns": direct_dns,
-            "mihomo_dns_query": match mihomo_query {
-                Some(Ok(v)) => json!({"ok": true, "response": v}),
-                Some(Err(e)) => json!({"ok": false, "error": e}),
-                None => json!({"ok": false, "error": "external controller disabled"}),
-            },
             "proxy_trace_sample": proxy_trace.lines().take(12).collect::<Vec<_>>(),
         })
         .to_string(),
@@ -18535,12 +18614,11 @@ fn handle_dns_diagnostics(daemon: &Daemon) -> (u16, &'static str, String) {
 }
 
 fn handle_dns_diagnostics_v2(daemon: &Daemon) -> (u16, &'static str, String) {
-    let (split_enabled, dns_port, ec, core_running, remote_servers, local_servers) = {
+    let (split_enabled, dns_port, core_running, remote_servers, local_servers) = {
         let mut inner = lock(&daemon.inner);
         (
             inner.state.split_routing.enabled,
             1053u16,
-            daemon_mihomo_controller(daemon, &inner.state.mihomo_features),
             inner.core.is_running(),
             inner.state.dns_settings.remote_servers.clone(),
             inner.state.dns_settings.local_servers.clone(),
@@ -18548,13 +18626,6 @@ fn handle_dns_diagnostics_v2(daemon: &Daemon) -> (u16, &'static str, String) {
     };
     let local_tcp = dns_query_tcp("127.0.0.1", dns_port, "example.com");
     let local_google = dns_query_tcp("127.0.0.1", dns_port, "google.com");
-    let mihomo_query = ec.as_ref().map(|(addr, secret)| {
-        mihomo_api_get_json(
-            addr,
-            secret.as_deref(),
-            "/dns/query?name=example.com&type=A",
-        )
-    });
     let verdict_ok = local_tcp
         .get("ok")
         .and_then(Value::as_bool)
@@ -18569,11 +18640,6 @@ fn handle_dns_diagnostics_v2(daemon: &Daemon) -> (u16, &'static str, String) {
             "core_running": core_running,
             "dns_listener": {"host": "127.0.0.1", "port": dns_port, "tcp_example": local_tcp, "tcp_google": local_google},
             "configured_servers": {"remote": remote_servers, "local": local_servers},
-            "mihomo_dns_query": match mihomo_query {
-                Some(Ok(v)) => json!({"ok": true, "response": v}),
-                Some(Err(e)) => json!({"ok": false, "error": e}),
-                None => json!({"ok": false, "error": "external controller disabled"}),
-            },
             "hints": [
                 "DNS is always enabled in router mode because firewall DNATs DNS to 127.0.0.1:1053",
                 "If local TCP DNS fails, validate Mihomo config and core logs before changing rules"
@@ -24608,6 +24674,101 @@ mod tests {
 
         let inner = lock(&daemon.inner);
         assert_eq!(inner.state.profiles[0].name, "NewName");
+    }
+
+    #[test]
+    fn subscription_move_swaps_only_subscription_order() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.subscriptions = vec![
+                StoredSubscription {
+                    url: "https://provider.example/sub/a".to_owned(),
+                    ..Default::default()
+                },
+                StoredSubscription {
+                    url: "https://provider.example/sub/b".to_owned(),
+                    ..Default::default()
+                },
+                StoredSubscription {
+                    url: "https://provider.example/sub/c".to_owned(),
+                    ..Default::default()
+                },
+            ];
+        }
+        let request = json!({
+            "url": "https://provider.example/sub/b",
+            "adjacent_url": "https://provider.example/sub/a",
+            "direction": "up"
+        });
+        let (status, _, response) = handle_subscription_move(&request.to_string(), &daemon);
+        assert_eq!(status, 200, "{response}");
+        let response: Value = serde_json::from_str(&response).expect("move response");
+        assert_eq!(response["moved"], true);
+        let inner = lock(&daemon.inner);
+        assert_eq!(
+            inner
+                .state
+                .subscriptions
+                .iter()
+                .map(|subscription| subscription.url.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://provider.example/sub/b",
+                "https://provider.example/sub/a",
+                "https://provider.example/sub/c"
+            ]
+        );
+    }
+
+    #[test]
+    fn subscription_move_reports_boundaries_and_missing_source() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.subscriptions = vec![StoredSubscription {
+                url: "https://provider.example/sub/a".to_owned(),
+                ..Default::default()
+            }];
+        }
+        let boundary = json!({
+            "url": "https://provider.example/sub/a",
+            "adjacent_url": "https://provider.example/sub/missing",
+            "direction": "down"
+        });
+        assert_eq!(
+            handle_subscription_move(&boundary.to_string(), &daemon).0,
+            409
+        );
+        let missing = json!({
+            "url": "https://provider.example/sub/missing",
+            "adjacent_url": "https://provider.example/sub/a",
+            "direction": "up"
+        });
+        assert_eq!(
+            handle_subscription_move(&missing.to_string(), &daemon).0,
+            404
+        );
+    }
+
+    #[test]
+    fn youtube_unlock_result_uses_native_playback_contract() {
+        let value = unlock_probe_from_resource_test(ResourceTestResult {
+            contract_version: 6,
+            id: "youtube".to_owned(),
+            name: "YouTube".to_owned(),
+            attempts: 2,
+            successes: 1,
+            reachable: true,
+            stable: true,
+            avg_ttfb_ms: 123,
+            max_ttfb_ms: 160,
+            avg_download_kbps: 1024.0,
+            error: None,
+        });
+        assert_eq!(value["reachable"], true);
+        assert_eq!(value["method"], "youtube-playback");
+        assert_eq!(value["attempts"], 2);
     }
 
     #[test]

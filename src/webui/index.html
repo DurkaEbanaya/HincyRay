@@ -859,6 +859,7 @@ body::before{opacity:.58;background:radial-gradient(520px 420px at 40px 70px,col
 input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--accent)!important;outline-offset:1px}.brightness-slider:focus-visible,.acrylic-control input[type="range"]:focus-visible{outline:2px solid var(--accent)!important;outline-offset:4px;box-shadow:none!important}
 .btn.is-pending{cursor:progress;opacity:.72}.btn.is-pending::after{content:'';width:12px;height:12px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:v2-spin .7s linear infinite}.btn.is-pending>*{visibility:hidden}.btn:disabled{filter:saturate(.35)}
 .data-source-state{display:none;margin-left:auto;padding:3px 7px;border:1px solid var(--border);font:10px/1.3 var(--font-mono);letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}.data-source-state.show{display:inline-flex}.data-source-state.live{color:var(--success)}
+.sidebar-operation{cursor:pointer}.sidebar-operation:hover{background:var(--accent-soft)}.routing-disclosure{margin-top:18px}.routing-disclosure>summary{cursor:pointer;font-weight:600}.routing-disclosure-body{margin-top:14px}
 .msg-bar{min-height:40px;border-bottom:1px solid color-mix(in srgb,currentColor 24%,transparent)}.msg-bar::before{content:'i';display:grid;place-items:center;width:17px;height:17px;border:1px solid currentColor;font:600 11px var(--font-mono)}.msg-bar.error::before{content:'!'} .msg-bar.success::before{content:'✓'}
 .tbl td[colspan],.routing-visual-table td[colspan]{padding:34px 16px!important;text-align:center;color:var(--muted);background:var(--bg)}.state-empty{display:grid;place-items:center;min-height:120px;padding:24px;text-align:center;color:var(--muted);border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
 .skeleton{position:relative;overflow:hidden;border-radius:0}.skeleton::after{content:'';position:absolute;inset:0;background:linear-gradient(90deg,transparent,color-mix(in srgb,var(--surface) 60%,transparent),transparent);transform:translateX(-100%);animation:v2-shimmer 1.3s ease-in-out 3}
@@ -985,7 +986,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   <nav class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="sidebar-brand" style="border-radius: 0px;">
       <svg class="brand-icon" viewBox="0 0 1024 1024" role="img" aria-label="HincyRay"><defs><radialGradient id="brand-bg" cx="50%" cy="46%" r="62%"><stop stop-color="#172b3d"/><stop offset=".55" stop-color="#0b1018"/><stop offset="1" stop-color="#05070b"/></radialGradient><linearGradient id="brand-phone" x1="250" y1="100" x2="760" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#3b424d"/><stop offset=".45" stop-color="#151a21"/><stop offset="1" stop-color="#050608"/></linearGradient><linearGradient id="brand-screen" x1="310" y1="150" x2="690" y2="850" gradientUnits="userSpaceOnUse"><stop stop-color="#1f3146"/><stop offset="1" stop-color="#070a0f"/></linearGradient></defs><rect width="1024" height="1024" rx="220" fill="url(#brand-bg)"/><path d="M130 740 40 820M190 820 95 930M845 170l115-92M820 790l130 92M93 276l112 52" stroke="#0078d7" stroke-width="18" stroke-linecap="round" opacity=".65"/><g transform="rotate(-8 512 512)"><rect x="290" y="92" width="444" height="840" rx="78" fill="url(#brand-phone)" stroke="#737b87" stroke-width="14"/><rect x="328" y="138" width="368" height="748" rx="48" fill="url(#brand-screen)" stroke="#0e1620" stroke-width="10"/><circle cx="512" cy="176" r="16" fill="#080b10" stroke="#4d5663" stroke-width="5"/><path d="M510 132 455 292l68-30-42 172 106-238-72 34z" fill="#f4d03f" stroke="#fff2a4" stroke-width="8"/><path d="M496 432 365 536l112 8-74 204 214-260-102 14 75-134z" fill="#ff453a" stroke="#ffb2ab" stroke-width="9"/><path d="M520 398 660 496l-92 22 70 188-198-238 92 18z" fill="#60cdff" stroke="#b8efff" stroke-width="8"/><path d="M445 308 340 248M444 309l-96 102M521 264l118-98M514 436l-160 44M514 437l120 152M477 546l-112 188M566 515l104 166" stroke="#d8e6f3" stroke-width="10" stroke-linecap="round" opacity=".8"/><path d="M336 610 238 660l87 36-142 98 238-62-62-42 98-38zM664 300l150-50-72 102 160 10-228 68 38-78z" fill="#1f8fff" opacity=".88"/><text x="512" y="760" text-anchor="middle" font-family="Arial Black,Arial,sans-serif" font-size="76" fill="#f2f6fb" stroke="#05070b" stroke-width="7" paint-order="stroke">POCO</text></g></svg>
-      <div><div class="logo">HincyRay</div><div class="version">v1.3.2</div></div>
+      <div><div class="logo">HincyRay</div><div class="version">v1.3.3</div></div>
     </div>
     <div class="brightness-row">
       <svg class="brightness-icon" onclick="toggleTheme()" title="Переключить тему" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9L14 6M5.9 14l-1.1 1.1"></path></svg>
@@ -1366,6 +1367,9 @@ https://sub.example.com/…"></textarea>
           <svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg>
         </div>
         <div class="section-body">
+          <details id="splitRoutingSection" class="feature-card routing-disclosure">
+            <summary>Split Routing / Прозрачный прокси</summary>
+            <div class="routing-disclosure-body">
           <div class="form-row">
             <label class="toggle"><input type="checkbox" id="splitEnabled"><span class="slider"></span></label>
             <span style="font-weight:500">Split Routing / Прозрачный прокси</span>
@@ -1392,7 +1396,9 @@ https://sub.example.com/…"></textarea>
             <button class="btn" onclick="showRoutingPreview()">Предпросмотр изменений</button>
             <button class="btn btn-danger" onclick="resetRoutingDefaults()">↺ Штатные настройки</button>
           </div>
-          <div class="feature-card" style="margin-bottom:16px">
+            </div>
+          </details>
+          <div class="feature-card" id="geoAssetsCard" style="margin-bottom:16px">
             <h4>Геобаза</h4>
             <div class="form-row">
               <div class="form-group"><label>Поставщик</label><select id="geoProvider"><option value="metacubex-lite">MetaCubeX meta-rules-dat</option></select></div>
@@ -1534,6 +1540,11 @@ https://sub.example.com/…"></textarea>
             <button class="btn btn-accent" onclick="apiAction('POST','/api/routing/firewall-start',null,t('Файрвол запущен'),refreshDashboard)">Запустить файрвол</button>
             <button class="btn btn-danger" onclick="confirmCmd(t('Остановить файрвол?'),'/api/routing/firewall-stop')">Остановить</button>
           </div>
+          <details id="geoBaseSection" class="feature-card routing-disclosure">
+            <summary>GeoData и GeoBase</summary>
+            <div id="geoBaseSectionBody" class="routing-disclosure-body"></div>
+          </details>
+          <div id="splitRoutingSectionTarget"></div>
         </div>
       </section>
 
@@ -1708,17 +1719,6 @@ https://sub.example.com/…"></textarea>
             <thead><tr><th>Хост</th><th>Source IP</th><th>Сеть</th><th>Цепочка</th><th>Правило</th><th>↑</th><th>↓</th></tr></thead>
             <tbody id="activeConnsBody"></tbody>
           </table>
-          <h3 style="font-size:var(--fs-h3);margin:20px 0 8px">EC API</h3>
-          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
-            <button class="btn btn-sm" onclick="showEcRaw('version')">version</button>
-            <button class="btn btn-sm" onclick="showEcRaw('configs')">configs</button>
-            <button class="btn btn-sm" onclick="showEcRaw('configs/geo')">configs/geo</button>
-            <button class="btn btn-sm" onclick="showEcRaw('rules')">rules</button>
-            <button class="btn btn-sm" onclick="showEcRaw('providers/proxies')">providers/proxies</button>
-            <button class="btn btn-sm" onclick="showEcRaw('providers/rules')">providers/rules</button>
-            <button class="btn btn-sm btn-danger" onclick="disableMihomoRules()">Disable rules</button>
-          </div>
-          <div id="ecApiResult" class="log-viewer" style="display:none;margin-top:8px"></div>
         </div>
       </section>
 
@@ -2508,6 +2508,20 @@ const LONG_OPERATIONS = [
   [/^\/api\/mihomo-config\/validate$/, 'Проверка конфигурации…'],
   [/^\/api\/substore-lite\/apply$/, 'Применение Sub-Store…'],
 ];
+function operationSection(path) {
+  if (/^\/api\/(subscriptions|profiles)/.test(path)) return 'profiles';
+  if (/^\/api\/(routing|routing-presets|geobases|geo)/.test(path)) return 'routing';
+  if (/^\/api\/(dns|diagnostics\/dns|unlock-check)/.test(path)) return path.includes('unlock') ? 'unlock' : 'diag-network';
+  if (/^\/api\/deep-bench/.test(path)) return 'deep-bench';
+  if (/^\/api\/mihomo-api/.test(path)) return 'ov-proxy';
+  if (/^\/api\/(core|update|mihomo-config)/.test(path)) return path.includes('update') ? 'update' : 'config';
+  if (/^\/api\/backups/.test(path)) return 'backups';
+  return 'ov-system';
+}
+function openOperationSection(element) {
+  const section = element?.dataset?.operationSection;
+  if (section) navTo(section);
+}
 const activeLongOperations = new Map();
 let longOperationHideTimer = null;
 let longOperationSequence = 0;
@@ -2522,6 +2536,8 @@ function beginLongOperation(path, label) {
   const box = document.getElementById('longOperationProgress');
   const text = document.getElementById('longOperationLabel');
   if (box) box.style.display = 'block';
+  if (box) box.dataset.operationSection = operationSection(path);
+  if (box) box.onclick = () => openOperationSection(box);
   if (text) text.textContent = t(label);
   setLongOperationBeamRunning(true);
   return token;
@@ -2671,7 +2687,8 @@ function checkUnlock(svc) {
       const cell = probe => {
         const ok = probe && probe.reachable;
         const badge = `<span class="result-badge ${ok?'ok':'bad'}">${ok?t('Доступен'):t('Заблокирован')}</span>`;
-        const meta = probe ? `HTTP ${probe.http_status ?? '—'} · ${probe.elapsed_ms ?? '—'} ms${probe.error ? '<br><span style="color:var(--danger)">'+probe.error+'</span>' : ''}` : '—';
+        const method = probe?.method === 'youtube-playback' ? t('Проверка воспроизведения') : `HTTP ${probe?.http_status ?? '—'}`;
+        const meta = probe ? `${method} · ${probe.elapsed_ms ?? '—'} ms${probe.download_kbps ? ` · ${Number(probe.download_kbps).toFixed(0)} Kbps` : ''}${probe.error ? '<br><span style="color:var(--danger)">'+htmlEscape(probe.error)+'</span>' : ''}` : '—';
         return `${badge}<br><span class="mono" style="font-size:11px;color:var(--muted)">${meta}</span>`;
       };
       return `<tr><td>${item.name || item.id}</td><td>${cell(item.direct)}</td><td>${cell(item.proxy)}</td></tr>`;
@@ -3105,6 +3122,20 @@ function navTo(section) {
   if (section === 'features') loadFeatures();
 }
 
+function arrangeRoutingSecondarySections() {
+  const geoBody = document.getElementById('geoBaseSectionBody');
+  const geoSection = document.getElementById('geoBaseSection');
+  const geoAssets = document.getElementById('geoAssetsCard');
+  const constructor = document.getElementById('geobaseConstructor');
+  if (geoBody && geoAssets && geoAssets.parentElement !== geoBody) geoBody.appendChild(geoAssets);
+  if (geoBody && constructor && constructor.parentElement !== geoBody) geoBody.appendChild(constructor);
+  const splitTarget = document.getElementById('splitRoutingSectionTarget');
+  const split = document.getElementById('splitRoutingSection');
+  if (splitTarget && geoSection && geoSection.nextElementSibling !== splitTarget) splitTarget.before(geoSection);
+  if (splitTarget && split && splitTarget.nextElementSibling !== split) splitTarget.after(split);
+  splitTarget?.remove();
+}
+
 function globalSearch(query) {
   const box = document.getElementById('globalSearchResults');
   if (!box) return;
@@ -3423,6 +3454,8 @@ const I18N = {
   'Размер uplink-блока, bytes/range':'Uplink block size, bytes/range','Интервал отправки, ms/range':'Send interval, ms/range','Например: 4096-4096 и 15-15. Пустое поле удаляет override.':'Example: 4096-4096 and 15-15. An empty field removes the override.',
   'Смена сервера':'Switching server','Переключение сервера…':'Switching server…','Подготовка переключения…':'Preparing switch…','Генерация конфигурации…':'Generating configuration…','Проверка конфигурации…':'Validating configuration…','Запись конфигурации…':'Writing configuration…','Применение в ядре…':'Applying to core…','Ожидание готовности ядра…':'Waiting for core readiness…','Сохранение состояния…':'Saving state…','Закрытие старых соединений…':'Closing old connections…','Откат после ошибки…':'Rolling back after error…','Сервер выбран':'Server selected','Переключение не выполнено':'Switch failed','Останавливается…':'Stopping…','Остановка запрошена':'Stop requested',
   'Превышено время ожидания ответа роутера':'Router response timed out',
+  'Переместить подписку выше':'Move subscription up','Переместить подписку ниже':'Move subscription down','Подписка уже находится на границе списка':'Subscription is already at the list boundary',
+  'Проверка воспроизведения':'Playback probe',
   'Проверить локальные профили':'Revalidate local profiles','Повторно разобрать локально сохранённые share-ссылки профилей без группы. Подписки и сеть не используются.':'Reparse locally stored share links for ungrouped profiles. No subscription or network fetch is performed.','Локальная проверка профилей…':'Revalidating local profiles…','Локальная проверка завершена':'Local revalidation complete','проверено':'checked','обновлено':'updated','без изменений':'unchanged','ошибок':'errors','Локальная проверка не изменила профили':'Local revalidation did not change profiles','Обновить эту подписку из источника':'Refresh this subscription from its source',
   'Geo asset path':'Geo asset path','Обновить каталог':'Refresh catalog','Добавить правило':'Add rule','Быстрая строка':'Quick row','Домены':'Domains','IPs':'IPs','Порты':'Ports','Популярные сервисы':'Popular services',  'Редактировать':'Edit','Удалить':'Delete','Правила сохранены':'Rules saved','Отмена':'Cancel','Редактировать правило':'Edit rule','Сохранить':'Save',
   'Активные соединения (max 50)':'Active connections (max 50)','Disable rules':'Disable rules','Auto-refresh subscriptions':'Auto-refresh subscriptions','Auto-refresh interval (ч)':'Auto-refresh interval (h)',
@@ -3529,7 +3562,7 @@ const I18N = {
   '204 или 200-299':'204 or 200-299','ч':'h',
   '1д 0ч 0м':'1d 0h 0m','Cortex-A76 · 4 ядра':'Cortex-A76 · 4 cores',
   'Остановить ядро?':'Stop core?','Остановить файрвол?':'Stop firewall?','Обновить Mihomo?':'Update Mihomo?',
-  'Удалить профиль':'Delete profile','Удалить подписку?':'Delete subscription?','Отключить правила Mihomo через EC API?':'Disable Mihomo rules via EC API?',
+  'Удалить профиль':'Delete profile','Удалить подписку?':'Delete subscription?',
   'Всё через VPN':'All through VPN','Всё напрямую':'All direct','MATCH цель изменена':'MATCH target changed',
   'только эти':'only these','кроме этих':'except these','Режим портов':'Port mode',
   'Геобаза':'Geo database','Загрузка геобазы…':'Downloading geo database…','Геобаза обновлена':'Geo database updated',
@@ -4041,7 +4074,7 @@ function normalizedSubscriptionUrl(value) {
   }
 }
 
-function profileGroupDescriptors(data) {
+function profileGroupDescriptors(data, subscriptions = (typeof MOCK === 'undefined' ? [] : MOCK.subscriptions)) {
   const sourceGroups = new Map();
   const deadItems = [];
   data.forEach(profile => {
@@ -4054,7 +4087,17 @@ function profileGroupDescriptors(data) {
     if (!sourceGroups.has(key)) sourceGroups.set(key, {key, source, dead:false, items:[]});
     sourceGroups.get(key).items.push(profile);
   });
-  const groups = [...sourceGroups.values()];
+  const subscriptionOrder = new Map((subscriptions || []).map((subscription,index) => [
+    normalizedSubscriptionUrl(subscription.url), index,
+  ]));
+  const groups = [...sourceGroups.values()].sort((left,right) => {
+    const leftOrder = subscriptionOrder.get(normalizedSubscriptionUrl(left.source));
+    const rightOrder = subscriptionOrder.get(normalizedSubscriptionUrl(right.source));
+    if (leftOrder == null && rightOrder == null) return 0;
+    if (leftOrder == null) return -1;
+    if (rightOrder == null) return 1;
+    return leftOrder - rightOrder;
+  });
   if (deadItems.length) groups.push({key:DEAD_SERVERS_GROUP_KEY, source:null, dead:true, items:deadItems});
   return groups;
 }
@@ -4125,7 +4168,7 @@ function restoreSelectedDeadServers() {
   return restoreDeadServers(selectedProfiles().filter(profile => profile.dead).map(profile => profile.server_ref)).catch(() => {});
 }
 
-function renderProfileGroup(descriptor) {
+function renderProfileGroup(descriptor, index, descriptors) {
   const {key, source, dead, items} = descriptor;
   const groupAttr = attrEscape(key);
   const groupJs = jsStringAttr(key);
@@ -4140,7 +4183,12 @@ function renderProfileGroup(descriptor) {
   const groupBenchTitleRu = sub ? 'Quick Test подписки, до настроенного числа серверов параллельно' : 'Quick Test группы, до настроенного числа серверов параллельно';
   const groupBenchTitleEn = sub ? 'Quick Test subscription, up to the configured parallel count' : 'Quick Test group, up to the configured parallel count';
   const groupBenchTitle = t(groupBenchTitleRu);
-  const groupActions = dead ? '' : `<button class="btn btn-sm" data-bench-scope="group" data-title-ru="${attrEscape(groupBenchTitleRu)}" data-title-en="${attrEscape(groupBenchTitleEn)}" onclick="${benchmarkAction}" title="${attrEscape(groupBenchTitle)}">⚡</button>
+  const previous = sub ? descriptors.slice(0,index).reverse().find(group => subscriptionForGroup(group.source)) : null;
+  const next = sub ? descriptors.slice(index+1).find(group => subscriptionForGroup(group.source)) : null;
+  const previousUrl = previous ? subscriptionForGroup(previous.source)?.url : null;
+  const nextUrl = next ? subscriptionForGroup(next.source)?.url : null;
+  const subscriptionOrder = sub ? `<button class="btn-icon btn-sm" ${previousUrl?'': 'disabled'} onclick="moveSubscription(${jsStringAttr(sub.url)},${jsStringAttr(previousUrl || '')},'up',this)" title="${attrEscape(t('Переместить подписку выше'))}">↑</button><button class="btn-icon btn-sm" ${nextUrl?'': 'disabled'} onclick="moveSubscription(${jsStringAttr(sub.url)},${jsStringAttr(nextUrl || '')},'down',this)" title="${attrEscape(t('Переместить подписку ниже'))}">↓</button>` : '';
+  const groupActions = dead ? '' : `${subscriptionOrder}<button class="btn btn-sm" data-bench-scope="group" data-title-ru="${attrEscape(groupBenchTitleRu)}" data-title-en="${attrEscape(groupBenchTitleEn)}" onclick="${benchmarkAction}" title="${attrEscape(groupBenchTitle)}">⚡</button>
     ${subRefresh}
     ${localRevalidate}
     <button class="btn btn-sm" onclick="shareProfileGroup(${jsStringAttr(source || t('Без группы'))})">⤴ ${t('Поделиться / QR')}</button>
@@ -4179,7 +4227,8 @@ function renderProfiles(data) {
   const body = document.getElementById('profilesBody');
   if (!body) return;
   const sorted = applyProfileSort(data);
-  body.innerHTML = profileGroupDescriptors(sorted).map(renderProfileGroup).join('');
+  const descriptors = profileGroupDescriptors(sorted);
+  body.innerHTML = descriptors.map((descriptor,index) => renderProfileGroup(descriptor,index,descriptors)).join('');
   // Update count badge
   const badge = document.getElementById('profileCountBadge');
   if (badge) badge.textContent = data.length;
@@ -4189,6 +4238,15 @@ function renderProfiles(data) {
   syncProfileMetricSettings();
   updateDeadServerBulkBar();
   renderFavorites(MOCK.profiles);
+}
+
+function moveSubscription(url, adjacentUrl, direction, button) {
+  if (!adjacentUrl || button?.disabled) return;
+  setButtonPending(button,true);
+  return api('POST','/api/subscriptions/move',{url,adjacent_url:adjacentUrl,direction}).then(result => {
+    if (!result.moved) showToast('info',t('Подписка уже находится на границе списка'));
+    return Promise.all([loadSubscriptions(),loadProfiles()]);
+  }).catch(()=>{}).finally(() => setButtonPending(button,false));
 }
 
 function updateSortArrows() {
@@ -5747,17 +5805,6 @@ function explainConnectionResource(button) {
     showResultModal(`${t('Почему этот маршрут')}: ${resource}`, fmtJsonBlock(result));
   }).catch(()=>{});
 }
-function showEcRaw(endpoint) {
-  const out = document.getElementById('ecApiResult');
-  if (out) { out.style.display='block'; out.textContent = t('Загрузка…'); }
-  api('GET','/api/mihomo-api/' + endpoint).then(d => {
-    if (out) out.textContent = typeof d === 'string' ? d : JSON.stringify(d, null, 2);
-  }).catch(e => { if (out) out.textContent = e.message || String(e); });
-}
-function disableMihomoRules() {
-  confirmCmd(t('Отключить правила Mihomo через EC API?'), '/api/mihomo-api/rules/disable');
-}
-
 // ─── CONNECTION LOG ──────────────────────────────────────────────────
 function renderConnLog(data) {
   const body = document.getElementById('connLogBody');
@@ -6039,13 +6086,12 @@ function dnsLeakTest() {
 function dnsDiagnostics() {
   showToast('info',t('Диагностика выполняется…'));
   api('GET','/api/dns/diagnostics').then(d=>{
-    const fmtNs = n => n
-      ? `<div class="result-pre">${(n.stdout||'')+(n.stderr?'\n\n[stderr]\n'+n.stderr:'')||t('пустой ответ')}</div>`
-      : '<span class="result-badge bad">недоступно</span>';
-    const mq = d.mihomo_dns_query;
-    const mqHtml = mq.ok
-      ? `<div class="result-pre">${JSON.stringify(mq.response,null,2)}</div>`
-      : `<span class="result-badge bad">${mq.error||'ошибка'}</span>`;
+    const fmtNs = n => {
+      if (!n) return '<span class="result-badge bad">недоступно</span>';
+      if (Object.prototype.hasOwnProperty.call(n,'ok')) return fmtJsonBlock(n);
+      const text = (n.stdout||'')+(n.stderr?'\n\n[stderr]\n'+n.stderr:'');
+      return `<div class="result-pre">${htmlEscape(text||t('пустой ответ'))}</div>`;
+    };
     const rows = [
       ['Split routing', d.split_routing_enabled?'включён':'выключен'],
       ['Порт DNS-листенера', d.dns_listener_port],
@@ -6053,7 +6099,6 @@ function dnsDiagnostics() {
     let html = `<table class="result-table">${rows.map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('')}</table>`;
     html += `<h4 style="margin:14px 0 4px;font-size:14px">${t('DNS через Mihomo (127.0.0.1:1053)')}</h4>${fmtNs(d.local_dns)}`;
     html += `<h4 style="margin:14px 0 4px;font-size:14px">${t('DNS прямой (системный)')}</h4>${fmtNs(d.direct_dns)}`;
-    html += `<h4 style="margin:14px 0 4px;font-size:14px">${t('DNS-запрос через Mihomo API')}</h4>${mqHtml}`;
     if (d.proxy_trace_sample && d.proxy_trace_sample.length) {
       html += `<h4 style="margin:14px 0 4px;font-size:14px">${t('Trace через прокси (Cloudflare)')}</h4>`;
       html += `<div class="result-pre">${d.proxy_trace_sample.join('\n')}</div>`;
@@ -7226,6 +7271,7 @@ function startAutoRefreshLoops() {
 }
 
 function init() {
+  arrangeRoutingSecondarySections();
   // Delegation keeps Reveal and press feedback working for controls rendered
   // later by API responses. No decorative child is inserted into the control,
   // so native/inline click handlers keep their original event targets.

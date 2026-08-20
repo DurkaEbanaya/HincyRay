@@ -199,6 +199,20 @@ pub struct ProfileUpdateResponse {
     pub dataplane_applied: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionMoveRequest {
+    pub url: String,
+    pub adjacent_url: String,
+    pub direction: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct SubscriptionMoveResponse {
+    pub url: String,
+    pub moved: bool,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ProfileSafeFields {
     pub id: usize,
@@ -605,6 +619,14 @@ pub fn api_endpoint_contracts() -> Vec<ApiEndpointContract> {
             mutates_state: true,
         },
         ApiEndpointContract {
+            method: "POST",
+            path: "/api/subscriptions/move",
+            request_schema: Some("SubscriptionMoveRequest"),
+            response_schema: "SubscriptionMoveResponse",
+            bounded: true,
+            mutates_state: true,
+        },
+        ApiEndpointContract {
             method: "GET",
             path: "/api/active-profile/status",
             request_schema: None,
@@ -792,6 +814,8 @@ pub fn openapi_document() -> Value {
         "ProfileDetailResponse": schema_value::<ProfileDetailResponse>(),
         "ProfileUpdateRequest": schema_value::<ProfileUpdateRequest>(),
         "ProfileUpdateResponse": schema_value::<ProfileUpdateResponse>(),
+        "SubscriptionMoveRequest": schema_value::<SubscriptionMoveRequest>(),
+        "SubscriptionMoveResponse": schema_value::<SubscriptionMoveResponse>(),
         "XhttpTuning": schema_value::<XhttpTuning>(),
         "ActiveProfileApplyStatusResponse": schema_value::<ActiveProfileApplyStatusResponse>(),
         "ProfileSafeFields": schema_value::<ProfileSafeFields>(),
