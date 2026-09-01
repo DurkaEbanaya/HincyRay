@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.3.4 - 2026-09-01
+
+### Routing and connections
+
+- Canonicalized leading-dot domain zones such as `.ai` to `ai` before persistence and Mihomo rule generation, including startup migration for existing rules.
+- Recognized the full Mihomo fake-IP block `198.18.0.0/15`, prevented synthetic addresses from becoming persistent routing resources, and exposed recovered host metadata in the connection view.
+- Refreshed the routing server catalog after bulk subscription updates so stale opaque `srv-v1` references are not submitted after profile identities change.
+
+### XHTTP and router memory
+
+- Added measured 4/8/16/32 KiB `scMaxEachPostBytes` choices for manual XHTTP profiles while preserving unknown `extra` keys and existing custom values.
+- Upload benchmarks now reject deadline-censored `curl` results instead of reporting the exact timeout boundary as measured throughput.
+- Limited glibc allocator arenas and periodically returned unused pages after transient router work, reducing retained HincyRay RSS on the 512 MiB/no-swap target.
+
 ## v1.3.3 - 2026-08-20
 
 ### Web UI

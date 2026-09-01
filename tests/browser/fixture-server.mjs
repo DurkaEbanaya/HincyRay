@@ -122,6 +122,7 @@ const initialProfileRaws = new Map([
   [profile.id, 'vless://subscription-secret@fixture.proxy.test:443?security=reality&type=tcp#Fixture'],
   [manualProfile.id, 'vless://manual-key@192.0.2.44:8443?encryption=none&security=tls&type=ws&host=hidden.example&path=%2Fsecret#Fixture-Manual'],
 ]);
+const initialXhttpRaw = 'vless://fixture-xhttp@xhttp.fixture.test:443?type=xhttp&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%2C%22scMaxEachPostBytes%22%3A%222048-2048%22%7D#Fixture-XHTTP';
 const profileDetails = new Map([
   [profile.id, { ...profile, raw: initialProfileRaws.get(profile.id), subscription_managed: true }],
   [manualProfile.id, { ...manualProfile, raw: initialProfileRaws.get(manualProfile.id), subscription_managed: false }],
@@ -129,7 +130,7 @@ const profileDetails = new Map([
     id: 103, server_ref: 'srv-v2-fixture-xhttp', name: 'Fixture XHTTP', protocol: 'VLESS',
     transport: 'xhttp', address: 'xhttp.fixture.test', port: 443, active: false, favorite: false,
     group: null, dead: false, block_quic: false, subscription_managed: false,
-    raw: 'vless://fixture-xhttp@xhttp.fixture.test:443?type=xhttp&extra=%7B%22xPaddingBytes%22%3A%22100-200%22%2C%22scMaxEachPostBytes%22%3A%222048-2048%22%7D#Fixture-XHTTP',
+    raw: initialXhttpRaw,
     xhttp_tuning: { sc_max_each_post_bytes: '2048', sc_min_posts_interval_ms: null },
   }],
 ]);
@@ -405,6 +406,11 @@ const server = http.createServer(async (request, response) => {
       profileDetails.get(item.id).name = item.name;
       profileDetails.get(item.id).raw = initialProfileRaws.get(item.id);
     }
+    Object.assign(profileDetails.get(103), {
+      name: 'Fixture XHTTP',
+      raw: initialXhttpRaw,
+      xhttp_tuning: { sc_max_each_post_bytes: '2048', sc_min_posts_interval_ms: null },
+    });
     responses.set('/api/bench/status', { running: false, results: [] });
     profileDiagnostic = { active: null, completed: null, statusPolls: 0 };
     sendJson(response, 200, { ok: true });

@@ -1,4 +1,4 @@
-# HincyRay v1.3.3 (`xray-vpn-test`)
+# HincyRay v1.3.4 (`xray-vpn-test`)
 
 Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 and the feature-gated `xray-vpn-test` desktop diagnostics app. Router mode uses Mihomo with iptables NAT REDIRECT (TCP 10810) and mangle TPROXY (UDP 10811); there is no TUN/tun2socks path.
 
@@ -39,6 +39,7 @@ Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 a
 - DIRECT routes use configured local DNS servers by default so their name resolution does not depend on VPN upstream health.
 - Router geo assets are MetaCubeX `geosite.dat` + `geoip.metadb`; legacy `geoip.dat` and the oversized RKN bypass list are not runtime inputs.
 - Quick/Full server workers are bounded to 1–6. YouTube uses a serialized narrow Innertube direct-format probe with Rust + `curl`; Telegram serializes access to its one private SQLite session. AI Studio uses the bounded ipregion Google-region + published-region-list method. The legacy direct AI Studio request remains disabled. Do not add Python/yt-dlp/JS runtime; ipregion has no Telegram check.
+- Manual XHTTP tuning preserves unknown `extra` keys. The profile editor offers the measured `scMaxEachPostBytes` choices 4096/8192/16384/32768; do not treat this client buffer as identical to `uplinkChunkSize` or apply it to subscription-managed profiles.
 - Quick/Full cancellation must interrupt and reap benchmark-owned `curl`, `ping`, and temporary Mihomo children. Temporary-core concurrency also preserves a router memory reserve; do not replace it with the requested worker count unconditionally.
 - Web UI activity polling is single-flight and operation-instance based. Do not use fixed-interval overlapping requests or path strings as unique operation identities; CSS owns sidebar scanner animation.
 - Redir and TPROXY listeners must stay on separate ports. The ndm hook is the primary firewall-reload mechanism; watchdog reinstall is a safety net.
@@ -120,7 +121,7 @@ Use this repeatable live-update sequence; do not improvise a different installer
 5. Poll bounded `/api/health` and `/api/safe-mode` until the expected version, `core_status=running`, and `firewall_status=running`; only then disarm the trap and remove the staged file.
 6. Verify active profile, fallback group, routing/firewall, the changed live behavior, and bounded router E2E. Keep the rollback directory and report its path.
 
-Release artifact SHA256: `31dd64d4e43ff823d70666f8e09b1f33f6e5b6d46df938b26032bea98bf97290`. Release evidence is recorded in `docs/releases/v1.3.3.md`.
+Release artifact SHA256: `232f6d5a71ecb4afb6d09d1e83c92463a714bb3f84988705142e78eecbf70340`. Release evidence is recorded in `docs/releases/v1.3.4.md`.
 
 ## Release
 

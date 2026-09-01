@@ -4,7 +4,7 @@
 //! module owns normalization into a typed domain/IP resource so downstream
 //! handlers do not guess from raw UI strings.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutingResourceKind {
@@ -25,6 +25,52 @@ impl RoutingResourceKind {
 pub struct RoutingResource {
     pub kind: RoutingResourceKind,
     pub value: String,
+}
+
+pub fn is_mihomo_fake_ip(ip: IpAddr) -> bool {
+    let IpAddr::V4(ip) = ip else {
+        return false;
+    };
+    let value = u32::from(ip);
+    value >= u32::from(Ipv4Addr::new(198, 18, 0, 0))
+        && value <= u32::from(Ipv4Addr::new(198, 19, 255, 255))
+}
+
+pub fn normalize_domain_rule(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    for prefix in ["geosite:", "keyword:", "regex:", "wildcard:"] {
+        if let Some(body) = value.strip_prefix(prefix) {
+            let body = body.trim();
+            return (!body.is_empty()).then(|| format!("{prefix}{body}"));
+        }
+    }
+    let exact = value.starts_with('=');
+    let domain = value
+        .trim_start_matches('=')
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if !valid_domain_suffix(&domain) {
+        return None;
+    }
+    Some(if exact { format!("={domain}") } else { domain })
+}
+
+fn valid_domain_suffix(value: &str) -> bool {
+    value.len() <= 253
+        && value.parse::<IpAddr>().is_err()
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 pub fn normalize_routing_resource(raw: &str) -> Option<RoutingResource> {
@@ -53,17 +99,16 @@ pub fn normalize_routing_resource(raw: &str) -> Option<RoutingResource> {
     if value.is_empty() {
         return None;
     }
-    if value.parse::<IpAddr>().is_ok() {
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        if is_mihomo_fake_ip(ip) {
+            return None;
+        }
         return Some(RoutingResource {
             kind: RoutingResourceKind::Ip,
             value,
         });
     }
-    if value.contains('.')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
-    {
+    if let Some(value) = normalize_domain_rule(&value) {
         return Some(RoutingResource {
             kind: RoutingResourceKind::Domain,
             value,
@@ -89,5 +134,32 @@ mod tests {
         let ipv6 = normalize_routing_resource("[2001:db8::1]:443").expect("ipv6");
         assert_eq!(ipv6.kind, RoutingResourceKind::Ip);
         assert_eq!(ipv6.value, "2001:db8::1");
+    }
+
+    #[test]
+    fn normalizes_bare_tlds_and_leading_dot_suffixes() {
+        for raw in ["ai", ".ai", "..AI."] {
+            assert_eq!(normalize_domain_rule(raw).as_deref(), Some("ai"));
+            assert_eq!(
+                normalize_routing_resource(raw),
+                Some(RoutingResource {
+                    kind: RoutingResourceKind::Domain,
+                    value: "ai".to_owned(),
+                })
+            );
+        }
+        assert_eq!(
+            normalize_domain_rule("Example.AI.").as_deref(),
+            Some("example.ai")
+        );
+        assert!(normalize_domain_rule("bad..ai").is_none());
+    }
+
+    #[test]
+    fn rejects_the_full_mihomo_fake_ip_block_as_a_routing_resource() {
+        for raw in ["198.18.0.0", "198.18.42.7", "198.19.255.255"] {
+            assert!(normalize_routing_resource(raw).is_none(), "{raw}");
+        }
+        assert!(normalize_routing_resource("198.20.0.1").is_some());
     }
 }

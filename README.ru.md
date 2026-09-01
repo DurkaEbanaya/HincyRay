@@ -1,4 +1,4 @@
-# HincyRay v1.3.3
+# HincyRay v1.3.4
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -43,9 +43,9 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 
 ## Возможности
 
-### v1.3.3
+### v1.3.4
 
-v1.3.3 упрощает Web UI и диагностику роутера. Группы подписок можно переставлять стрелками за один клик, индикаторы операций слева переходят в связанный раздел, второстепенные настройки маршрутизации и GeoBase перенесены вниз, а сырой EC API убран из статуса прокси. DNS Diagnostics теперь показывает реальный ответ listener, а YouTube Unlock Check использует нативную проверку воспроизведения вместо ошибочного `generate_204`. Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.3.3.md`](docs/releases/v1.3.3.md).
+v1.3.4 исправляет маршрутизацию доменных зон с ведущей точкой, запрещает сохранять fake-IP Mihomo как routing resource, обновляет routing identity после перезагрузки подписок и уменьшает удерживаемую память демона на роутере с 512 МБ RAM. Для ручных XHTTP-профилей также добавлен выбор проверенного размера upload-блока 4/8/16/32 КиБ. Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.3.4.md`](docs/releases/v1.3.4.md).
 
 ### v1.3.2
 
@@ -376,7 +376,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.3.3 зафиксированы в [`docs/releases/v1.3.3.md`](docs/releases/v1.3.3.md).
+Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.3.4 зафиксированы в [`docs/releases/v1.3.4.md`](docs/releases/v1.3.4.md).
 
 ## Установка
 

@@ -1880,11 +1880,10 @@ fn curl_download_with_timeout(port: u16, url: &str, max_secs: u64) -> Result<f32
 /// temp-file filesystem quirks on Entware. Uses POST (Cloudflare __up
 /// expects POST).
 ///
-/// HTTP `100 Continue` is accepted as a valid response: it means the
-/// server received the upload body. When curl times out (rc=28) after
-/// the body was fully sent, we still compute speed from `size_upload`
-/// and `time_total` — the upload itself succeeded, only the final
-/// `200 OK` response didn't arrive within the deadline.
+/// HTTP `100 Continue` is accepted as a valid response only when curl exits
+/// successfully. A timeout is an error even when `size_upload` reached the
+/// requested body size: `time_total` then equals the deadline and would report
+/// a censored boundary as measured throughput.
 fn curl_upload(port: u16, url: &str) -> Result<f32, String> {
     let chunk = vec![0xAAu8; 5_000_000];
 
@@ -1938,8 +1937,7 @@ fn curl_upload(port: u16, url: &str) -> Result<f32, String> {
     // `000` = no response received (proxy connect may have succeeded but
     // server didn't reply — still count if data was sent).
     let http_ok = http_code.starts_with('1') || http_code.starts_with('2') || http_code == "000";
-    let timed_out_with_data = output.status.code() == Some(28) && bytes > 0.0 && http_ok;
-    if (!output.status.success() && !timed_out_with_data) || !http_ok || bytes <= 0.0 {
+    if !output.status.success() || !http_ok || bytes <= 0.0 {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "curl upload rc={rc}, http={http_code}, bytes={bytes}, {stderr}",

@@ -30,7 +30,7 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.3');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.4');
 });
 
 test('profile table shows compact service status and configurable metric columns', async ({ page }) => {
@@ -352,6 +352,34 @@ test('connection table pages through the server instead of loading 500 rows', as
 
   expect(request.postDataJSON()).toEqual({ query: '', offset: 100, limit: 100 });
   await expect(page.locator('#connectionsTablePage')).toHaveText('101–200 / 702');
+});
+
+test('synthetic Mihomo fake IP cannot be persisted as a routing resource', async ({ page }) => {
+  await openFixture(page);
+  const result = await page.evaluate(() => ({
+    fake18: isMihomoFakeIp('198.18.42.7'),
+    fake19: isMihomoFakeIp('198.19.255.255'),
+    real: isMihomoFakeIp('198.20.0.1'),
+    resource: connectionRoutingResource({site:'198.18.42.7:443'}),
+    recovered: visualRoutingSite({recovered_host:'api.example.ai',destination_ip:'198.18.42.7'}),
+  }));
+  expect(result).toEqual({
+    fake18: true,
+    fake19: true,
+    real: false,
+    resource: '',
+    recovered: 'api.example.ai',
+  });
+});
+
+test('refreshing every subscription also invalidates the routing server catalog', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page, 'import');
+  const routingReload = page.waitForRequest(request =>
+    request.method() === 'GET' && new URL(request.url()).pathname === '/api/routing'
+  );
+  await page.getByRole('button', { name: '↻ Обновить все' }).click();
+  await routingReload;
 });
 
 test('device accounting uses the bounded backend projection', async ({ page }) => {
@@ -722,7 +750,10 @@ test('manual XHTTP editor exposes reusable tuning without replacing the share-li
   await expect(modal).toBeVisible();
   await expect(modal.locator('#profileEditorXhttpTuning')).toBeVisible();
   await expect(modal.locator('#profileEditorScMaxEachPostBytes')).toHaveValue('2048');
-  await modal.locator('#profileEditorScMaxEachPostBytes').fill('4096-4096');
+  await expect(modal.locator('#profileEditorScMaxEachPostBytes option')).toHaveText([
+    '2048 bytes (текущее)', '4 КБ', '8 КБ', '16 КБ', '32 КБ',
+  ]);
+  await modal.locator('#profileEditorScMaxEachPostBytes').selectOption('32768');
   await modal.locator('#profileEditorScMinPostsIntervalMs').fill('15-15');
   const updateRequest = page.waitForRequest(request =>
     request.method() === 'POST' && new URL(request.url()).pathname === '/api/profiles/update'
@@ -732,7 +763,7 @@ test('manual XHTTP editor exposes reusable tuning without replacing the share-li
     profile_id: 103,
     expected_server_ref: 'srv-v2-fixture-xhttp',
     xhttp_tuning: {
-      sc_max_each_post_bytes: '4096-4096',
+      sc_max_each_post_bytes: '32768',
       sc_min_posts_interval_ms: '15-15',
     },
   });

@@ -73,7 +73,10 @@ use crate::hincyray_mihomo_api::{
 };
 #[cfg(test)]
 use crate::hincyray_mihomo_api::{controller_dial_address, first_stream_json};
-use crate::hincyray_routing::{RoutingResource, RoutingResourceKind, normalize_routing_resource};
+use crate::hincyray_routing::{
+    RoutingResource, RoutingResourceKind, is_mihomo_fake_ip, normalize_domain_rule,
+    normalize_routing_resource,
+};
 #[cfg(test)]
 use crate::hincyray_security::verify_password;
 use crate::hincyray_security::{
@@ -124,6 +127,8 @@ const MAX_PROFILE_NAME_CHARS: usize = 256;
 const MAX_PROFILE_RAW_BYTES: usize = 64 * 1024;
 const BENCH_MEMORY_RESERVE_KB: u64 = 80 * 1024;
 const BENCH_WORKER_MEMORY_BUDGET_KB: u64 = 48 * 1024;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const GLIBC_MALLOC_ARENA_LIMIT: i32 = 2;
 const MAX_PROFILE_REVALIDATION_ERRORS: usize = 100;
 const PROFILE_DIAGNOSTIC_MIN_DURATION_SECS: u32 = 60;
 const PROFILE_DIAGNOSTIC_MAX_DURATION_SECS: u32 = 300;
@@ -169,6 +174,7 @@ fn register_signal_handlers() {
 /// connection to avoid one slow client blocking the API.
 pub fn run() -> Result<(), String> {
     register_signal_handlers();
+    configure_router_allocator();
 
     let listen = std::env::var("HINCYRAY_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_owned());
     let state_path = resolve_state_path();
@@ -286,6 +292,30 @@ pub fn run() -> Result<(), String> {
         eprintln!("hincyray: state persisted, children stopped, iptables cleaned");
     }
     Ok(())
+}
+
+fn configure_router_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: called once before worker threads start. Limiting glibc
+        // arenas avoids retaining one large arena per temporary worker on the
+        // router's 512 MiB/no-swap runtime.
+        unsafe {
+            libc::mallopt(libc::M_ARENA_MAX, GLIBC_MALLOC_ARENA_LIMIT);
+        }
+    }
+}
+
+fn trim_process_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: glibc documents malloc_trim as process-wide and thread-safe.
+        // This runs outside the daemon state lock after temporary allocations
+        // from completed work and persistence have been dropped.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
 }
 
 pub fn run_cli() -> Result<(), String> {
@@ -3752,13 +3782,15 @@ fn load_state_with_hasher(
     let deep_bench_filter_changed = migrate_legacy_deep_bench_filter_refs(&mut state);
     let active_dead_membership_changed = reconcile_active_dead_server_membership(&mut state);
     let stale_profile_stats_changed = prune_stale_profile_stats(&mut state);
+    let routing_domains_changed = migrate_routing_rule_domains(&mut state);
     let mut migration_changed = routing_identity_changed
         || auth_migration.changed()
         || legacy_mihomo_migration.removed_surface
         || dead_servers_changed
         || deep_bench_filter_changed
         || active_dead_membership_changed
-        || stale_profile_stats_changed;
+        || stale_profile_stats_changed
+        || routing_domains_changed;
     if let AuthMigration::Disabled(error) = auth_migration {
         eprintln!("hincyray: failed to migrate Web UI password: {error}");
     }
@@ -4192,7 +4224,7 @@ fn build_routing_context<'a>(
     let mut pinned_routes = Vec::new();
     let mut routes: Vec<XrayRouteRule> = Vec::new();
     for rule in state.routing_rules.iter().filter(|rule| rule.enabled) {
-        let mut domains = normalize_route_items(&rule.domains);
+        let mut domains = normalize_domain_rule_items(&rule.domains);
         let mut ips = normalize_route_items(&rule.ips);
         for service in &rule.services {
             let service = service.trim().trim_start_matches("geosite:");
@@ -4203,7 +4235,11 @@ fn build_routing_context<'a>(
         if domains.is_empty() && ips.is_empty() && !rule.pattern.trim().is_empty() {
             match rule.kind.as_str() {
                 "ip" | "geoip" => ips.push(rule.pattern.trim().to_owned()),
-                _ => domains.push(rule.pattern.trim().to_owned()),
+                _ => {
+                    if let Some(domain) = normalize_domain_rule(&rule.pattern) {
+                        domains.push(domain);
+                    }
+                }
             }
         }
         let ports = normalize_route_items(&rule.ports);
@@ -4660,6 +4696,34 @@ fn normalize_route_items(items: &[String]) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn normalize_domain_rule_items(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| normalize_domain_rule(item).unwrap_or_else(|| item.trim().to_owned()))
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn migrate_routing_rule_domains(state: &mut HincyrayState) -> bool {
+    let mut changed = false;
+    for rule in &mut state.routing_rules {
+        let normalized = normalize_domain_rule_items(&rule.domains);
+        if normalized != rule.domains {
+            rule.domains = normalized;
+            changed = true;
+        }
+        if !matches!(rule.kind.as_str(), "ip" | "geoip")
+            && !rule.pattern.trim().is_empty()
+            && let Some(normalized) = normalize_domain_rule(&rule.pattern)
+            && normalized != rule.pattern
+        {
+            rule.pattern = normalized;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn normalize_auto_vpn_domain(input: &str) -> Option<String> {
@@ -11366,7 +11430,13 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         if rule.target.is_empty() {
             rule.target = default_routing_target();
         }
-        rule.domains = normalize_route_items(&rule.domains);
+        rule.domains = normalize_domain_rule_items(&rule.domains);
+        if !matches!(rule.kind.as_str(), "ip" | "geoip")
+            && !rule.pattern.is_empty()
+            && let Some(pattern) = normalize_domain_rule(&rule.pattern)
+        {
+            rule.pattern = pattern;
+        }
         rule.ips = normalize_route_items(&rule.ips);
         rule.services = normalize_route_items(&rule.services);
         rule.ports = normalize_route_items(&rule.ports);
@@ -15375,6 +15445,9 @@ fn handle_mihomo_api_connections(daemon: &Daemon) -> (u16, &'static str, String)
     };
     match mihomo_api_get_connections_json(&addr, secret.as_deref()) {
         Ok(mut value) => {
+            if let Some(connections) = value.get_mut("connections").and_then(Value::as_array_mut) {
+                annotate_connection_items(connections);
+            }
             enrich_connections_with_geoip(&mut value, geo_dir.as_deref().map(Path::new), daemon);
             json_response(&value)
         }
@@ -15416,6 +15489,7 @@ fn handle_mihomo_api_connections_page(body: &str, daemon: &Daemon) -> (u16, &'st
         limit,
         connection_search_text,
         |connections| {
+            annotate_connection_items(connections);
             enrich_connection_items_with_geoip(
                 connections,
                 geo_dir.as_deref().map(Path::new),
@@ -15638,12 +15712,49 @@ fn enrich_connection_items_with_geoip(
         let Some(ip) = ["destinationIP", "remoteDestination"]
             .into_iter()
             .filter_map(|key| metadata.get(key).and_then(Value::as_str))
-            .find_map(|ip| ip.trim().parse::<IpAddr>().ok())
+            .find_map(|ip| {
+                ip.trim()
+                    .parse::<IpAddr>()
+                    .ok()
+                    .filter(|ip| !is_mihomo_fake_ip(*ip))
+            })
         else {
             continue;
         };
         if let Some(country) = geoip_country_code(&reader, ip) {
             metadata.insert("destinationCountry".to_owned(), json!(country));
+        }
+    }
+}
+
+fn annotate_connection_items(connections: &mut [Value]) {
+    for connection in connections {
+        let Some(metadata) = connection
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let destination = metadata
+            .get("destinationIP")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<IpAddr>().ok());
+        if destination.is_some_and(is_mihomo_fake_ip) {
+            metadata.insert("hincyrayFakeIp".to_owned(), json!(true));
+            let recovered = metadata
+                .get("host")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    metadata
+                        .get("sniffHost")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                })
+                .map(str::to_owned);
+            if let Some(recovered) = recovered {
+                metadata.insert("hincyrayRecoveredHost".to_owned(), json!(recovered));
+            }
         }
     }
 }
@@ -21739,6 +21850,9 @@ fn start_watchdog(
                 let mut inner = lock(&daemon.inner);
                 flush_if_dirty(&mut inner, &daemon.state_path);
             }
+            if watchdog_tick.is_multiple_of(6) {
+                trim_process_allocator();
+            }
 
             bench_was_running = bench_running;
         }
@@ -24151,6 +24265,45 @@ mod tests {
                 .expect("sanitized state")
                 .contains("authentication")
         );
+    }
+
+    #[test]
+    fn load_state_migrates_leading_dot_domain_suffixes() {
+        let dir = TempDir::new().expect("temp dir");
+        let state_path = dir.path().join("state.json");
+        let state = HincyrayState {
+            routing_rules: vec![RoutingRule {
+                enabled: true,
+                name: "AI".to_owned(),
+                domains: vec![".AI".to_owned(), "example.AI.".to_owned()],
+                ..RoutingRule::default()
+            }],
+            ..HincyrayState::default()
+        };
+        fs::write(
+            &state_path,
+            serde_json::to_string(&state).expect("state JSON"),
+        )
+        .expect("legacy state");
+
+        let loaded = load_state(&state_path);
+
+        let loaded_rule = loaded
+            .routing_rules
+            .iter()
+            .find(|rule| rule.name == "AI")
+            .expect("AI rule");
+        assert_eq!(loaded_rule.domains, ["ai", "example.ai"]);
+        let persisted: Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).expect("migrated state"))
+                .expect("persisted JSON");
+        let persisted_rule = persisted["routing_rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|rule| rule["name"] == "AI")
+            .expect("persisted AI rule");
+        assert_eq!(persisted_rule["domains"], json!(["ai", "example.ai"]));
     }
 
     #[test]
@@ -29917,6 +30070,26 @@ ntp:
         }
         let terms = ["ru", "chatgpt.com"];
         assert!(terms.iter().all(|term| text.contains(term)));
+    }
+
+    #[test]
+    fn connection_annotation_marks_fake_ip_and_exposes_recovered_host() {
+        let mut connections = vec![json!({
+            "metadata": {
+                "host": "",
+                "sniffHost": "api.example.ai",
+                "destinationIP": "198.18.42.7",
+                "remoteDestination": "203.0.113.7"
+            }
+        })];
+
+        annotate_connection_items(&mut connections);
+
+        assert_eq!(connections[0]["metadata"]["hincyrayFakeIp"], true);
+        assert_eq!(
+            connections[0]["metadata"]["hincyrayRecoveredHost"],
+            "api.example.ai"
+        );
     }
 
     #[test]

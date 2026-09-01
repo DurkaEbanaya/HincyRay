@@ -949,10 +949,10 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
         <div id="profileEditorXhttpTuning" hidden>
           <h4 style="margin:4px 0 8px">XHTTP upload tuning</h4>
           <div class="profile-editor-tuning-grid">
-            <div class="form-group"><label for="profileEditorScMaxEachPostBytes">Размер uplink-блока, bytes/range</label><input id="profileEditorScMaxEachPostBytes" maxlength="64" placeholder="Mihomo default: 1000000"></div>
+            <div class="form-group"><label for="profileEditorScMaxEachPostBytes">Размер uplink-блока</label><select id="profileEditorScMaxEachPostBytes" data-native-select="1"><option value="4096">4 КБ</option><option value="8192">8 КБ</option><option value="16384">16 КБ</option><option value="32768">32 КБ</option></select></div>
             <div class="form-group"><label for="profileEditorScMinPostsIntervalMs">Интервал отправки, ms/range</label><input id="profileEditorScMinPostsIntervalMs" maxlength="64" placeholder="Mihomo default: 30"></div>
           </div>
-          <p class="profile-editor-explanation">Например: 4096-4096 и 15-15. Пустое поле удаляет override.</p>
+          <p class="profile-editor-explanation">Размер применяется только к этому XHTTP-профилю. Интервал допускает число или диапазон; пустое поле удаляет override.</p>
         </div>
       </fieldset>
       <div class="modal-actions">
@@ -986,7 +986,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   <nav class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="sidebar-brand" style="border-radius: 0px;">
       <svg class="brand-icon" viewBox="0 0 1024 1024" role="img" aria-label="HincyRay"><defs><radialGradient id="brand-bg" cx="50%" cy="46%" r="62%"><stop stop-color="#172b3d"/><stop offset=".55" stop-color="#0b1018"/><stop offset="1" stop-color="#05070b"/></radialGradient><linearGradient id="brand-phone" x1="250" y1="100" x2="760" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#3b424d"/><stop offset=".45" stop-color="#151a21"/><stop offset="1" stop-color="#050608"/></linearGradient><linearGradient id="brand-screen" x1="310" y1="150" x2="690" y2="850" gradientUnits="userSpaceOnUse"><stop stop-color="#1f3146"/><stop offset="1" stop-color="#070a0f"/></linearGradient></defs><rect width="1024" height="1024" rx="220" fill="url(#brand-bg)"/><path d="M130 740 40 820M190 820 95 930M845 170l115-92M820 790l130 92M93 276l112 52" stroke="#0078d7" stroke-width="18" stroke-linecap="round" opacity=".65"/><g transform="rotate(-8 512 512)"><rect x="290" y="92" width="444" height="840" rx="78" fill="url(#brand-phone)" stroke="#737b87" stroke-width="14"/><rect x="328" y="138" width="368" height="748" rx="48" fill="url(#brand-screen)" stroke="#0e1620" stroke-width="10"/><circle cx="512" cy="176" r="16" fill="#080b10" stroke="#4d5663" stroke-width="5"/><path d="M510 132 455 292l68-30-42 172 106-238-72 34z" fill="#f4d03f" stroke="#fff2a4" stroke-width="8"/><path d="M496 432 365 536l112 8-74 204 214-260-102 14 75-134z" fill="#ff453a" stroke="#ffb2ab" stroke-width="9"/><path d="M520 398 660 496l-92 22 70 188-198-238 92 18z" fill="#60cdff" stroke="#b8efff" stroke-width="8"/><path d="M445 308 340 248M444 309l-96 102M521 264l118-98M514 436l-160 44M514 437l120 152M477 546l-112 188M566 515l104 166" stroke="#d8e6f3" stroke-width="10" stroke-linecap="round" opacity=".8"/><path d="M336 610 238 660l87 36-142 98 238-62-62-42 98-38zM664 300l150-50-72 102 160 10-228 68 38-78z" fill="#1f8fff" opacity=".88"/><text x="512" y="760" text-anchor="middle" font-family="Arial Black,Arial,sans-serif" font-size="76" fill="#f2f6fb" stroke="#05070b" stroke-width="7" paint-order="stroke">POCO</text></g></svg>
-      <div><div class="logo">HincyRay</div><div class="version">v1.3.3</div></div>
+      <div><div class="logo">HincyRay</div><div class="version">v1.3.4</div></div>
     </div>
     <div class="brightness-row">
       <svg class="brightness-icon" onclick="toggleTheme()" title="Переключить тему" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9L14 6M5.9 14l-1.1 1.1"></path></svg>
@@ -1350,7 +1350,7 @@ https://sub.example.com/…"></textarea>
             <button class="btn btn-accent" onclick="doImport()">Импортировать</button>
           </div>
            <h3 style="margin:20px 0 12px;font-size:var(--fs-h3)">Подписки</h3>
-           <button class="btn btn-sm" onclick="apiAction('POST','/api/subscriptions/refresh',null,t('Подписки обновляются'),loadSubscriptions)" style="margin-bottom:12px">↻ Обновить все</button>
+           <button class="btn btn-sm" onclick="apiAction('POST','/api/subscriptions/refresh',null,t('Подписки обновляются'),refreshDashboard)" style="margin-bottom:12px">↻ Обновить все</button>
            <div id="subscriptionRefreshReport" class="msg-bar show info" style="position:static;margin:0 0 12px">Отчёт обновления: —</div>
            <button class="btn btn-sm" onclick="showUndoStack()" style="margin:0 0 12px">↶ История изменений</button>
            <table class="tbl" id="subsTable">
@@ -3387,6 +3387,8 @@ const I18N = {
   'Подписки обновляются':'Subscriptions refreshing','Бенчмарк остановлен':'Benchmark stopped',
   'Каталог обновляется':'Catalog refreshing','Файрвол запущен':'Firewall started',
   'Fake-IP кэш сброшен':'Fake-IP cache flushed','DNS кэш сброшен':'DNS cache flushed',
+  'Fake-IP: ожидается восстановление домена':'Fake-IP: waiting for domain recovery',
+  'текущее':'current',
   'Соединения закрыты':'Connections closed','Тест скорости запущен':'Speed test started',
   'Маршруты устройств применены':'Device routes applied','Профиль выбран':'Profile selected',
   'Настройки сохранены':'Settings saved','Настройки загружены':'Settings loaded',
@@ -3451,7 +3453,7 @@ const I18N = {
   'Группы прокси':'Proxy Groups','Лог подключений':'Connection Log',
   'Добавить один профиль':'Add single profile','Добавить профиль':'Add profile','Share link':'Share link','Группа':'Group','Без группы':'No group','Переименовать':'Rename','Редактировать профиль':'Edit profile','Refresh':'Refresh','Избранные профили':'Favorite profiles','Нет избранных профилей':'No favorite profiles',
   'Загрузка профиля…':'Loading profile…','Не удалось загрузить профиль':'Could not load profile','Полная share-ссылка':'Full share link','Разобранные параметры профиля':'Parsed profile fields','Дохлый сервер':'Dead server','Показать секрет':'Show secret','Скрыть секрет':'Hide secret','Копировать ссылку':'Copy link','Ссылка скопирована':'Link copied','Ссылка управляется подпиской и доступна только для просмотра. Имя можно изменить.':'This link is managed by its subscription and is read-only. You can still edit the name.','Имя и share-ссылка не должны быть пустыми':'Name and share link must not be empty','Имя не должно быть пустым':'Name must not be empty','Профиль обновлён':'Profile updated','да':'yes','нет':'no',
-  'Размер uplink-блока, bytes/range':'Uplink block size, bytes/range','Интервал отправки, ms/range':'Send interval, ms/range','Например: 4096-4096 и 15-15. Пустое поле удаляет override.':'Example: 4096-4096 and 15-15. An empty field removes the override.',
+  'Размер uplink-блока':'Uplink block size','Интервал отправки, ms/range':'Send interval, ms/range','Размер применяется только к этому XHTTP-профилю. Интервал допускает число или диапазон; пустое поле удаляет override.':'The size applies only to this XHTTP profile. The interval accepts a number or range; an empty field removes the override.',
   'Смена сервера':'Switching server','Переключение сервера…':'Switching server…','Подготовка переключения…':'Preparing switch…','Генерация конфигурации…':'Generating configuration…','Проверка конфигурации…':'Validating configuration…','Запись конфигурации…':'Writing configuration…','Применение в ядре…':'Applying to core…','Ожидание готовности ядра…':'Waiting for core readiness…','Сохранение состояния…':'Saving state…','Закрытие старых соединений…':'Closing old connections…','Откат после ошибки…':'Rolling back after error…','Сервер выбран':'Server selected','Переключение не выполнено':'Switch failed','Останавливается…':'Stopping…','Остановка запрошена':'Stop requested',
   'Превышено время ожидания ответа роутера':'Router response timed out',
   'Переместить подписку выше':'Move subscription up','Переместить подписку ниже':'Move subscription down','Подписка уже находится на границе списка':'Subscription is already at the list boundary',
@@ -4361,6 +4363,7 @@ function resetProfileEditorFields() {
   safeValue('profileEditorRaw','');
   safeValue('profileEditorScMaxEachPostBytes','');
   safeValue('profileEditorScMinPostsIntervalMs','');
+  document.querySelectorAll('#profileEditorScMaxEachPostBytes option[data-current-value]').forEach(option => option.remove());
   const xhttpTuning = document.getElementById('profileEditorXhttpTuning');
   if (xhttpTuning) xhttpTuning.hidden = true;
   ['Protocol','Transport','Address','Port','Group','Active','Dead','BlockQuic'].forEach(field => safeSet(`profileEditor${field}`,'—'));
@@ -4374,6 +4377,18 @@ function resetProfileEditorFields() {
   if (fields) fields.disabled = true;
   const save = document.getElementById('profileEditorSave');
   if (save) save.disabled = true;
+}
+function setProfileEditorXhttpBlockSize(value) {
+  const select = document.getElementById('profileEditorScMaxEachPostBytes');
+  if (!select) return;
+  const normalized = String(value || '').trim();
+  select.querySelectorAll('option[data-current-value]').forEach(option => option.remove());
+  if (normalized && !Array.from(select.options).some(option => option.value === normalized)) {
+    const option = new Option(`${normalized} bytes (${t('текущее')})`, normalized);
+    option.dataset.currentValue = '1';
+    select.add(option, 0);
+  }
+  select.value = normalized || '4096';
 }
 function clearProfileEditorSensitiveState() {
   ++profileEditorGeneration;
@@ -4405,7 +4420,7 @@ function openProfileEditor(profileId) {
     safeSet('profileEditorActive',t(detail.active ? 'да' : 'нет'));
     safeSet('profileEditorDead',t(detail.dead ? 'да' : 'нет'));
     safeSet('profileEditorBlockQuic',t(detail.block_quic ? 'да' : 'нет'));
-    safeValue('profileEditorScMaxEachPostBytes',xhttpTuning?.sc_max_each_post_bytes || '');
+    setProfileEditorXhttpBlockSize(xhttpTuning?.sc_max_each_post_bytes);
     safeValue('profileEditorScMinPostsIntervalMs',xhttpTuning?.sc_min_posts_interval_ms || '');
     const tuningFields = document.getElementById('profileEditorXhttpTuning');
     if (tuningFields) tuningFields.hidden = !xhttpTuning;
@@ -5638,11 +5653,21 @@ function describeConnectionRoute(conn, suffixMap, status) {
 }
 
 function visualRoutingSite(conn) {
-  const host = String(conn.host || '').trim();
+  const host = String(conn.recovered_host || conn.host || '').trim();
   if (host) return host;
   const ip = String(conn.destination_ip || conn.remote_destination || '').trim();
   const port = String(conn.destination_port || '').trim();
   return ip ? `${ip}${port ? ':' + port : ''}` : '—';
+}
+function isMihomoFakeIp(value) {
+  const parts = String(value || '').trim().split('.').map(Number);
+  return parts.length === 4 && parts.every(part => Number.isInteger(part) && part >= 0 && part <= 255)
+    && parts[0] === 198 && (parts[1] === 18 || parts[1] === 19);
+}
+function connectionRoutingResource(row) {
+  const host = String(row?.site || '').trim();
+  if (!host || isMihomoFakeIp(host.split(':')[0])) return '';
+  return host;
 }
 
 function buildVisualRoutingRows(connections, routingData, status) {
@@ -5718,8 +5743,10 @@ function renderConnectionsTableRows() {
   body.innerHTML = rows.map(row => {
     const routeHtml = Array.from(row.routes.entries()).map(([label,badge]) => `<span class="result-badge ${badge}">${htmlEscape(label)}</span>`).join('<br>') || '—';
     const details = Array.from(row.details).slice(0, 3).join('\n');
-    const resource = attrEscape(row.resource || row.site || '');
-    const actionSelect = `<select class="form-control" style="min-width:150px;font-size:12px;padding:4px 8px" data-testid="connections-action" data-native-select="1" data-resource="${resource}" onchange="routeConnectionResource(this)">
+    const rawResource = connectionRoutingResource(row);
+    const actionable = !!rawResource;
+    const resource = attrEscape(actionable ? rawResource : '');
+    const actionSelect = `<select class="form-control" style="min-width:150px;font-size:12px;padding:4px 8px" data-testid="connections-action" data-native-select="1" data-resource="${resource}" onchange="routeConnectionResource(this)" ${actionable?'':'disabled title="'+attrEscape(t('Fake-IP: ожидается восстановление домена'))+'"'}>
       <option value="">${htmlEscape(t('Следовать правилу…'))}</option>
       <option value="active">${htmlEscape(t('Текущий активный VPN'))}</option>
       <option value="direct">DIRECT</option>
@@ -7101,6 +7128,8 @@ function normalizeConnections(data, limit = 50) {
       source_ip: metadata.sourceIP || c.source_ip || '',
       destination_ip: metadata.destinationIP || c.destination_ip || '',
       remote_destination: metadata.remoteDestination || c.remote_destination || '',
+      fake_ip: metadata.hincyrayFakeIp === true,
+      recovered_host: metadata.hincyrayRecoveredHost || '',
       destination_port: metadata.destinationPort || c.destination_port || '',
       country: metadata.destinationGeoIP || metadata.destinationCountry || metadata.country || c.country || c.country_code || '',
       network: metadata.network || c.network || '',

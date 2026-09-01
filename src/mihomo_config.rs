@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
+use crate::hincyray_routing::normalize_domain_rule;
 use crate::profiles::{Profile, Protocol, decode_vmess_json};
 use crate::xray_config::{
     DNS_INBOUND_PORT, GeoBaseRuleBehavior, GeoBaseRuleProvider, GeoBaseRuleTarget, PortMode,
@@ -2954,6 +2955,7 @@ fn domain_rule_body(domain: &str) -> String {
     } else if let Some(wildcard) = domain.strip_prefix("wildcard:") {
         format!("DOMAIN-WILDCARD,{wildcard}")
     } else {
+        let domain = normalize_domain_rule(domain).unwrap_or_else(|| domain.trim().to_owned());
         format!("DOMAIN-SUFFIX,{domain}")
     }
 }
@@ -6755,6 +6757,8 @@ mod tests {
     fn domain_and_ip_rule_bodies_exclude_target() {
         assert_eq!(domain_rule_body("geosite:youtube"), "GEOSITE,youtube");
         assert_eq!(domain_rule_body("example.com"), "DOMAIN-SUFFIX,example.com");
+        assert_eq!(domain_rule_body(".AI"), "DOMAIN-SUFFIX,ai");
+        assert_eq!(domain_rule_body("ai"), "DOMAIN-SUFFIX,ai");
         assert_eq!(domain_rule_body("=exact.com"), "DOMAIN,exact.com");
         assert_eq!(domain_rule_body("keyword:foo"), "DOMAIN-KEYWORD,foo");
 
