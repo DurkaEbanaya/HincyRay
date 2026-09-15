@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.3.5 - 2026-09-15
+
+### Router resource safety
+
+- Replaced unbounded per-connection HTTP thread creation with 32 fallible bounded workers, smaller worker stacks, and strict pre-auth request-line, header-size, header-count, and aggregate large-body limits.
+- Bounded active Mihomo logs during runtime and changed `/api/logs` to read only a limited tail, preventing concurrent requests from loading a multi-megabyte or larger active log in full.
+- Streamed or capped speed-test, WebDAV, Mihomo controller, GitHub API, and asset responses; serialized memory-heavy backup operations and capped detached DNS resolver workers.
+- Pruned live Parovozik probe metadata and removed internal timestamp caches from routing responses. Periodic status polling no longer serializes or reapplies the complete routing form.
+
+### Lifecycle and diagnostics
+
+- Enforced the 1-15 minute Deep Bench stability window in persisted settings and API requests, while defensively bounding duration-derived sample allocations.
+- Made Deep Bench downloads and unlock probes cancellation-aware, added parent-death protection to temporary Mihomo children, and coordinated benchmark and watchdog shutdown without blocking service cleanup.
+- Added regression coverage for HTTP/resource permits, bounded streams and logs, routing projections, Deep Bench validation, log cursor generations, and live metadata pruning.
+
 ## v1.3.4 - 2026-09-01
 
 ### Routing and connections

@@ -272,6 +272,7 @@ const routing = {
     vpn_subnet: '192.0.2.0/24',
     redirect_port: 10810,
     policy_name: 'Fixture',
+    quic_mode: 'block',
     port_mode: 'all',
     proxy_ports: [],
     bypass_ports: [],
@@ -292,7 +293,7 @@ const responses = new Map([
     socks_port: 10808,
     http_port: 10809,
     mihomo_version: 'fixture',
-    split_routing: routing.settings,
+    quic_mode: routing.settings.quic_mode,
   }],
   ['/api/system', {
     cpu: { usage_pct: 1, model: 'Fixture CPU', cores: 1, usage_per_core: [1] },

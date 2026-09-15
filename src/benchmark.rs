@@ -14,6 +14,8 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -35,6 +37,8 @@ use crate::telegram_probe::{TelegramProbeConfig, probe_media};
 pub const DEFAULT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 pub const DEFAULT_DOWNLOAD_URL: &str = "https://proof.ovh.net/files/100Mb.dat";
 pub const DEFAULT_UPLOAD_URL: &str = "https://speed.cloudflare.com/__up";
+pub const MIN_DEEP_BENCH_STABILITY_MINUTES: u32 = 1;
+pub const MAX_DEEP_BENCH_STABILITY_MINUTES: u32 = 15;
 
 const PROBE_ATTEMPTS: usize = 3;
 const PROBE_TIMEOUT_SECS: u64 = 6;
@@ -1719,14 +1723,36 @@ fn spawn_mihomo_with_combined_log(
     process_log: &NamedTempFile,
 ) -> std::io::Result<Child> {
     let (stdout, stderr) = combined_process_log_files(process_log)?;
-    Command::new(mihomo_path)
+    let mut command = Command::new(mihomo_path);
+    command
         .arg("-f")
         .arg(config_path)
         .arg("-d")
         .arg(benchmark_mihomo_home(config_path))
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
+        .stderr(Stdio::from(stderr));
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: getpid has no preconditions and does not dereference pointers.
+        let parent_pid = unsafe { libc::getpid() };
+        // SAFETY: the closure only invokes async-signal-safe libc calls between
+        // fork and exec, and returns an io::Error on failure.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    libc::kill(libc::getpid(), libc::SIGKILL);
+                    return Err(std::io::Error::other(
+                        "benchmark parent exited while spawning Mihomo",
+                    ));
+                }
+                Ok(())
+            });
+        }
+    }
+    command.spawn()
 }
 
 fn benchmark_mihomo_home(config_path: &Path) -> PathBuf {
@@ -1829,11 +1855,17 @@ fn curl_probe(
 }
 
 fn curl_download(port: u16, url: &str) -> Result<f32, String> {
-    curl_download_with_timeout(port, url, DOWNLOAD_MAX_SECS)
+    curl_download_with_timeout(port, url, DOWNLOAD_MAX_SECS, None)
 }
 
-fn curl_download_with_timeout(port: u16, url: &str, max_secs: u64) -> Result<f32, String> {
-    let output = Command::new("curl")
+fn curl_download_with_timeout(
+    port: u16,
+    url: &str,
+    max_secs: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<f32, String> {
+    let mut command = Command::new("curl");
+    command
         .arg("--socks5-hostname")
         .arg(format!("127.0.0.1:{port}"))
         .arg("-L")
@@ -1847,9 +1879,11 @@ fn curl_download_with_timeout(port: u16, url: &str, max_secs: u64) -> Result<f32
         .arg("/dev/null")
         .arg("--write-out")
         .arg("%{http_code} %{size_download} %{time_total}")
-        .arg(url)
-        .output()
-        .map_err(|e| format!("curl spawn: {e}"))?;
+        .arg(url);
+    let output = match cancel {
+        Some(cancel) => run_cancellable_command(&mut command, cancel)?,
+        None => command.output().map_err(|e| format!("curl spawn: {e}"))?,
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parts: Vec<&str> = stdout.split_whitespace().collect();
@@ -2151,7 +2185,12 @@ pub fn run_stability_and_unlock(
     cancel: &AtomicBool,
 ) -> Option<(StabilityMetrics, UnlockTestResult)> {
     let (port, _guard) = spawn_bench_mihomo(profile)?;
-    let observation_secs = minutes.max(1) * 60;
+    let observation_secs = minutes
+        .clamp(
+            MIN_DEEP_BENCH_STABILITY_MINUTES,
+            MAX_DEEP_BENCH_STABILITY_MINUTES,
+        )
+        .saturating_mul(60);
     let sample_period = 10u64;
     let expected_samples = observation_secs / sample_period as u32;
     let mut latency_samples: Vec<u32> = Vec::with_capacity(expected_samples as usize);
@@ -2184,9 +2223,15 @@ pub fn run_stability_and_unlock(
         }
     }
 
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     let total_attempts = latency_samples.len() as u32 + drop_count;
     let (sustained_download_mbps, sustained_download_source, sustained_download_error) =
-        sustained_download_probe(port);
+        sustained_download_probe(port, cancel);
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     // Skip upload for stability — it doubles test time and download
     // is the dominant signal for streaming/browsing quality.
     let sustained_upload_mbps = 0.0;
@@ -2201,7 +2246,10 @@ pub fn run_stability_and_unlock(
         sustained_download_error,
         sustained_upload_mbps,
     });
-    let unlock = run_unlock_test(port);
+    let unlock = run_unlock_test_cancellable(port, Some(cancel));
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     Some((metrics, unlock))
 }
 
@@ -2220,10 +2268,13 @@ fn warmup_bench_proxy(port: u16, cancel: &AtomicBool) -> bool {
     false
 }
 
-fn sustained_download_probe(port: u16) -> (f32, String, String) {
+fn sustained_download_probe(port: u16, cancel: &AtomicBool) -> (f32, String, String) {
     let mut errors = Vec::new();
     for url in SUSTAINED_DOWNLOAD_CANDIDATES {
-        match curl_download_with_timeout(port, url, SUSTAINED_DOWNLOAD_MAX_SECS) {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        match curl_download_with_timeout(port, url, SUSTAINED_DOWNLOAD_MAX_SECS, Some(cancel)) {
             Ok(mbps) if mbps > 0.0 => return (mbps, (*url).to_owned(), String::new()),
             Ok(_) => errors.push(format!("{url}: zero bytes/speed")),
             Err(error) => errors.push(format!("{url}: {error}")),
@@ -2303,10 +2354,14 @@ fn aggregate_stability(input: StabilityAggregationInput) -> StabilityMetrics {
 /// v0.20: Probe a single URL via SOCKS for the unlock-test. Retries
 /// up to `UNLOCK_RETRIES` times. Records HTTP status + TTFB. Returns
 /// the best (most-reachable) result observed.
-fn probe_unlock(port: u16, url: &str) -> UnlockStatus {
+fn probe_unlock(port: u16, url: &str, cancel: Option<&AtomicBool>) -> UnlockStatus {
     let mut best = UnlockStatus::default();
     for _ in 0..UNLOCK_RETRIES {
-        let output = Command::new("curl")
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            break;
+        }
+        let mut command = Command::new("curl");
+        command
             .arg("--socks5-hostname")
             .arg(format!("127.0.0.1:{port}"))
             .arg("-L")
@@ -2318,8 +2373,11 @@ fn probe_unlock(port: u16, url: &str) -> UnlockStatus {
             .arg("/dev/null")
             .arg("--write-out")
             .arg("%{http_code} %{time_starttransfer}")
-            .arg(url)
-            .output();
+            .arg(url);
+        let output = match cancel {
+            Some(cancel) => run_cancellable_command(&mut command, cancel),
+            None => command.output().map_err(|error| error.to_string()),
+        };
         let Ok(out) = output else { continue };
         let raw = String::from_utf8_lossy(&out.stdout);
         let parts: Vec<&str> = raw.split_whitespace().collect();
@@ -2348,11 +2406,15 @@ fn probe_unlock(port: u16, url: &str) -> UnlockStatus {
 /// Probes github, cloudflare, google, telegram. Each probe does up to
 /// `UNLOCK_RETRIES` attempts to avoid false negatives.
 pub fn run_unlock_test(port: u16) -> UnlockTestResult {
+    run_unlock_test_cancellable(port, None)
+}
+
+fn run_unlock_test_cancellable(port: u16, cancel: Option<&AtomicBool>) -> UnlockTestResult {
     UnlockTestResult {
-        github: probe_unlock(port, "https://github.com"),
-        cloudflare: probe_unlock(port, "https://www.cloudflare.com"),
-        google: probe_unlock(port, "https://www.google.com"),
-        telegram: probe_unlock(port, "https://web.telegram.org"),
+        github: probe_unlock(port, "https://github.com", cancel),
+        cloudflare: probe_unlock(port, "https://www.cloudflare.com", cancel),
+        google: probe_unlock(port, "https://www.google.com", cancel),
+        telegram: probe_unlock(port, "https://web.telegram.org", cancel),
     }
 }
 

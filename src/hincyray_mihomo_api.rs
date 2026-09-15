@@ -4,7 +4,11 @@
 //! already-resolved controller descriptor plus the desired EC path; they do not
 //! build HTTP clients or know wildcard bind-address rewrite rules.
 
-use std::{io::Read, process::Command, time::Duration};
+use std::{
+    io::Read,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::Value;
@@ -12,7 +16,35 @@ use serde_json::Value;
 use crate::mihomo_config::MihomoFeatures;
 
 const MAX_CONNECTIONS_JSON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONTROLLER_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_STREAM_RESPONSE_BYTES: usize = 256 * 1024;
 pub const MAX_DIAGNOSTIC_CONNECTIONS_JSON_BYTES: usize = 4 * 1024 * 1024;
+
+fn read_response_text_bounded(
+    response: &mut reqwest::blocking::Response,
+    path: &str,
+) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_CONTROLLER_RESPONSE_BYTES as u64)
+    {
+        return Err(format!("Mihomo API {path}: response is too large"));
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(64 * 1024)
+            .min(MAX_CONTROLLER_RESPONSE_BYTES as u64) as usize,
+    );
+    response
+        .take((MAX_CONTROLLER_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Mihomo API {path}: body read error: {error}"))?;
+    if bytes.len() > MAX_CONTROLLER_RESPONSE_BYTES {
+        return Err(format!("Mihomo API {path}: response is too large"));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("Mihomo API {path}: invalid UTF-8: {error}"))
+}
 
 /// Return the fixed internal controller endpoint and its optional persisted secret.
 pub fn mihomo_controller(features: &MihomoFeatures) -> Option<(String, Option<String>)> {
@@ -65,9 +97,9 @@ pub fn mihomo_api_get_response(
     {
         req = req.header("Authorization", format!("Bearer {s}"));
     }
-    let resp = req.send().map_err(|e| e.to_string())?;
+    let mut resp = req.send().map_err(|e| e.to_string())?;
     let status = resp.status().as_u16();
-    let body = resp.text().map_err(|e| e.to_string())?;
+    let body = read_response_text_bounded(&mut resp, path)?;
     Ok((status, body))
 }
 
@@ -128,9 +160,9 @@ pub fn mihomo_api_post_response(
             .header("Content-Type", "application/json")
             .body(body.to_owned());
     }
-    let resp = req.send().map_err(|e| e.to_string())?;
+    let mut resp = req.send().map_err(|e| e.to_string())?;
     let status = resp.status().as_u16();
-    let response = resp.text().map_err(|e| e.to_string())?;
+    let response = read_response_text_bounded(&mut resp, path)?;
     Ok((status, response))
 }
 
@@ -180,13 +212,32 @@ pub fn mihomo_api_stream_get(
     {
         cmd.args(["-H", &format!("Authorization: Bearer {s}")]);
     }
-    let output = cmd.output().map_err(|e| e.to_string())?;
-    let body = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() && body.trim().is_empty() {
-        return Err(format!(
-            "Mihomo API {path}: curl exit {:?}",
-            output.status.code()
-        ));
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut bytes = Vec::with_capacity(4096);
+    let read_error = child.stdout.as_mut().and_then(|stdout| {
+        stdout
+            .take((MAX_STREAM_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .err()
+    });
+    if let Some(error) = read_error {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.to_string());
+    }
+    if bytes.len() > MAX_STREAM_RESPONSE_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("Mihomo API {path}: stream response is too large"));
+    }
+    let status = child.wait().map_err(|error| error.to_string())?;
+    let body = String::from_utf8_lossy(&bytes);
+    if !status.success() && body.trim().is_empty() {
+        return Err(format!("Mihomo API {path}: curl exit {:?}", status.code()));
     }
     first_stream_json(&body).ok_or_else(|| format!("empty or invalid Mihomo stream {path}"))
 }

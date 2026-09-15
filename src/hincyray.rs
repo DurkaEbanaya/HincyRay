@@ -38,8 +38,9 @@ use tempfile::NamedTempFile;
 
 use crate::benchmark::{
     BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL,
-    DEFAULT_UPLOAD_URL, QuickProbeConfig, ResourceTestResult, SharedJob, new_bench_job,
-    probe_youtube_via_socks, run_bench,
+    DEFAULT_UPLOAD_URL, MAX_DEEP_BENCH_STABILITY_MINUTES, MIN_DEEP_BENCH_STABILITY_MINUTES,
+    QuickProbeConfig, ResourceTestResult, SharedJob, new_bench_job, probe_youtube_via_socks,
+    run_bench,
 };
 use crate::geobase::{
     self, Classification, DomainClassification, GeoBaseArtifactKind, GeoBaseGenerationInput,
@@ -104,6 +105,15 @@ use crate::xray_config::{
 use crate::xray_config::{GeoBaseRuleBehavior, GeoBaseRuleProvider, GeoBaseRuleTarget};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
+const MAX_HTTP_CONNECTIONS: usize = 32;
+const HTTP_WORKER_STACK_BYTES: usize = 512 * 1024;
+const MAX_HTTP_REQUEST_LINE_BYTES: usize = 8 * 1024;
+const MAX_HTTP_HEADER_LINE_BYTES: usize = 8 * 1024;
+const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
+const MAX_HTTP_HEADERS: usize = 100;
+const MAX_LARGE_HTTP_BODIES_IN_FLIGHT: usize = 2;
+const MAX_DNS_RESOLVER_THREADS: usize = 8;
+const DNS_RESOLVER_STACK_BYTES: usize = 256 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_GEOBASE_ANALYZE_BODY_BYTES: usize = 9 * 1024 * 1024;
 const MAX_HISTORY_SAMPLES: usize = 1000;
@@ -123,6 +133,19 @@ const MIHOMO_VALIDATE_TIMEOUT: Duration = Duration::from_secs(15);
 const MIHOMO_VALIDATE_MEMORY_LIMIT: &str = "64MiB";
 const MIHOMO_VALIDATE_GOGC: &str = "20";
 const COMMAND_OUTPUT_LIMIT_BYTES: u64 = 64 * 1024;
+const MAX_SPEED_TEST_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CLI_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_WEBDAV_STATE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_GITHUB_CATALOG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_GITHUB_API_RESPONSE_BYTES: &str = "2097152";
+const MAX_GEO_ASSET_DOWNLOAD_BYTES: &str = "67108864";
+const MAX_MIHOMO_DOWNLOAD_BYTES: &str = "33554432";
+const MIN_SPEED_TEST_TIMEOUT_SECS: u64 = 3;
+const MAX_SPEED_TEST_TIMEOUT_SECS: u64 = 120;
+const LOG_ROTATE_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+const ROTATED_LOG_TAIL_BYTES: u64 = 1024 * 1024;
+const API_LOG_TAIL_BYTES: u64 = 256 * 1024;
+const API_LOG_TAIL_LINES: usize = 200;
 const MAX_PROFILE_NAME_CHARS: usize = 256;
 const MAX_PROFILE_RAW_BYTES: usize = 64 * 1024;
 const BENCH_MEMORY_RESERVE_KB: u64 = 80 * 1024;
@@ -149,6 +172,78 @@ const PAROVOZIK_VPN_FILE: &str = "parovozik-vpn.txt";
 
 /// Global shutdown flag set by the SIGTERM/SIGINT handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static ACTIVE_LARGE_HTTP_BODIES: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_DNS_RESOLVERS: AtomicUsize = AtomicUsize::new(0);
+static LOG_ROTATION_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+static BACKUP_OPERATION_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct HttpConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for HttpConnectionPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_http_connection(active: Arc<AtomicUsize>) -> Option<HttpConnectionPermit> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < MAX_HTTP_CONNECTIONS).then_some(count + 1)
+        })
+        .ok()?;
+    Some(HttpConnectionPermit { active })
+}
+
+struct LargeHttpBodyPermit;
+
+impl Drop for LargeHttpBodyPermit {
+    fn drop(&mut self) {
+        ACTIVE_LARGE_HTTP_BODIES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_large_http_body() -> Option<LargeHttpBodyPermit> {
+    ACTIVE_LARGE_HTTP_BODIES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < MAX_LARGE_HTTP_BODIES_IN_FLIGHT).then_some(count + 1)
+        })
+        .ok()?;
+    Some(LargeHttpBodyPermit)
+}
+
+struct DnsResolverPermit;
+
+impl Drop for DnsResolverPermit {
+    fn drop(&mut self) {
+        ACTIVE_DNS_RESOLVERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_dns_resolver() -> Option<DnsResolverPermit> {
+    ACTIVE_DNS_RESOLVERS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < MAX_DNS_RESOLVER_THREADS).then_some(count + 1)
+        })
+        .ok()?;
+    Some(DnsResolverPermit)
+}
+
+struct BackupOperationPermit;
+
+impl Drop for BackupOperationPermit {
+    fn drop(&mut self) {
+        BACKUP_OPERATION_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
+fn try_acquire_backup_operation() -> Option<BackupOperationPermit> {
+    BACKUP_OPERATION_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    Some(BackupOperationPermit)
+}
 
 extern "C" fn handle_signal(_sig: i32) {
     SHUTDOWN.store(true, Ordering::SeqCst);
@@ -170,8 +265,8 @@ fn register_signal_handlers() {
 }
 
 /// Entry point for the `hincyray` binary. Binds the listener and serves
-/// requests on the calling thread; spawn background threads per
-/// connection to avoid one slow client blocking the API.
+/// requests on the calling thread; a bounded set of background threads keeps
+/// slow clients from blocking the API without exhausting router memory.
 pub fn run() -> Result<(), String> {
     register_signal_handlers();
     configure_router_allocator();
@@ -232,12 +327,13 @@ pub fn run() -> Result<(), String> {
     }
 
     // Start watchdog on router targets.
-    start_watchdog(daemon.clone(), mihomo_log_path, mihomo_log_cursor);
+    let watchdog_handle = start_watchdog(daemon.clone(), mihomo_log_path, mihomo_log_cursor)?;
 
     let listener = TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("set_nonblocking: {error}"))?;
+    let active_http_connections = Arc::new(AtomicUsize::new(0));
     eprintln!("hincyray listening on {listen}");
     eprintln!("hincyray state: {}", daemon.state_path.to_string_lossy());
     eprintln!(
@@ -251,15 +347,29 @@ pub fn run() -> Result<(), String> {
             break;
         }
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((mut stream, _)) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+                let Some(permit) =
+                    try_acquire_http_connection(Arc::clone(&active_http_connections))
+                else {
+                    let body = json!({"error": "server is busy"}).to_string();
+                    let _ = write_response(&mut stream, 503, "application/json", &body);
+                    continue;
+                };
                 let daemon = daemon.clone();
-                thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, &daemon) {
-                        eprintln!("hincyray handler: {error}");
-                    }
-                });
+                if let Err(error) = thread::Builder::new()
+                    .name("hincyray-http".to_owned())
+                    .stack_size(HTTP_WORKER_STACK_BYTES)
+                    .spawn(move || {
+                        let _permit = permit;
+                        if let Err(error) = handle_connection(stream, &daemon) {
+                            eprintln!("hincyray handler: {error}");
+                        }
+                    })
+                {
+                    eprintln!("hincyray: failed to spawn HTTP worker: {error}");
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(200));
@@ -272,6 +382,8 @@ pub fn run() -> Result<(), String> {
     }
 
     eprintln!("hincyray: shutting down...");
+    cancel_and_join_bench_workers(&daemon);
+    join_watchdog_bounded(watchdog_handle);
     cancel_and_join_profile_diagnostics(&daemon);
     // Reap Mihomo after the bounded diagnostic worker has stopped so its final
     // environment snapshot still describes the captured core.
@@ -366,9 +478,16 @@ fn cli_api(method: &str, path: &str, body: Option<&str>) -> Result<String, Strin
             .body(body.unwrap_or("").to_owned()),
         _ => return Err(format!("unsupported CLI method {method}")),
     };
-    let response = request.send().map_err(|error| format!("{url}: {error}"))?;
+    let mut response = request.send().map_err(|error| format!("{url}: {error}"))?;
     let status = response.status();
-    let text = response.text().map_err(|error| error.to_string())?;
+    let bytes =
+        read_bounded_stream(&mut response, MAX_CLI_RESPONSE_BYTES).map_err(
+            |error| match error {
+                BoundedReadError::LimitExceeded => format!("{url}: response is too large"),
+                BoundedReadError::Io(error) => error,
+            },
+        )?;
+    let text = String::from_utf8(bytes).map_err(|error| error.to_string())?;
     if status.is_success() {
         Ok(text)
     } else {
@@ -1164,7 +1283,7 @@ pub const WEEKDAY_SAT: u8 = 1 << 6;
 /// `stability_minutes` to measure drop rate, latency variance, and
 /// unlock capability. Results are persisted to
 /// `/opt/etc/hincyray/quality-history.json` for 30-day trend analysis.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeepBenchSettings {
     /// Master switch. When false, the watchdog never triggers a deep
     /// bench, but manual `/api/deep-bench/start` still works.
@@ -1196,6 +1315,21 @@ pub struct DeepBenchSettings {
     /// scheduler skips even if the window is active.
     #[serde(default)]
     pub last_completed_date: u32,
+}
+
+impl Default for DeepBenchSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            weekdays: default_deep_bench_weekdays(),
+            start_hour: default_deep_bench_start_hour(),
+            end_hour: default_deep_bench_end_hour(),
+            stability_minutes: default_deep_bench_stability_minutes(),
+            profile_filter: ProfileFilter::default(),
+            last_run_unix: 0,
+            last_completed_date: 0,
+        }
+    }
 }
 
 /// v0.20: Selector for which profiles to deep-bench.
@@ -1771,6 +1905,34 @@ impl Default for SplitRoutingSettings {
     }
 }
 
+fn split_routing_settings_response(settings: &SplitRoutingSettings) -> Value {
+    json!({
+        "enabled": settings.enabled,
+        "auto_switch": settings.auto_switch,
+        "block_quic_global": settings.block_quic_global,
+        "rule_source": settings.rule_source,
+        "vpn_subnet": settings.vpn_subnet,
+        "redirect_port": settings.redirect_port,
+        "policy_name": settings.policy_name,
+        "policy_mark": settings.policy_mark,
+        "quic_mode": settings.quic_mode,
+        "tproxy_available": settings.tproxy_available,
+        "port_mode": settings.port_mode,
+        "proxy_ports": settings.proxy_ports,
+        "bypass_ports": settings.bypass_ports,
+        "geo_asset_path": settings.geo_asset_path,
+        "ru_direct_mode": settings.ru_direct_mode,
+        "ru_direct_exceptions": settings.ru_direct_exceptions,
+        "auto_vpn_exceptions": settings.auto_vpn_exceptions,
+        "auto_vpn_learning_enabled": settings.auto_vpn_learning_enabled,
+        "parovozik_enabled": settings.parovozik_enabled,
+        "parovozik_direct_domains": settings.parovozik_direct_domains,
+        "parovozik_vpn_domains": settings.parovozik_vpn_domains,
+        "parovozik_server_refs": settings.parovozik_server_refs,
+        "match_target": settings.match_target,
+    })
+}
+
 fn default_rule_source() -> String {
     "metacubex-lite".to_owned()
 }
@@ -2131,9 +2293,9 @@ fn sha256(input: &[u8]) -> [u8; 32] {
         0x1f83d9ab,
         0x5be0cd19,
     ];
-    for chunk in data.chunks_exact(64) {
+    for chunk in data.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(word);
             w[i] = u32::from_be_bytes(bytes);
@@ -2172,7 +2334,7 @@ fn sha256(input: &[u8]) -> [u8; 32] {
         }
     }
     let mut out = [0u8; 32];
-    for (chunk, value) in out.chunks_exact_mut(4).zip(h) {
+    for (chunk, value) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
         chunk.copy_from_slice(&value.to_be_bytes());
     }
     out
@@ -2479,6 +2641,7 @@ impl CoreManager {
         {
             // Capture before fork. If the daemon dies before the child installs
             // PDEATHSIG, the post-prctl PPID check kills the child explicitly.
+            // SAFETY: getpid has no preconditions and does not dereference pointers.
             let parent_pid = unsafe { libc::getpid() };
             // SAFETY: the closure only invokes async-signal-safe libc calls and
             // constructs an io::Error after fork, before exec.
@@ -3585,27 +3748,69 @@ fn resolve_log_dir() -> PathBuf {
     PathBuf::from("./hincyray-logs")
 }
 
-/// Open a log file in the daemon log directory, rotating if the existing
-/// file exceeds 1 MB. A new inode gives incremental readers an unambiguous
-/// generation boundary.
+/// Open a log file in the daemon log directory, capping an existing file at
+/// startup and recording a generation boundary for incremental readers.
 fn open_log_file(name: &str) -> Result<Stdio, String> {
     let dir = resolve_log_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let path = dir.join(name);
-    // Rotate if the file is too large (> 1 MB).
-    if let Ok(meta) = fs::metadata(&path)
-        && meta.len() > 1_048_576
-    {
-        let rotated = path.with_extension("log.1");
-        let _ = fs::remove_file(&rotated);
-        fs::rename(&path, &rotated).map_err(|e| format!("rotate {}: {e}", path.display()))?;
-    }
+    rotate_log_in_place(&path, 1_048_576)?;
     let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .map_err(|e| format!("open {}: {e}", path.display()))?;
     Ok(Stdio::from(file))
+}
+
+fn read_file_tail_bytes(path: &Path, max_bytes: u64) -> Result<(Vec<u8>, bool), String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let len = file.metadata().map_err(|error| error.to_string())?.len();
+    let truncated = len > max_bytes;
+    if truncated {
+        file.seek(SeekFrom::Start(len - max_bytes))
+            .map_err(|error| error.to_string())?;
+    }
+    let mut bytes = Vec::with_capacity(len.min(max_bytes) as usize);
+    file.take(max_bytes)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok((bytes, truncated))
+}
+
+fn rotate_log_in_place(path: &Path, threshold_bytes: u64) -> Result<bool, String> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(false);
+    };
+    if metadata.len() <= threshold_bytes {
+        return Ok(false);
+    }
+
+    let (tail, _) = read_file_tail_bytes(path, ROTATED_LOG_TAIL_BYTES)?;
+    let rotated = path.with_extension("log.1");
+    fs::write(&rotated, tail).map_err(|error| format!("rotate {}: {error}", path.display()))?;
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|error| format!("truncate {}: {error}", path.display()))?;
+    let generation = format!(
+        "{}:{}:{}",
+        unix_now(),
+        std::process::id(),
+        LOG_ROTATION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    fs::write(log_generation_path(path), generation)
+        .map_err(|error| format!("record rotation for {}: {error}", path.display()))?;
+    Ok(true)
+}
+
+fn log_generation_path(path: &Path) -> PathBuf {
+    path.with_extension("log.generation")
+}
+
+fn read_log_generation(path: &Path) -> Option<String> {
+    fs::read_to_string(log_generation_path(path)).ok()
 }
 
 fn resolve_state_path() -> PathBuf {
@@ -3780,6 +3985,7 @@ fn load_state_with_hasher(
     // once after switching to forced `proxy-active` EC probes.
     let dead_servers_changed = migrate_legacy_dead_server_refs(&mut state);
     let deep_bench_filter_changed = migrate_legacy_deep_bench_filter_refs(&mut state);
+    let deep_bench_duration_changed = normalize_deep_bench_duration(&mut state.deep_bench);
     let active_dead_membership_changed = reconcile_active_dead_server_membership(&mut state);
     let stale_profile_stats_changed = prune_stale_profile_stats(&mut state);
     let routing_domains_changed = migrate_routing_rule_domains(&mut state);
@@ -3788,6 +3994,7 @@ fn load_state_with_hasher(
         || legacy_mihomo_migration.removed_surface
         || dead_servers_changed
         || deep_bench_filter_changed
+        || deep_bench_duration_changed
         || active_dead_membership_changed
         || stale_profile_stats_changed
         || routing_domains_changed;
@@ -3993,22 +4200,25 @@ fn compact_state_for_persist(state: &mut HincyrayState) {
         .split_routing
         .parovozik_server_refs
         .truncate(MAX_PAROVOZIK_SERVERS);
-    if state.split_routing.parovozik_last_checked_unix.len() > MAX_PAROVOZIK_DOMAINS * 2 {
-        let mut checked: Vec<(String, u64)> = state
-            .split_routing
-            .parovozik_last_checked_unix
-            .iter()
-            .map(|(domain, timestamp)| (domain.clone(), *timestamp))
-            .collect();
-        checked.sort_by_key(|(_, timestamp)| *timestamp);
-        let remove_count = checked.len() - MAX_PAROVOZIK_DOMAINS * 2;
-        for (domain, _) in checked.into_iter().take(remove_count) {
-            state
-                .split_routing
-                .parovozik_last_checked_unix
-                .remove(&domain);
-        }
+    prune_parovozik_metadata(&mut state.split_routing);
+}
+
+fn prune_parovozik_metadata(settings: &mut SplitRoutingSettings) -> bool {
+    let limit = MAX_PAROVOZIK_DOMAINS * 2;
+    if settings.parovozik_last_checked_unix.len() <= limit {
+        return false;
     }
+    let mut checked: Vec<(String, u64)> = settings
+        .parovozik_last_checked_unix
+        .iter()
+        .map(|(domain, timestamp)| (domain.clone(), *timestamp))
+        .collect();
+    checked.sort_unstable_by_key(|(_, timestamp)| *timestamp);
+    let remove_count = checked.len() - limit;
+    for (domain, _) in checked.into_iter().take(remove_count) {
+        settings.parovozik_last_checked_unix.remove(&domain);
+    }
+    true
 }
 
 fn prune_stale_profile_stats(state: &mut HincyrayState) -> bool {
@@ -5034,6 +5244,27 @@ fn check_auth(daemon: &Daemon, auth_header: &Option<String>, path: &str, method:
     false
 }
 
+enum BoundedHttpLine {
+    Eof,
+    Line(String),
+    TooLong,
+}
+
+fn read_bounded_http_line<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<BoundedHttpLine> {
+    let mut line = String::new();
+    let read = reader.take((max_bytes + 1) as u64).read_line(&mut line)?;
+    if read == 0 {
+        Ok(BoundedHttpLine::Eof)
+    } else if read > max_bytes {
+        Ok(BoundedHttpLine::TooLong)
+    } else {
+        Ok(BoundedHttpLine::Line(line))
+    }
+}
+
 fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), String> {
     let peer_ip = stream
         .peer_addr()
@@ -5041,29 +5272,67 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let mut reader = BufReader::new(stream.try_clone().map_err(|error| error.to_string())?);
 
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .map_err(|error| error.to_string())?;
-    if request_line.is_empty() {
-        return Ok(());
-    }
+    let request_line = match read_bounded_http_line(&mut reader, MAX_HTTP_REQUEST_LINE_BYTES)
+        .map_err(|error| error.to_string())?
+    {
+        BoundedHttpLine::Eof => return Ok(()),
+        BoundedHttpLine::Line(line) => line,
+        BoundedHttpLine::TooLong => {
+            write_response(
+                &mut stream,
+                414,
+                "application/json",
+                &json!({"error": "request line too long"}).to_string(),
+            )?;
+            return Ok(());
+        }
+    };
 
     let mut content_length = None;
     let mut auth_header: Option<String> = None;
     let mut host_header: Option<String> = None;
     let mut origin_header: Option<String> = None;
+    let mut header_bytes = 0usize;
+    let mut header_count = 0usize;
     loop {
-        let mut line = String::new();
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
+        let line = match read_bounded_http_line(&mut reader, MAX_HTTP_HEADER_LINE_BYTES)
+            .map_err(|error| error.to_string())?
+        {
+            BoundedHttpLine::Eof => break,
+            BoundedHttpLine::Line(line) => line,
+            BoundedHttpLine::TooLong => {
+                write_response(
+                    &mut stream,
+                    431,
+                    "application/json",
+                    &json!({"error": "request header line too long"}).to_string(),
+                )?;
+                return Ok(());
+            }
+        };
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > MAX_HTTP_HEADER_BYTES {
+            write_response(
+                &mut stream,
+                431,
+                "application/json",
+                &json!({"error": "request headers too large"}).to_string(),
+            )?;
+            return Ok(());
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
+        }
+        header_count += 1;
+        if header_count > MAX_HTTP_HEADERS {
+            write_response(
+                &mut stream,
+                431,
+                "application/json",
+                &json!({"error": "too many request headers"}).to_string(),
+            )?;
+            return Ok(());
         }
         let Some((header_name, header_value)) = trimmed.split_once(':') else {
             continue;
@@ -5125,25 +5394,6 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
         )?;
         return Ok(());
     }
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader
-            .read_exact(&mut body)
-            .map_err(|error| error.to_string())?;
-    }
-    let body_text = match String::from_utf8(body) {
-        Ok(text) => text,
-        Err(_) => {
-            write_response(
-                &mut stream,
-                400,
-                "application/json",
-                &json!({"error": "request body must be valid UTF-8"}).to_string(),
-            )?;
-            return Ok(());
-        }
-    };
-
     if is_state_changing_method(method)
         && let Some(origin) = origin_header.as_deref()
         && !origin_matches_host(origin, host_header.as_deref())
@@ -5163,6 +5413,41 @@ fn handle_connection(mut stream: TcpStream, daemon: &Daemon) -> Result<(), Strin
         write_response(&mut stream, 401, "application/json", &response_body)?;
         return Ok(());
     }
+
+    let _large_body_permit = if content_length > MAX_BODY_BYTES {
+        match try_acquire_large_http_body() {
+            Some(permit) => Some(permit),
+            None => {
+                write_response(
+                    &mut stream,
+                    503,
+                    "application/json",
+                    &json!({"error": "too many large requests in progress"}).to_string(),
+                )?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader
+            .read_exact(&mut body)
+            .map_err(|error| error.to_string())?;
+    }
+    let body_text = match String::from_utf8(body) {
+        Ok(text) => text,
+        Err(_) => {
+            write_response(
+                &mut stream,
+                400,
+                "application/json",
+                &json!({"error": "request body must be valid UTF-8"}).to_string(),
+            )?;
+            return Ok(());
+        }
+    };
 
     let (status, content_type, response_body) =
         dispatch_from(method, path, &body_text, daemon, peer_ip);
@@ -5264,7 +5549,7 @@ fn dispatch_from(
                 "core_status": inner.core.status(),
                 "mihomo_version": inner.state.mihomo_version,
                 "update_available_version": inner.state.update_available_version,
-                "split_routing": inner.state.split_routing,
+                "quic_mode": inner.state.split_routing.quic_mode,
                 "dns_enabled": inner.state.dns_settings.enabled,
                 "hwid": inner.state.hwid_config.hwid,
                 "ec_enabled": true,
@@ -7562,6 +7847,38 @@ fn handle_bench_stop(daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
+fn cancel_and_join_bench_workers(daemon: &Daemon) {
+    let (bench_handle, deep_bench_handle) = {
+        let mut inner = lock(&daemon.inner);
+        if let Some(cancel) = inner.bench.cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(cancel) = inner.deep_bench_cancel.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        (inner.bench.handle.take(), inner.deep_bench_handle.take())
+    };
+    if let Some(handle) = bench_handle {
+        let _ = handle.join();
+    }
+    if let Some(handle) = deep_bench_handle {
+        let _ = handle.join();
+    }
+}
+
+fn join_watchdog_bounded(handle: JoinHandle<()>) {
+    for _ in 0..10 {
+        if handle.is_finished() {
+            if handle.join().is_err() {
+                eprintln!("hincyray: watchdog thread panicked during shutdown");
+            }
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("hincyray: watchdog is still finishing; continuing bounded shutdown");
+}
+
 fn handle_telegram_probe_status(daemon: &Daemon) -> (u16, &'static str, String) {
     let config_path = telegram_config_path(&daemon.state_path);
     let session_path = telegram_session_path(&daemon.state_path);
@@ -9299,9 +9616,42 @@ fn handle_deep_bench_settings_get(daemon: &Daemon) -> (u16, &'static str, String
     )
 }
 
+fn parse_deep_bench_duration(value: &Value) -> Result<Option<u32>, String> {
+    let Some(value) = value.get("stability_minutes") else {
+        return Ok(None);
+    };
+    let Some(minutes) = value.as_u64() else {
+        return Err("stability_minutes must be an integer".to_owned());
+    };
+    if !(u64::from(MIN_DEEP_BENCH_STABILITY_MINUTES)..=u64::from(MAX_DEEP_BENCH_STABILITY_MINUTES))
+        .contains(&minutes)
+    {
+        return Err(format!(
+            "stability_minutes must be between {MIN_DEEP_BENCH_STABILITY_MINUTES} and {MAX_DEEP_BENCH_STABILITY_MINUTES}"
+        ));
+    }
+    Ok(Some(minutes as u32))
+}
+
+fn normalize_deep_bench_duration(settings: &mut DeepBenchSettings) -> bool {
+    let normalized = settings.stability_minutes.clamp(
+        MIN_DEEP_BENCH_STABILITY_MINUTES,
+        MAX_DEEP_BENCH_STABILITY_MINUTES,
+    );
+    if normalized == settings.stability_minutes {
+        return false;
+    }
+    settings.stability_minutes = normalized;
+    true
+}
+
 fn handle_deep_bench_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return json_error(400, "invalid JSON body");
+    };
+    let stability_minutes = match parse_deep_bench_duration(&value) {
+        Ok(minutes) => minutes,
+        Err(error) => return json_error(400, &error),
     };
     let mut inner = lock(&daemon.inner);
     let s = &mut inner.state.deep_bench;
@@ -9317,8 +9667,8 @@ fn handle_deep_bench_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static
     if let Some(v) = value.get("end_hour").and_then(Value::as_u64) {
         s.end_hour = (v as u8).min(23);
     }
-    if let Some(v) = value.get("stability_minutes").and_then(Value::as_u64) {
-        s.stability_minutes = v as u32;
+    if let Some(minutes) = stability_minutes {
+        s.stability_minutes = minutes;
     }
     if let Some(obj) = value.get("profile_filter").and_then(Value::as_object)
         && let Some(kind) = obj.get("kind").and_then(Value::as_str)
@@ -9370,11 +9720,18 @@ fn handle_deep_bench_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static
 
 fn handle_deep_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     // Optional body overrides the persistent settings for this run only.
-    let override_minutes: Option<u32> = serde_json::from_str::<Value>(body).ok().and_then(|v| {
-        v.get("stability_minutes")
-            .and_then(Value::as_u64)
-            .map(|x| x as u32)
-    });
+    let request = if body.trim().is_empty() {
+        Value::Null
+    } else {
+        match serde_json::from_str::<Value>(body) {
+            Ok(value) => value,
+            Err(_) => return json_error(400, "invalid JSON body"),
+        }
+    };
+    let override_minutes = match parse_deep_bench_duration(&request) {
+        Ok(minutes) => minutes,
+        Err(error) => return json_error(400, &error),
+    };
     let mut inner = lock(&daemon.inner);
     if inner.deep_bench_active {
         return json_error(409, "deep bench already running");
@@ -9386,8 +9743,12 @@ fn handle_deep_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, S
     if profiles.is_empty() {
         return json_error(400, "no profiles match the current filter");
     }
-    let stability_minutes =
-        override_minutes.unwrap_or(inner.state.deep_bench.stability_minutes.max(1));
+    let stability_minutes = override_minutes.unwrap_or_else(|| {
+        inner.state.deep_bench.stability_minutes.clamp(
+            MIN_DEEP_BENCH_STABILITY_MINUTES,
+            MAX_DEEP_BENCH_STABILITY_MINUTES,
+        )
+    });
     let mihomo_path = inner.state.mihomo_path.clone();
     let filter = inner.state.deep_bench.profile_filter.clone();
     let started_unix = unix_now();
@@ -9408,7 +9769,7 @@ fn handle_deep_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, S
 
     let daemon_clone = daemon.clone();
     let cancel_clone = cancel.clone();
-    let handle = std::thread::Builder::new()
+    let handle = match std::thread::Builder::new()
         .name("hincyray-deep-bench".to_owned())
         .spawn(move || {
             run_deep_bench(
@@ -9420,8 +9781,17 @@ fn handle_deep_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, S
                 cancel_clone,
                 started_unix,
             );
-        })
-        .expect("spawn deep bench thread");
+        }) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let mut inner = lock(&daemon.inner);
+            inner.deep_bench_cancel = None;
+            inner.deep_bench_active = false;
+            inner.deep_bench_status.state = "failed".to_owned();
+            inner.deep_bench_status.last_error = format!("spawn deep bench worker: {error}");
+            return json_error(503, &inner.deep_bench_status.last_error);
+        }
+    };
     let mut inner = lock(&daemon.inner);
     inner.deep_bench_handle = Some(handle);
     (
@@ -10545,7 +10915,16 @@ fn managed_geobase_routing_rules(
 }
 
 fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
-    let (settings, rules, conflicts, servers) = {
+    let (
+        settings_response,
+        parovozik_enabled,
+        parovozik_direct_domains,
+        parovozik_vpn_domains,
+        match_target,
+        rules,
+        conflicts,
+        servers,
+    ) = {
         let mut inner = lock(&daemon.inner);
         sync_server_route_registry(&mut inner.state);
         let active_canonical = inner
@@ -10577,7 +10956,11 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
             })
             .collect();
         (
-            inner.state.split_routing.clone(),
+            split_routing_settings_response(&inner.state.split_routing),
+            inner.state.split_routing.parovozik_enabled,
+            inner.state.split_routing.parovozik_direct_domains.clone(),
+            inner.state.split_routing.parovozik_vpn_domains.clone(),
+            inner.state.split_routing.match_target.clone(),
             inner.state.routing_rules.clone(),
             detect_routing_conflicts(&inner.state),
             servers,
@@ -10585,18 +10968,18 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
     };
     let mut rules = rules;
     rules.push(RoutingRule {
-        enabled: settings.parovozik_enabled,
+        enabled: parovozik_enabled,
         name: "Паровозик Direct".to_owned(),
         target: "direct".to_owned(),
-        domains: settings.parovozik_direct_domains.clone(),
+        domains: parovozik_direct_domains,
         kind: "managed-parovozik".to_owned(),
         ..RoutingRule::default()
     });
     rules.push(RoutingRule {
-        enabled: settings.parovozik_enabled,
+        enabled: parovozik_enabled,
         name: "Паровозик VPN".to_owned(),
         target: "parovozik".to_owned(),
-        domains: settings.parovozik_vpn_domains.clone(),
+        domains: parovozik_vpn_domains,
         kind: "managed-parovozik".to_owned(),
         ..RoutingRule::default()
     });
@@ -10611,12 +10994,12 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
         }
     };
     let response = json!({
-        "settings": settings,
+        "settings": settings_response,
         "rules": rules,
         "catalog": popular_service_catalog(),
         "sources": rule_sources(),
         "conflicts": conflicts,
-        "managed_rules": managed_geobase_routing_rules(&manifest, &settings.match_target),
+        "managed_rules": managed_geobase_routing_rules(&manifest, &match_target),
         "servers": servers,
         "geobase_requires_apply": manifest.requires_apply(),
     });
@@ -11378,25 +11761,29 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
     };
     if apply_requested {
         return match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
-            Ok(result) => (
-                200,
-                "application/json",
-                json!({
-                    "settings": settings,
-                    "applied": true,
-                    "core_status": result.core_status,
-                    "firewall_status": result.firewall_status,
-                    "generation": result.generation,
-                    "gc_warning": result.gc_warning,
-                })
-                .to_string(),
-            ),
+            Ok(result) => {
+                let settings = split_routing_settings_response(&settings);
+                (
+                    200,
+                    "application/json",
+                    json!({
+                        "settings": settings,
+                        "applied": true,
+                        "core_status": result.core_status,
+                        "firewall_status": result.firewall_status,
+                        "generation": result.generation,
+                        "gc_warning": result.gc_warning,
+                    })
+                    .to_string(),
+                )
+            }
             Err(error) => {
                 let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
                 json_error(500, &format!("{error}; state rollback: {rollback}"))
             }
         };
     }
+    let settings = split_routing_settings_response(&settings);
     (
         200,
         "application/json",
@@ -12102,6 +12489,8 @@ fn handle_geo_download(body: &str, daemon: &Daemon) -> (u16, &'static str, Strin
             "-s",
             "--max-time",
             "30",
+            "--max-filesize",
+            MAX_GITHUB_API_RESPONSE_BYTES,
             "--socks5-hostname",
             &format!("127.0.0.1:{socks_port}"),
             "-H",
@@ -12186,6 +12575,8 @@ fn handle_geo_download(body: &str, daemon: &Daemon) -> (u16, &'static str, Strin
                 "-L",
                 "--max-time",
                 "120",
+                "--max-filesize",
+                MAX_GEO_ASSET_DOWNLOAD_BYTES,
                 "--socks5-hostname",
                 &format!("127.0.0.1:{socks_port}"),
                 "-H",
@@ -16672,6 +17063,50 @@ fn handle_prometheus_metrics(daemon: &Daemon) -> (u16, &'static str, String) {
 /// throughput. Body: `{"url": "...", "timeout_secs": 30}`.
 /// Default URL: Cloudflare 10MB download. Requires the core to be
 /// running (SOCKS proxy must be active).
+#[derive(Debug)]
+enum BoundedReadError {
+    Io(String),
+    LimitExceeded,
+}
+
+fn count_bounded_stream<R: Read>(reader: &mut R, max_bytes: u64) -> Result<u64, BoundedReadError> {
+    let mut total = 0u64;
+    let mut buffer = [0u8; 32 * 1024];
+    loop {
+        let remaining = max_bytes.saturating_add(1).saturating_sub(total);
+        let read_limit = remaining.min(buffer.len() as u64) as usize;
+        if read_limit == 0 {
+            return Err(BoundedReadError::LimitExceeded);
+        }
+        let read = reader
+            .read(&mut buffer[..read_limit])
+            .map_err(|error| BoundedReadError::Io(error.to_string()))?;
+        if read == 0 {
+            return Ok(total);
+        }
+        total = total.saturating_add(read as u64);
+        if total > max_bytes {
+            return Err(BoundedReadError::LimitExceeded);
+        }
+    }
+}
+
+fn read_bounded_stream<R: Read>(
+    reader: &mut R,
+    max_bytes: u64,
+) -> Result<Vec<u8>, BoundedReadError> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024) as usize);
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| BoundedReadError::Io(error.to_string()))?;
+    if bytes.len() as u64 > max_bytes {
+        Err(BoundedReadError::LimitExceeded)
+    } else {
+        Ok(bytes)
+    }
+}
+
 fn handle_speed_test(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     let (socks_url, core_running) = {
         let mut inner = lock(&daemon.inner);
@@ -16697,7 +17132,10 @@ fn handle_speed_test(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
                 .and_then(Value::as_str)
                 .unwrap_or("https://speed.cloudflare.com/__down?bytes=10485760")
                 .to_owned(),
-            v.get("timeout_secs").and_then(Value::as_u64).unwrap_or(30),
+            v.get("timeout_secs")
+                .and_then(Value::as_u64)
+                .unwrap_or(30)
+                .clamp(MIN_SPEED_TEST_TIMEOUT_SECS, MAX_SPEED_TEST_TIMEOUT_SECS),
         ),
         Err(_) => (
             "https://speed.cloudflare.com/__down?bytes=10485760".to_owned(),
@@ -16734,7 +17172,7 @@ fn handle_speed_test(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
 
     let start = std::time::Instant::now();
     match client.get(&url).send() {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let status = resp.status();
             if !status.is_success() {
                 return (
@@ -16743,10 +17181,9 @@ fn handle_speed_test(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
                     json!({"error": format!("HTTP {status}")}).to_string(),
                 );
             }
-            match resp.bytes() {
-                Ok(bytes) => {
+            match count_bounded_stream(&mut resp, MAX_SPEED_TEST_RESPONSE_BYTES) {
+                Ok(bytes_len) => {
                     let elapsed_ms = start.elapsed().as_millis() as u64;
-                    let bytes_len = bytes.len() as u64;
                     let mbps = if elapsed_ms > 0 {
                         (bytes_len as f64 * 8.0 / 1_000_000.0) / (elapsed_ms as f64 / 1000.0)
                     } else {
@@ -16763,10 +17200,19 @@ fn handle_speed_test(body: &str, daemon: &Daemon) -> (u16, &'static str, String)
                         .to_string(),
                     )
                 }
-                Err(e) => (
+                Err(BoundedReadError::LimitExceeded) => (
+                    502,
+                    "application/json",
+                    json!({"error": format!(
+                        "speed test response exceeded {} MiB",
+                        MAX_SPEED_TEST_RESPONSE_BYTES / (1024 * 1024)
+                    )})
+                    .to_string(),
+                ),
+                Err(BoundedReadError::Io(error)) => (
                     500,
                     "application/json",
-                    json!({"error": format!("read body: {e}")}).to_string(),
+                    json!({"error": format!("read body: {error}")}).to_string(),
                 ),
             }
         }
@@ -17012,6 +17458,7 @@ fn parovozik_candidate_from_mihomo_log_payload(payload: &str) -> Option<AutoVpnC
 struct MihomoLogCursor {
     identity: Option<(u64, u64)>,
     offset: u64,
+    generation: Option<String>,
 }
 
 impl MihomoLogCursor {
@@ -17020,6 +17467,7 @@ impl MihomoLogCursor {
             Ok(metadata) => Self {
                 identity: Some(file_identity(&metadata)),
                 offset: metadata.len(),
+                generation: read_log_generation(path),
             },
             Err(_) => Self::default(),
         }
@@ -17040,6 +17488,7 @@ impl MihomoLogCursor {
             .metadata()
             .map_err(|e| format!("metadata {}: {e}", path.display()))?;
         let identity = file_identity(&metadata);
+        let generation = read_log_generation(path);
         match self.identity {
             None => {
                 self.identity = Some(identity);
@@ -17054,6 +17503,10 @@ impl MihomoLogCursor {
             }
             Some(_) => {}
         }
+        if self.generation != generation {
+            self.offset = 0;
+        }
+        self.generation = generation;
 
         file.seek(SeekFrom::Start(self.offset))
             .map_err(|e| format!("seek {}: {e}", path.display()))?;
@@ -17371,6 +17824,7 @@ fn run_parovozik(
                 vpn_changed |= target == Some("vpn");
             }
         }
+        changed |= prune_parovozik_metadata(&mut inner.state.split_routing);
         inner.state.split_routing.parovozik_direct_domains =
             normalize_parovozik_domains(&inner.state.split_routing.parovozik_direct_domains);
         inner.state.split_routing.parovozik_vpn_domains =
@@ -18423,13 +18877,21 @@ fn resolve_public_addrs_bounded(
     }
     let host_owned = host.to_owned();
     let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let result = (host_owned.as_str(), port)
-            .to_socket_addrs()
-            .map(|addresses| addresses.collect::<Vec<_>>())
-            .map_err(|error| error.to_string());
-        let _ = sender.send(result);
-    });
+    let Some(permit) = try_acquire_dns_resolver() else {
+        return Err("DNS resolver worker limit reached".to_owned());
+    };
+    thread::Builder::new()
+        .name("hincyray-dns".to_owned())
+        .stack_size(DNS_RESOLVER_STACK_BYTES)
+        .spawn(move || {
+            let _permit = permit;
+            let result = (host_owned.as_str(), port)
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect::<Vec<_>>())
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("spawn DNS resolver: {error}"))?;
     let dns_deadline = deadline.min(Instant::now() + GEOBASE_DNS_TIMEOUT);
     loop {
         check_geobase_job(cancel, deadline)?;
@@ -19097,6 +19559,9 @@ fn handle_backup_webdav_upload(body: &str, daemon: &Daemon) -> (u16, &'static st
             json!({"error": "missing url"}).to_string(),
         );
     };
+    let Some(_permit) = try_acquire_backup_operation() else {
+        return json_error(409, "another backup operation is already running");
+    };
     let inner = lock(&daemon.inner);
     let state_json = match serde_json::to_string_pretty(&inner.state) {
         Ok(text) => text,
@@ -19138,6 +19603,9 @@ fn handle_backup_webdav_download(body: &str, daemon: &Daemon) -> (u16, &'static 
             "application/json",
             json!({"error": "missing url"}).to_string(),
         );
+    };
+    let Some(_permit) = try_acquire_backup_operation() else {
+        return json_error(409, "another backup operation is already running");
     };
     match webdav_get(
         url,
@@ -19296,11 +19764,27 @@ fn webdav_get(url: &str, username: Option<&str>, password: Option<&str>) -> Resu
     {
         req = req.basic_auth(user, password.map(str::to_owned));
     }
-    let resp = req.send().map_err(|e| e.to_string())?;
+    let mut resp = req.send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("WebDAV GET HTTP {}", resp.status()));
     }
-    resp.text().map_err(|e| e.to_string())
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_WEBDAV_STATE_BYTES)
+    {
+        return Err(format!(
+            "WebDAV state exceeds {} MiB",
+            MAX_WEBDAV_STATE_BYTES / (1024 * 1024)
+        ));
+    }
+    match read_bounded_stream(&mut resp, MAX_WEBDAV_STATE_BYTES) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|error| error.to_string()),
+        Err(BoundedReadError::LimitExceeded) => Err(format!(
+            "WebDAV state exceeds {} MiB",
+            MAX_WEBDAV_STATE_BYTES / (1024 * 1024)
+        )),
+        Err(BoundedReadError::Io(error)) => Err(error),
+    }
 }
 
 fn restart_core_locked(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon) -> Result<(), String> {
@@ -19768,24 +20252,30 @@ fn handle_logs(_daemon: &Daemon) -> (u16, &'static str, String) {
     let dir = resolve_log_dir();
     let mihomo_log = dir.join("mihomo.log");
 
-    let read_tail = |path: &Path| -> String {
-        let Ok(text) = fs::read_to_string(path) else {
-            return String::new();
-        };
-        let lines: Vec<&str> = text.lines().collect();
-        let start = lines.len().saturating_sub(200);
-        redact_log_text(&lines[start..].join("\n"))
-    };
-
     (
         200,
         "application/json",
         json!({
-            "mihomo": read_tail(&mihomo_log),
+            "mihomo": read_redacted_log_tail(&mihomo_log),
             "mihomo_log_path": mihomo_log.to_string_lossy(),
         })
         .to_string(),
     )
+}
+
+fn read_redacted_log_tail(path: &Path) -> String {
+    let Ok((bytes, truncated)) = read_file_tail_bytes(path, API_LOG_TAIL_BYTES) else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if truncated {
+        text.split_once('\n').map(|(_, tail)| tail).unwrap_or("")
+    } else {
+        text.as_ref()
+    };
+    let mut lines: Vec<&str> = text.lines().rev().take(API_LOG_TAIL_LINES).collect();
+    lines.reverse();
+    redact_log_text(&lines.join("\n"))
 }
 
 fn redact_log_text(text: &str) -> String {
@@ -20544,6 +21034,8 @@ fn check_latest_mihomo_release(socks_port: u16) -> Result<MihomoRelease, String>
             "-s",
             "--max-time",
             "30",
+            "--max-filesize",
+            MAX_GITHUB_API_RESPONSE_BYTES,
             "--socks5-hostname",
             &format!("127.0.0.1:{socks_port}"),
             "-H",
@@ -20638,6 +21130,8 @@ fn download_and_install_mihomo(
             "-sL",
             "--max-time",
             "300",
+            "--max-filesize",
+            MAX_MIHOMO_DOWNLOAD_BYTES,
             "--socks5-hostname",
             &format!("127.0.0.1:{socks_port}"),
             "-H",
@@ -20651,6 +21145,10 @@ fn download_and_install_mihomo(
     if !dl_status.success() {
         let _ = fs::remove_file(tmp_gz);
         return Err("download failed (curl exited with non-zero status)".to_owned());
+    }
+    if SHUTDOWN.load(Ordering::Acquire) {
+        let _ = fs::remove_file(tmp_gz);
+        return Err("update cancelled during shutdown".to_owned());
     }
 
     // 2. Decompress
@@ -20992,16 +21490,31 @@ fn start_watchdog(
     daemon: Daemon,
     mihomo_log_path: PathBuf,
     mut mihomo_log_cursor: MihomoLogCursor,
-) {
-    thread::spawn(move || {
+) -> Result<JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name("hincyray-watchdog".to_owned())
+        .spawn(move || {
         let mut bench_was_running = false;
         let mut restart_backoff_secs: u64 = 0;
         let mut failover_rejected_profiles: HashSet<String> = HashSet::new();
         let mut watchdog_tick: u64 = 0;
         let mut pending_auto_vpn_domains: VecDeque<AutoVpnCandidate> = VecDeque::new();
 
+        macro_rules! stop_if_shutting_down {
+            () => {
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    return;
+                }
+            };
+        }
+
         loop {
-            thread::sleep(Duration::from_secs(10));
+            for _ in 0..50 {
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
             watchdog_tick += 1;
 
             // --- Read state snapshot (short lock) ---
@@ -21073,6 +21586,7 @@ fn start_watchdog(
                 )
             };
 
+            stop_if_shutting_down!();
             // --- Phase 1: Core restart (always) ---
             if !core_running {
                 if restart_backoff_secs > 0 {
@@ -21099,6 +21613,7 @@ fn start_watchdog(
                 }
             }
 
+            stop_if_shutting_down!();
             // --- Phase 2: Firewall rules (split routing only) ---
             if split_enabled {
                 if !firewall_active {
@@ -21159,6 +21674,7 @@ fn start_watchdog(
                 observe_pinned_routes(&daemon, addr, ec_secret.as_deref());
             }
 
+            stop_if_shutting_down!();
             // --- Phase 3: Health check (always) + failover (auto_switch) ---
             // Health check runs on every tick when the core is running and
             // no benchmark is in progress. The `auto_switch` flag controls
@@ -21367,6 +21883,7 @@ fn start_watchdog(
                 }
             }
 
+            stop_if_shutting_down!();
             // --- Phase 4: Auto-benchmark ---
             if auto_bench_hours > 0 && !bench_running {
                 let now = unix_now();
@@ -21380,6 +21897,7 @@ fn start_watchdog(
                 }
             }
 
+            stop_if_shutting_down!();
             // --- Phase 5: Auto-select after benchmark ---
             if bench_was_running && !bench_running && auto_select {
                 eprintln!("hincyray: benchmark finished, auto-selecting lowest-latency profile");
@@ -21394,6 +21912,7 @@ fn start_watchdog(
                 }
             }
 
+            stop_if_shutting_down!();
             // --- Phase 6: Auto-update check ---
             if auto_update_enabled && core_running && !bench_running {
                 let now = unix_now();
@@ -21402,6 +21921,7 @@ fn start_watchdog(
                     eprintln!("hincyray: auto-update check triggered");
                     match check_latest_mihomo_release(socks_port) {
                         Ok(release) => {
+                            stop_if_shutting_down!();
                             let current_version =
                                 get_mihomo_version(&mihomo_path).unwrap_or_default();
                             if !current_version.is_empty()
@@ -21417,6 +21937,7 @@ fn start_watchdog(
                                     socks_port,
                                 ) {
                                     Ok(new_version) => {
+                                        stop_if_shutting_down!();
                                         let mut inner = lock(&daemon.inner);
                                         let geo_dir = geo_dir_from_state(&inner.state);
                                         let restart = inner.core.restart(
@@ -21473,6 +21994,7 @@ fn start_watchdog(
                 }
             }
 
+            stop_if_shutting_down!();
             // --- Phase 7: Auto-refresh subscriptions ---
             if auto_refresh_enabled
                 && auto_refresh_interval_hours > 0
@@ -21484,6 +22006,7 @@ fn start_watchdog(
                 if now.saturating_sub(last_auto_refresh) >= interval_secs {
                     eprintln!("hincyray: auto-refresh subscriptions triggered");
                     let _result = refresh_all_subscriptions(&daemon);
+                    stop_if_shutting_down!();
 
                     // After refresh, check if the active profile was
                     // removed (its raw link no longer exists). If so,
@@ -21528,6 +22051,7 @@ fn start_watchdog(
                 }
             }
 
+            stop_if_shutting_down!();
             // --- Phase 8: Traffic statistics ---
             // Poll Mihomo /traffic every tick (10s) and accumulate
             // cumulative byte counters. Persist every 6 ticks (60s)
@@ -21559,6 +22083,7 @@ fn start_watchdog(
                 }
             }
 
+            stop_if_shutting_down!();
             // --- Phase 9: Connection log ---
             // Poll Mihomo /connections every 30s for the UI connection log.
             // Auto-VPN learning has its own lossless incremental file source.
@@ -21685,6 +22210,7 @@ fn start_watchdog(
                 }
             }
 
+            stop_if_shutting_down!();
             // --- Phase 10: Scheduled maintenance ---
             if maintenance_due(&maintenance, unix_now()) && !bench_running {
                 eprintln!("hincyray: scheduled maintenance triggered");
@@ -21696,6 +22222,7 @@ fn start_watchdog(
                 );
             }
 
+            stop_if_shutting_down!();
             // --- Auto VPN exceptions ---
             // Mihomo's EC /logs endpoint is live-only, so periodic stream
             // sampling loses events. Consume every completed line appended
@@ -21745,6 +22272,7 @@ fn start_watchdog(
                 }
             }
 
+            stop_if_shutting_down!();
             // --- Phase 13: Deep Bench (v0.20) ---
             // Two-phase quality testing on a schedule. Phase A reuses
             // `run_bench()` for the quick scan, Phase B observes each
@@ -21767,7 +22295,10 @@ fn start_watchdog(
                         let inner = lock(&daemon.inner);
                         (
                             select_profiles_for_deep_bench(&inner.state),
-                            inner.state.deep_bench.stability_minutes.max(1),
+                            inner.state.deep_bench.stability_minutes.clamp(
+                                MIN_DEEP_BENCH_STABILITY_MINUTES,
+                                MAX_DEEP_BENCH_STABILITY_MINUTES,
+                            ),
                             inner.state.deep_bench.profile_filter.clone(),
                             inner.state.mihomo_path.clone(),
                         )
@@ -21815,10 +22346,19 @@ fn start_watchdog(
                                     cancel_clone,
                                     started_unix,
                                 );
-                            })
-                            .expect("spawn deep bench thread");
+                            });
                         let mut inner = lock(&daemon.inner);
-                        inner.deep_bench_handle = Some(handle);
+                        match handle {
+                            Ok(handle) => inner.deep_bench_handle = Some(handle),
+                            Err(error) => {
+                                inner.deep_bench_cancel = None;
+                                inner.deep_bench_active = false;
+                                inner.deep_bench_status.state = "failed".to_owned();
+                                inner.deep_bench_status.last_error =
+                                    format!("spawn deep bench worker: {error}");
+                                eprintln!("hincyray: {}", inner.deep_bench_status.last_error);
+                            }
+                        }
                     }
                 }
             }
@@ -21851,12 +22391,21 @@ fn start_watchdog(
                 flush_if_dirty(&mut inner, &daemon.state_path);
             }
             if watchdog_tick.is_multiple_of(6) {
+                match rotate_log_in_place(&mihomo_log_path, LOG_ROTATE_THRESHOLD_BYTES) {
+                    Ok(true) => eprintln!(
+                        "hincyray: capped active Mihomo log at {} MiB",
+                        LOG_ROTATE_THRESHOLD_BYTES / (1024 * 1024)
+                    ),
+                    Ok(false) => {}
+                    Err(error) => eprintln!("hincyray: Mihomo log rotation failed: {error}"),
+                }
                 trim_process_allocator();
             }
 
             bench_was_running = bench_running;
         }
-    });
+        })
+        .map_err(|error| format!("spawn watchdog: {error}"))
 }
 
 fn fallback_routes_through_live_active(group: &Value, active: &Value) -> bool {
@@ -22542,7 +23091,7 @@ fn fetch_github_names(url: &str, proxy: Option<&str>) -> Result<Vec<Value>, Stri
         builder = builder.proxy(proxy);
     }
     let client = builder.build().map_err(|error| error.to_string())?;
-    let response = client
+    let mut response = client
         .get(url)
         .header("User-Agent", "HincyRay")
         .send()
@@ -22550,8 +23099,20 @@ fn fetch_github_names(url: &str, proxy: Option<&str>) -> Result<Vec<Value>, Stri
     if !response.status().is_success() {
         return Err(format!("GitHub returned HTTP {}", response.status()));
     }
-    let text = response.text().map_err(|error| error.to_string())?;
-    let value: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_GITHUB_CATALOG_BYTES)
+    {
+        return Err("GitHub catalog response is too large".to_owned());
+    }
+    let bytes = match read_bounded_stream(&mut response, MAX_GITHUB_CATALOG_BYTES) {
+        Ok(bytes) => bytes,
+        Err(BoundedReadError::LimitExceeded) => {
+            return Err("GitHub catalog response is too large".to_owned());
+        }
+        Err(BoundedReadError::Io(error)) => return Err(error),
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     let Some(items) = value.as_array() else {
         return Err("GitHub response is not an array".to_owned());
     };
@@ -22612,7 +23173,10 @@ fn status_text(code: u16) -> &'static str {
         429 => "Too Many Requests",
         409 => "Conflict",
         413 => "Payload Too Large",
+        414 => "URI Too Long",
+        431 => "Request Header Fields Too Large",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
         500 => "Internal Server Error",
         _ => "OK",
     }
@@ -23493,6 +24057,108 @@ mod tests {
             request_body_limit("POST", "/api/geobases/analyze"),
             MAX_GEOBASE_ANALYZE_BODY_BYTES
         );
+    }
+
+    #[test]
+    fn http_parser_bounds_request_and_header_lines() {
+        let (_dir, daemon) = test_daemon();
+        let request = format!(
+            "GET /{} HTTP/1.1\r\n\r\n",
+            "x".repeat(MAX_HTTP_REQUEST_LINE_BYTES)
+        );
+        let response = http_request(daemon.clone(), &request);
+        assert!(response.starts_with("HTTP/1.1 414"), "{response}");
+
+        let request = format!(
+            "GET /api/health HTTP/1.1\r\nX-Oversized: {}\r\n\r\n",
+            "x".repeat(MAX_HTTP_HEADER_LINE_BYTES)
+        );
+        let response = http_request(daemon, &request);
+        assert!(response.starts_with("HTTP/1.1 431"), "{response}");
+    }
+
+    #[test]
+    fn http_connection_permits_are_bounded_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let permits: Vec<_> = (0..MAX_HTTP_CONNECTIONS)
+            .map(|_| try_acquire_http_connection(Arc::clone(&active)).expect("connection permit"))
+            .collect();
+        assert!(try_acquire_http_connection(Arc::clone(&active)).is_none());
+        assert_eq!(active.load(Ordering::Acquire), MAX_HTTP_CONNECTIONS);
+
+        drop(permits);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(try_acquire_http_connection(active).is_some());
+    }
+
+    #[test]
+    fn large_http_body_permits_bound_aggregate_request_memory() {
+        assert_eq!(ACTIVE_LARGE_HTTP_BODIES.load(Ordering::Acquire), 0);
+        let first = try_acquire_large_http_body().expect("first large body");
+        let second = try_acquire_large_http_body().expect("second large body");
+        assert!(try_acquire_large_http_body().is_none());
+        drop((first, second));
+        assert_eq!(ACTIVE_LARGE_HTTP_BODIES.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn resolver_and_backup_permits_release_their_capacity() {
+        assert_eq!(ACTIVE_DNS_RESOLVERS.load(Ordering::Acquire), 0);
+        let resolvers: Vec<_> = (0..MAX_DNS_RESOLVER_THREADS)
+            .map(|_| try_acquire_dns_resolver().expect("DNS resolver permit"))
+            .collect();
+        assert!(try_acquire_dns_resolver().is_none());
+        drop(resolvers);
+        assert_eq!(ACTIVE_DNS_RESOLVERS.load(Ordering::Acquire), 0);
+
+        let backup = try_acquire_backup_operation().expect("backup permit");
+        assert!(try_acquire_backup_operation().is_none());
+        drop(backup);
+        assert!(!BACKUP_OPERATION_ACTIVE.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn bounded_stream_counter_does_not_buffer_or_accept_oversized_input() {
+        let mut exact = std::io::Cursor::new(vec![0u8; 1024]);
+        assert!(matches!(count_bounded_stream(&mut exact, 1024), Ok(1024)));
+
+        let mut oversized = std::io::Cursor::new(vec![0u8; 1025]);
+        assert!(matches!(
+            count_bounded_stream(&mut oversized, 1024),
+            Err(BoundedReadError::LimitExceeded)
+        ));
+
+        let mut bounded = std::io::Cursor::new(vec![7u8; 1024]);
+        assert_eq!(
+            read_bounded_stream(&mut bounded, 1024).expect("bounded body"),
+            vec![7u8; 1024]
+        );
+        let mut oversized = std::io::Cursor::new(vec![0u8; 1025]);
+        assert!(matches!(
+            read_bounded_stream(&mut oversized, 1024),
+            Err(BoundedReadError::LimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn log_tail_and_rotation_keep_large_files_bounded() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("mihomo.log");
+        let mut log = vec![b'x'; API_LOG_TAIL_BYTES as usize + 32];
+        log.extend_from_slice(b"\nold line\npassword=secret\nfinal line\n");
+        fs::write(&path, log).expect("large log");
+
+        let tail = read_redacted_log_tail(&path);
+        assert!(tail.contains("old line"));
+        assert!(tail.contains("final line"));
+        assert!(tail.contains("[redacted log line: possible secret]"));
+        assert!(!tail.contains("password=secret"));
+        assert!(tail.len() <= API_LOG_TAIL_BYTES as usize);
+
+        assert!(rotate_log_in_place(&path, 1024).expect("rotate"));
+        assert_eq!(fs::metadata(&path).expect("active metadata").len(), 0);
+        let rotated = path.with_extension("log.1");
+        assert!(fs::metadata(rotated).expect("rotated metadata").len() <= ROTATED_LOG_TAIL_BYTES);
     }
 
     #[test]
@@ -25852,14 +26518,38 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let state_path = dir.path().join("state.json");
         let mihomo_config_path = dir.path().join("mihomo-config.yaml");
-        let daemon = Daemon::new(HincyrayState::default(), state_path, mihomo_config_path);
+        let mut state = HincyrayState::default();
+        state
+            .split_routing
+            .parovozik_last_checked_unix
+            .insert("internal.example".to_owned(), 1);
+        let daemon = Daemon::new(state, state_path, mihomo_config_path);
         let (status, _, body) = dispatch("GET", "/api/status", "", &daemon);
         assert_eq!(status, 200);
         assert!(body.contains("\"socks_port\":10808"));
         assert!(body.contains("\"core_status\":\"stopped\""));
         assert!(body.contains("\"mihomo_path\":\"mihomo\""));
         assert!(body.contains("\"mihomo_config_path\":\""));
+        assert!(body.contains("\"quic_mode\":\"block\""));
+        assert!(!body.contains("split_routing"));
+        assert!(!body.contains("internal.example"));
         assert!(!body.contains("core_engine"));
+    }
+
+    #[test]
+    fn routing_settings_response_omits_internal_probe_caches() {
+        let mut settings = SplitRoutingSettings::default();
+        settings
+            .auto_vpn_last_checked_unix
+            .insert("auto.internal".to_owned(), 1);
+        settings
+            .parovozik_last_checked_unix
+            .insert("parovozik.internal".to_owned(), 2);
+
+        let response = split_routing_settings_response(&settings);
+        assert_eq!(response["enabled"], false);
+        assert!(response.get("auto_vpn_last_checked_unix").is_none());
+        assert!(response.get("parovozik_last_checked_unix").is_none());
     }
 
     #[test]
@@ -26186,6 +26876,39 @@ mod tests {
             assert_eq!(status, 400);
             assert!(response.contains("concurrency must be an integer from 1 to 6"));
         }
+    }
+
+    #[test]
+    fn deep_bench_duration_is_validated_and_migrated() {
+        let (_dir, daemon) = test_daemon();
+        assert_eq!(
+            DeepBenchSettings::default().stability_minutes,
+            default_deep_bench_stability_minutes()
+        );
+        for value in [0u64, 16, u64::MAX] {
+            let body = format!(r#"{{"stability_minutes":{value}}}"#);
+            let (status, _, response) = handle_deep_bench_settings_set(&body, &daemon);
+            assert_eq!(status, 400, "{response}");
+            let (status, _, response) = handle_deep_bench_start(&body, &daemon);
+            assert_eq!(status, 400, "{response}");
+        }
+
+        let (status, _, _) = handle_deep_bench_settings_set(
+            &format!(r#"{{"stability_minutes":{MAX_DEEP_BENCH_STABILITY_MINUTES}}}"#),
+            &daemon,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            lock(&daemon.inner).state.deep_bench.stability_minutes,
+            MAX_DEEP_BENCH_STABILITY_MINUTES
+        );
+
+        let mut settings = DeepBenchSettings {
+            stability_minutes: u32::MAX,
+            ..DeepBenchSettings::default()
+        };
+        assert!(normalize_deep_bench_duration(&mut settings));
+        assert_eq!(settings.stability_minutes, MAX_DEEP_BENCH_STABILITY_MINUTES);
     }
 
     #[test]
@@ -31360,6 +32083,30 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
     }
 
     #[test]
+    fn parovozik_metadata_pruning_bounds_live_state() {
+        let mut settings = SplitRoutingSettings::default();
+        let limit = MAX_PAROVOZIK_DOMAINS * 2;
+        for index in 0..limit + 5 {
+            settings
+                .parovozik_last_checked_unix
+                .insert(format!("domain-{index}.example"), index as u64);
+        }
+
+        assert!(prune_parovozik_metadata(&mut settings));
+        assert_eq!(settings.parovozik_last_checked_unix.len(), limit);
+        assert!(
+            !settings
+                .parovozik_last_checked_unix
+                .contains_key("domain-0.example")
+        );
+        assert!(
+            settings
+                .parovozik_last_checked_unix
+                .contains_key(&format!("domain-{}.example", limit + 4))
+        );
+    }
+
+    #[test]
     fn parovozik_geobase_match_supports_exact_and_suffix_entries() {
         let bytes = b"exact.example\n+.suffix.example\n";
         assert!(domain_matches_geobase_artifact("exact.example", bytes));
@@ -31449,6 +32196,26 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
                 .read_new_domains(&path, false)
                 .expect("read rotated log"),
             vec![auto_candidate("rotated.example", Some(443))]
+        );
+    }
+
+    #[test]
+    fn mihomo_log_cursor_detects_in_place_rotation_after_fast_regrowth() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("mihomo.log");
+        fs::write(&path, "old line\n".repeat(16)).expect("old log");
+        let mut cursor = MihomoLogCursor::start_at_end(&path);
+
+        assert!(rotate_log_in_place(&path, 32).expect("in-place rotation"));
+        let mut new_log = "noise\n".repeat(32);
+        new_log.push_str("new dial DIRECT --> regrown.example:443 error: failed\n");
+        fs::write(&path, new_log).expect("regrown log");
+
+        assert_eq!(
+            cursor
+                .read_new_domains(&path, false)
+                .expect("read after in-place rotation"),
+            vec![auto_candidate("regrown.example", Some(443))]
         );
     }
 

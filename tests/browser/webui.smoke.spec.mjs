@@ -30,7 +30,7 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.4');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.5');
 });
 
 test('profile table shows compact service status and configurable metric columns', async ({ page }) => {

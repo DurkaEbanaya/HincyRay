@@ -1,4 +1,4 @@
-# HincyRay v1.3.4
+# HincyRay v1.3.5
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -43,9 +43,9 @@ Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN eve
 
 ## Features
 
-### v1.3.4
+### v1.3.5
 
-v1.3.4 fixes leading-dot domain-zone routing, rejects Mihomo fake IPs as persistent routing resources, refreshes routing identities after subscription reloads, and reduces retained daemon memory on the 512 MiB router. Manual XHTTP profiles also gain measured 4/8/16/32 KiB upload-block choices. Details: [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.3.4.md`](docs/releases/v1.3.4.md).
+v1.3.5 bounds HTTP workers, request parsing, logs, network responses, resolver threads, and diagnostic allocations after a live router exhausted its thread resources. It also makes benchmark cancellation and daemon shutdown reap owned children promptly and trims recurring control-plane payloads. Details: [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.3.5.md`](docs/releases/v1.3.5.md).
 
 ### v1.3.2
 
@@ -408,7 +408,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.4 release evidence is recorded in [`docs/releases/v1.3.4.md`](docs/releases/v1.3.4.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.5 release evidence is recorded in [`docs/releases/v1.3.5.md`](docs/releases/v1.3.5.md).
 
 ## Installation
 

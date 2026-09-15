@@ -1,4 +1,4 @@
-# HincyRay v1.3.4 (`xray-vpn-test`)
+# HincyRay v1.3.5 (`xray-vpn-test`)
 
 Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 and the feature-gated `xray-vpn-test` desktop diagnostics app. Router mode uses Mihomo with iptables NAT REDIRECT (TCP 10810) and mangle TPROXY (UDP 10811); there is no TUN/tun2socks path.
 
@@ -121,7 +121,7 @@ Use this repeatable live-update sequence; do not improvise a different installer
 5. Poll bounded `/api/health` and `/api/safe-mode` until the expected version, `core_status=running`, and `firewall_status=running`; only then disarm the trap and remove the staged file.
 6. Verify active profile, fallback group, routing/firewall, the changed live behavior, and bounded router E2E. Keep the rollback directory and report its path.
 
-Release artifact SHA256: `232f6d5a71ecb4afb6d09d1e83c92463a714bb3f84988705142e78eecbf70340`. Release evidence is recorded in `docs/releases/v1.3.4.md`.
+Release artifact SHA256: `649588fd46380cc42349e0df2a8b2c7492fa05cac234bd61a5b28b801ff05a44`. Release evidence is recorded in `docs/releases/v1.3.5.md`.
 
 ## Release
 
