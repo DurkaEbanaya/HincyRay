@@ -37,10 +37,10 @@ use qrcode::{QrCode, render::svg};
 use tempfile::NamedTempFile;
 
 use crate::benchmark::{
-    BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL,
-    DEFAULT_UPLOAD_URL, MAX_DEEP_BENCH_STABILITY_MINUTES, MIN_DEEP_BENCH_STABILITY_MINUTES,
-    QuickProbeConfig, ResourceTestResult, SharedJob, new_bench_job, probe_youtube_via_socks,
-    run_bench,
+    BenchCompleteCallback, BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL,
+    DEFAULT_PROBE_URL, DEFAULT_UPLOAD_URL, MAX_DEEP_BENCH_STABILITY_MINUTES,
+    MIN_DEEP_BENCH_STABILITY_MINUTES, QUICK_RESOURCE_CONTRACT_VERSION, QuickProbeConfig,
+    ResourceTestResult, SharedJob, new_bench_job, probe_youtube_via_socks, run_bench,
 };
 use crate::geobase::{
     self, Classification, DomainClassification, GeoBaseArtifactKind, GeoBaseGenerationInput,
@@ -60,7 +60,8 @@ use crate::hincyray_api::{
     ProfileDiagnosticReportResponse, ProfileDiagnosticServiceResult,
     ProfileDiagnosticSessionRequest, ProfileDiagnosticSessionStatus, ProfileDiagnosticStartRequest,
     ProfileDiagnosticStartResponse, ProfileDiagnosticStatusResponse, ProfileDiagnosticSummary,
-    ProfileRevalidationError, ProfileSafeFields, ProfileUpdateRequest, ProfileUpdateResponse,
+    ProfileRevalidationError, ProfileSafeFields, ProfileTestSettings, ProfileTestSettingsResponse,
+    ProfileTestSettingsUpdateRequest, ProfileUpdateRequest, ProfileUpdateResponse,
     ProfilesRevalidateResponse, ReadinessCheck, RoutingConnectionContextResponse,
     RoutingPreviewDiff, RoutingPreviewResponse, RoutingServerSummary, RoutingSummaryResponse,
     SafeModeRequest, SafeModeResponse, SubscriptionMoveRequest, SubscriptionMoveResponse,
@@ -1113,6 +1114,10 @@ pub struct HincyrayState {
     /// v0.20: Deep Bench settings (scheduled quality testing).
     #[serde(default)]
     pub deep_bench: DeepBenchSettings,
+    /// Post-processing applied only after a complete, non-cancelled Quick or
+    /// Full profile test.
+    #[serde(default)]
+    pub profile_test_settings: ProfileTestSettings,
     /// Opaque canonical server references assigned to the virtual
     /// "Dead Servers" lifecycle group. Profile provenance remains in
     /// `Profile.group`; lifecycle membership survives subscription refresh,
@@ -1173,6 +1178,7 @@ impl Default for HincyrayState {
             memory_guard: MemoryGuardSettings::default(),
             safe_mode_enabled: false,
             deep_bench: DeepBenchSettings::default(),
+            profile_test_settings: ProfileTestSettings::default(),
             dead_server_refs: std::collections::HashSet::new(),
             dead_promoted_at: std::collections::HashMap::new(),
             quality_history: Vec::new(),
@@ -5609,6 +5615,8 @@ fn dispatch_from(
         ("POST", "/api/core/stop") => handle_core_stop(daemon),
         ("POST", "/api/core/restart") => handle_core_restart(daemon),
         ("GET", "/api/bench/status") => handle_bench_status(daemon),
+        ("GET", "/api/bench/settings") => handle_profile_test_settings_get(daemon),
+        ("POST", "/api/bench/settings") => handle_profile_test_settings_set(body, daemon),
         ("POST", "/api/bench/start") => handle_bench_start(body, daemon),
         ("POST", "/api/bench/stop") => handle_bench_stop(daemon),
         ("GET", "/api/telegram-probe/status") => handle_telegram_probe_status(daemon),
@@ -7530,6 +7538,27 @@ fn handle_core_restart(daemon: &Daemon) -> (u16, &'static str, String) {
     }
 }
 
+fn handle_profile_test_settings_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    let settings = lock(&daemon.inner).state.profile_test_settings.clone();
+    json_response(&ProfileTestSettingsResponse { settings })
+}
+
+fn handle_profile_test_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(request) = serde_json::from_str::<ProfileTestSettingsUpdateRequest>(body) else {
+        return json_error(400, "invalid profile test settings");
+    };
+    let settings = ProfileTestSettings::from(request);
+    let mut inner = lock(&daemon.inner);
+    let mut candidate = inner.state.clone();
+    candidate.profile_test_settings = settings.clone();
+    if let Err(error) = persist_state(&daemon.state_path, &candidate) {
+        return json_error(500, &format!("persist profile test settings: {error}"));
+    }
+    inner.state.profile_test_settings = settings.clone();
+    inner.dirty = false;
+    json_response(&ProfileTestSettingsResponse { settings })
+}
+
 fn handle_bench_status(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
     let job = inner.bench.snapshot();
@@ -7578,6 +7607,269 @@ fn bench_summary(job: &BenchJob) -> Value {
         "failed": failed,
         "avg_latency_ms": avg_latency,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProfileTestRank {
+    tier: u8,
+    latency_ms: u32,
+}
+
+fn current_profile_test_resource<'a>(
+    result: &'a BenchResult,
+    id: &str,
+) -> Option<&'a ResourceTestResult> {
+    result
+        .resource_tests
+        .iter()
+        .find(|test| test.contract_version == QUICK_RESOURCE_CONTRACT_VERSION && test.id == id)
+}
+
+fn profile_test_rank(result: &BenchResult) -> Option<ProfileTestRank> {
+    if !matches!(result.method.as_str(), "quick" | "full") {
+        return None;
+    }
+    let ping_passed = ["ping_icmp", "ping_tcp", "ping_proxy"]
+        .into_iter()
+        .filter_map(|id| current_profile_test_resource(result, id))
+        .any(|test| test.attempts > 0 && test.reachable);
+    let service_passed = |id| {
+        current_profile_test_resource(result, id)
+            .is_some_and(|test| test.attempts > 0 && test.successes > 0 && test.stable)
+    };
+    if !ping_passed || !service_passed("youtube") {
+        return None;
+    }
+    let telegram = service_passed("telegram");
+    let ai = service_passed("ai");
+    Some(ProfileTestRank {
+        tier: if telegram && ai {
+            3
+        } else if telegram {
+            2
+        } else {
+            1
+        },
+        latency_ms: if result.latency_ms > 0 {
+            result.latency_ms
+        } else {
+            u32::MAX
+        },
+    })
+}
+
+fn profile_test_result_is_completely_unresponsive(result: &BenchResult) -> bool {
+    if !matches!(result.method.as_str(), "quick" | "full") {
+        return false;
+    }
+    let all_pings_failed = ["ping_icmp", "ping_tcp", "ping_proxy"]
+        .into_iter()
+        .all(|id| {
+            current_profile_test_resource(result, id)
+                .is_some_and(|test| test.attempts > 0 && test.successes == 0 && !test.reachable)
+        });
+    all_pings_failed
+        && !result.resource_tests.iter().any(|test| {
+            test.contract_version == QUICK_RESOURCE_CONTRACT_VERSION
+                && test.attempts > 0
+                && (test.successes > 0 || test.reachable || test.stable)
+        })
+}
+
+fn profile_test_result_server_ref(result: &BenchResult) -> String {
+    lifecycle_ref_for_canonical(&canonical_lifecycle_identity_from_raw(&result.profile_raw))
+}
+
+fn promote_successful_tested_profiles(state: &mut HincyrayState, results: &[BenchResult]) -> bool {
+    let active_raw = state
+        .active_profile_id
+        .and_then(|id| state.profiles.iter().find(|profile| profile.id == id))
+        .map(|profile| profile.raw.clone());
+    let mut ranks = HashMap::<String, ProfileTestRank>::new();
+    for result in results {
+        let Some(rank) = profile_test_rank(result) else {
+            continue;
+        };
+        let server_ref = profile_test_result_server_ref(result);
+        ranks
+            .entry(server_ref)
+            .and_modify(|current| {
+                if rank.tier > current.tier
+                    || (rank.tier == current.tier && rank.latency_ms < current.latency_ms)
+                {
+                    *current = rank;
+                }
+            })
+            .or_insert(rank);
+    }
+    if ranks.is_empty() {
+        return false;
+    }
+    ranks.retain(|server_ref, _| !state.dead_server_refs.contains(server_ref));
+
+    let slot_groups = state
+        .profiles
+        .iter()
+        .map(|profile| normalized_profile_group(profile.group.as_deref()).map(str::to_owned))
+        .collect::<Vec<_>>();
+    let before = state
+        .profiles
+        .iter()
+        .map(|profile| profile.raw.clone())
+        .collect::<Vec<_>>();
+    let mut grouped = HashMap::<Option<String>, Vec<Profile>>::new();
+    for (profile, group) in state
+        .profiles
+        .iter()
+        .cloned()
+        .zip(slot_groups.iter().cloned())
+    {
+        grouped.entry(group).or_default().push(profile);
+    }
+    for profiles in grouped.values_mut() {
+        profiles.sort_by(|left, right| {
+            let left_rank = ranks.get(&profile_server_ref(left));
+            let right_rank = ranks.get(&profile_server_ref(right));
+            match (left_rank, right_rank) {
+                (Some(left), Some(right)) => right
+                    .tier
+                    .cmp(&left.tier)
+                    .then_with(|| left.latency_ms.cmp(&right.latency_ms)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+    }
+
+    let mut offsets = HashMap::<Option<String>, usize>::new();
+    for (index, group) in slot_groups.into_iter().enumerate() {
+        let offset = offsets.entry(group.clone()).or_default();
+        if let Some(profile) = grouped
+            .get(&group)
+            .and_then(|profiles| profiles.get(*offset))
+        {
+            state.profiles[index] = profile.clone();
+        }
+        *offset += 1;
+    }
+    let changed = before
+        != state
+            .profiles
+            .iter()
+            .map(|profile| profile.raw.clone())
+            .collect::<Vec<_>>();
+    if changed {
+        for (id, profile) in state.profiles.iter_mut().enumerate() {
+            profile.id = id;
+        }
+        state.active_profile_id = active_raw.and_then(|raw| {
+            state
+                .profiles
+                .iter()
+                .find(|profile| profile.raw == raw)
+                .map(|profile| profile.id)
+        });
+    }
+    changed
+}
+
+fn auto_move_unresponsive_tested_profiles(
+    daemon: &Daemon,
+    results: &[BenchResult],
+) -> Result<usize, (u16, String)> {
+    let mut unresponsive_by_ref = HashMap::<String, bool>::new();
+    for result in results
+        .iter()
+        .filter(|result| matches!(result.method.as_str(), "quick" | "full"))
+    {
+        let unresponsive = profile_test_result_is_completely_unresponsive(result);
+        unresponsive_by_ref
+            .entry(profile_test_result_server_ref(result))
+            .and_modify(|all_unresponsive| *all_unresponsive &= unresponsive)
+            .or_insert(unresponsive);
+    }
+    let server_refs = unresponsive_by_ref
+        .into_iter()
+        .filter_map(|(server_ref, unresponsive)| unresponsive.then_some(server_ref))
+        .collect::<Vec<_>>();
+    if server_refs.is_empty() {
+        return Ok(0);
+    }
+    mutate_dead_server_membership(daemon, |state| {
+        let active_ref = state
+            .active_profile_id
+            .and_then(|id| state.profiles.iter().find(|profile| profile.id == id))
+            .map(profile_server_ref);
+        let eligible = server_refs
+            .iter()
+            .filter(|server_ref| {
+                active_ref.as_deref() != Some(server_ref.as_str())
+                    && !state.dead_server_refs.contains(server_ref.as_str())
+                    && state
+                        .profiles
+                        .iter()
+                        .any(|profile| profile_server_ref(profile) == server_ref.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let now = unix_now();
+        for server_ref in &eligible {
+            state.dead_server_refs.insert(server_ref.clone());
+            state
+                .dead_promoted_at
+                .entry(server_ref.clone())
+                .or_insert(now);
+        }
+        Ok(eligible.len())
+    })
+}
+
+fn apply_profile_test_post_actions(daemon: &Daemon, results: &[BenchResult]) -> Result<(), String> {
+    let settings = lock(&daemon.inner).state.profile_test_settings.clone();
+    if settings.auto_move_no_ping_to_dead_servers {
+        auto_move_unresponsive_tested_profiles(daemon, results).map_err(|(_, error)| error)?;
+    }
+    if settings.promote_successful_tested_servers {
+        let _apply = daemon
+            .apply
+            .lock()
+            .map_err(|_| "config apply lock is poisoned".to_owned())?;
+        let mut inner = lock(&daemon.inner);
+        let mut candidate = inner.state.clone();
+        if promote_successful_tested_profiles(&mut candidate, results) {
+            persist_state(&daemon.state_path, &candidate)
+                .map_err(|error| format!("persist promoted profile order: {error}"))?;
+            inner.state.profiles = candidate.profiles;
+            inner.state.active_profile_id = candidate.active_profile_id;
+            inner.dirty = false;
+        }
+    }
+    Ok(())
+}
+
+fn remap_completed_bench_result_ids(daemon: &Daemon, results: &mut [BenchResult]) {
+    let inner = lock(&daemon.inner);
+    let ids_by_raw = inner
+        .state
+        .profiles
+        .iter()
+        .map(|profile| (profile.raw.as_str(), profile.id))
+        .collect::<HashMap<_, _>>();
+    let mut ids_by_ref = HashMap::<String, Option<usize>>::new();
+    for profile in &inner.state.profiles {
+        ids_by_ref
+            .entry(profile_server_ref(profile))
+            .and_modify(|id| *id = None)
+            .or_insert(Some(profile.id));
+    }
+    for result in results {
+        if let Some(id) = ids_by_raw.get(result.profile_raw.as_str()) {
+            result.profile_id = *id;
+        } else if let Some(Some(id)) = ids_by_ref.get(&profile_test_result_server_ref(result)) {
+            result.profile_id = *id;
+        }
+    }
 }
 
 fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
@@ -7669,6 +7961,16 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
     let on_result = Box::new(move |result: BenchResult| {
         apply_bench_result(&daemon_for_callback, result);
     });
+    let on_complete = matches!(method, BenchMethod::Quick | BenchMethod::Full).then(|| {
+        let daemon = daemon.clone();
+        Box::new(move |mut results: Vec<BenchResult>| {
+            if let Err(error) = apply_profile_test_post_actions(&daemon, &results) {
+                eprintln!("hincyray: profile test post-processing failed: {error}");
+            }
+            remap_completed_bench_result_ids(&daemon, &mut results);
+            results
+        }) as BenchCompleteCallback
+    });
     let quick_probe =
         matches!(method, BenchMethod::Quick | BenchMethod::Full).then(|| QuickProbeConfig {
             telegram_session_path: telegram_session_path(&daemon.state_path)
@@ -7730,6 +8032,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             Arc::clone(&job),
             cancel,
             on_result,
+            on_complete,
         ) {
             Ok(handle) => handle,
             Err(error) => {
@@ -7822,14 +8125,16 @@ fn select_profiles_for_quick_bench(
 }
 
 fn handle_bench_stop(daemon: &Daemon) -> (u16, &'static str, String) {
-    let (running, handle) = {
+    let (cancelled, handle) = {
         let mut inner = lock(&daemon.inner);
-        let running = inner.bench.is_running();
-        if running {
+        let snapshot = inner.bench.snapshot();
+        let running = snapshot.running;
+        let cancellable = running && snapshot.completed < snapshot.total;
+        if cancellable {
             inner.bench.request_cancel();
         }
         (
-            running,
+            cancellable,
             running.then(|| inner.bench.take_handle()).flatten(),
         )
     };
@@ -7840,7 +8145,7 @@ fn handle_bench_stop(daemon: &Daemon) -> (u16, &'static str, String) {
         200,
         "application/json",
         json!({
-            "stopped": running,
+            "stopped": cancelled,
             "cancel_requested": false,
         })
         .to_string(),
@@ -11014,6 +11319,7 @@ fn handle_api_contracts() -> (u16, &'static str, String) {
             "/api/profiles/{id}",
             "/api/profiles/update",
             "/api/profiles/revalidate-ungrouped",
+            "/api/bench/settings",
             "/api/routing/summary",
             "/api/routing/connection-context",
             "/api/routing/preview",
@@ -21246,6 +21552,7 @@ fn start_auto_benchmark(daemon: &Daemon) {
         Arc::clone(&job),
         cancel,
         on_result,
+        None,
     ) {
         Ok(handle) => inner.bench.handle = Some(handle),
         Err(error) => {
@@ -22681,6 +22988,7 @@ fn run_deep_bench(
         job.clone(),
         cancel.clone(),
         on_result,
+        None,
     );
     let handle = match handle {
         Ok(handle) => handle,
@@ -23203,6 +23511,74 @@ mod tests {
         };
         let daemon = Daemon::new(state, state_path, mihomo_config_path);
         (dir, daemon)
+    }
+
+    fn profile_test_fixture_profile(id: usize, name: &str, group: &str) -> Profile {
+        Profile {
+            id,
+            name: name.to_owned(),
+            protocol: crate::profiles::Protocol::Vless,
+            address: format!("server-{id}.example"),
+            port: Some(443),
+            raw: format!(
+                "vless://11111111-1111-1111-1111-111111111111@server-{id}.example:443?security=tls#{name}"
+            ),
+            selected: false,
+            block_quic: false,
+            group: Some(group.to_owned()),
+        }
+    }
+
+    fn profile_test_fixture_resource(id: &str, passed: bool) -> ResourceTestResult {
+        ResourceTestResult {
+            contract_version: QUICK_RESOURCE_CONTRACT_VERSION,
+            id: id.to_owned(),
+            name: id.to_owned(),
+            attempts: 1,
+            successes: u32::from(passed),
+            reachable: passed,
+            stable: passed,
+            avg_ttfb_ms: if passed { 10 } else { 0 },
+            max_ttfb_ms: if passed { 10 } else { 0 },
+            avg_download_kbps: 0.0,
+            error: (!passed).then(|| "failed".to_owned()),
+        }
+    }
+
+    fn profile_test_fixture_result(
+        profile: &Profile,
+        ping: bool,
+        youtube: bool,
+        telegram: bool,
+        ai: bool,
+        latency_ms: u32,
+    ) -> BenchResult {
+        let mut resource_tests = ["ping_icmp", "ping_tcp", "ping_proxy"]
+            .into_iter()
+            .map(|id| profile_test_fixture_resource(id, ping))
+            .collect::<Vec<_>>();
+        resource_tests.extend([
+            profile_test_fixture_resource("youtube", youtube),
+            profile_test_fixture_resource("telegram", telegram),
+            profile_test_fixture_resource("ai", ai),
+        ]);
+        BenchResult {
+            profile_id: profile.id,
+            profile_name: profile.name.clone(),
+            profile_raw: profile.raw.clone(),
+            method: "quick".to_owned(),
+            latency_ms,
+            jitter_ms: 0,
+            download_mbps: None,
+            upload_mbps: None,
+            download_error: None,
+            upload_error: None,
+            loss_percent: if ping { 0.0 } else { 100.0 },
+            success: ping && youtube && telegram && ai,
+            error: None,
+            resource_tests,
+            timestamp: 1,
+        }
     }
 
     fn diagnostic_controller(daemon: &Daemon, responses: Vec<Value>) -> JoinHandle<()> {
@@ -26814,6 +27190,7 @@ mod tests {
         assert!(loaded.subscriptions.is_empty());
         assert!(loaded.favorites.is_empty());
         assert!(loaded.stats.is_empty());
+        assert_eq!(loaded.profile_test_settings, ProfileTestSettings::default());
     }
 
     #[test]
@@ -26974,6 +27351,291 @@ mod tests {
     }
 
     #[test]
+    fn profile_test_settings_default_disabled_and_persist() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, body) = dispatch("GET", "/api/bench/settings", "", &daemon);
+        assert_eq!(status, 200);
+        let response: ProfileTestSettingsResponse =
+            serde_json::from_str(&body).expect("settings response");
+        assert_eq!(response.settings, ProfileTestSettings::default());
+
+        let body = json!({
+            "promote_successful_tested_servers": true,
+            "auto_move_no_ping_to_dead_servers": true,
+        })
+        .to_string();
+        let (status, _, response) = dispatch("POST", "/api/bench/settings", &body, &daemon);
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(
+            lock(&daemon.inner).state.profile_test_settings,
+            ProfileTestSettings {
+                promote_successful_tested_servers: true,
+                auto_move_no_ping_to_dead_servers: true,
+            }
+        );
+        assert_eq!(
+            load_state(&daemon.state_path).profile_test_settings,
+            lock(&daemon.inner).state.profile_test_settings
+        );
+
+        let invalid = json!({
+            "promote_successful_tested_servers": "yes",
+            "auto_move_no_ping_to_dead_servers": true,
+        });
+        assert_eq!(
+            dispatch("POST", "/api/bench/settings", &invalid.to_string(), &daemon,).0,
+            400
+        );
+        let unknown = json!({
+            "promote_successful_tested_servers": true,
+            "auto_move_no_ping_to_dead_servers": true,
+            "future_setting": true,
+        });
+        assert_eq!(
+            dispatch("POST", "/api/bench/settings", &unknown.to_string(), &daemon).0,
+            400
+        );
+
+        let mut future_state = serde_json::to_value(HincyrayState::default()).expect("state JSON");
+        future_state["profile_test_settings"] = json!({
+            "promote_successful_tested_servers": true,
+            "auto_move_no_ping_to_dead_servers": false,
+            "future_setting": true,
+        });
+        let future_state: HincyrayState =
+            serde_json::from_value(future_state).expect("forward-compatible settings state");
+        assert!(
+            future_state
+                .profile_test_settings
+                .promote_successful_tested_servers
+        );
+    }
+
+    #[test]
+    fn successful_tested_profiles_move_up_within_groups_by_tier_then_ping() {
+        let a_unranked = profile_test_fixture_profile(10, "A unranked", "group-a");
+        let b_unranked = profile_test_fixture_profile(20, "B unranked", "group-b");
+        let a_prefix = profile_test_fixture_profile(11, "A prefix", "group-a");
+        let b_without_ai = profile_test_fixture_profile(21, "B without AI", "group-b");
+        let a_all_slow = profile_test_fixture_profile(12, "A all slow", "group-a");
+        let a_all_fast = profile_test_fixture_profile(13, "A all fast", "group-a");
+        let mut state = HincyrayState {
+            active_profile_id: Some(a_unranked.id),
+            profiles: vec![
+                a_unranked.clone(),
+                b_unranked.clone(),
+                a_prefix.clone(),
+                b_without_ai.clone(),
+                a_all_slow.clone(),
+                a_all_fast.clone(),
+            ],
+            ..Default::default()
+        };
+        let original_group_slots = state
+            .profiles
+            .iter()
+            .map(|profile| profile.group.clone())
+            .collect::<Vec<_>>();
+        let results = vec![
+            // AI cannot compensate for a failed Telegram prefix.
+            profile_test_fixture_result(&a_prefix, true, true, false, true, 5),
+            profile_test_fixture_result(&b_without_ai, true, true, true, false, 30),
+            profile_test_fixture_result(&a_all_slow, true, true, true, true, 80),
+            profile_test_fixture_result(&a_all_fast, true, true, true, true, 20),
+        ];
+
+        assert!(promote_successful_tested_profiles(&mut state, &results));
+        assert_eq!(state.active_profile_id, Some(5));
+        assert_eq!(
+            state
+                .profiles
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "A all fast",
+                "B without AI",
+                "A all slow",
+                "B unranked",
+                "A prefix",
+                "A unranked",
+            ]
+        );
+        assert_eq!(
+            state
+                .profiles
+                .iter()
+                .map(|profile| profile.group.clone())
+                .collect::<Vec<_>>(),
+            original_group_slots
+        );
+        assert!(
+            state
+                .profiles
+                .iter()
+                .enumerate()
+                .all(|(index, profile)| profile.id == index)
+        );
+        assert_eq!(
+            state
+                .profiles
+                .iter()
+                .find(|profile| Some(profile.id) == state.active_profile_id)
+                .map(|profile| profile.raw.as_str()),
+            Some(a_unranked.raw.as_str())
+        );
+
+        let (_dir, daemon) = test_daemon();
+        lock(&daemon.inner).state = state;
+        let delete_id = lock(&daemon.inner)
+            .state
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "B unranked")
+            .map(|profile| profile.id)
+            .expect("profile to delete");
+        let (status, _, response) =
+            handle_profile_delete(&json!({"profile_id": delete_id}).to_string(), &daemon);
+        assert_eq!(status, 200, "{response}");
+        let inner = lock(&daemon.inner);
+        let active = inner
+            .state
+            .active_profile_id
+            .and_then(|id| inner.state.profiles.iter().find(|profile| profile.id == id))
+            .expect("active profile after deletion");
+        assert_eq!(active.raw, a_unranked.raw);
+    }
+
+    #[test]
+    fn completely_unresponsive_requires_all_failed_pings_and_no_success() {
+        let profile = profile_test_fixture_profile(1, "candidate", "group");
+        let dead = profile_test_fixture_result(&profile, false, false, false, false, 0);
+        assert!(profile_test_result_is_completely_unresponsive(&dead));
+
+        let pinged = profile_test_fixture_result(&profile, true, false, false, false, 10);
+        assert!(!profile_test_result_is_completely_unresponsive(&pinged));
+
+        let service_replied = profile_test_fixture_result(&profile, false, true, false, false, 0);
+        assert!(!profile_test_result_is_completely_unresponsive(
+            &service_replied
+        ));
+
+        let mut missing_ping = dead.clone();
+        missing_ping
+            .resource_tests
+            .retain(|test| test.id != "ping_proxy");
+        assert!(!profile_test_result_is_completely_unresponsive(
+            &missing_ping
+        ));
+
+        let mut tcp = dead;
+        tcp.method = "tcp".to_owned();
+        assert!(!profile_test_result_is_completely_unresponsive(&tcp));
+    }
+
+    #[test]
+    fn responsive_canonical_alias_prevents_automatic_dead_move() {
+        let profile = profile_test_fixture_profile(0, "candidate", "group");
+        let mut responsive_alias = profile.clone();
+        responsive_alias.id = 1;
+        responsive_alias.name = "renamed candidate".to_owned();
+        responsive_alias.raw =
+            profile.raw.split('#').next().unwrap_or_default().to_owned() + "#renamed-candidate";
+        assert_eq!(
+            profile_server_ref(&profile),
+            profile_server_ref(&responsive_alias)
+        );
+        let mut results = vec![
+            profile_test_fixture_result(&profile, false, false, false, false, 0),
+            profile_test_fixture_result(&responsive_alias, true, true, true, true, 15),
+        ];
+        let (_dir, daemon) = test_daemon();
+        lock(&daemon.inner).state.profiles = vec![profile.clone(), responsive_alias.clone()];
+
+        assert_eq!(
+            auto_move_unresponsive_tested_profiles(&daemon, &results).expect("automatic move"),
+            0
+        );
+        assert!(lock(&daemon.inner).state.dead_server_refs.is_empty());
+
+        results[0].profile_id = 10;
+        results[1].profile_id = 11;
+        remap_completed_bench_result_ids(&daemon, &mut results);
+        assert_eq!(results[0].profile_id, 0);
+        assert_eq!(results[1].profile_id, 1);
+    }
+
+    #[test]
+    fn completed_profile_test_actions_promote_and_move_only_inactive_dead_servers() {
+        let active = profile_test_fixture_profile(0, "active", "group");
+        let unavailable = profile_test_fixture_profile(1, "unavailable", "group");
+        let good = profile_test_fixture_profile(2, "good", "group");
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![active.clone(), unavailable.clone(), good.clone()];
+            inner.state.active_profile_id = Some(active.id);
+            inner.state.profile_test_settings = ProfileTestSettings {
+                promote_successful_tested_servers: true,
+                auto_move_no_ping_to_dead_servers: true,
+            };
+        }
+        let results = vec![
+            profile_test_fixture_result(&active, false, false, false, false, 0),
+            profile_test_fixture_result(&unavailable, false, false, false, false, 0),
+            profile_test_fixture_result(&good, true, true, true, true, 25),
+        ];
+
+        apply_profile_test_post_actions(&daemon, &results).expect("post actions");
+        let mut remapped_results = results.clone();
+        remap_completed_bench_result_ids(&daemon, &mut remapped_results);
+        assert_eq!(remapped_results[0].profile_id, 1);
+        assert_eq!(remapped_results[1].profile_id, 2);
+        assert_eq!(remapped_results[2].profile_id, 0);
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.active_profile_id, Some(1));
+        assert_eq!(
+            inner
+                .state
+                .profiles
+                .iter()
+                .find(|profile| Some(profile.id) == inner.state.active_profile_id)
+                .map(|profile| profile.raw.as_str()),
+            Some(active.raw.as_str())
+        );
+        assert!(
+            !inner
+                .state
+                .dead_server_refs
+                .contains(&profile_server_ref(&active))
+        );
+        assert!(
+            inner
+                .state
+                .dead_server_refs
+                .contains(&profile_server_ref(&unavailable))
+        );
+        assert_eq!(inner.state.profiles[0].id, 0);
+        assert_eq!(inner.state.profiles[1].id, 1);
+        assert_eq!(inner.state.profiles[2].id, 2);
+        assert_eq!(inner.state.profiles[0].raw, good.raw);
+        assert_eq!(inner.state.profiles[1].raw, active.raw);
+        assert_eq!(inner.state.profiles[2].raw, unavailable.raw);
+        drop(inner);
+
+        let persisted = load_state(&daemon.state_path);
+        assert_eq!(persisted.profiles[0].id, 0);
+        assert_eq!(persisted.profiles[0].raw, good.raw);
+        assert_eq!(persisted.active_profile_id, Some(1));
+        assert_eq!(persisted.profiles[1].raw, active.raw);
+        assert!(
+            persisted
+                .dead_server_refs
+                .contains(&profile_server_ref(&unavailable))
+        );
+    }
+
+    #[test]
     fn bench_start_returns_409_when_already_running() {
         let (_dir, daemon) = test_daemon();
         // Simulate a running job without actually spawning the worker.
@@ -27047,6 +27709,29 @@ mod tests {
         assert_eq!(status, 200);
         let response: Value = serde_json::from_str(&body).expect("parse");
         assert_eq!(response["stopped"], false);
+    }
+
+    #[test]
+    fn bench_stop_does_not_cancel_completed_post_processing() {
+        let (_dir, daemon) = test_daemon();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job: SharedJob = Arc::new(Mutex::new(BenchJob {
+            running: true,
+            total: 1,
+            completed: 1,
+            ..Default::default()
+        }));
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.bench.job = Some(job);
+            inner.bench.cancel = Some(Arc::clone(&cancel));
+        }
+
+        let (status, _, body) = handle_bench_stop(&daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("stop response");
+        assert_eq!(response["stopped"], false);
+        assert!(!cancel.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -30899,6 +31584,14 @@ ntp:
         let (status, _, contracts) = handle_api_contracts();
         assert_eq!(status, 200);
         assert!(contracts.contains("/api/routing/summary"));
+        assert!(contracts.contains("/api/bench/settings"));
+        let openapi = openapi_document();
+        assert!(openapi["paths"]["/api/bench/settings"]["get"].is_object());
+        assert!(openapi["paths"]["/api/bench/settings"]["post"].is_object());
+        assert_eq!(
+            openapi["components"]["schemas"]["ProfileTestSettingsUpdateRequest"]["additionalProperties"],
+            false
+        );
         let (status, _, summary) = handle_routing_summary(&daemon);
         assert_eq!(status, 200);
         let value: Value = serde_json::from_str(&summary).expect("summary");

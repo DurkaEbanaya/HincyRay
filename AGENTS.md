@@ -1,4 +1,4 @@
-# HincyRay v1.3.5 (`xray-vpn-test`)
+# HincyRay v1.3.6 (`xray-vpn-test`)
 
 Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 and the feature-gated `xray-vpn-test` desktop diagnostics app. Router mode uses Mihomo with iptables NAT REDIRECT (TCP 10810) and mangle TPROXY (UDP 10811); there is no TUN/tun2socks path.
 
@@ -33,6 +33,7 @@ Rust 2024 crate shipping two binaries: `hincyray` for Keenetic/Entware aarch64 a
   - never parse, substitute, or expose one contract as the other.
 - Lifecycle canonicalization removes display identity but preserves connection identity. Startup migration converts raw and resolvable current-profile v1 lifecycle values to v2; legacy orphan v1 Trash entries remain restorable.
 - Manual and automatic Dead Servers transitions share the serialized `mutate_dead_server_membership()` boundary. Validate the whole batch before mutation; active profiles cannot be moved; persistence/dataplane failures must roll lifecycle fields back without erasing unrelated state.
+- Quick/Full post-actions run only for complete, non-cancelled tests. Promotion stays within provenance groups, preserves active connection identity during ID reassignment, and remaps completed result IDs; any responsive canonical alias prevents automatic dead movement.
 - Routing-rule deletions are desired-state safe: activation failure leaves the deletion persisted and pending apply; additions and edits retain transactional rollback.
 - Automatic/all/subscription scopes exclude dead profiles. Explicit diagnostic requests may include them. Enabled pinned routes preserve intent and use active fallback while their target is dead.
 - Router DNS is always present because firewall rules unconditionally redirect port 53 to Mihomo on 1053. `dns.enabled` is a desktop-Xray concept.
@@ -121,7 +122,7 @@ Use this repeatable live-update sequence; do not improvise a different installer
 5. Poll bounded `/api/health` and `/api/safe-mode` until the expected version, `core_status=running`, and `firewall_status=running`; only then disarm the trap and remove the staged file.
 6. Verify active profile, fallback group, routing/firewall, the changed live behavior, and bounded router E2E. Keep the rollback directory and report its path.
 
-Release artifact SHA256: `649588fd46380cc42349e0df2a8b2c7492fa05cac234bd61a5b28b801ff05a44`. Release evidence is recorded in `docs/releases/v1.3.5.md`.
+Release artifact SHA256: `9ff1019564cb66292dca956832ab30649150f1fed62bc68b6eadd68307cf020c`. Release evidence is recorded in `docs/releases/v1.3.6.md`.
 
 ## Release
 

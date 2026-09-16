@@ -1,4 +1,4 @@
-# HincyRay v1.3.5
+# HincyRay v1.3.6
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -43,9 +43,9 @@ Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN eve
 
 ## Features
 
-### v1.3.5
+### v1.3.6
 
-v1.3.5 bounds HTTP workers, request parsing, logs, network responses, resolver threads, and diagnostic allocations after a live router exhausted its thread resources. It also makes benchmark cancellation and daemon shutdown reap owned children promptly and trims recurring control-plane payloads. Details: [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.3.5.md`](docs/releases/v1.3.5.md).
+v1.3.6 adds opt-in Quick/Full Test automation: promote successful servers within their group by service tier and ping, and move completely unresponsive inactive servers to Dead Servers. Settings and profile order are persisted; cancelled tests do not apply these actions. Details: [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.3.6.md`](docs/releases/v1.3.6.md).
 
 ### v1.3.2
 
@@ -408,7 +408,7 @@ npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.5 release evidence is recorded in [`docs/releases/v1.3.5.md`](docs/releases/v1.3.5.md).
+The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.6 release evidence is recorded in [`docs/releases/v1.3.6.md`](docs/releases/v1.3.6.md).
 
 ## Installation
 

@@ -986,7 +986,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   <nav class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="sidebar-brand" style="border-radius: 0px;">
       <svg class="brand-icon" viewBox="0 0 1024 1024" role="img" aria-label="HincyRay"><defs><radialGradient id="brand-bg" cx="50%" cy="46%" r="62%"><stop stop-color="#172b3d"/><stop offset=".55" stop-color="#0b1018"/><stop offset="1" stop-color="#05070b"/></radialGradient><linearGradient id="brand-phone" x1="250" y1="100" x2="760" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#3b424d"/><stop offset=".45" stop-color="#151a21"/><stop offset="1" stop-color="#050608"/></linearGradient><linearGradient id="brand-screen" x1="310" y1="150" x2="690" y2="850" gradientUnits="userSpaceOnUse"><stop stop-color="#1f3146"/><stop offset="1" stop-color="#070a0f"/></linearGradient></defs><rect width="1024" height="1024" rx="220" fill="url(#brand-bg)"/><path d="M130 740 40 820M190 820 95 930M845 170l115-92M820 790l130 92M93 276l112 52" stroke="#0078d7" stroke-width="18" stroke-linecap="round" opacity=".65"/><g transform="rotate(-8 512 512)"><rect x="290" y="92" width="444" height="840" rx="78" fill="url(#brand-phone)" stroke="#737b87" stroke-width="14"/><rect x="328" y="138" width="368" height="748" rx="48" fill="url(#brand-screen)" stroke="#0e1620" stroke-width="10"/><circle cx="512" cy="176" r="16" fill="#080b10" stroke="#4d5663" stroke-width="5"/><path d="M510 132 455 292l68-30-42 172 106-238-72 34z" fill="#f4d03f" stroke="#fff2a4" stroke-width="8"/><path d="M496 432 365 536l112 8-74 204 214-260-102 14 75-134z" fill="#ff453a" stroke="#ffb2ab" stroke-width="9"/><path d="M520 398 660 496l-92 22 70 188-198-238 92 18z" fill="#60cdff" stroke="#b8efff" stroke-width="8"/><path d="M445 308 340 248M444 309l-96 102M521 264l118-98M514 436l-160 44M514 437l120 152M477 546l-112 188M566 515l104 166" stroke="#d8e6f3" stroke-width="10" stroke-linecap="round" opacity=".8"/><path d="M336 610 238 660l87 36-142 98 238-62-62-42 98-38zM664 300l150-50-72 102 160 10-228 68 38-78z" fill="#1f8fff" opacity=".88"/><text x="512" y="760" text-anchor="middle" font-family="Arial Black,Arial,sans-serif" font-size="76" fill="#f2f6fb" stroke="#05070b" stroke-width="7" paint-order="stroke">POCO</text></g></svg>
-      <div><div class="logo">HincyRay</div><div class="version">v1.3.5</div></div>
+      <div><div class="logo">HincyRay</div><div class="version">v1.3.6</div></div>
     </div>
     <div class="brightness-row">
       <svg class="brightness-icon" onclick="toggleTheme()" title="Переключить тему" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9L14 6M5.9 14l-1.1 1.1"></path></svg>
@@ -1239,6 +1239,12 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
                 </div>
                 <button class="btn btn-accent" id="benchFullAll" data-bench-scope="global" data-title-ru="Full Test всех серверов, до выбранного числа параллельно" data-title-en="Full Test all servers, up to the selected parallel count" title="Full Test всех серверов, до выбранного числа параллельно" onclick="fullBenchAll()">⚡ Full Test всех серверов</button>
               </div>
+              <div class="form-row" style="align-items:flex-end;flex-wrap:wrap;gap:16px;margin-bottom:8px">
+                <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Поднимать серверы с успешными проверками</label><label class="toggle"><input type="checkbox" id="benchPromoteSuccessful"><span class="slider"></span></label></div>
+                <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Отправлять недоступные серверы в Dead Servers</label><label class="toggle"><input type="checkbox" id="benchAutoMoveNoPing"><span class="slider"></span></label></div>
+                <button class="btn" id="benchSettingsSave" onclick="saveProfileTestSettings()">Сохранить настройки</button>
+              </div>
+              <p id="benchPostActionsHelp" style="font-size:var(--fs-xs);color:var(--muted);margin:0 0 12px">После завершённого Quick/Full Test успешные серверы поднимаются внутри своей группы: Ping+YouTube+Telegram+AI, затем без AI, затем без Telegram; при равной оценке — по ping. В Dead Servers попадают только неактивные серверы без единого успешного ответа и со всеми проваленными ping-проверками.</p>
               <div id="benchSummary" style="margin-top:12px;display:none" class="cards">
                 <div class="card"><div class="card-label">Прошло</div><div class="card-value success" id="benchPassed">0</div></div>
                 <div class="card"><div class="card-label">Не прошло</div><div class="card-value danger" id="benchFailed">0</div></div>
@@ -2382,6 +2388,7 @@ function previewApi(method, path, body) {
     '/api/auth-settings': {enabled:false,username:'admin'},
     '/api/update/status': {current_version:'v1.19.27',update_available_version:null,auto_update_enabled:true,auto_update_interval_hours:24},
     '/api/bench/status': previewBenchStatus,
+    '/api/bench/settings': {settings:{promote_successful_tested_servers:false,auto_move_no_ping_to_dead_servers:false}},
     '/api/deep-bench/status': {state:'phase_b',phase_progress:62,phase_detail:'Проверка стабильности 🇯🇵 Tokyo — AI / low jitter',eta_seconds:412},
     '/api/deep-bench/settings': {settings:{enabled:true,weekdays:31,start_hour:2,end_hour:6,stability_minutes:3,profile_filter:{kind:'all'}}},
     '/api/deep-bench/history': {history:[{server_ref:'preview:0',profile_name:'🇩🇪 Frankfurt · VLESS Reality',date:'20260722',phase_a_success:true,stability:{latency_avg:154,latency_stddev:5,loss_percent:0,sustained_download_mbps:45.5},unlock:{github:{reachable:true},cloudflare:{reachable:true},google:{reachable:true},telegram:{reachable:true}}},{server_ref:'preview:1',profile_name:'🇳🇱 Amsterdam • Streaming',date:'20260722',phase_a_success:false,stability:{latency_avg:0,latency_stddev:0,loss_percent:100,sustained_download_mbps:0},unlock:{github:{reachable:true},cloudflare:{reachable:true},google:{reachable:false},telegram:{reachable:true}}},{server_ref:'preview:2',profile_name:'🇯🇵 Tokyo — AI / low jitter',date:'20260723',phase_a_success:true,stability:{latency_avg:176,latency_stddev:8,loss_percent:0.1,sustained_download_mbps:39.2},unlock:{github:{reachable:true},cloudflare:{reachable:true},google:{reachable:true},telegram:{reachable:true}}}]},
@@ -2419,6 +2426,10 @@ function previewApi(method, path, body) {
     return Promise.resolve({started:true});
   }
   if (path === '/api/bench/stop') { previewBenchStatus = {...previewBenchStatus,state:'stopped',running:false}; return Promise.resolve({stopped:true}); }
+  if (method === 'POST' && path === '/api/bench/settings') {
+    routes[path] = {settings:structuredClone(body)};
+    return Promise.resolve(structuredClone(routes[path]));
+  }
   if (method === 'GET' && Object.prototype.hasOwnProperty.call(routes,path)) return Promise.resolve(structuredClone(routes[path]));
   if (method === 'POST' && path === '/api/mihomo-features') return Promise.resolve({parameters:structuredClone(body.parameters),runtime:structuredClone(routes[path].runtime)});
   if (method === 'POST' && path === '/api/profiles/revalidate-ungrouped') return Promise.resolve({checked:2,updated:1,unchanged:1,dataplane_applied:false,errors:[]});
@@ -3338,6 +3349,9 @@ const I18N = {
   'Прошло':'Passed','Не прошло':'Failed','Средняя задержка':'Avg latency',
   'В работе':'Active',
   'Параллельных серверов':'Parallel servers',
+  'Поднимать серверы с успешными проверками':'Promote servers with successful checks',
+  'Отправлять недоступные серверы в Dead Servers':'Move unavailable servers to Dead Servers',
+  'После завершённого Quick/Full Test успешные серверы поднимаются внутри своей группы: Ping+YouTube+Telegram+AI, затем без AI, затем без Telegram; при равной оценке — по ping. В Dead Servers попадают только неактивные серверы без единого успешного ответа и со всеми проваленными ping-проверками.':'After a completed Quick/Full Test, successful servers move up within their group: Ping+YouTube+Telegram+AI, then without AI, then without Telegram; equal scores are ordered by ping. Only inactive servers with no successful response and all ping checks failed move to Dead Servers.',
   '⚡ в строке проверяет только один сервер. ⚡ у группы/подписки, выбранная область и Full Test используют до настроенного числа параллельных серверов.':'A row ⚡ tests only one server. Group/subscription ⚡, selected scope, and Full Test use up to the configured parallel count.',
   'Для группы, выбранной области и Full Test; строка ⚡ всегда одна.':'For group, selected-scope, and Full tests; a row ⚡ always tests one.',
   'Quick Test только этого сервера':'Quick Test this server only',
@@ -3384,7 +3398,7 @@ const I18N = {
   'пустой ответ':'empty response','недоступно':'unavailable',
   'Результат':'Result','Закрыть':'Close',
   'Ядро запущено':'Core started','Ядро перезапущено':'Core restarted','Маршруты применены':'Routes applied',
-  'Подписки обновляются':'Subscriptions refreshing','Бенчмарк остановлен':'Benchmark stopped',
+  'Подписки обновляются':'Subscriptions refreshing','Бенчмарк остановлен':'Benchmark stopped','Бенчмарк уже завершён':'Benchmark already completed',
   'Каталог обновляется':'Catalog refreshing','Файрвол запущен':'Firewall started',
   'Fake-IP кэш сброшен':'Fake-IP cache flushed','DNS кэш сброшен':'DNS cache flushed',
   'Fake-IP: ожидается восстановление домена':'Fake-IP: waiting for domain recovery',
@@ -5980,7 +5994,7 @@ function pollBenchStatus() {
 function stopBench(button) {
   setButtonPending(button,true,t('Останавливается…'));
   return api('POST','/api/bench/stop',null).then(result => {
-    showToast('info',result.stopped ? t('Бенчмарк остановлен') : t('Остановка запрошена'));
+    showToast('info',result.stopped ? t('Бенчмарк остановлен') : t('Бенчмарк уже завершён'));
     pollBenchStatus();
   }).catch(()=>setButtonPending(button,false));
 }
@@ -6007,6 +6021,22 @@ function initBenchConcurrency() {
   const normalized = normalizeBenchConcurrency(persisted == null ? input.value : persisted);
   input.value = String(normalized);
   try { localStorage.setItem('hr_bench_concurrency', String(normalized)); } catch (_) {}
+}
+
+function loadProfileTestSettings() {
+  return api('GET','/api/bench/settings').then(data => {
+    const settings = data.settings || {};
+    safeChecked('benchPromoteSuccessful', settings.promote_successful_tested_servers === true);
+    safeChecked('benchAutoMoveNoPing', settings.auto_move_no_ping_to_dead_servers === true);
+  });
+}
+
+function saveProfileTestSettings() {
+  const settings = {
+    promote_successful_tested_servers: document.getElementById('benchPromoteSuccessful')?.checked === true,
+    auto_move_no_ping_to_dead_servers: document.getElementById('benchAutoMoveNoPing')?.checked === true,
+  };
+  return apiAction('POST','/api/bench/settings',settings,t('Настройки сохранены'),loadProfileTestSettings);
 }
 
 /// Benchmark a single profile by id. Uses the method/probe/download settings
@@ -7280,7 +7310,7 @@ function refreshDashboard() {
   const tasks = [
     refreshStatus(), refreshSystem(), loadProfiles(), loadRouting(), loadSubscriptions(), loadBackups(),
     loadDns(), loadHwid(), loadAuthSettings(), loadTelegramProbeStatus(), loadUpdateStatus(),
-    loadOperationalSafety(), pollBenchStatus(), loadGeoStatus(), loadGeoBases(),
+    loadOperationalSafety(), loadProfileTestSettings(), pollBenchStatus(), loadGeoStatus(), loadGeoBases(),
   ];
   loadTrafficAndConnections();
   dashboardRefreshPromise = Promise.allSettled(tasks).finally(() => { dashboardRefreshPromise = null; });

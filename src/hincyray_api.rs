@@ -556,6 +556,33 @@ pub struct TelegramProbeDeleteResponse {
     pub revoked: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileTestSettings {
+    pub promote_successful_tested_servers: bool,
+    pub auto_move_no_ping_to_dead_servers: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileTestSettingsUpdateRequest {
+    pub promote_successful_tested_servers: bool,
+    pub auto_move_no_ping_to_dead_servers: bool,
+}
+
+impl From<ProfileTestSettingsUpdateRequest> for ProfileTestSettings {
+    fn from(request: ProfileTestSettingsUpdateRequest) -> Self {
+        Self {
+            promote_successful_tested_servers: request.promote_successful_tested_servers,
+            auto_move_no_ping_to_dead_servers: request.auto_move_no_ping_to_dead_servers,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileTestSettingsResponse {
+    pub settings: ProfileTestSettings,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ApiEndpointContract {
     pub method: &'static str,
@@ -731,6 +758,22 @@ pub fn api_endpoint_contracts() -> Vec<ApiEndpointContract> {
             mutates_state: true,
         },
         ApiEndpointContract {
+            method: "GET",
+            path: "/api/bench/settings",
+            request_schema: None,
+            response_schema: "ProfileTestSettingsResponse",
+            bounded: true,
+            mutates_state: false,
+        },
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/bench/settings",
+            request_schema: Some("ProfileTestSettingsUpdateRequest"),
+            response_schema: "ProfileTestSettingsResponse",
+            bounded: true,
+            mutates_state: true,
+        },
+        ApiEndpointContract {
             method: "POST",
             path: "/api/mihomo-api/connections/page",
             request_schema: Some("ConnectionQueryRequest"),
@@ -856,9 +899,32 @@ pub fn openapi_document() -> Value {
         "ProfileDiagnosticReport": schema_value::<ProfileDiagnosticReport>(),
         "ProfileDiagnosticReportResponse": schema_value::<ProfileDiagnosticReportResponse>(),
         "ProfileDiagnosticDiscardResponse": schema_value::<ProfileDiagnosticDiscardResponse>(),
+        "ProfileTestSettings": schema_value::<ProfileTestSettings>(),
+        "ProfileTestSettingsUpdateRequest": schema_value::<ProfileTestSettingsUpdateRequest>(),
+        "ProfileTestSettingsResponse": schema_value::<ProfileTestSettingsResponse>(),
     });
     let mut schemas = base_schemas.as_object().cloned().unwrap_or_default();
     schemas.extend(diagnostic_schemas.as_object().cloned().unwrap_or_default());
+    let mut paths = serde_json::Map::new();
+    for endpoint in api_endpoint_contracts() {
+        let request = endpoint
+            .request_schema
+            .map(|schema| json!({"$ref": format!("#/components/schemas/{schema}")}));
+        let operation = json!({
+            "x-bounded": endpoint.bounded,
+            "x-mutates-state": endpoint.mutates_state,
+            "requestBody": request.map(|schema| json!({"content":{"application/json":{"schema":schema}}})),
+            "responses": {
+                "200": {"content":{"application/json":{"schema":{"$ref": format!("#/components/schemas/{}", endpoint.response_schema)}}}}
+            }
+        });
+        let path_item = paths
+            .entry(endpoint.path.to_owned())
+            .or_insert_with(|| json!({}));
+        if let Some(path_item) = path_item.as_object_mut() {
+            path_item.insert(endpoint.method.to_ascii_lowercase(), operation);
+        }
+    }
     json!({
         "openapi": "3.1.0",
         "info": {
@@ -868,22 +934,7 @@ pub fn openapi_document() -> Value {
         "x-contract-version": 1,
         "x-state-changing-requires-same-origin": true,
         "x-authentication": "argon2id-password+cSPRNG-bearer-expiry",
-        "paths": api_endpoint_contracts().into_iter().map(|endpoint| {
-            let request = endpoint.request_schema.map(|schema| json!({"$ref": format!("#/components/schemas/{schema}")}));
-            (
-                endpoint.path.to_owned(),
-                json!({
-                    endpoint.method.to_ascii_lowercase(): {
-                        "x-bounded": endpoint.bounded,
-                        "x-mutates-state": endpoint.mutates_state,
-                        "requestBody": request.map(|schema| json!({"content":{"application/json":{"schema":schema}}})),
-                        "responses": {
-                            "200": {"content":{"application/json":{"schema":{"$ref": format!("#/components/schemas/{}", endpoint.response_schema)}}}}
-                        }
-                    }
-                }),
-            )
-        }).collect::<serde_json::Map<_, _>>(),
+        "paths": paths,
         "components": {
             "schemas": Value::Object(schemas)
         }

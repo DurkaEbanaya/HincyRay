@@ -46,7 +46,7 @@ const DOWNLOAD_MAX_SECS: u64 = 3;
 const SUSTAINED_DOWNLOAD_MAX_SECS: u64 = 15;
 const XRAY_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const QUICK_RESOURCE_CONTRACT_VERSION: u8 = 6;
+pub const QUICK_RESOURCE_CONTRACT_VERSION: u8 = 6;
 const YOUTUBE_VIDEO_ID: &str = "aqz-KE-bpKQ";
 const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=aqz-KE-bpKQ&hl=en";
 const YOUTUBE_PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
@@ -182,6 +182,7 @@ pub struct ActiveBenchProfile {
 }
 
 pub type SharedJob = Arc<Mutex<BenchJob>>;
+pub type BenchCompleteCallback = Box<dyn Fn(Vec<BenchResult>) -> Vec<BenchResult> + Send + 'static>;
 
 pub fn new_bench_job(method: BenchMethod, total: usize, concurrency: usize) -> SharedJob {
     Arc::new(Mutex::new(BenchJob {
@@ -213,6 +214,7 @@ pub fn run_bench(
     job: SharedJob,
     cancel: Arc<AtomicBool>,
     on_result: Box<dyn Fn(BenchResult) + Send + Sync + 'static>,
+    on_complete: Option<BenchCompleteCallback>,
 ) -> Result<thread::JoinHandle<()>, String> {
     thread::Builder::new()
         .name("hincyray-benchmark".to_owned())
@@ -304,6 +306,18 @@ pub fn run_bench(
                     });
                 }
             });
+
+            let completed_results = {
+                let state = job.lock().unwrap_or_else(|poison| poison.into_inner());
+                (!cancel.load(Ordering::Relaxed) && state.completed == state.total)
+                    .then(|| state.results.clone())
+            };
+            if let (Some(on_complete), Some(results)) = (on_complete, completed_results) {
+                let results = on_complete(results);
+                job.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .results = results;
+            }
 
             {
                 let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -2976,6 +2990,7 @@ mod tests {
             Arc::clone(&job),
             cancel,
             on_result,
+            None,
         )
         .expect("spawn bench worker");
         {
@@ -2996,6 +3011,35 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn run_bench_skips_completion_callback_after_cancellation() {
+        let job = new_bench_job(BenchMethod::Quick, 0, 1);
+        let cancel = Arc::new(AtomicBool::new(true));
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_callback = Arc::clone(&completed);
+        let handle = run_bench(
+            Vec::new(),
+            BenchMethod::Quick,
+            String::new(),
+            String::new(),
+            String::new(),
+            "mihomo".to_owned(),
+            None,
+            false,
+            false,
+            job,
+            cancel,
+            Box::new(|_| {}),
+            Some(Box::new(move |_| {
+                completed_for_callback.store(true, Ordering::Relaxed);
+                Vec::new()
+            })),
+        )
+        .expect("spawn cancelled benchmark");
+        handle.join().expect("cancelled benchmark exits");
+        assert!(!completed.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -3021,6 +3065,8 @@ mod tests {
         let job = new_bench_job(BenchMethod::Quick, 1, 1);
         let collected = Arc::new(Mutex::new(Vec::new()));
         let collected_for_callback = Arc::clone(&collected);
+        let completed = Arc::new(Mutex::new(Vec::<Vec<BenchResult>>::new()));
+        let completed_for_callback = Arc::clone(&completed);
         let handle = run_bench(
             vec![profile],
             BenchMethod::Quick,
@@ -3039,6 +3085,14 @@ mod tests {
                     .unwrap_or_else(|poison| poison.into_inner())
                     .push(result);
             }),
+            Some(Box::new(move |mut results| {
+                results[0].profile_id = 99;
+                completed_for_callback
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push(results.clone());
+                results
+            })),
         )
         .expect("spawn quick benchmark worker");
 
@@ -3052,6 +3106,20 @@ mod tests {
                 .error
                 .as_deref()
                 .is_some_and(|error| error.contains("/definitely/missing/quick-mihomo"))
+        );
+        drop(results);
+        let completed = completed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].len(), 1);
+        assert_eq!(completed[0][0].profile_id, 99);
+        assert_eq!(
+            job.lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .results[0]
+                .profile_id,
+            99
         );
     }
 }

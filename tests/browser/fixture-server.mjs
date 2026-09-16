@@ -172,6 +172,10 @@ let mihomoFeatures = {
     external_controller: { enabled: true, address: '127.0.0.1:9090', connected: true },
   },
 };
+let profileTestSettings = {
+  promote_successful_tested_servers: false,
+  auto_move_no_ping_to_dead_servers: false,
+};
 
 const canonicalConnection = {
       id: 'canonical-chatgpt',
@@ -346,6 +350,7 @@ const responses = new Map([
   ['/api/auth-settings', { enabled: false, username: 'admin' }],
   ['/api/update/status', { current_version: 'fixture', auto_update_enabled: false }],
   ['/api/bench/status', { running: false, results: [] }],
+  ['/api/bench/settings', { settings: profileTestSettings }],
   ['/api/active-profile/status', { generation: 1, state: 'running', profile_id: 102, profile_name: 'Fixture Manual', stage: 'waiting-core', updated_at_unix: 1719900000 }],
   ['/api/trash', { count: 1, trash: [{
     server_ref: deadServerRef,
@@ -413,6 +418,11 @@ const server = http.createServer(async (request, response) => {
       xhttp_tuning: { sc_max_each_post_bytes: '2048', sc_min_posts_interval_ms: null },
     });
     responses.set('/api/bench/status', { running: false, results: [] });
+    profileTestSettings = {
+      promote_successful_tested_servers: false,
+      auto_move_no_ping_to_dead_servers: false,
+    };
+    responses.set('/api/bench/settings', { settings: profileTestSettings });
     profileDiagnostic = { active: null, completed: null, statusPolls: 0 };
     sendJson(response, 200, { ok: true });
     return;
@@ -532,6 +542,19 @@ const server = http.createServer(async (request, response) => {
     }
     if (request.method === 'POST' && url.pathname === '/api/telegram-probe/delete') {
       sendJson(response, 200, { deleted: true, revoked: true });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/bench/settings') {
+      const keys = Object.keys(body || {}).sort();
+      if (keys.join(',') !== 'auto_move_no_ping_to_dead_servers,promote_successful_tested_servers'
+          || typeof body.auto_move_no_ping_to_dead_servers !== 'boolean'
+          || typeof body.promote_successful_tested_servers !== 'boolean') {
+        sendJson(response, 400, { error: 'fixture expected exact profile test settings booleans' });
+        return;
+      }
+      profileTestSettings = { ...body };
+      responses.set('/api/bench/settings', { settings: profileTestSettings });
+      sendJson(response, 200, { settings: profileTestSettings });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/routing/rules') {

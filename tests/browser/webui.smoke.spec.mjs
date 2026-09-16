@@ -30,7 +30,7 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.5');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.6');
 });
 
 test('profile table shows compact service status and configurable metric columns', async ({ page }) => {
@@ -190,12 +190,40 @@ test('persisted concurrency survives reload and group/global tests send four wor
   }));
 });
 
+test('profile test post-actions load and save exact persisted settings', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await openFixture(page);
+  await navigateTo(page, 'profiles');
+  await page.getByText('Настройки тестирования').click();
+  await expect(page.locator('#benchPromoteSuccessful')).not.toBeChecked();
+  await expect(page.locator('#benchAutoMoveNoPing')).not.toBeChecked();
+
+  await page.locator('#benchPromoteSuccessful').locator('xpath=..').click();
+  await page.locator('#benchAutoMoveNoPing').locator('xpath=..').click();
+  const saveRequest = page.waitForRequest(request =>
+    request.method() === 'POST' && new URL(request.url()).pathname === '/api/bench/settings'
+  );
+  await page.locator('#benchSettingsSave').click();
+  expect((await saveRequest).postDataJSON()).toEqual({
+    promote_successful_tested_servers: true,
+    auto_move_no_ping_to_dead_servers: true,
+  });
+
+  await page.reload();
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Profile');
+  await expect(page.locator('#benchPromoteSuccessful')).toBeChecked();
+  await expect(page.locator('#benchAutoMoveNoPing')).toBeChecked();
+  await page.request.post('/__fixture/reset');
+});
+
 test('benchmark help and stable scope titles explain single versus parallel tests in RU and EN', async ({ page }) => {
   await openFixture(page);
   await navigateTo(page, 'profiles');
   await page.getByText('Настройки тестирования').click();
   await expect(page.locator('#benchSemanticsHelp')).toContainText('⚡ в строке проверяет только один сервер');
   await expect(page.locator('#benchConcurrencyHelp')).toContainText('строка ⚡ всегда одна');
+  await expect(page.locator('#benchPostActionsHelp')).toContainText('Ping+YouTube+Telegram+AI');
+  await expect(page.locator('#benchPromoteSuccessful').locator('xpath=ancestor::div[contains(@class,"field")]')).toContainText('Поднимать серверы');
   await expect(page.locator('[data-bench-scope="single"]').first()).toHaveAttribute('title', 'Quick Test только этого сервера');
   await expect(page.locator('[data-bench-scope="group"]').first()).toHaveAttribute('title', /до настроенного числа серверов параллельно/);
   await expect(page.locator('#benchFullAll')).toHaveAttribute('title', 'Full Test всех серверов, до выбранного числа параллельно');
@@ -203,6 +231,8 @@ test('benchmark help and stable scope titles explain single versus parallel test
   await page.evaluate(() => toggleLang());
   await expect(page.locator('#benchSemanticsHelp')).toContainText('A row ⚡ tests only one server');
   await expect(page.locator('#benchConcurrencyHelp')).toContainText('a row ⚡ always tests one');
+  await expect(page.locator('#benchPostActionsHelp')).toContainText('successful servers move up within their group');
+  await expect(page.locator('#benchPromoteSuccessful').locator('xpath=ancestor::div[contains(@class,"field")]')).toContainText('Promote servers');
   await expect(page.locator('#benchConcurrency')).toHaveAttribute('title', 'From 1 to 6; a row test always checks one server');
   await expect(page.locator('#benchFullAll')).toHaveAttribute('title', 'Full Test all servers, up to the selected parallel count');
 });

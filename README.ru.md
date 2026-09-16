@@ -1,4 +1,4 @@
-# HincyRay v1.3.5
+# HincyRay v1.3.6
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -43,9 +43,9 @@ HincyRay — лёгкий VPN/proxy-клиент для роутеров Keeneti
 
 ## Возможности
 
-### v1.3.5
+### v1.3.6
 
-v1.3.5 ограничивает число HTTP workers, разбор запросов, логи, сетевые ответы, resolver threads и диагностические аллокации после исчерпания потоков на реальном роутере. Отмена benchmark и остановка демона теперь также быстро завершают дочерние процессы, а периодические control-plane ответы стали компактнее. Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.3.5.md`](docs/releases/v1.3.5.md).
+v1.3.6 добавляет отключённую по умолчанию автоматизацию Quick/Full Test: подъём успешных серверов внутри группы по уровню сервисных проверок и ping, а также перенос полностью недоступных неактивных серверов в Dead Servers. Настройки и порядок профилей сохраняются; отменённые тесты не применяют эти действия. Подробности: [`CHANGELOG.md`](CHANGELOG.md) и [`docs/releases/v1.3.6.md`](docs/releases/v1.3.6.md).
 
 ### v1.3.2
 
@@ -376,7 +376,7 @@ npm run test:browser
 git diff --check
 ```
 
-Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.3.5 зафиксированы в [`docs/releases/v1.3.5.md`](docs/releases/v1.3.5.md).
+Команда Playwright запускает fixture-backed browser smoke suite. Актуальные release evidence v1.3.6 зафиксированы в [`docs/releases/v1.3.6.md`](docs/releases/v1.3.6.md).
 
 ## Установка
 

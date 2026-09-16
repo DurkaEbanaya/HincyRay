@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.3.6 - 2026-09-16
+
+### Profile test automation
+
+- Added persisted, default-disabled test settings to promote successful servers and move completely unresponsive inactive servers to Dead Servers after completed Quick/Full tests.
+- Ranked promoted profiles within their provenance group by Ping+YouTube+Telegram+AI, then without AI, then without Telegram, with lower ping first within equal tiers.
+- Kept automatic Dead Servers transitions behind the shared transactional lifecycle boundary, skipped active and already-dead profiles, and required all ping checks to fail with no successful response. Responsive canonical aliases prevent automatic dead movement.
+- Preserved active connection identity during profile renumbering and remapped completed benchmark results to current profile IDs. Cancelled or partial tests do not run post-actions.
+- Added bounded typed benchmark settings contracts and retained both GET and POST operations for shared OpenAPI paths.
+- Added regression coverage for settings persistence and validation, ranking, active identity after deletion, canonical aliases, completion callbacks, cancellation, and RU/EN Web UI controls.
+
 ## v1.3.5 - 2026-09-15
 
 ### Router resource safety
