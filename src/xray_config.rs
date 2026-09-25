@@ -144,6 +144,28 @@ impl GeoBaseRuleProvider {
 
 /// Extra router-level config passed to `build_xray_router_config` for
 /// DNS anti-leak, port-based routing, and GeoIP/GeoSite asset paths.
+#[derive(Clone)]
+pub struct TorrentSocksInbound {
+    pub listen: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+    pub proxy: String,
+}
+
+impl std::fmt::Debug for TorrentSocksInbound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TorrentSocksInbound")
+            .field("listen", &self.listen)
+            .field("port", &self.port)
+            .field("username", &"<redacted>")
+            .field("password", &"<redacted>")
+            .field("proxy", &self.proxy)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RouterExtra {
     pub dns: Option<DnsSettings>,
@@ -170,6 +192,8 @@ pub struct RouterExtra {
     pub mihomo_home: Option<String>,
     /// Local GeoBase providers are Mihomo-only; legacy Xray ignores them.
     pub geobase_rule_providers: Vec<GeoBaseRuleProvider>,
+    /// Dedicated authenticated SOCKS5 listener for a cooperating torrent client.
+    pub torrent_socks: Option<TorrentSocksInbound>,
 }
 
 /// A daemon-level Xray routing rule after HincyRay has resolved UI targets

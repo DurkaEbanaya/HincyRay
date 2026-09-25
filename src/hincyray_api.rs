@@ -9,7 +9,15 @@ use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::benchmark::{
+    ActiveBenchProfile, AdaptiveSearchOptions, BenchResult, PreflightFailure, SearchProgress,
+    ServiceCheckOptions,
+};
+use crate::direct_monitor::{
+    DirectMonitorSettingsRequest, DirectMonitorSettingsResponse, DirectMonitorStatusResponse,
+};
 use crate::mihomo_config::TunnelConfig;
+use crate::policy_automation::{PolicyAutomationRequest, PolicyAutomationStatus};
 use crate::telegram_probe::TelegramProbeConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -134,11 +142,124 @@ pub struct RoutingServerSummary {
     pub address: String,
     pub group: Option<String>,
     pub active: bool,
+    pub dead: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct RoutingConnectionContextResponse {
     pub servers: Vec<RoutingServerSummary>,
+}
+
+#[derive(Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TorrentSocksSettingsUpdate {
+    pub enabled: Option<bool>,
+    #[schemars(length(max = 64))]
+    pub listen: Option<String>,
+    pub port: Option<u16>,
+    #[schemars(length(max = 128))]
+    pub username: Option<String>,
+    #[schemars(length(max = 512))]
+    pub password: Option<String>,
+    pub clear_credentials: Option<bool>,
+    #[schemars(length(max = 64))]
+    pub target: Option<String>,
+}
+
+impl std::fmt::Debug for TorrentSocksSettingsUpdate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TorrentSocksSettingsUpdate")
+            .field("enabled", &self.enabled)
+            .field("listen", &self.listen)
+            .field("port", &self.port)
+            .field("username", &self.username.as_ref().map(|_| "<redacted>"))
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("clear_credentials", &self.clear_credentials)
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct TorrentSocksSettingsResponse {
+    pub enabled: bool,
+    pub listen: String,
+    pub port: u16,
+    pub username: String,
+    pub password_set: bool,
+    pub target: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingSettingsUpdateRequest {
+    pub apply: Option<bool>,
+    pub enabled: Option<bool>,
+    pub auto_switch: Option<bool>,
+    pub block_quic_global: Option<bool>,
+    pub rule_source: Option<String>,
+    pub vpn_subnet: Option<String>,
+    pub redirect_port: Option<u16>,
+    pub policy_name: Option<String>,
+    pub quic_mode: Option<String>,
+    pub port_mode: Option<String>,
+    pub proxy_ports: Option<Vec<String>>,
+    pub bypass_ports: Option<Vec<String>>,
+    pub geo_asset_path: Option<String>,
+    pub ru_direct_mode: Option<String>,
+    pub ru_direct_exceptions: Option<Vec<String>>,
+    pub auto_vpn_learning_enabled: Option<bool>,
+    pub auto_vpn_exceptions: Option<Vec<String>>,
+    pub parovozik_enabled: Option<bool>,
+    pub parovozik_direct_domains: Option<Vec<String>>,
+    pub parovozik_vpn_domains: Option<Vec<String>>,
+    pub parovozik_server_refs: Option<Vec<String>>,
+    pub match_target: Option<String>,
+    pub torrent_socks: Option<TorrentSocksSettingsUpdate>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct RoutingSettingsUpdateResponse {
+    pub settings: Value,
+    pub applied: bool,
+    pub requires_apply: Option<bool>,
+    pub core_status: Option<String>,
+    pub firewall_status: Option<String>,
+    pub generation: Option<u64>,
+    pub gc_warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingResourceReloadRequest {
+    #[schemars(length(min = 1, max = 1024))]
+    pub resource: String,
+    #[serde(default)]
+    #[schemars(length(max = 64))]
+    pub source_ip: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    #[schemars(length(max = 8))]
+    pub network: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct RoutingResourceReloadResponse {
+    pub ok: bool,
+    pub resource: String,
+    pub target: String,
+    pub fallback_active: bool,
+    pub runtime_evaluation: bool,
+    pub applied: bool,
+    pub core_status: String,
+    pub firewall_status: String,
+    pub generation: u64,
+    pub closed_connections: usize,
+    #[schemars(length(max = 20), inner(length(max = 512)))]
+    pub close_errors: Vec<String>,
+    pub gc_warning: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -556,6 +677,98 @@ pub struct TelegramProbeDeleteResponse {
     pub revoked: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+pub struct BenchStartRequest {
+    /// Availability methods check channel previews; quick/full retain native playback compatibility.
+    #[schemars(regex(
+        pattern = "^(tcp|head|get|quick|full|availability_quick|availability_full)$"
+    ))]
+    pub method: Option<String>,
+    pub probe_url: Option<String>,
+    pub download_url: Option<String>,
+    pub upload_url: Option<String>,
+    #[schemars(range(min = 1, max = 6))]
+    pub concurrency: Option<usize>,
+    pub test_download: Option<bool>,
+    pub test_upload: Option<bool>,
+    pub profile_ids: Option<Vec<usize>>,
+    pub subscription_url: Option<String>,
+    /// Quick/availability_quick adaptive search; speed stages must be disabled.
+    pub search: Option<AdaptiveSearchOptions>,
+    /// Availability-only ordered service prefix and fail-fast policy; mutually exclusive with search.
+    pub service_checks: Option<ServiceCheckOptions>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct BenchStartResponse {
+    pub started: bool,
+    pub method: String,
+    pub total: usize,
+    pub running: bool,
+    pub requested_concurrency: usize,
+    pub concurrency: usize,
+    pub search: Option<SearchProgress>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct BenchSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub inconclusive: usize,
+    pub avg_latency_ms: f32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchConcurrencyLimit {
+    MemoryCap,
+    CandidateCount,
+    TargetSlots,
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+pub struct BenchConcurrencyStatus {
+    #[schemars(range(min = 0, max = 6))]
+    pub requested: usize,
+    #[schemars(range(min = 0, max = 6))]
+    pub effective: usize,
+    #[schemars(range(min = 0, max = 6))]
+    pub active: usize,
+    #[schemars(range(min = 0, max = 6))]
+    pub admission_limit: usize,
+    #[schemars(length(max = 3))]
+    pub limit_reasons: Vec<BenchConcurrencyLimit>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct BenchStatusResult {
+    #[serde(flatten)]
+    pub result: BenchResult,
+    #[schemars(regex(pattern = "^srv-v2-[0-9a-f]{32}$"))]
+    pub server_ref: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct BenchStatusResponse {
+    pub running: bool,
+    pub method: Option<String>,
+    pub total: usize,
+    pub completed: usize,
+    pub current_profile_id: Option<usize>,
+    pub current_profile_name: Option<String>,
+    #[schemars(length(max = 6))]
+    pub active_profiles: Vec<ActiveBenchProfile>,
+    pub concurrency_status: BenchConcurrencyStatus,
+    pub last_updated: u64,
+    pub cancel_requested: bool,
+    pub results: Vec<BenchStatusResult>,
+    pub summary: BenchSummary,
+    pub search: Option<SearchProgress>,
+    #[schemars(length(max = 20))]
+    pub preflight_failures: Vec<PreflightFailure>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileTestSettings {
     pub promote_successful_tested_servers: bool,
@@ -612,6 +825,14 @@ pub fn api_endpoint_contracts() -> Vec<ApiEndpointContract> {
             response_schema: "MihomoParametersResponse",
             bounded: true,
             mutates_state: false,
+        },
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/routing/settings",
+            request_schema: Some("RoutingSettingsUpdateRequest"),
+            response_schema: "RoutingSettingsUpdateResponse",
+            bounded: true,
+            mutates_state: true,
         },
         ApiEndpointContract {
             method: "POST",
@@ -702,6 +923,14 @@ pub fn api_endpoint_contracts() -> Vec<ApiEndpointContract> {
             mutates_state: false,
         },
         ApiEndpointContract {
+            method: "POST",
+            path: "/api/routing/resource-reload",
+            request_schema: Some("RoutingResourceReloadRequest"),
+            response_schema: "RoutingResourceReloadResponse",
+            bounded: true,
+            mutates_state: true,
+        },
+        ApiEndpointContract {
             method: "GET",
             path: "/api/memory-estimate",
             request_schema: None,
@@ -716,6 +945,46 @@ pub fn api_endpoint_contracts() -> Vec<ApiEndpointContract> {
             response_schema: "SafeModeResponse",
             bounded: true,
             mutates_state: false,
+        },
+        ApiEndpointContract {
+            method: "GET",
+            path: "/api/diagnostics/direct-availability",
+            request_schema: None,
+            response_schema: "DirectAvailabilityDiagnosticsResponse",
+            bounded: true,
+            mutates_state: false,
+        },
+        ApiEndpointContract {
+            method: "GET",
+            path: "/api/diagnostics/direct-monitor",
+            request_schema: None,
+            response_schema: "DirectMonitorStatusResponse",
+            bounded: true,
+            mutates_state: false,
+        },
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/diagnostics/direct-monitor",
+            request_schema: Some("DirectMonitorSettingsRequest"),
+            response_schema: "DirectMonitorSettingsResponse",
+            bounded: true,
+            mutates_state: true,
+        },
+        ApiEndpointContract {
+            method: "GET",
+            path: "/api/automation/direct-policy",
+            request_schema: None,
+            response_schema: "PolicyAutomationStatus",
+            bounded: true,
+            mutates_state: false,
+        },
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/automation/direct-policy",
+            request_schema: Some("PolicyAutomationRequest"),
+            response_schema: "PolicyAutomationStatus",
+            bounded: true,
+            mutates_state: true,
         },
         ApiEndpointContract {
             method: "POST",
@@ -756,6 +1025,22 @@ pub fn api_endpoint_contracts() -> Vec<ApiEndpointContract> {
             response_schema: "TelegramProbeDeleteResponse",
             bounded: true,
             mutates_state: true,
+        },
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/bench/start",
+            request_schema: Some("BenchStartRequest"),
+            response_schema: "BenchStartResponse",
+            bounded: true,
+            mutates_state: true,
+        },
+        ApiEndpointContract {
+            method: "GET",
+            path: "/api/bench/status",
+            request_schema: None,
+            response_schema: "BenchStatusResponse",
+            bounded: true,
+            mutates_state: false,
         },
         ApiEndpointContract {
             method: "GET",
@@ -882,6 +1167,13 @@ pub fn openapi_document() -> Value {
         "TelegramProbeDeleteResponse": schema_value::<TelegramProbeDeleteResponse>(),
     });
     let diagnostic_schemas = json!({
+        "DirectMonitorSettingsRequest": schema_value::<DirectMonitorSettingsRequest>(),
+        "DirectMonitorSettingsResponse": schema_value::<DirectMonitorSettingsResponse>(),
+        "DirectMonitorStatusResponse": schema_value::<DirectMonitorStatusResponse>(),
+        "PolicyAutomationRequest": schema_value::<PolicyAutomationRequest>(),
+        "PolicyAutomationStatus": schema_value::<PolicyAutomationStatus>(),
+        "RoutingResourceReloadRequest": schema_value::<RoutingResourceReloadRequest>(),
+        "RoutingResourceReloadResponse": schema_value::<RoutingResourceReloadResponse>(),
         "ProfileDiagnosticStartRequest": schema_value::<ProfileDiagnosticStartRequest>(),
         "ProfileDiagnosticSessionRequest": schema_value::<ProfileDiagnosticSessionRequest>(),
         "ProfileDiagnosticDiscardRequest": schema_value::<ProfileDiagnosticDiscardRequest>(),
@@ -899,12 +1191,38 @@ pub fn openapi_document() -> Value {
         "ProfileDiagnosticReport": schema_value::<ProfileDiagnosticReport>(),
         "ProfileDiagnosticReportResponse": schema_value::<ProfileDiagnosticReportResponse>(),
         "ProfileDiagnosticDiscardResponse": schema_value::<ProfileDiagnosticDiscardResponse>(),
+        "BenchStartRequest": schema_value::<BenchStartRequest>(),
+        "BenchStartResponse": schema_value::<BenchStartResponse>(),
+        "BenchConcurrencyLimit": schema_value::<BenchConcurrencyLimit>(),
+        "BenchConcurrencyStatus": schema_value::<BenchConcurrencyStatus>(),
+        "BenchStatusResponse": schema_value::<BenchStatusResponse>(),
+        "BenchStatusResult": schema_value::<BenchStatusResult>(),
+        "BenchSummary": schema_value::<BenchSummary>(),
+        "PreflightFailure": schema_value::<PreflightFailure>(),
+        "AdaptiveSearchOptions": schema_value::<AdaptiveSearchOptions>(),
+        "ServiceCheckOptions": schema_value::<ServiceCheckOptions>(),
+        "ServiceCheckPrefix": schema_value::<crate::benchmark::ServiceCheckPrefix>(),
+        "SearchProgress": schema_value::<SearchProgress>(),
+        "ActiveBenchProfile": schema_value::<ActiveBenchProfile>(),
+        "BenchResult": schema_value::<BenchResult>(),
         "ProfileTestSettings": schema_value::<ProfileTestSettings>(),
         "ProfileTestSettingsUpdateRequest": schema_value::<ProfileTestSettingsUpdateRequest>(),
         "ProfileTestSettingsResponse": schema_value::<ProfileTestSettingsResponse>(),
     });
+    let routing_settings_schemas = json!({
+        "TorrentSocksSettingsUpdate": schema_value::<TorrentSocksSettingsUpdate>(),
+        "TorrentSocksSettingsResponse": schema_value::<TorrentSocksSettingsResponse>(),
+        "RoutingSettingsUpdateRequest": schema_value::<RoutingSettingsUpdateRequest>(),
+        "RoutingSettingsUpdateResponse": schema_value::<RoutingSettingsUpdateResponse>(),
+    });
     let mut schemas = base_schemas.as_object().cloned().unwrap_or_default();
     schemas.extend(diagnostic_schemas.as_object().cloned().unwrap_or_default());
+    schemas.extend(
+        routing_settings_schemas
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    );
     let mut paths = serde_json::Map::new();
     for endpoint in api_endpoint_contracts() {
         let request = endpoint

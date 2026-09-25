@@ -1,5 +1,235 @@
 # Changelog
 
+## v1.3.28 - 2026-09-25
+
+- Show Keenetic's `active` status as green/red connection indicators in the policy automation device list. Keep online devices visible and offline registered devices in a collapsed-by-default section, including previously selected MACs.
+
+## v1.3.27 - 2026-09-25
+
+- Removed Bing from Direct probes, status, and bot messages. Added the opt-in “Zигануть Vсеми руками” automation page with a global switch and per-device MAC selection.
+- On scheduled five-minute samples, keep the current policy when both VK and ya.ru fail; otherwise assign Default Policy if Google passes, XKeen (Policy0) if Google fails. Validate Keenetic's policy/registered host, verify each assignment by rereading RCI, and leave unrelated devices alone. Existing bot pairing remains separate.
+
+## v1.3.26 - 2026-09-25
+
+- Removed Telegram from the Direct reachability checks, dashboard indicators and change notifications. The five remaining sites still check every five minutes; the Telegram bot continues delivering change-only notifications to its already paired private chat via the local SOCKS listener.
+
+## v1.3.25 - 2026-09-25
+
+- Extended lightweight Direct HTTPS availability checks to Telegram and YouTube, with a cached five-minute monitor.
+- Added optional private bot pairing through `/start` and change-only six-site notifications; bot credentials stay outside regular state in a mode-0600 file.
+
+## v1.3.24 - 2026-09-25
+
+### Direct Availability Card
+
+- Replaced the unused final status card with a Direct availability action and four independent site indicators: Google, Vk.ru, ya.ru, and bing.ru.
+- Added a bounded read-only daemon endpoint that runs the four direct `curl` probes in parallel with no SOCKS/HTTP proxy, redirects limited to three, and errors/statuses kept per site.
+- Added fixture/browser coverage for the endpoint request and independent green/red results.
+
+## v1.3.23 - 2026-09-24
+
+### Persistent Results View
+
+- Fixed a gap in v1.3.22: a newly opened page restored Import order, even when completed subscription checks had produced ranked service evidence. Results is now the default profile order; accepted subscription checks select and persist Results. Explicit manual choices, including Import order, persist across reloads.
+- Exercise the accepted subscription start, terminal result ranking, reload, and manual Import choice in fixture-backed browser tests. The prior ranking contract and no-mutation live verification remain separate.
+
+## v1.3.22 - 2026-09-24
+
+### Subscription Check Results Ordering
+
+- After an accepted subscription Check Services run, select Results ordering for profile tables. Rank current YouTube thumbnail, Telegram, and AI passes first, then fresh reachable ping; unknown/stale evidence is not treated as a failed check, and confirmed unreachable profiles come last.
+- Display the same fresh ping used for ordering in the Ping column while Results ordering is selected; preserve import and manual column-order options. A fixture-backed browser regression covers the subscription button, sorted rows, and stale/unreachable cases.
+
+## v1.3.21 - 2026-09-23
+
+### Connection Identity and Immediate Rule Application
+
+- Label connections from the dedicated `torrent-socks-in` inbound in both the active-connection list and grouped connections table, including mixed-site counts.
+- After successful Torrent SOCKS5 target/listener updates, close only existing connections from that inbound so the torrent client reconnects through the new target. After applied general routing changes, close existing Mihomo connections so new sessions re-evaluate the rules. Reconnection occurs only after successful activation; errors are returned as a separate bounded status and surfaced in the UI.
+- Cover exact inbound filtering, real mock controller GET/DELETE behavior, routing scope, and UI labels with regression tests. The release record is in [`docs/releases/v1.3.21.md`](docs/releases/v1.3.21.md). GitHub publication remains unauthorized.
+
+## v1.3.20 - 2026-09-23
+
+### Torrent SOCKS5 Password Guidance
+
+- Added a live UTF-8 byte counter and explicit first-password instructions to the Torrent SOCKS5 card. The browser now rejects an empty first password or a supplied password outside the existing 12–512-byte/control-free contract before sending any routing settings.
+- Kept blank-as-preserve semantics for already configured credentials. Browser regression exercises missing, 11-byte, and 12-byte first passwords through a deferred routing refresh; the SOCKS credential policy itself is unchanged.
+
+All final gates passed (705 Rust tests / 104 browser tests / 132 frontend routes); local, staged, and installed ARM64 SHA256 agreed at `51940d29a69c9ca3aa336f80d7a683572e5043cc78dbb93a21de0f6180237b33`. Transactional deployment, complete rollback, router E2E, and read-only live UI evidence are recorded in [`docs/releases/v1.3.20.md`](docs/releases/v1.3.20.md). GitHub publication remains unauthorized.
+
+## v1.3.19 - 2026-09-23
+
+### Independent Torrent SOCKS5 Authentication
+
+- Removed the requirement to enable Web UI authentication before activating Torrent SOCKS5, and allowed disabling panel authentication while the SOCKS5 listener remains enabled.
+- Preserved mandatory per-listener SOCKS5 username/password, private/loopback IPv4 binding, listener collision checks, and transactional state/core activation. Updated the Web UI hint and regression coverage.
+
+All final gates passed (705 Rust tests / 103 browser tests / 132 frontend routes); local, staged, and installed ARM64 SHA256 agreed at `e9c4d14df558d0aa8b9ee812b237a2e372e3bd32fea5f784b86738290da41059`. Transactional deployment, complete rollback, router E2E, disabled-listener proof, and unchanged durable projections are recorded in [`docs/releases/v1.3.19.md`](docs/releases/v1.3.19.md). GitHub publication remains unauthorized.
+
+## v1.3.18 - 2026-09-22
+
+### Stable Routing Editors
+
+- Moved searchable grouped server-target menus into a centered, wide, viewport-bound dialog shared by routing rules, connection actions, and Torrent SOCKS. Navigation, Escape, or removal of the originating editor closes the dialog.
+- Deferred background routing/connection refresh while an edit or target picker is active, including responses arriving after editing begins; unrelated unsaved settings survive a forced rule-table reload.
+- Made rule deletion visible with a named Delete action and escaped Undo notice. Disabled Parovozik projections are hidden, and its wagon list starts collapsed.
+- Captured read-only evidence of Mihomo memory pressure during Steam downloads for a separate diagnosis; no load reproduction, automatic core restart, or routing mutation was used to claim a memory fix.
+
+All final gates passed (703 Rust tests / 103 browser tests / 132 frontend routes); local, staged, and installed ARM64 SHA256 matched at `9b13359c1fc40dbd1baad6aeb4d610fa41b31a50af89da60b9a9cde56b1a5b3f`. Transactional deployment, complete rollback, router E2E, and read-only desktop/mobile live UI verification are recorded in [`docs/releases/v1.3.18.md`](docs/releases/v1.3.18.md). GitHub publication remains pending and unauthorized.
+
+## v1.3.17 - 2026-09-22
+
+### Dedicated Torrent SOCKS5 Identity
+
+- Added an optional authenticated SOCKS5 listener in the existing Mihomo process so a cooperating torrent client can identify all traffic it sends through the listener without heuristic BitTorrent DPI. Listener-scoped routing supports explicit DIRECT, canonical active VPN, REJECT, Parovozik, and fixed-server targets.
+- Added strict private-listener, credential, port-collision, target, Web UI authentication, and TCP+UDP socket-ownership contracts. The listener is disabled by default; clients must proxy peers, trackers, and DNS and disable direct fallback. DHT/uTP require SOCKS5 UDP support in the client.
+- Integrated fixed torrent targets with routing registry retention, profile identity migration, deletion/subscription-refresh protection, pinned observation, and Dead Servers dataplane transitions.
+- Added typed routing settings/OpenAPI, a grouped searchable target picker, password-preserve and explicit credential-clear flows, and structural secret redaction. State, Mihomo config, validation, corrupt-state, and local backup files use Unix mode `0600`; WebDAV requires HTTPS without redirects.
+- Made settings activation and local/WebDAV restore transactional across state, generated config, core/firewall runtime, selector intent, and candidate/rollback socket contracts. Invalid restore/auth/listener states are rejected before persistence.
+
+All final gates passed (703 Rust tests / 97 browser tests / 132 frontend routes); local, staged, and installed ARM64 SHA256 agreed at `9348d5a5bc4401c7436f73f2c185408c1dd410f79dd39aa2f9cc43aced33afa6`. Transactional deployment, the retained complete rollback, disabled-listener proof, private file modes, fail-closed selector evidence, router E2E, and unchanged durable projections are recorded in [`docs/releases/v1.3.17.md`](docs/releases/v1.3.17.md). No credentials were invented and no torrent traffic was generated. GitHub publication remains pending and unauthorized.
+
+## v1.3.16 - 2026-09-21
+
+### Isolated Health Hysteresis
+
+- Replaced the canonical health-driven fallback with a fail-closed selector `[proxy-active, REJECT]` and a hidden `proxy-health` sensor. One Mihomo URL-test result can no longer change the main dataplane directly.
+- Count only fresh main-namespace health samples: three consecutive failures select `REJECT`, while two consecutive successes restore `proxy-active`. The observation is one `/proxies` snapshot serialized against config apply and scoped to core generation plus canonical active identity.
+- Isolated pinned and Parovozik health namespaces and reduced their interval to 60 seconds; main health remains 10 seconds with an 8-second timeout. This prevents auxiliary checks from overwriting main state or creating synchronized probe storms.
+- Preserved selector intent across hot reloads, full restarts, profile-switch rollback, and manual/automatic Mihomo updates. Runtime selector shape is validated exactly; unverifiable restart or rollback stops the tracked core instead of leaving an unknown dataplane.
+- Updated the Web UI to hide the sensor, derive canonical health from the exact main URL state, and prioritize REJECT over pinned labels.
+
+The incident was reconstructed without an intentional load reproduction. Profile 202 was already unhealthy, so its Hugging Face route fell back to the same active VPN. Parallel transfer load delayed the shared 3-second health probe just beyond its deadline, and v1.3.15's one-sample fallback immediately selected REJECT for all new VPN connections while explicit DIRECT remained available. All final gates passed (693 Rust tests / 96 browser tests / 132 frontend routes); local, staged, and installed ARM64 SHA256 agreed at `3a261c99eba8b33917322bf93d34efe8420622e25bf4aba1417b56d402f87eb5`. Transactional deployment, exact selector/sensor evidence, isolated REJECT/no-IP proof, router E2E, unchanged durable projections, and the complete rollback are recorded in [`docs/releases/v1.3.16.md`](docs/releases/v1.3.16.md).
+
+## v1.3.15 - 2026-09-20
+
+### Fail-Closed VPN Routing
+
+- Replaced the canonical `[proxy-active, DIRECT]` group with Mihomo-safe `[REJECT, proxy-active]`. Mihomo skips the unhealthy local reject member while VPN is healthy and selects it when every member is unhealthy, preventing transient active-profile health failures from exposing the direct WAN address.
+- Applied the same REJECT-first contract to pinned-server and Parovozik VPN groups. A route explicitly targeting the current active server now uses the canonical fail-closed group instead of bypassing it through the raw outbound.
+- Made watchdog recovery depend on the selected `proxy-active` member and its raw health rather than a separately mutable aggregate `alive` value. Default delay diagnostics now probe `proxy-active`, avoiding aggregate health poisoning.
+- Made the Web UI prioritize REJECT chains and treat missing/non-boolean proxy health as unhealthy. Explicit DIRECT rules, direct GeoBase/RU routes, configured port bypasses, and local destination firewall bypasses remain intentional direct-routing policy.
+
+The incident was captured live: the daemon repeatedly logged Mihomo fallback to DIRECT during 95-371 ms active-profile health flaps, while direct WAN and VPN egress were distinct. Immediate containment was hot-reloaded before this release. An isolated installed-Mihomo test then proved `[REJECT, dead-proxy]` selected REJECT after the health interval and returned no public IP. Final gates passed (**692 Rust tests**, **96 browser tests**, **132 frontend routes**); local, staged, and installed ARM64 SHA256 agreed at `d18d27e4837b632962177e337e8a9ab418c6e21162ad8025d3f64d65659f25b0`. Transactional deployment, router E2E, post-deployment group/delay/outage proof, and complete rollback are recorded in [`docs/releases/v1.3.15.md`](docs/releases/v1.3.15.md).
+
+## v1.3.14 - 2026-09-19
+
+### Routing Target and Reconnect Corrections
+
+- Replaced narrow native route-target selects with one wide searchable grouped picker across new rules, inline rule editing, connection actions, and the connection rule editor. Server entries include profile IDs and explicit Dead Servers/fallback state, and connection polling pauses while a picker is open.
+- Added a typed atomic resource-reload action that serializes routing mutations, applies current desired routing before closing matching Mihomo connections, and matches sniffed host, source IP, destination port, and network. Runtime GeoIP/GeoSite/rule-set decisions are reported as runtime-evaluated rather than as a fabricated target.
+- Preserved Dead Servers routing intent while making active fallback explicit. Connection closure is bounded to 20 IDs with bounded redacted errors, and partial closure remains visible to the UI.
+- Made routing settings, rules, resource routes, resets, presets, and device routes share the apply lock. Persistence failures now restore in-memory state, and device-route apply starts the core before enabling transparent routing.
+- Added strict Xray VLESS `pcs`/`vcn` compatibility: one SHA-256 certificate pin maps to Mihomo `fingerprint`, and one certificate verification name maps to `name-cert-verify`, without disabling TLS verification. This restores Quattro profiles that use private pinned certificate chains.
+
+Local v1.3.14 is deployed and verified. All final-version gates passed (**692 Rust tests**, **95 browser tests**, **132 frontend routes**); final local, staged, and installed ARM64 SHA256 agreed at `1ea0fb4073d2c98f0c630e46cb6135f94231f46c9065813fb3c637524be4e2af`. Health, core/firewall readiness, DNS/REDIRECT/TPROXY/table 111, and router E2E passed after the real resource reload and certificate-pin hotfix. Quattro LTE 86 passed an isolated daemon benchmark at 359 ms/0% loss and a real active switch with a 92 ms healthy leaf before profile 88 was restored. BeautifulVPN Obhod 11 retained its old identity but showed an upstream certificate-name mismatch, so it was not altered. The saved `us.aws.cdn.hf.co` rule remained on Dead Server profile 23 and the routing response correctly reported active fallback. Desktop/mobile live UI found profile 431, rendered Dead Servers fallback, had no overflow or JavaScript errors, and sent no mutation beyond the existing read-only connections-page query. Complete rollback and evidence are in [`docs/releases/v1.3.14.md`](docs/releases/v1.3.14.md). GitHub publication remains unauthorized.
+
+## v1.3.13 - 2026-09-17
+
+### Shared Service Policy and Exact Worker Admission
+
+- Added optional strict `service_checks` to ordinary availability requests: required ordered prefix `all`/`youtube`/`telegram`/`ai` and boolean `fail_fast`, rejecting unknown fields/invalid values and combination with `search`. Missing/null retains shipped method defaults, including full/all continued checking for `availability_full`.
+- Applied shared GUI prefix/fail-fast choices to ordinary `availability_full` across all/global, subscription, group, single, favorite, selected, and explicit Dead Servers scopes. All and fail-fast are selectable in ordinary and advanced modes; only the separate explicit advanced global Find N action owns a candidate target. Ordinary checks do not use search/preflight.
+- Required exact ordinary explicit-policy admission of `min(requested workers, candidates)` or HTTP 503 before reservation, preserving the existing job. No silent worker reduction or memory bypass: reserve 80 MiB + 48 MiB/worker, estimated 272 MiB available for four, unknown/zero budgets rejected. Legacy/adaptive memory caps and remaining-target limits remain.
+- Removed the native YouTube mutex from candidate-local contract-1 thumbnail probes, with independent private core/config/captures, per-worker HTML/image/decoder bounds, and cancellation/reaping guards. Native contract-7 Innertube and the shared Telegram SQLite session remain serialized.
+- Kept previews separate from native playback/history, generic health, and automatic promotion/Dead Servers/AutoSelect. Added no authentication, native video, cookies, JavaScript/yt-dlp runtime, or protocol/security/timeout workaround.
+
+Local v1.3.13 is deployed and verified: all final-version gates passed (685 Rust / 92 browser tests / 131 frontend routes), separately from verified development gates; local/staged/installed SHA agreed and router E2E passed. Simulated budget-four admission and budget-three rejection preserving a job remain fixture evidence. The four-thread local SOCKS-failure regression proves native Innertube mutex independence, not four successful router transfers.
+
+Actual four-distinct-candidate/four-worker YT-only admission returned HTTP 503 with memory permitting three before reservation, preserving the existing idle job. A subsequent ordinary `availability_full` request for active `[88]`, concurrency four, explicit YT/no-fail-fast policy, and no search/preflight admitted exactly one worker for one candidate and passed real MrBeast identity/three decoded previews (contract 1). TG/AI were unrequested, native YouTube absent; all three ping checks passed. Desired routing/settings and durable lifecycle projections stayed unchanged, with expected cache/stats/service/traffic updates allowed. Final SHA, retained complete rollback, private proof, and exact smoke evidence are in [`docs/releases/v1.3.13.md`](docs/releases/v1.3.13.md). Separate actual LAN desktop/mobile DOM confirmed enabled ordinary/advanced All/fail-fast controls, browser-local label toggle, YT green/current and TG/AI gray/skipped on 88, collapsed details, no sidebar technical nodes/mobile overflow, and zero JS errors. Single/global builders received intercepted mock 503 with zero forwarded mutations, not backend acceptance or global All success. New v1.3.13 All/TG/AI positives and dynamic fail-fast sequences, actual backend clicks across all scopes, four positive concurrent router transfers, peak/continuous memory, cancellation under load, and reboot persistence remain unverified. No profile-431 repair or parameter guess is claimed. This documentation finalization performs no commands, credential handling, native clock/PC power action, or GitHub operation. Publication remains pending and unauthorized; v1.3.12 (674 Rust / 88 browser tests) and all older release evidence remain unchanged.
+
+## v1.3.12 - 2026-09-17
+
+### Explicit complete-service actions
+
+- Made all/global, subscription, group, single, favorite, selected, and explicit Dead Servers lightning actions consistently Check Services: `availability_full`, no `search`, all YouTube/Telegram/AI checks, and no generic discovery preflight gate.
+- Isolated opt-in advanced global Find N parameters so stored target/prefix/fail-fast values cannot turn an explicit diagnostic into partial discovery or skip later service checks. Advanced checkbox/help labels are global-only; Find N policy itself is unchanged.
+- Moved technical explanations into collapsed Profiles check details; sidebar activity retains only name/count, Stop, and animation. Current conclusive results use red/green; unknown stays amber, and gray means stale/no-attempt/skipped rather than a fabricated failure. Native contract-7/contract-6 history is not converted into thumbnail success.
+- Kept thumbnail contract 1, service timestamp/ref matching, bounded diagnostics, saved native compatibility settings, and exclusions from generic health, native promotion, automatic Dead Servers, and AutoSelect unchanged.
+- Fixed the minimal Trash-list performance bug by canonicalizing all profiles once into a first-alias HashMap instead of repeating the scan for 519 dead refs across 433 profiles under the daemon lock. Added first-alias/restorable-legacy-orphan regression coverage without database or broader strategy changes; live `/api/trash` returned 519 entries within a five-second request budget.
+
+The pre-update v1.3.11 direct `availability_full` test of Obhod 10 primary 431 (old aliases 93/100) failed all three services; its alive pinned group selected active-88 fallback. Primary forwarding is not repaired, and endpoint TCP/group health do not prove it. The old single-click Find N did not test YouTube; no private-builder field loss or cause for all 335 original rejects is established. Initial Astra consultation completed successfully and its advice was implemented; a follow-up encountered transient network failure, not a new verdict. No additional consultation occurs here.
+
+Final v1.3.12 is deployed and verified: all gates passed (674 Rust / 88 browser tests / 131 frontend routes), final artifact hashes matched local/staged/installed, and router E2E passed. Actual `availability_full` without `search` passed YouTube previews, authorized Telegram media, and AI region checks on active 88. Read-only live Chromium confirmed three green indicators on 88 and three red existing results on 431, collapsed advanced details, no mobile overflow, and zero JavaScript errors; no live lightning click was made. Desired routing/settings and durable lifecycle projections stayed unchanged, allowing expected resource/accounting updates. Final SHA, retained rollback, build/deploy chronology, full-service and live UI evidence are in [`docs/releases/v1.3.12.md`](docs/releases/v1.3.12.md). No anonymous video playback, quantitative speedup, native network/time/power action, or parameter guess is claimed. Historical evidence is unchanged; GitHub publication remains pending and unauthorized.
+
+## v1.3.11 - 2026-09-17
+
+### Corrective UI and service evidence
+
+- Restored subscription/group header lightning actions for whole-scope testing and table presentation after the v1.3.10 regression.
+- Rendered fixed neutral YT/TG/AI indicators for every profile with not-tested, stale, skipped, and current states rather than treating absent/skipped evidence as service failure.
+- Matched fresh result overlays after profile load using canonical lifecycle-v2 `server_ref` plus exact profile ID. Exposed an independent public `last_service_test_unix` for service freshness, not generic health timestamps; private raw connection identity stays out of status.
+- Classified a bounded 64 KiB private temporary-core warning-log tail into fixed diagnostic categories without exposing raw core addresses/logs. Preserved HTTP/curl errors and appended upstream deadline evidence, distinguishing preflight transport failure from an actual YouTube check.
+- Kept complete-scope Quick YouTube/Telegram short-circuit and Full continue policy, Find N preflight/history ordering/goals, thumbnail contract 1, and separate legacy native contract-7 API/history unchanged. Weak availability evidence still cannot drive generic health, native promotion, automatic Dead Servers, or AutoSelect.
+
+Sampled profile 88 forwarded gstatic HTTP 204 and YouTube HTTP 200; profiles 93 WebSocket/TLS, 91 gRPC/Reality, and 118 Hysteria2 reached 5-second upstream deadlines. Profile 91 had an owned TCP socket established without a completed protocol stream; cause remains unproven. Reparsed profile-93 fields generated byte-identical config, with no observed persistence loss. No protocol/SNI/certificate-verification/timeout change is justified by these observations, and 335 preflight rejects mean services untested, not 335 proven false failures or dead servers.
+
+Local corrective v1.3.11 is deployed and verified: all final gates passed (673 Rust / 84 browser tests / 131 frontend routes), local/staged/installed hashes matched, and router E2E passed. The negative profile-93 smoke preserved TLS EOF/curl 35 with fixed `[deadline_exceeded]`, zero service tests, and no raw core output. The final positive active-profile-88 smoke confirmed three decoded previews and reached target 1 with matching canonical ref/public service timestamp. Lifecycle/order/dead, profile provenance, and pinned/device routing intent stayed unchanged; other accounting/bookkeeping may change. Actual live browser DOM was not exercised; embedded markers and fixture browser behavior were verified separately. Artifact, complete rollback, and logs are recorded in [`docs/releases/v1.3.11.md`](docs/releases/v1.3.11.md). No clock/NTP change or quantitative speedup/playback repair is claimed. Historical release evidence is unchanged; GitHub publication remains pending and unauthorized.
+
+## v1.3.10 - 2026-09-16
+
+### YouTube channel and preview availability
+
+- Made the public MrBeast channel page plus three successfully decoded previews for distinct videos the only YouTube check in every user-facing search scope. Completion/short-circuit policy, Find N prefixes, and explicit Dead Servers diagnostic scopes remain separate.
+- Added `availability_quick`/`availability_full` methods and `search_availability` results with `youtube_thumbnails` contract 1. Preserved native contract-7 `quick`/`full` API/history separately for shipped API and persisted-data compatibility; preview evidence cannot become native playback evidence or consume old native success as a preview pass.
+- Persisted resource diagnostics without generic EWMA health or overall native Quick/Full success. Availability searches never run native promotion, automatic Dead Servers movement, or AutoSelect, including completed scopes; compatibility controls/help remain separate.
+- Bounded HTML to 2 MiB/20 seconds and each image to 128 KiB/8 seconds; pinned previews to HTTPS `i.ytimg.com:443` without credentials/redirects, actual JPEG/PNG/WebP decode, 1024-pixel dimensions, and 16 MiB decoder allocation. YouTube remains serialized, with existing cancellation and 80 MiB reserve/48 MiB worker startup estimates unchanged.
+- Added no Innertube/video request, cookies/session import, JavaScript runtime, login, or authentication workaround to this availability method. Success means page/previews access, not playback, account access, or strong server health.
+
+v1.3.10 is deployed and verified: all final-version gates passed before build (668 Rust / 67 browser tests / 131 UI routes), local/staged/installed artifact hashes agreed, and router E2E passed. The production `availability_quick` target-1 search on active profile 88 confirmed MrBeast and three distinct decoded previews, returned contract-1 `youtube_thumbnails` success, and reached the target without cancellation. Active identity/order/dead projections stayed unchanged; resource/search bookkeeping and background accounting may change. This is a page/preview pass on one profile, not playback or Mihomo health evidence; native post-actions remain excluded. Full artifact, complete rollback set, and logs are in [`docs/releases/v1.3.10.md`](docs/releases/v1.3.10.md). The earlier isolated ten-endpoint experiment is historical, not a ten-endpoint production release result. No lower-byte-cost or quantitative speedup claim is made. Clock/NTP were unchanged; historical v1.3.9 evidence remains intact. GitHub publication remains pending and unauthorized.
+
+## v1.3.9 - 2026-09-16
+
+### Reachability and native outcome honesty
+
+- Accepted completed adaptive HTTPS preflights with any HTTP status 200-599 as transport reachability only, retrying once on an alternate domain through the same isolated core. This is not YouTube playback evidence; rejection still carries no persisted health/Dead Servers penalty.
+- Retained the private temporary core home/config/log until child reap and bounded status to the last 20 preflight diagnostics with redacted errors up to 2 KiB.
+- Replaced the obsolete ANDROID_VR 1.65.10 path with native direct VISIONOS Innertube without mandatory web watch/bootstrap. A pass requires successful video-MIME media transfer of at least 16 KiB, not a player response or reachability sample.
+- Classified bot/login refusal, HTTP 429, and HTTP client-compatibility refusals as inconclusive instead of server failure or pass. Amber/unknown UI and summaries exclude false failures and stale legacy successes; unknown evidence/history cannot drive promotion, Dead Servers, or AutoSelect.
+- Documented native resource contract 7: contract-6 evidence is stale, unknown history stays unknown, and a serde-defaulted `inconclusive` field tolerates old saves. No authentication/cookie/session workaround, captcha, JavaScript, or yt-dlp runtime is introduced.
+
+### Core creator lifetime
+
+- Fixed Linux `PDEATHSIG` killing Mihomo when its short-lived creator HTTP thread exited. A persistent spawn-owner thread uses a 256 KiB stack and queue bound 1, retains actual `Child` ownership, and preserves daemon-death kill/pre-exec behavior without an optional runtime path.
+- Passed 10 caller-exit regression iterations and 10/10 rollback iterations. The owner adds one baseline daemon thread; the fresh live daemon had three threads after diagnostics.
+
+v1.3.9 is deployed and verified with matching local/staged/installed SHA, all required gates passed (649 Rust / 66 browser tests / 131 UI routes), and router E2E passed before and after authorized manual clock correction. Controlled two-candidate YouTube searches remained exhausted with zero passes/failures and one inconclusive native result: bot refusal stayed unknown, while the other candidate failed TLS preflight. Active identity/order/Dead Servers stayed unchanged. Clock correction did not resolve either outcome. Initial 17:23 UTC observations were unsynchronized/manual; independent 17:34 UTC checks twice confirmed automatic NTP synchronization (`accurate=yes`, `synchronized=yes`, `usertime=no`, server `pool.ntp.org`) within one second of the host. Causes of the initial failure and later success are not established, and reboot persistence remains unverified without a system-wide configuration save. Full artifact, rollback, logs, and chronology are recorded in [`docs/releases/v1.3.9.md`](docs/releases/v1.3.9.md). No anonymous media playback, blanket explanation for the original 335 rejects, or quantitative speedup is claimed. GitHub publication remains pending and unauthorized.
+
+## v1.3.8 - 2026-09-16
+
+### Unified server search
+
+- Unified global, selected, subscription, group, and single-profile actions behind shared browser-stored parameters: complete scope or find N.
+- Complete scope uses all native services with a YouTube/Telegram failure short-circuit policy (existing Quick internally) or continued checking (existing Full internally). Find N retains targets 1-20 and supported YouTube, YouTube+Telegram, or YouTube+Telegram+AI Studio prefixes; unsupported combinations are not offered.
+- Kept explicit Dead Servers diagnostics in complete scope, even when browser parameters select find N. Discovery continues to exclude dead candidates and never runs profile post-actions.
+- Exposed requested/effective/active workers, admission limits, and memory-cap, candidate-count, and target-slot reasons without implying concurrent native YouTube/Telegram probes.
+
+### Worker retention and memory admission
+
+- Fixed temporary discovery target-slot saturation permanently retiring workers: workers now wait and can resume when rejected or failed candidates release slots.
+- Rejected temporary-core starts with HTTP 503 when the memory budget is unknown or allows zero workers, using an 80 MiB router reserve and 48 MiB per-worker startup estimate instead of forcing one worker.
+- Kept bounded cancellation and serialized native YouTube/Telegram probes. The memory guard is a startup admission estimate, not a continuous reserve guarantee; requesting four workers does not mean four simultaneous YouTube checks.
+
+v1.3.8 is a verified local router update: all required gates passed (625 Rust / 63 browser tests / 131 UI routes), local/staged/installed artifact hashes agreed, and core/firewall plus router E2E were verified. Controlled three-candidate YouTube searches observed peak active work of three at target 3 and one at target 1 with lifecycle/order/dead membership unchanged. Worker retention after failed reservations is covered by injected Rust tests, not proven by these live traces. Artifact SHA256, complete rollback path, logs, and runtime coverage limits are recorded in [`docs/releases/v1.3.8.md`](docs/releases/v1.3.8.md). GitHub publication remains pending; no available release asset or quantified speedup is claimed.
+
+## v1.3.7 - 2026-09-16
+
+### Adaptive discovery
+
+- Added Find Servers for all live profiles, selected profiles, or one subscription, with a target of 1-20 unique lifecycle identities and required prefixes YouTube, YouTube+Telegram, or YouTube+Telegram+AI Studio.
+- Used current-contract service history younger than six hours for ordering only; every counted server must pass a fresh measurement. Deduplicated canonical aliases, interleaved endpoint/provenance buckets, and rotated exploration of unknown candidates.
+- Added bounded real-protocol HTTPS preflight in temporary Mihomo, reusing successful cores for requested native service probes. Rejected preflights skip media work without persisted health failures or Dead Servers evidence.
+- Stopped admission at the requested target within existing memory/concurrency bounds; distinguished target reached, exhausted, and cancelled outcomes. Requested-prefix success is not an exhaustive Quick pass, and discovery never activates profiles or runs Quick/Full promotion/dead-movement post-actions.
+
+### Security and control-plane safety
+
+- Retained existing login-throttle blocks when the bounded source table overflows instead of clearing them.
+- Treated unavailable or malformed local Mihomo controller observations as inconclusive, resetting the consecutive-failure streak without penalizing the active profile or initiating failover. The canonical fallback group remains the upstream-health authority.
+- Omitted raw connection credentials from benchmark status, redacted diagnostic strings, safely remapped result identities to current profile IDs, and excluded results whose identities no longer resolve.
+- Prevented delayed navigation focus from stealing focus from an input on the next animation frame.
+
+The verified local artifact SHA256, passed gates, and live router deployment evidence are recorded in [`docs/releases/v1.3.7.md`](docs/releases/v1.3.7.md). GitHub publication remains pending; historical evidence is not reused as v1.3.8 verification.
+
 ## v1.3.6 - 2026-09-16
 
 ### Profile test automation

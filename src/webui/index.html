@@ -130,13 +130,28 @@ select::-ms-expand{display:none}
   display:none;
 }
 .custom-select.open .custom-select-menu{display:block}
+.custom-select-search-wrap{position:sticky;top:0;z-index:1;padding:8px;background:color-mix(in srgb,var(--surface) 94%,transparent);border-bottom:1px solid var(--border)}
+.custom-select-search{width:100%;min-height:34px;background-color:var(--surface)}
+.custom-select-group{padding:9px 10px 5px;color:var(--muted);font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;border-top:1px solid var(--border);overflow-wrap:anywhere}
+.custom-select-group:first-child{border-top:0}
 .custom-select-option{
   padding:7px 10px;color:var(--fg);font-size:var(--fs-body);cursor:pointer;
   border-radius:0!important;user-select:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
+.custom-select-option.disabled{opacity:.45;cursor:not-allowed}
 .custom-select-option:hover,.custom-select-option.active{
   background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--fg);
 }
+.routing-target-field{flex:1 1 360px;min-width:min(360px,100%)}
+.custom-select.routing-target-select{width:100%;min-width:280px}
+.routing-target-select .custom-select-trigger span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.routing-target-select .custom-select-option{white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;line-height:1.35}
+.routing-target-backdrop{position:fixed;inset:0;z-index:110;background:rgba(0,0,0,.5)}
+.custom-select-menu.routing-target-dialog{position:fixed;left:50%;top:50%;right:auto;transform:translate(-50%,-50%);z-index:111;width:min(920px,calc(100vw - 32px));max-width:none;max-height:min(76vh,760px);max-height:min(76dvh,760px);border:1px solid var(--border);box-shadow:var(--shadow-md)}
+.routing-target-dialog .custom-select-option{padding:11px 16px;white-space:normal;overflow-wrap:anywhere;line-height:1.45}
+.routing-target-dialog .custom-select-search-wrap{padding:14px}
+.routing-target-dialog .custom-select-search{min-height:44px}
+.routing-visual-table-wrap.select-menu-open{overflow:visible;max-height:none}
 table{border-collapse:collapse;width:100%}
 
 /* ═══ APP SHELL ═══ */
@@ -363,8 +378,17 @@ table{border-collapse:collapse;width:100%}
 .card-label{font-size:var(--fs-sm);color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em;font-family:var(--font-mono)}
 .card-value{font-size:var(--fs-h2);font-weight:600;font-family:var(--font-mono);font-variant-numeric:tabular-nums}
 .card-value.accent{color:var(--accent)}
-.card-value.success{color:var(--success)}
-.card-value.danger{color:var(--danger)}
+  .card-value.success{color:var(--success)}
+  .card-value.danger{color:var(--danger)}
+  .direct-availability-card{display:flex;flex-direction:column;align-items:center;gap:7px}
+  .direct-availability-sites{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px 12px;width:100%;font-size:var(--fs-xs);color:var(--muted)}
+  .direct-availability-site{display:flex;align-items:center;justify-content:center;gap:4px;min-width:0}
+  .direct-availability-site.ok{color:var(--success)}
+  .direct-availability-site.bad{color:var(--danger)}
+  .direct-availability-site.unknown{color:var(--muted)}
+  .direct-availability-site-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .direct-policy-lamp{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--danger);flex:none;vertical-align:middle;margin-right:7px}
+  .direct-policy-lamp.online{background:var(--success)}
 
 /* ═══ BADGE / LABEL (flat text, no pill) ═══ */
 .badge{
@@ -723,7 +747,8 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .profile-service-test{display:inline-flex;align-items:center;justify-content:center;min-width:22px;padding:0 3px;border:1px solid currentColor;border-radius:3px;font-size:9px;font-weight:700;line-height:14px}
 .profile-service-test.ok{color:var(--success);background:color-mix(in srgb,var(--success) 12%,transparent)}
 .profile-service-test.bad{color:var(--danger);background:color-mix(in srgb,var(--danger) 12%,transparent)}
-.profile-service-test.skipped{color:var(--muted);background:var(--fg-soft)}
+.profile-service-test.unknown{color:var(--warning);background:color-mix(in srgb,var(--warning) 12%,transparent)}
+.profile-service-test.skipped,.profile-service-test.stale{color:var(--muted);background:var(--fg-soft)}
 .profile-name-cell{min-width:230px;max-width:360px;white-space:normal!important}
 .profile-name{font-weight:500;overflow-wrap:anywhere}
 .profile-row-actions{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:5px}
@@ -866,6 +891,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
 @keyframes v2-spin{to{transform:rotate(360deg)}}@keyframes v2-shimmer{to{transform:translateX(100%)}}
 @media(max-width:1024px){.context-heading{min-width:170px}.main-content{padding:18px 20px 72px}}
 @media(max-width:640px){.sub-tabs{min-height:52px;padding:0 8px}.context-heading{display:none}.main-content{padding:14px 12px 78px}.section-header h2{font-size:22px}.cards{grid-template-columns:1fr}.card{border-right:0;border-bottom:1px solid var(--border)}.feature-grid{grid-template-columns:1fr}.bottom-nav-item{min-height:52px}.sidebar.open{box-shadow:var(--shadow-md)}.btn,.custom-select-trigger,.nav-group-header,.nav-sub-item,.sub-tab{min-height:44px}.routing-visual-commandbar{align-items:stretch}.routing-visual-actions{width:100%}.routing-visual-actions .btn{flex:1}.modal{min-width:0;width:calc(100vw - 24px);max-height:calc(100vh - 24px);overflow:auto}.login-box{width:calc(100vw - 24px);padding:24px}table.responsive-cards tr{border-radius:0;box-shadow:none;background:transparent}}
+@media(max-width:640px){.custom-select.routing-target-select{min-width:0}.custom-select-menu.routing-target-dialog{width:calc(100vw - 24px);max-height:calc(100dvh - 32px)}}
 @media(max-width:640px){.profile-editor-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.profile-editor-tuning-grid{grid-template-columns:1fr}.profile-secret-tools .btn{flex:1}.profile-editor .modal-actions{position:sticky;bottom:-28px;margin:18px -28px -28px;padding:12px 28px;background:var(--surface);border-top:1px solid var(--border)}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}.bench-kitt.running .bench-kitt-scanner,.bench-kitt.running .bench-kitt-reveal{animation:bench-kitt-scan 3.4s ease-in-out infinite alternate!important}.reveal-wave,.skeleton::after{display:none}}
 @media(forced-colors:active){.sidebar,.sub-tabs,.bottom-nav,.dead-server-bulk{background:Canvas;backdrop-filter:none}.nav-sub-item.active,.sub-tab.active{outline:2px solid Highlight}.nav-group-header::before,.nav-sub-item::before,.tbl tbody tr::after{display:none}.v2-reveal-hot{background-image:none!important;outline:1px solid Highlight}}
@@ -986,7 +1012,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   <nav class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="sidebar-brand" style="border-radius: 0px;">
       <svg class="brand-icon" viewBox="0 0 1024 1024" role="img" aria-label="HincyRay"><defs><radialGradient id="brand-bg" cx="50%" cy="46%" r="62%"><stop stop-color="#172b3d"/><stop offset=".55" stop-color="#0b1018"/><stop offset="1" stop-color="#05070b"/></radialGradient><linearGradient id="brand-phone" x1="250" y1="100" x2="760" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#3b424d"/><stop offset=".45" stop-color="#151a21"/><stop offset="1" stop-color="#050608"/></linearGradient><linearGradient id="brand-screen" x1="310" y1="150" x2="690" y2="850" gradientUnits="userSpaceOnUse"><stop stop-color="#1f3146"/><stop offset="1" stop-color="#070a0f"/></linearGradient></defs><rect width="1024" height="1024" rx="220" fill="url(#brand-bg)"/><path d="M130 740 40 820M190 820 95 930M845 170l115-92M820 790l130 92M93 276l112 52" stroke="#0078d7" stroke-width="18" stroke-linecap="round" opacity=".65"/><g transform="rotate(-8 512 512)"><rect x="290" y="92" width="444" height="840" rx="78" fill="url(#brand-phone)" stroke="#737b87" stroke-width="14"/><rect x="328" y="138" width="368" height="748" rx="48" fill="url(#brand-screen)" stroke="#0e1620" stroke-width="10"/><circle cx="512" cy="176" r="16" fill="#080b10" stroke="#4d5663" stroke-width="5"/><path d="M510 132 455 292l68-30-42 172 106-238-72 34z" fill="#f4d03f" stroke="#fff2a4" stroke-width="8"/><path d="M496 432 365 536l112 8-74 204 214-260-102 14 75-134z" fill="#ff453a" stroke="#ffb2ab" stroke-width="9"/><path d="M520 398 660 496l-92 22 70 188-198-238 92 18z" fill="#60cdff" stroke="#b8efff" stroke-width="8"/><path d="M445 308 340 248M444 309l-96 102M521 264l118-98M514 436l-160 44M514 437l120 152M477 546l-112 188M566 515l104 166" stroke="#d8e6f3" stroke-width="10" stroke-linecap="round" opacity=".8"/><path d="M336 610 238 660l87 36-142 98 238-62-62-42 98-38zM664 300l150-50-72 102 160 10-228 68 38-78z" fill="#1f8fff" opacity=".88"/><text x="512" y="760" text-anchor="middle" font-family="Arial Black,Arial,sans-serif" font-size="76" fill="#f2f6fb" stroke="#05070b" stroke-width="7" paint-order="stroke">POCO</text></g></svg>
-      <div><div class="logo">HincyRay</div><div class="version">v1.3.6</div></div>
+      <div><div class="logo">HincyRay</div><div class="version">v1.3.28</div></div>
     </div>
     <div class="brightness-row">
       <svg class="brightness-icon" onclick="toggleTheme()" title="Переключить тему" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9L14 6M5.9 14l-1.1 1.1"></path></svg>
@@ -1057,6 +1083,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
         </div>
         <div class="nav-sub-list">
           <div class="nav-sub-item" data-section="auto-select" onclick="navTo('auto-select')"><span class="nav-label">Auto-Select</span></div>
+          <div class="nav-sub-item" data-section="direct-policy" onclick="navTo('direct-policy')"><span class="nav-label">Zигануть Vсеми руками</span></div>
           <div class="nav-sub-item" data-section="maintenance" onclick="navTo('maintenance')"><span class="nav-label">Обслуживание</span></div>
         </div>
       </div>
@@ -1165,7 +1192,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
             <div class="card clickable-card" style="text-align:center"><div class="card-label" style="width:100%;text-align:center">Профилей</div><div class="card-value mono" id="sCount" style="width:100%;text-align:center">42</div></div>
             <div class="card clickable-card" style="text-align:center"><div class="card-label" style="width:100%;text-align:center">SOCKS</div><div class="card-value mono" id="sSocks" style="width:100%;text-align:center">127.0.0.1:10808</div></div>
             <div class="card clickable-card" style="text-align:center"><div class="card-label" style="width:100%;text-align:center">HTTP</div><div class="card-value mono" id="sHttp" style="width:100%;text-align:center">127.0.0.1:10809</div></div>
-            <div class="card clickable-card" style="text-align:center"><div class="card-label" style="width:100%;text-align:center">Mihomo</div><div class="card-value mono" id="sVersion" style="width:100%;text-align:center">v1.19.27</div></div>
+            <div class="card direct-availability-card" id="directAvailabilityCard"><div class="card-label" style="width:100%;text-align:center">Доступность Direct · каждые 5 минут</div><button class="btn btn-sm" id="directAvailabilityButton" type="button" onclick="runDirectAvailability()">Проверить</button><div class="direct-availability-sites" id="directAvailabilitySites"><span class="direct-availability-site unknown" data-direct-site="google"><span class="direct-availability-site-name">Google</span><span>—</span></span><span class="direct-availability-site unknown" data-direct-site="vk"><span class="direct-availability-site-name">Vk.ru</span><span>—</span></span><span class="direct-availability-site unknown" data-direct-site="ya"><span class="direct-availability-site-name">ya.ru</span><span>—</span></span><span class="direct-availability-site unknown" data-direct-site="youtube"><span class="direct-availability-site-name">YouTube</span><span>—</span></span></div><input id="directBotToken" type="password" autocomplete="new-password" placeholder="Токен бота (только на роутере)" style="width:100%;max-width:240px"><button class="btn btn-sm" type="button" id="directBotSave" onclick="saveDirectBot()">Сохранить бота</button><button class="btn btn-sm" type="button" id="directBotDisable" onclick="disableDirectBot()">Отключить</button><small id="directBotStatus">Уведомления отключены</small></div>
           </div>
           <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
             <button class="btn btn-accent" onclick="apiAction('POST','/api/core/start',null,t('Ядро запущено'),refreshDashboard)">▶ Запустить</button>
@@ -1229,27 +1256,39 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
         </div>
         <div class="section-body">
           <details id="testPanel" style="margin-bottom:16px;border:1px solid var(--border);border-radius:8px;overflow:hidden">
-            <summary style="cursor:pointer;font-weight:600;padding:10px 14px;background:var(--surface-2);user-select:none">Настройки тестирования</summary>
+            <summary style="cursor:pointer;font-weight:600;padding:10px 14px;background:var(--surface-2);user-select:none">Параметры проверки сервисов</summary>
             <div style="padding:12px 14px">
-              <p id="benchSemanticsHelp" style="font-size:var(--fs-sm);color:var(--muted);margin:0 0 10px">⚡ в строке проверяет только один сервер. ⚡ у группы/подписки, выбранная область и Full Test используют до настроенного числа параллельных серверов.</p>
-              <div class="form-row" style="align-items:flex-end;flex-wrap:wrap;gap:16px;margin-bottom:12px">
-                <div class="form-group" style="margin:0;min-width:240px"><label for="benchConcurrency" id="benchConcurrencyLabel" data-title-ru="Максимум одновременно проверяемых серверов для групповых, выбранных и Full тестов" data-title-en="Maximum servers tested at once by group, selected-scope, and Full tests" title="Максимум одновременно проверяемых серверов для групповых, выбранных и Full тестов">Параллельных серверов</label>
-                  <select id="benchConcurrency" data-native-select="1" data-title-ru="От 1 до 6; строковый тест всегда проверяет один сервер" data-title-en="From 1 to 6; a row test always checks one server" title="От 1 до 6; строковый тест всегда проверяет один сервер" onchange="saveBenchConcurrency(this.value)"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option></select>
-                  <span id="benchConcurrencyHelp" style="font-size:var(--fs-xs);color:var(--muted)">Для группы, выбранной области и Full Test; строка ⚡ всегда одна.</span>
-                </div>
-                <button class="btn btn-accent" id="benchFullAll" data-bench-scope="global" data-title-ru="Full Test всех серверов, до выбранного числа параллельно" data-title-en="Full Test all servers, up to the selected parallel count" title="Full Test всех серверов, до выбранного числа параллельно" onclick="fullBenchAll()">⚡ Full Test всех серверов</button>
+              <p id="benchSemanticsHelp" style="font-size:var(--fs-xs);color:var(--muted)">Кнопки проверяют всю свою область. Сервисы, стоп после сбоя и параллелизм общие.</p>
+              <p id="benchYouTubeHelp" style="font-size:var(--fs-xs);color:var(--muted)">YouTube: страница канала @MrBeast и 3 превью, не воспроизведение видео.</p>
+              <div id="benchSearchParameters" class="form-row" style="align-items:flex-end;flex-wrap:wrap;gap:12px;margin-bottom:12px">
+                <div class="form-group" style="margin:0;min-width:160px;flex:1"><label for="benchSearchServices">Нужные сервисы</label><select id="benchSearchServices" data-native-select="1" onchange="syncServerSearchParameters('required_services')"><option value="all">Все: Ping+YT+TG+AI</option><option value="youtube">YT</option><option value="telegram">YT+TG</option><option value="ai">YT+TG+AI</option></select></div>
+                <div class="field"><label for="benchSearchFailFast">Стоп после сбоя YT/TG</label><label class="toggle"><input type="checkbox" id="benchSearchFailFast" onchange="syncServerSearchParameters('fail_fast')"><span class="slider"></span></label></div>
               </div>
+              <p id="benchDeadDiagnosticsHelp" style="font-size:var(--fs-xs);color:var(--muted)">Dead Servers проверяются явно, без автоматического восстановления.</p>
+              <details id="benchAdvancedParameters" style="margin-bottom:12px">
+                <summary style="cursor:pointer">Расширенный поиск (все серверы)</summary>
+              <div class="form-row" style="align-items:flex-end;flex-wrap:wrap;gap:12px;margin-bottom:12px">
+                <div class="form-group" style="margin:0;min-width:160px;flex:1"><label for="benchSearchStopMode">Когда остановиться</label><select id="benchSearchStopMode" data-native-select="1" onchange="syncServerSearchParameters('stop_mode')"><option value="complete_scope">Проверить всю область</option><option value="find_n">Найти N подходящих</option></select></div>
+                <div class="form-group" style="margin:0;width:100px"><label for="benchSearchTarget">Найти серверов</label><input id="benchSearchTarget" type="number" min="1" max="20" step="1" value="5" disabled oninput="syncServerSearchParameters('target_good')"></div>
+              </div>
+              <p id="benchSearchHelp" style="font-size:var(--fs-xs);color:var(--muted)">Режим остановки и цель N действуют только для расширенного поиска. Сервисы и стоп после сбоя общие для всех проверок. Найти N: частичный поиск; предпроверка не является проверкой YouTube.</p>
+              <button class="btn btn-sm" id="benchAdvancedSearch" onclick="startServerSearch({advanced:true})">Запустить расширенный поиск</button>
+              </details>
+              <div class="form-row" style="align-items:flex-end;flex-wrap:wrap;gap:16px;margin-bottom:12px">
+                <div class="form-group" style="margin:0;min-width:200px"><label for="benchConcurrency" id="benchConcurrencyLabel">Параллельных серверов</label>
+                  <select id="benchConcurrency" data-native-select="1" data-title-ru="От 1 до 6; строковый тест всегда проверяет один сервер" data-title-en="From 1 to 6; a row test always checks one server" title="От 1 до 6; строковый тест всегда проверяет один сервер" onchange="saveBenchConcurrency(this.value)"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option></select>
+                </div>
+              </div>
+              <details id="benchNativeCompatibility" style="margin-bottom:12px">
+                <summary style="cursor:pointer">Совместимость нативных тестов</summary>
+              <h4 id="benchNativePostActionsLabel" style="font-size:var(--fs-sm);margin:8px 0">Нативные пост-действия (совместимость)</h4>
               <div class="form-row" style="align-items:flex-end;flex-wrap:wrap;gap:16px;margin-bottom:8px">
                 <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Поднимать серверы с успешными проверками</label><label class="toggle"><input type="checkbox" id="benchPromoteSuccessful"><span class="slider"></span></label></div>
                 <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Отправлять недоступные серверы в Dead Servers</label><label class="toggle"><input type="checkbox" id="benchAutoMoveNoPing"><span class="slider"></span></label></div>
                 <button class="btn" id="benchSettingsSave" onclick="saveProfileTestSettings()">Сохранить настройки</button>
               </div>
-              <p id="benchPostActionsHelp" style="font-size:var(--fs-xs);color:var(--muted);margin:0 0 12px">После завершённого Quick/Full Test успешные серверы поднимаются внутри своей группы: Ping+YouTube+Telegram+AI, затем без AI, затем без Telegram; при равной оценке — по ping. В Dead Servers попадают только неактивные серверы без единого успешного ответа и со всеми проваленными ping-проверками.</p>
-              <div id="benchSummary" style="margin-top:12px;display:none" class="cards">
-                <div class="card"><div class="card-label">Прошло</div><div class="card-value success" id="benchPassed">0</div></div>
-                <div class="card"><div class="card-label">Не прошло</div><div class="card-value danger" id="benchFailed">0</div></div>
-                <div class="card"><div class="card-label">Средняя задержка</div><div class="card-value mono" id="benchAvg">— ms</div></div>
-              </div>
+              <p id="benchPostActionsHelp" style="font-size:var(--fs-xs);color:var(--muted);margin:0 0 12px">Настройки автоматических действий относятся к прежним нативным тестам; проверка превью их не запускает. Поиск доступности, как всей области, так и N серверов, не запускает поднятие серверов, перенос в Dead Servers или AutoSelect.</p>
+              </details>
               <details style="margin-top:14px">
                 <summary style="cursor:pointer;font-weight:600">Telegram media probe</summary>
                 <div style="margin-top:10px">
@@ -1273,6 +1312,29 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
               </details>
             </div>
           </details>
+          <button class="btn btn-accent" id="benchSearchAll" data-bench-scope="global" data-title-ru="Для всех серверов" data-title-en="For all servers" title="Для всех серверов" onclick="startServerSearch()" style="margin-bottom:16px">Проверить сервисы</button>
+          <p id="benchResultStatus" style="display:none;margin:0 0 12px" aria-live="polite"></p>
+          <details id="benchDetails" style="margin-bottom:16px">
+            <summary style="cursor:pointer">Подробности проверки</summary>
+          <p id="benchSearchStatus" style="display:none;font-size:var(--fs-xs);color:var(--muted);overflow-wrap:anywhere"></p>
+          <p id="benchConcurrencyStatus" style="display:none;font-size:var(--fs-xs);color:var(--muted);overflow-wrap:anywhere"></p>
+          <p id="benchSearchPartialHelp" style="display:none;font-size:var(--fs-xs);color:var(--muted)"></p>
+          <p id="benchConcurrencyHelp" style="font-size:var(--fs-xs);color:var(--muted)">Канал и превью YouTube (контракт 1) проверяются параллельно допущенными работниками. У каждого кандидата своё временное ядро и файлы; лимиты декодера прежние. Нативный YouTube (контракт 7) и общая сессия Telegram остаются последовательными. Обычная проверка с явной политикой: min(запрошено, кандидаты) работников или HTTP 503; оценка для 4 работников: 272 МиБ доступной памяти. В поиске N допуск также ограничен оставшимися местами цели.</p>
+          <span id="benchSelectionSearchHelp" style="font-size:var(--fs-xs);color:var(--muted)"></span>
+          <div id="benchSummary" style="margin-top:12px;display:none" class="cards">
+            <div class="card"><div class="card-label">Прошло</div><div class="card-value success" id="benchPassed">0</div></div>
+            <div class="card"><div class="card-label">Не прошло</div><div class="card-value danger" id="benchFailed">0</div></div>
+            <div class="card"><div class="card-label">Не определено</div><div class="card-value" id="benchInconclusive" style="color:var(--warning)">0</div></div>
+            <div class="card"><div class="card-label">Средняя задержка</div><div class="card-value mono" id="benchAvg">— ms</div></div>
+          </div>
+          <p id="benchInconclusiveStatus" style="display:none;font-size:var(--fs-sm);color:var(--warning)" aria-live="polite"></p>
+          <details id="benchPreflightDiagnostics" style="display:none;margin-bottom:16px">
+            <summary style="cursor:pointer">Диагностика предпроверки (последние 20)</summary>
+            <p style="font-size:var(--fs-xs);color:var(--muted)">Отказ подготовки ядра/транспорта не является результатом проверки YouTube.</p>
+            <p style="font-size:var(--fs-xs);color:var(--muted)">ID диагностики относятся к исходному запуску, а не к текущим строкам после перенумерации.</p>
+            <ol id="benchPreflightFailures" style="max-height:240px;overflow:auto;overflow-wrap:anywhere;font-size:var(--fs-sm)"></ol>
+          </details>
+          </details>
           <h3 style="font-size:var(--fs-h3);margin:0 0 8px">Добавить один профиль</h3>
           <div class="form-row" style="align-items:flex-end;margin-bottom:16px">
             <div class="form-group" style="flex:1"><label>Share link</label><input id="profileAddLink" class="mono" placeholder="vless://…"></div>
@@ -1282,7 +1344,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
           <div class="form-row">
             <select id="profileSort" style="width:auto" onchange="sortProfiles(this.value)">
               <option value="import">Порядок импорта</option>
-              <option value="results">По результатам</option>
+              <option value="results" selected>По результатам</option>
               <option value="latency">По ping ↑</option>
               <option value="name">По имени А-Я</option>
             </select>
@@ -1307,7 +1369,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
             <span id="deadServerSelectedBreakdown" style="font-size:12px;color:var(--muted)"></span>
             <button class="btn btn-danger btn-sm" id="deadServerMoveSelected" onclick="moveSelectedToDeadServers()">В Дохлые серверы</button>
             <button class="btn btn-sm" id="deadServerRestoreSelected" onclick="restoreSelectedDeadServers()">↩ Восстановить</button>
-            <button class="btn btn-accent btn-sm" id="benchQuickSelected" data-bench-scope="selected" data-title-ru="Quick Test выбранных серверов, до выбранного числа параллельно" data-title-en="Quick Test selected servers, up to the selected parallel count" title="Quick Test выбранных серверов, до выбранного числа параллельно" onclick="quickBenchSelected()">⚡ Быстрый тест</button>
+            <button class="btn btn-accent btn-sm" id="benchSearchSelected" data-bench-scope="selected" data-title-ru="Для выбранных серверов" data-title-en="For selected servers" title="Для выбранных серверов" onclick="startServerSearch({selected:true})">Проверить сервисы</button>
             <button class="btn btn-sm" onclick="clearServerSelection()">Снять выбор</button>
           </div>
           <div class="profiles-table-wrap profile-grid-wrap">
@@ -1396,6 +1458,20 @@ https://sub.example.com/…"></textarea>
               <div class="field" id="proxyPortsField" style="display:none"><label style="font-size:var(--fs-sm);color:var(--muted)">Proxy ports</label><textarea id="rProxyPorts" class="mono" rows="2" placeholder="80,443,8080"></textarea></div>
               <div class="field" id="bypassPortsField" style="display:none"><label style="font-size:var(--fs-sm);color:var(--muted)">Bypass ports</label><textarea id="rBypassPorts" class="mono" rows="2" placeholder="22,53"></textarea></div>
             </div>
+            <div class="feature-card" id="torrentSocksCard">
+              <h4>Torrent SOCKS5</h4>
+              <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Включить отдельный SOCKS5 для торрент-клиента</label><label class="toggle"><input type="checkbox" id="rTorrentSocksEnabled"><span class="slider"></span></label></div>
+              <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Адрес listener</label><input id="rTorrentSocksListen" value="127.0.0.1" class="mono" placeholder="192.168.1.1"></div>
+              <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Порт SOCKS5</label><input id="rTorrentSocksPort" type="number" min="1" max="65535" value="10812" class="mono"></div>
+              <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Имя пользователя</label><input id="rTorrentSocksUsername" maxlength="128" autocomplete="off"></div>
+              <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Новый пароль</label><input id="rTorrentSocksPassword" type="password" maxlength="512" autocomplete="new-password" placeholder="Не менять" oninput="updateTorrentSocksPasswordHint()"></div>
+              <div class="field routing-target-field"><label style="font-size:var(--fs-sm);color:var(--muted)">Маршрут торрент-трафика</label><select id="rTorrentSocksTarget" data-routing-target-select="1" data-searchable-select="1"><option value="direct">DIRECT</option><option value="active">Текущий активный VPN</option><option value="reject">REJECT</option><option value="parovozik">Паровозик VPN</option></select></div>
+              <div class="hint" id="rTorrentSocksPasswordStatus">Пароль не настроен</div>
+              <div class="hint" id="rTorrentSocksPasswordLength"></div>
+              <div class="hint">Для включения задайте отдельный пароль SOCKS5 длиной от 12 до 512 байт. Пустое поле «Новый пароль» сохраняет только уже настроенный пароль.</div>
+              <div><button class="btn btn-danger" type="button" id="rTorrentSocksClear" onclick="clearTorrentSocksCredentials()">Очистить учётные данные</button></div>
+              <div class="hint">Для SOCKS5 обязательны отдельные имя пользователя и пароль; авторизация панели не требуется. Укажите этот SOCKS5 в торрент-клиенте для peers, trackers и DNS и отключите прямой fallback. При смене цели активные Torrent SOCKS5 соединения прерываются и переподключаются к новой цели. UDP/DHT/uTP требуют SOCKS5 UDP support самого клиента.</div>
+            </div>
           </div>
           <div style="display:flex;gap:8px;margin:12px 0">
             <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить настройки</button>
@@ -1438,7 +1514,7 @@ https://sub.example.com/…"></textarea>
                 <h4>🚂 Паровозик</h4>
                 <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Включить экспериментальную direct-first классификацию</label><label class="toggle"><input type="checkbox" id="rParovozikEnabled"><span class="slider"></span></label></div>
                 <div style="font-size:var(--fs-sm);color:var(--muted);margin:8px 0">Только для сайтов, отсутствующих во включённых GeoBase: сначала DIRECT, после подтверждённой ошибки — текущее VPN и выбранные резервные серверы. GeoBase всегда имеет приоритет.</div>
-                <details class="parovozik-consist" id="rParovozikConsist" open>
+                <details class="parovozik-consist" id="rParovozikConsist">
                   <summary>Состав вагонов · <span id="rParovozikCount">0 / 5</span></summary>
                   <div class="parovozik-wagons" id="rParovozikWagons"></div>
                   <div class="parovozik-consist-actions"><button class="btn btn-accent" type="button" onclick="saveParovozikConsist()">Сохранить состав вагонов</button><span class="hint">Текущее VPN — локомотив и добавляется автоматически.</span></div>
@@ -1508,7 +1584,7 @@ https://sub.example.com/…"></textarea>
             <h4 id="ruleFormTitle">Добавить правило</h4>
             <div class="form-row">
               <div class="form-group"><label>Имя</label><input id="ruleName" placeholder="YouTube via proxy"></div>
-              <div class="form-group"><label>Цель</label><select id="ruleTarget"><option value="active">active</option><option value="direct">direct</option><option value="reject">reject</option></select></div>
+              <div class="form-group routing-target-field"><label>Цель</label><select id="ruleTarget" data-routing-target-select="1" data-searchable-select="1"><option value="active">active</option><option value="direct">direct</option><option value="reject">reject</option></select></div>
               <div class="form-group"><label>Протокол</label><select id="ruleNetwork"><option value="any">any</option><option value="tcp">tcp</option><option value="udp">udp</option></select></div>
               <div class="form-group"><label>Порты</label><input id="rulePorts" class="mono" placeholder="80,443"></div>
               <div class="form-group"><label>Режим портов</label><select id="rulePortMode"><option value="include">только эти</option><option value="exclude">кроме этих</option></select></div>
@@ -1525,7 +1601,7 @@ https://sub.example.com/…"></textarea>
           <div class="routing-rules">
             <div id="routingUndo" style="display:none;margin:0 0 10px;padding:10px;border:1px solid var(--warning);border-radius:8px;background:var(--warning-soft)"></div>
             <table class="tbl" id="routingRulesTable">
-              <thead><tr><th>Вкл</th><th>Имя</th><th>Домены / IP</th><th>Цель</th><th>Порты</th><th>Протокол</th><th></th></tr></thead>
+              <thead><tr><th>Вкл</th><th>Имя</th><th>Домены / IP</th><th>Цель</th><th>Порты</th><th>Протокол</th><th>Действие</th></tr></thead>
               <tbody id="routingRulesBody"></tbody>
             </table>
           </div>
@@ -1874,6 +1950,18 @@ https://sub.example.com/…"></textarea>
       </section>
 
       <!-- ═══ AUTO: MAINTENANCE ═══ -->
+      <section class="section-panel" data-section="direct-policy" data-od-id="sec-direct-policy">
+        <div class="section-header" onclick="toggleSection(this)"><h2>Zигануть Vсеми руками</h2><svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg></div>
+        <div class="section-body">
+          <p style="font-size:var(--fs-sm);color:var(--muted)">Каждые 5 минут: если VK и ya.ru оба недоступны — без изменений; Google OK → Default Policy, иначе → XKeen. Работает только для выбранных зарегистрированных устройств. Ручное изменение будет возвращено при следующей проверке.</p>
+          <div class="form-row" style="align-items:center;gap:10px"><label class="toggle"><input id="directPolicyEnabled" type="checkbox"><span class="slider"></span></label><span>Включить автоматизацию</span></div>
+          <div style="display:flex;gap:8px;margin:12px 0;flex-wrap:wrap"><button class="btn btn-sm" type="button" onclick="loadDirectPolicy()">Обновить устройства</button><button class="btn btn-accent btn-sm" id="directPolicySave" type="button" onclick="saveDirectPolicy()">Сохранить выбор</button></div>
+          <div id="directPolicyStatus" style="font-size:var(--fs-sm);color:var(--muted);margin-bottom:10px">—</div>
+          <div style="overflow-x:auto"><table class="tbl tbl-compact"><thead><tr><th>Авто</th><th>Устройство</th><th>IP</th><th>MAC</th><th>Политика Keenetic</th></tr></thead><tbody id="directPolicyDevices"><tr><td colspan="5">Загрузка…</td></tr></tbody></table></div>
+          <details id="directPolicyOffline" style="margin-top:14px"><summary id="directPolicyOfflineSummary">Не подключены (0)</summary><div style="overflow-x:auto;margin-top:8px"><table class="tbl tbl-compact"><thead><tr><th>Авто</th><th>Устройство</th><th>IP</th><th>MAC</th><th>Политика Keenetic</th></tr></thead><tbody id="directPolicyOfflineDevices"></tbody></table></div></details>
+        </div>
+      </section>
+
       <section class="section-panel" data-section="maintenance" data-od-id="sec-maintenance">
         <div class="section-header" onclick="toggleSection(this)">
           <h2>Обслуживание</h2>
@@ -2079,12 +2167,14 @@ https://sub.example.com/…"></textarea>
           </div>
           <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
             <button class="btn" onclick="loadTrash()">Обновить</button>
-            <button class="btn btn-accent" id="trashQuickAll" data-bench-scope="group" data-title-ru="Quick Test всех Dead Servers, до настроенного числа параллельно" data-title-en="Quick Test all Dead Servers, up to the configured parallel count" title="Quick Test всех Dead Servers, до настроенного числа параллельно" onclick="quickTestAllTrash()">⚡ Быстрый тест всех</button>
+              <button class="btn btn-accent" id="trashSearchAll" data-bench-scope="dead" data-title-ru="Для Dead Servers" data-title-en="For Dead Servers" title="Для Dead Servers" onclick="searchAllTrash()">Проверить сервисы</button>
+              <button class="btn" onclick="openServerSearchParameters()">Параметры проверки сервисов</button>
             <button class="btn" id="trashRestoreAll" onclick="restoreAllTrash()">↩ Восстановить все</button>
             <button class="btn" onclick="purgeGoneTrash()">Удалить отсутствующие</button>
             <button class="btn btn-danger" id="trashClearAll" onclick="clearAllTrash()">Очистить всё</button>
           </div>
           <div id="trashList"></div>
+          <p style="font-size:var(--fs-xs);color:var(--muted)">Диагностика Dead Servers: вся область, выбранные сервисы и политика сбоя; без автоматического восстановления.</p>
         </div>
       </section>
 
@@ -2309,9 +2399,9 @@ const MOCK = {
     split_routing: { enabled: true, auto_switch: false, block_quic_global: false, rule_source: "metacubex-lite", vpn_subnet: "192.168.2.0/24", redirect_port: 10810, policy_name: "HincyRay", geo_asset_path: "/opt/share/mihomo", quic_mode: "block", tproxy_available: true, port_mode: "all", proxy_ports: "80,443,8080", bypass_ports: "22,53" }
   },
   profiles: [
-    { id:0, name:"🇩🇪 Frankfurt · VLESS Reality", protocol:"VLESS", transport:"tcp", address:"de-1.example.net", port:443, active:true, group:null, block_quic:false, favorite:true, last_latency_ms:150, last_jitter_ms:5, last_download_mbps:45.5, last_upload_mbps:12.3, last_loss_percent:0, ewma_latency_ms:154, ewma_download_mbps:44.8, consecutive_failures:0, cooldown_until_unix:null, success_count:10, failure_count:2, resource_tests:[{contract_version:6,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:182},{contract_version:6,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:141},{contract_version:6,id:'ai',name:'AI',stable:true,successes:3,attempts:3,avg_ttfb_ms:271}] },
-    { id:1, name:"🇳🇱 Amsterdam • Streaming", protocol:"VMess", transport:"ws", address:"nl-ams.example.net", port:443, active:false, group:"Europe Premium", block_quic:false, favorite:false, last_latency_ms:210, last_jitter_ms:12, last_download_mbps:32.1, last_upload_mbps:8.5, last_loss_percent:1.5, ewma_latency_ms:218, ewma_download_mbps:31.4, consecutive_failures:1, cooldown_until_unix:null, success_count:8, failure_count:3, resource_tests:[{contract_version:6,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:238},{contract_version:6,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:202},{contract_version:6,id:'ai',name:'AI',stable:false,successes:1,attempts:3,avg_ttfb_ms:0}] },
-    { id:2, name:"🇯🇵 Tokyo — AI / low jitter", protocol:"Trojan", transport:"grpc", address:"jp-tyo.example.net", port:443, active:false, group:"Asia", block_quic:true, favorite:false, last_latency_ms:180, last_jitter_ms:8, last_download_mbps:38.7, last_upload_mbps:10.1, last_loss_percent:0, ewma_latency_ms:176, ewma_download_mbps:39.2, consecutive_failures:0, cooldown_until_unix:null, success_count:9, failure_count:1, resource_tests:[{contract_version:6,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:207},{contract_version:6,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:174},{contract_version:6,id:'ai',name:'AI',stable:true,successes:3,attempts:3,avg_ttfb_ms:233}] },
+    { id:0, name:"🇩🇪 Frankfurt · VLESS Reality", protocol:"VLESS", transport:"tcp", address:"de-1.example.net", port:443, active:true, group:null, block_quic:false, favorite:true, last_latency_ms:150, last_jitter_ms:5, last_download_mbps:45.5, last_upload_mbps:12.3, last_loss_percent:0, ewma_latency_ms:154, ewma_download_mbps:44.8, consecutive_failures:0, cooldown_until_unix:null, success_count:10, failure_count:2, resource_tests:[{contract_version:7,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:182},{contract_version:7,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:141},{contract_version:7,id:'ai',name:'AI',stable:true,successes:3,attempts:3,avg_ttfb_ms:271}] },
+    { id:1, name:"🇳🇱 Amsterdam • Streaming", protocol:"VMess", transport:"ws", address:"nl-ams.example.net", port:443, active:false, group:"Europe Premium", block_quic:false, favorite:false, last_latency_ms:210, last_jitter_ms:12, last_download_mbps:32.1, last_upload_mbps:8.5, last_loss_percent:1.5, ewma_latency_ms:218, ewma_download_mbps:31.4, consecutive_failures:1, cooldown_until_unix:null, success_count:8, failure_count:3, resource_tests:[{contract_version:7,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:238},{contract_version:7,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:202},{contract_version:7,id:'ai',name:'AI',stable:false,successes:1,attempts:3,avg_ttfb_ms:0}] },
+    { id:2, name:"🇯🇵 Tokyo — AI / low jitter", protocol:"Trojan", transport:"grpc", address:"jp-tyo.example.net", port:443, active:false, group:"Asia", block_quic:true, favorite:false, last_latency_ms:180, last_jitter_ms:8, last_download_mbps:38.7, last_upload_mbps:10.1, last_loss_percent:0, ewma_latency_ms:176, ewma_download_mbps:39.2, consecutive_failures:0, cooldown_until_unix:null, success_count:9, failure_count:1, resource_tests:[{contract_version:7,id:'youtube',name:'YouTube',stable:true,successes:3,attempts:3,avg_ttfb_ms:207},{contract_version:7,id:'telegram',name:'Telegram',stable:true,successes:3,attempts:3,avg_ttfb_ms:174},{contract_version:7,id:'ai',name:'AI',stable:true,successes:3,attempts:3,avg_ttfb_ms:233}] },
     { id:3, name:"Server-4", protocol:"VLESS", transport:"tcp", address:"13.14.15.16", port:443, active:false, group:null, block_quic:false, favorite:true, last_latency_ms:95, last_jitter_ms:3, last_download_mbps:62.3, last_upload_mbps:18.7, last_loss_percent:0, ewma_latency_ms:99, ewma_download_mbps:60.9, consecutive_failures:0, cooldown_until_unix:null, success_count:15, failure_count:0 },
     { id:4, name:"Server-5", protocol:"Shadowsocks", transport:"tcp", address:"17.18.19.20", port:8388, active:false, group:"Group-B", block_quic:false, favorite:false, last_latency_ms:320, last_jitter_ms:25, last_download_mbps:15.0, last_upload_mbps:3.2, last_loss_percent:5, ewma_latency_ms:335, ewma_download_mbps:14.1, consecutive_failures:4, cooldown_until_unix:1719903700, success_count:4, failure_count:8 },
     { id:5, name:"🇫🇮 Helsinki · WireGuard", protocol:"WireGuard", transport:"udp", address:"fi-hel.example.net", port:51820, active:false, group:"Europe Premium", block_quic:false, favorite:true, last_latency_ms:128, last_jitter_ms:4, last_download_mbps:58.2, last_upload_mbps:16.1, last_loss_percent:0, ewma_latency_ms:131, ewma_download_mbps:57.4, consecutive_failures:0, cooldown_until_unix:null, success_count:17, failure_count:1 },
@@ -2384,6 +2474,9 @@ function previewApi(method, path, body) {
     '/api/dns/diagnostics': {ok:true,listen:'127.0.0.1:1053'},
     '/api/diagnostics/dns': {ok:true,redirect:'53 → 127.0.0.1:1053'},
     '/api/diagnostics/udp-quic': {ok:true,udp_tproxy:true,quic_mode:'proxy'},
+    '/api/diagnostics/direct-availability': {ok:true,results:[{id:'google',name:'Google',ok:true,status:204,elapsed_ms:42},{id:'vk',name:'Vk.ru',ok:true,status:200,elapsed_ms:55},{id:'ya',name:'ya.ru',ok:true,status:200,elapsed_ms:49},{id:'youtube',name:'YouTube',ok:false,status:403,elapsed_ms:70,error:'HTTP 403'}]},
+    '/api/automation/direct-policy': {enabled:false,devices:[{mac:'02:00:00:00:00:33',ip:'192.168.2.33',name:'PC',policy:'Policy0',selected:false,active:true},{mac:'02:00:00:00:00:44',ip:'0.0.0.0',name:'Offline PC',policy:'Policy0',selected:false,active:false}],last_check_unix:null,last_action_unix:null,last_action:null,error:null},
+    '/api/diagnostics/direct-monitor': {bot_configured:false,bot_paired:false,results:[]},
     '/api/hwid': {hwid:'a1b2c3d4e5f60708',os_version:'Android 14',device_model:'Reference Device',device_os:'android',app_version:'2.18.0',bundle_id:'app.hincyray',api_version:'5'},
     '/api/auth-settings': {enabled:false,username:'admin'},
     '/api/update/status': {current_version:'v1.19.27',update_available_version:null,auto_update_enabled:true,auto_update_interval_hours:24},
@@ -2408,7 +2501,7 @@ function previewApi(method, path, body) {
     '/api/routing/connection-context': {connections:MOCK.active_connections},
     '/api/subscriptions/refresh-report': {report:{timestamp:now,refreshed:2,added:3,changed:2,removed:1,failed:1,entries:[{url:'https://sub.example.com/link1',title:'Premium · Europe & Asia',status:'updated',previous_count:17,new_count:20,added:3,changed:2,removed:0,error:null},{url:'https://sub.example.com/link2',title:'Reserve nodes',status:'error',previous_count:23,new_count:22,added:0,changed:0,removed:1,error:'timeout'}]}},
     '/api/undo': {undo:[{id:'preview-routing',timestamp:now-120,label:'Маршрутизация до применения GeoBase'}]},
-    '/api/mihomo-config/preview': {config:'proxy-groups:\n  - name: proxy-active\n    type: fallback\n    proxies: [proxy, DIRECT]\nrules:\n  - IP-CIDR,203.0.113.0/24,proxy-active'},
+    '/api/mihomo-config/preview': {config:'proxy-groups:\n  - name: proxy\n    type: select\n    proxies: [proxy-active, REJECT]\n  - name: proxy-health\n    type: fallback\n    hidden: true\n    proxies: [REJECT, proxy-active]\nrules:\n  - IP-CIDR,203.0.113.0/24,proxy'},
   };
   if (method === 'GET' && /^\/api\/profiles\/\d+$/.test(path)) {
     const profile = MOCK.profiles.find(item => item.id === Number(path.split('/').at(-1)));
@@ -2420,9 +2513,9 @@ function previewApi(method, path, body) {
   if (path === '/api/mihomo-api/connections/device-traffic') return Promise.resolve({devices:{}});
   if (path === '/api/bench/start') {
     const ids = body?.profile_ids || MOCK.profiles.filter(profile => !profile.active).map(profile => profile.id);
-    previewBenchStatus = {state:'running',running:true,method:body?.method || 'quick',quick:body?.method === 'quick',completed:0,total:ids.length,current_profile:'Подготовка проверки'};
+    previewBenchStatus = {state:'running',running:true,method:body?.method || 'availability_quick',completed:0,total:ids.length,current_profile:'Подготовка проверки'};
     setTimeout(() => { previewBenchStatus = {...previewBenchStatus,completed:Math.max(1,Math.floor(previewBenchStatus.total / 2)),current_profile:'🇫🇮 Helsinki · WireGuard'}; }, 900);
-    setTimeout(() => { previewBenchStatus = {state:'completed',running:false,method:body?.method || 'quick',quick:body?.method === 'quick',completed:ids.length,total:ids.length,current_profile:'Проверка завершена',results:ids.map(id => ({profile_id:id,success:true,latency_ms:128}))}; }, 5200);
+    setTimeout(() => { previewBenchStatus = {state:'completed',running:false,method:body?.method || 'availability_quick',completed:ids.length,total:ids.length,current_profile:'Проверка завершена',results:ids.map(id => ({profile_id:id,method:body?.search ? 'search_availability' : body?.method || 'availability_quick',success:false,resource_tests:[{contract_version:1,id:'youtube_thumbnails',name:'YouTube channel/thumbnails',attempts:0,successes:0,stable:false,inconclusive:true,error:t('Предпросмотр не выполняет сетевые проверки')}] })),search:body?.search ? {...body.search,found_good:0,preflight_completed:0,preflight_rejected:0,quick_completed:0,finish_reason:'exhausted'} : null}; }, 5200);
     return Promise.resolve({started:true});
   }
   if (path === '/api/bench/stop') { previewBenchStatus = {...previewBenchStatus,state:'stopped',running:false}; return Promise.resolve({stopped:true}); }
@@ -2432,6 +2525,12 @@ function previewApi(method, path, body) {
   }
   if (method === 'GET' && Object.prototype.hasOwnProperty.call(routes,path)) return Promise.resolve(structuredClone(routes[path]));
   if (method === 'POST' && path === '/api/mihomo-features') return Promise.resolve({parameters:structuredClone(body.parameters),runtime:structuredClone(routes[path].runtime)});
+  if (method === 'POST' && path === '/api/routing/settings') {
+    const settings = structuredClone(body || {});
+    if (settings.torrent_socks) delete settings.torrent_socks.password;
+    delete settings.apply;
+    return Promise.resolve({settings,applied:body?.apply === true});
+  }
   if (method === 'POST' && path === '/api/profiles/revalidate-ungrouped') return Promise.resolve({checked:2,updated:1,unchanged:1,dataplane_applied:false,errors:[]});
   if (path === '/api/auth/login') return Promise.resolve({token:'preview-token'});
   if (path.includes('delay')) return Promise.resolve({delay:47});
@@ -2605,6 +2704,7 @@ function setButtonPending(button, pending, label) {
 function apiAction(method, path, body, successMsg, reloadFn) {
   return api(method, path, body).then(r => {
     if (successMsg) showToast('success', successMsg);
+    if (path === '/api/routing/apply') showRoutingReconnectStatus(r);
     if (reloadFn) reloadFn();
     return r;
   }).catch(() => {});
@@ -2980,6 +3080,7 @@ function saveProfileLoggerReport() {
 
 // ─── LOGIN ───────────────────────────────────────────────────────────
 function showLoginOverlay() {
+  closeCustomSelects();
   clearProfileEditorSensitiveState();
   clearProfileLoggerState();
   document.getElementById('loginOverlay').style.display = 'flex';
@@ -3067,6 +3168,7 @@ const NAV_MAP = {
   'logs':        {group:'mihomo',label:'Логи'},
   'update':      {group:'mihomo',label:'Обновление'},
   'auto-select': {group:'automation',label:'Auto-Select'},
+  'direct-policy': {group:'automation',label:'Zигануть Vсеми руками'},
   'maintenance': {group:'automation',label:'Обслуживание'},
   'trace':       {group:'diagnostics',label:'Трассировка'},
   'unlock':      {group:'diagnostics',label:'Разблокировка'},
@@ -3086,7 +3188,7 @@ const GROUP_SUBS = {
   profiles:    ['profiles','import','sub-store'],
   routing:     ['routing','connections-table','devices','dns'],
   mihomo:      ['features','config','logs','update'],
-  automation:  ['auto-select','maintenance'],
+  automation:  ['auto-select','direct-policy','maintenance'],
   diagnostics: ['trace','unlock','diag-network','profile-logger','deep-bench','trash'],
   admin:       ['backups','auth','hwid','acrylic','tooltips'],
 };
@@ -3098,6 +3200,7 @@ const GROUP_LABELS = {
 function navTo(section) {
   const info = NAV_MAP[section];
   if (!info) return;
+  closeCustomSelects();
   stopConnectionsTableAutoRefresh();
   // Open the group accordion
   document.querySelectorAll('.nav-group').forEach(g => g.classList.toggle('open', g.dataset.group === info.group));
@@ -3117,7 +3220,8 @@ function navTo(section) {
   const contextSection = document.getElementById('contextSection');
   if (contextGroup) contextGroup.textContent = GROUP_LABELS[info.group] || info.group;
   if (contextSection) contextSection.textContent = info.label || section;
-  if (contextSection) requestAnimationFrame(() => contextSection.focus({preventScroll:true}));
+  // Deferred navigation focus can steal focus from an input on the next frame.
+  if (contextSection) contextSection.focus({preventScroll:true});
   // Update bottom-nav active
   document.querySelectorAll('.bottom-nav-item').forEach(b => {
     b.classList.toggle('active', b.dataset.group === info.group);
@@ -3131,6 +3235,7 @@ function navTo(section) {
   if (section === 'profile-logger') openProfileLogger();
   else stopProfileLoggerPolling();
   if (section === 'features') loadFeatures();
+  if (section === 'direct-policy') loadDirectPolicy();
 }
 
 function arrangeRoutingSecondarySections() {
@@ -3351,12 +3456,6 @@ const I18N = {
   'Параллельных серверов':'Parallel servers',
   'Поднимать серверы с успешными проверками':'Promote servers with successful checks',
   'Отправлять недоступные серверы в Dead Servers':'Move unavailable servers to Dead Servers',
-  'После завершённого Quick/Full Test успешные серверы поднимаются внутри своей группы: Ping+YouTube+Telegram+AI, затем без AI, затем без Telegram; при равной оценке — по ping. В Dead Servers попадают только неактивные серверы без единого успешного ответа и со всеми проваленными ping-проверками.':'After a completed Quick/Full Test, successful servers move up within their group: Ping+YouTube+Telegram+AI, then without AI, then without Telegram; equal scores are ordered by ping. Only inactive servers with no successful response and all ping checks failed move to Dead Servers.',
-  '⚡ в строке проверяет только один сервер. ⚡ у группы/подписки, выбранная область и Full Test используют до настроенного числа параллельных серверов.':'A row ⚡ tests only one server. Group/subscription ⚡, selected scope, and Full Test use up to the configured parallel count.',
-  'Для группы, выбранной области и Full Test; строка ⚡ всегда одна.':'For group, selected-scope, and Full tests; a row ⚡ always tests one.',
-  'Quick Test только этого сервера':'Quick Test this server only',
-  'Quick Test группы, до настроенного числа серверов параллельно':'Quick Test group, up to the configured parallel count',
-  'Quick Test подписки, до настроенного числа серверов параллельно':'Quick Test subscription, up to the configured parallel count',
   // Cards — update
   'Текущая':'Current','Доступна':'Available',
   // Buttons
@@ -3378,6 +3477,12 @@ const I18N = {
   'Host':'Host','Source IP':'Source IP','Port':'Port',
   'Группа (необязательно)':'Group (optional)','Вставьте ссылки / URL подписки / Xray JSON':'Paste links / subscription URL / Xray JSON',
   'Имя пользователя':'Username','Новый пароль':'New password','Защита паролем':'Password protection','Bundle ID':'Bundle ID','API Version':'API Version',
+  'Включить отдельный SOCKS5 для торрент-клиента':'Enable dedicated SOCKS5 for the torrent client','Порт SOCKS5':'SOCKS5 port','Маршрут торрент-трафика':'Torrent traffic route',
+  'Адрес listener':'Listener address',
+  'Пароль настроен':'Password configured','Пароль не настроен':'Password not configured','Не менять':'Leave unchanged','Очистить учётные данные':'Clear credentials','Учётные данные Torrent SOCKS5 очищены':'Torrent SOCKS5 credentials cleared',
+  'Для включения задайте отдельный пароль SOCKS5 длиной от 12 до 512 байт. Пустое поле «Новый пароль» сохраняет только уже настроенный пароль.':'To enable, enter a separate SOCKS5 password of 12–512 bytes. A blank New password field preserves only an already configured password.',
+  'Введите пароль SOCKS5 длиной от 12 до 512 байт':'Enter a SOCKS5 password of 12–512 bytes',
+  'Пароль SOCKS5: ':'SOCKS5 password: ',' байт (минимум 12)':' bytes (minimum 12)',
   'Стратегия запросов':'Query strategy','Удалённые DNS (через прокси)':'Remote DNS (via proxy)','Локальные DNS (напрямую)':'Local DNS (direct)',
   'Тест утечки':'Leak Test','Диагностика':'Diagnostics',
   'Тест утечки выполняется…':'DNS leak test running…','Диагностика выполняется…':'Diagnostics running…',
@@ -3460,6 +3565,12 @@ const I18N = {
   // Misc
   'Показывать подсказки':'Show tooltips','Дохлые серверы':'Dead Servers','Выбрано':'Selected','Живые':'Live',
   'Выбрать группу':'Select group','Выбрать сервер':'Select server','Снять выбор':'Clear selection',
+  'Поиск сервера…':'Search servers…','Поиск сервера':'Search servers',
+  'Применить правило и переподключить':'Apply rule and reconnect','Ресурс переподключён':'Resource reconnected',
+  'Открытых совпадающих соединений не найдено':'No matching open connections found','Не все соединения закрыты':'Some connections could not be closed',
+  'Цель определяет Mihomo во время запроса':'Mihomo determines the target at request time',
+  'Выбрать маршрут…':'Choose route…',
+  'Выбранный сервер в Dead Servers; используется текущий активный VPN.':'The selected server is in Dead Servers; the current active VPN is used.',
   'В Дохлые серверы':'Move to Dead Servers','Серверы перемещены в Дохлые серверы':'Servers moved to Dead Servers','Серверы восстановлены':'Servers restored',
   'При наведении на поля настроек появляются всплывающие пояснения':'Hover over settings fields to see explanatory tooltips',
   'Параметры acrylic-эффекта боковой панели':'Parameters for sidebar acrylic effect',
@@ -3600,6 +3711,47 @@ const I18N = {
   'loading':'Loading','analyzing':'Analyzing','saving':'Saving','complete':'Complete','cancelled':'Cancelled','error':'Error','idle':'Idle','url':'URL','upload':'File','manual':'Manual',
   'Синхронизировать':'Sync','Применить маршруты':'Apply routes','Загружен UTF-8 файл':'UTF-8 file loaded',
   'Нажми для редактирования':'Click to edit','только':'only','кроме':'except',
+  'Найти серверов':'Servers to find','Нужные сервисы':'Required services',
+  'Параметры поиска серверов':'Server search parameters','Когда остановиться':'When to stop',
+  'Проверить всю область':'Check complete scope','Найти N подходящих':'Find N good servers','Все: Ping+YT+TG+AI':'All: Ping+YT+TG+AI',
+  'Стоп после сбоя YT/TG':'Stop after YT/TG failure',
+  'Запустить поиск':'Start search','Поиск выбранных':'Search selection','Поиск подписки':'Search subscription','Поиск группы':'Search group','Поиск этого сервера':'Search this server','Поиск Dead Servers':'Search Dead Servers',
+  'Проверить сервисы':'Check services','Параметры проверки сервисов':'Service check parameters','Подробности проверки':'Check details',
+  'Расширенный поиск (все серверы)':'Advanced search (all servers)','Запустить расширенный поиск':'Start advanced search','Совместимость нативных тестов':'Native test compatibility',
+  'Для всех серверов':'For all servers','Для всех серверов подписки':'For all servers in this subscription','Для всех серверов группы':'For all servers in this group','Для выбранных серверов':'For selected servers','Для этого сервера':'For this server','Для Dead Servers':'For Dead Servers',
+  'Проверено':'Checked','Проверка завершена':'Check complete',
+  'Кнопки проверяют всю свою область. Сервисы, стоп после сбоя и параллелизм общие.':'Buttons check their complete scope. Services, stop after failure, and concurrency are shared.',
+  'YouTube: страница канала @MrBeast и 3 превью, не воспроизведение видео.':'YouTube: the @MrBeast channel page and 3 thumbnails, not video playback.',
+  'Режим остановки и цель N действуют только для расширенного поиска. Сервисы и стоп после сбоя общие для всех проверок. Найти N: частичный поиск; предпроверка не является проверкой YouTube.':'Stop mode and target N apply only to advanced search. Services and stop after failure are shared by all checks. Find N is partial discovery; preflight is not a YouTube test.',
+  'Dead Servers проверяются явно, без автоматического восстановления.':'Dead Servers are checked explicitly, without automatic restoration.',
+  'Все кнопки поиска используют эти параметры; область задаётся кнопкой: сервер, подписка, группа, выбранные или все серверы.':'All search buttons share these parameters; the button sets the scope: one server, subscription, group, selection, or all servers.',
+  'Вся область: ping, страница канала YouTube @MrBeast и 3 превью, медиа Telegram и регион AI Studio; ограничить сервисы нельзя. Опция прекращает дальнейшие проверки сервисов этого сервера после сбоя YouTube или Telegram, а не поиск всей области; без неё выполняются все проверки. Даже если все ping провалились, проверка YouTube продолжается. Сбой ping сам по себе не доказывает недоступность сервера. Найти N: только последовательные YT, YT+TG или YT+TG+AI; остановка цепочки после сбоя YouTube/Telegram обязательна, независимый выбор сервисов недоступен. Поиск N частичный: остановка по цели или исчерпанию кандидатов; непроверенные и отсеянные предпроверкой не считаются провалами сервисов. Дубликаты объединяются; история задаёт только приоритет, найденные серверы всегда проверяются заново.':'Complete scope: ping, the YouTube @MrBeast channel page and 3 thumbnails, Telegram media, and the AI Studio region; limiting services is unavailable. This option stops subsequent service checks for that server after a YouTube or Telegram failure, not the whole scope search; without it all checks run. Even if all ping checks fail, YouTube is still tested. Ping failure alone does not prove unreachability. Find N: only sequential YT, YT+TG, or YT+TG+AI; stopping the pipeline after a YouTube/Telegram failure is mandatory, independent service selection is unavailable. Find N is partial: it stops at the target or candidate exhaustion; untested and preflight-rejected candidates are not service failures. Duplicates are merged; history only sets priority, and found servers are always retested.',
+  'Найти N исключает Dead Servers из выбранной области. Отдельный поиск Dead Servers всегда проверяет всю область и все сервисы с выбранной политикой сбоя; автоматического восстановления нет. Параметры общие, в том числе для диагностики Dead Servers.':'Find N excludes Dead Servers from the selection. Explicit Dead Servers search always checks the complete scope and all services using the selected failure policy; it never restores automatically. Parameters are shared, including for Dead Servers diagnostics.',
+  'Канал и превью YouTube (контракт 1) проверяются параллельно допущенными работниками. У каждого кандидата своё временное ядро и файлы; лимиты декодера прежние. Нативный YouTube (контракт 7) и общая сессия Telegram остаются последовательными. Обычная проверка с явной политикой: min(запрошено, кандидаты) работников или HTTP 503; оценка для 4 работников: 272 МиБ доступной памяти. В поиске N допуск также ограничен оставшимися местами цели.':'YouTube channel and thumbnails (contract 1) run in parallel across admitted workers. Each candidate has its own private temporary core and files; decoder limits are unchanged. Native YouTube (contract 7) and the shared Telegram session remain serialized. Ordinary explicit-policy checks require min(requested, candidates) workers or HTTP 503; 4 workers need an estimated 272 MiB available memory. Find N admission is also bounded by remaining target slots.',
+  'Нативные пост-действия (совместимость)':'Native post-actions (compatibility)',
+  'Настройки автоматических действий относятся к прежним нативным тестам; проверка превью их не запускает. Поиск доступности, как всей области, так и N серверов, не запускает поднятие серверов, перенос в Dead Servers или AutoSelect.':'Automatic-action settings apply to legacy native tests; thumbnail checks do not trigger them. Availability search, for both complete scope and N servers, never triggers server promotion, movement to Dead Servers, or AutoSelect.',
+  'Исключено Dead Servers':'Excluded Dead Servers','Все выбранные, включая Dead Servers':'All selected, including Dead Servers','Нет кандидатов: Dead Servers исключены':'No candidates: Dead Servers excluded',
+  'Частичный поиск: непроверенные и отсеянные предпроверкой не являются провалами сервисов.':'Partial search: untested and preflight-rejected candidates are not service failures.',
+  'Выберите режим остановки':'Select a stop mode',
+  'Диагностика Dead Servers: вся область, выбранные сервисы и политика сбоя; без автоматического восстановления.':'Dead Servers diagnostics: complete scope, selected services and failure policy; no automatic restoration.',
+  'Запрошено':'Requested','доступно':'available','в работе':'active','лимит допуска':'admission limit','резерв памяти':'memory reserve','число кандидатов':'candidate count','оставшиеся места цели':'remaining target slots',
+  'Укажите целое число серверов от 1 до 20':'Enter a whole number of servers from 1 to 20',
+  'Выберите нужные сервисы':'Select required services',
+  'Найдено':'Found','Кандидаты':'Candidates','Предпроверено':'Preflight completed','Отсеяно предпроверкой':'Preflight rejected','Сервисы проверены':'Services tested',
+  'YouTube: только страница канала @MrBeast и 3 превью. Это проверка доступности страницы/изображений, не воспроизведения видео. Старые результаты видеотестов YouTube не используются в поиске.':'YouTube: only the @MrBeast channel page and 3 thumbnails. This checks page/image availability, not video playback. Old YouTube video-test results are not used in search.',
+  'Не определено':'Inconclusive','Страницу канала/превью не удалось подтвердить':'Channel page/thumbnails could not be verified','Доступность не удалось подтвердить':'Availability could not be verified',
+  'Не подтверждает непригодность сервера':'Does not prove the server is unusable',
+  'Проверку доступности не удалось подтвердить':'Availability checks could not be verified',
+  'Не считается успехом или доказанным сбоем сервера':'Not counted as success or a proven server failure',
+  'Диагностика предпроверки (последние 20)':'Preflight diagnostics (last 20)',
+  'Отказ подготовки ядра/транспорта не является результатом проверки YouTube.':'Core setup/transport rejection is not a YouTube test result.',
+  'ID диагностики относятся к исходному запуску, а не к текущим строкам после перенумерации.':'Diagnostic IDs belong to the original run, not current rows after renumbering.',
+  'Подготовка ядра':'Core setup','Транспорт':'Transport',
+  'Не проверено':'Not tested','Устаревший результат; требуется новая проверка':'Stale result; a new check is required',
+  'Проверка пропущена':'Check skipped','Предпроверка отклонена; YouTube не проверен':'Preflight rejected; YouTube not tested',
+  'Подтверждено YT (канал/превью)':'Verified YT (channel/thumbnails)','YouTube не проверен':'YouTube not tested',
+  'Предпросмотр не выполняет сетевые проверки':'Preview does not run network checks',
+  'Поиск: цель достигнута':'Discovery: target reached','Поиск: кандидаты исчерпаны':'Discovery: candidates exhausted','Поиск отменён':'Discovery cancelled','Поиск завершён':'Discovery ended',
  };
 
 function applyLang(lang) {
@@ -3654,6 +3806,7 @@ function applyLang(lang) {
   });
   // Paragraphs
   document.querySelectorAll('p').forEach(translate);
+  document.querySelectorAll('summary').forEach(translate);
   // Table headers
   document.querySelectorAll('th').forEach(translate);
   // Toggle labels (font-weight:500 spans)
@@ -3702,6 +3855,12 @@ function applyLang(lang) {
   if (typeof applyTooltips === 'function') applyTooltips();
   // Refresh custom dropdown labels after option translations
   if (typeof refreshCustomSelects === 'function') refreshCustomSelects();
+  if (benchLastStatus) renderBenchSearchStatus(benchLastStatus);
+  if (benchLastStatus) renderBenchConcurrencyStatus(benchLastStatus);
+  if (benchLastStatus) renderBenchDiagnostics(benchLastStatus);
+  renderProfiles(MOCK.profiles);
+  renderSubs(MOCK.subscriptions || []);
+  updateDeadServerBulkBar();
 }
 
 function toggleLang() {
@@ -3744,7 +3903,113 @@ function toggleLang() {
 // ─── CUSTOM ACRYLIC SELECTS ───────────────────────────────────────────
 function closeCustomSelects(except) {
   document.querySelectorAll('.custom-select.open').forEach(shell => {
-    if (shell !== except) shell.classList.remove('open');
+    if (shell !== except) setCustomSelectOpen(shell, false);
+  });
+}
+function customSelectMenu(shell) {
+  return shell?._routingMenu || shell?.querySelector('.custom-select-menu');
+}
+function setCustomSelectOpen(shell, open) {
+  if (!shell) return;
+  const menu = customSelectMenu(shell);
+  if (!open && !menu && shell._routingBackdrop) {
+    shell._routingBackdrop.remove();
+    shell._routingBackdrop = null;
+    shell._routingMenu = null;
+  }
+  if (!open && shell._routingMenu) {
+    shell.appendChild(menu);
+    menu.classList.remove('routing-target-dialog');
+    shell._routingMenu = null;
+    shell._routingBackdrop?.remove();
+    shell._routingBackdrop = null;
+  }
+  if (open && shell.classList.contains('routing-target-select') && menu) {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'routing-target-backdrop';
+    backdrop.addEventListener('click', () => setCustomSelectOpen(shell, false));
+    document.body.appendChild(backdrop);
+    shell._routingBackdrop = backdrop;
+    shell._routingMenu = menu;
+    menu.classList.add('routing-target-dialog');
+    document.body.appendChild(menu);
+  }
+  shell.classList.toggle('open', open);
+  if (menu) menu.style.display = open && shell._routingMenu ? 'block' : '';
+  shell.querySelector('.custom-select-trigger')?.setAttribute('aria-expanded', String(open));
+  shell.closest('.routing-visual-table-wrap')?.classList.toggle('select-menu-open', open);
+  if (open) {
+    const search = menu?.querySelector('.custom-select-search');
+    if (search) {
+      search.value = '';
+      filterCustomSelect(shell, '');
+      requestAnimationFrame(() => search.focus({preventScroll:true}));
+    }
+  } else if (routingReloadDeferred) {
+    queueMicrotask(flushDeferredRoutingReload);
+  }
+  if (!open && connectionsTableRefreshPending && isConnectionsTableActive()) queueMicrotask(() => {
+    if (!connectionRoutingEditorActive()) refreshConnectionsTable({auto:true});
+  });
+}
+function filterCustomSelect(shell, query) {
+  const needle = String(query || '').trim().toLocaleLowerCase();
+  const menu = customSelectMenu(shell);
+  menu?.querySelectorAll('.custom-select-option').forEach(item => {
+    item.hidden = !!needle && !item.textContent.toLocaleLowerCase().includes(needle);
+  });
+  menu?.querySelectorAll('.custom-select-group').forEach(group => {
+    let sibling = group.nextElementSibling;
+    let visible = false;
+    while (sibling && !sibling.classList.contains('custom-select-group')) {
+      if (sibling.classList.contains('custom-select-option') && !sibling.hidden) visible = true;
+      sibling = sibling.nextElementSibling;
+    }
+    group.hidden = !visible;
+  });
+}
+function addCustomSelectOption(select, shell, menu, option) {
+  const item = document.createElement('div');
+  item.className = 'custom-select-option' + (option.disabled ? ' disabled' : '');
+  item.dataset.value = option.value;
+  item.textContent = option.textContent;
+  item.title = option.textContent;
+  item.setAttribute('role', 'option');
+  item.setAttribute('aria-disabled', String(option.disabled));
+  item.addEventListener('click', () => {
+    if (option.disabled) return;
+    select.value = option.value;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    syncCustomSelect(select);
+    setCustomSelectOpen(shell, false);
+  });
+  menu.appendChild(item);
+}
+function populateCustomSelectMenu(select, shell, menu) {
+  menu.innerHTML = '';
+  if (select.dataset.searchableSelect) {
+    const wrap = document.createElement('div');
+    wrap.className = 'custom-select-search-wrap';
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.className = 'custom-select-search';
+    search.placeholder = t('Поиск сервера…');
+    search.setAttribute('aria-label', t('Поиск сервера'));
+    search.addEventListener('input', () => filterCustomSelect(shell, search.value));
+    search.addEventListener('click', event => event.stopPropagation());
+    wrap.appendChild(search);
+    menu.appendChild(wrap);
+  }
+  [...select.children].forEach(child => {
+    if (child.tagName === 'OPTGROUP') {
+      const group = document.createElement('div');
+      group.className = 'custom-select-group';
+      group.textContent = child.label;
+      menu.appendChild(group);
+      [...child.children].forEach(option => addCustomSelectOption(select, shell, menu, option));
+    } else if (child.tagName === 'OPTION') {
+      addCustomSelectOption(select, shell, menu, child);
+    }
   });
 }
 function syncCustomSelect(select) {
@@ -3752,17 +4017,23 @@ function syncCustomSelect(select) {
   const shell = select.closest('.custom-select');
   if (!shell) return;
   const trigger = shell.querySelector('.custom-select-trigger');
-  const menu = shell.querySelector('.custom-select-menu');
+  const menu = customSelectMenu(shell);
   const selected = select.options[select.selectedIndex] || select.options[0];
-  if (trigger && selected) trigger.querySelector('span').textContent = selected.textContent;
+  if (trigger && selected) {
+    trigger.querySelector('span').textContent = selected.textContent;
+    trigger.title = selected.textContent;
+  }
+  if (trigger) trigger.disabled = select.disabled;
   if (menu) {
-    [...menu.children].forEach(item => item.classList.toggle('active', item.dataset.value === (selected ? selected.value : '')));
+    menu.querySelectorAll('.custom-select-option').forEach(item => item.classList.toggle('active', item.dataset.value === (selected ? selected.value : '')));
   }
 }
 function buildCustomSelect(select) {
   if (!select || select.dataset.nativeSelect || select.dataset.customSelectEnhanced || select.closest('.custom-select')) return;
   const shell = document.createElement('div');
   shell.className = 'custom-select';
+  if (select.dataset.routingTargetSelect) shell.classList.add('routing-target-select');
+  if (select.dataset.customSelectAlign === 'end') shell.classList.add('connection-route-target');
   const inlineStyle = select.getAttribute('style');
   if (inlineStyle) {
     shell.setAttribute('style', inlineStyle);
@@ -3771,33 +4042,25 @@ function buildCustomSelect(select) {
   const trigger = document.createElement('button');
   trigger.type = 'button';
   trigger.className = 'custom-select-trigger';
+  trigger.setAttribute('aria-haspopup', 'listbox');
+  trigger.setAttribute('aria-expanded', 'false');
   trigger.innerHTML = '<span></span>';
   const menu = document.createElement('div');
   menu.className = 'custom-select-menu';
-  [...select.options].forEach(option => {
-    const item = document.createElement('div');
-    item.className = 'custom-select-option';
-    item.dataset.value = option.value;
-    item.textContent = option.textContent;
-    item.addEventListener('click', () => {
-      select.value = option.value;
-      select.dispatchEvent(new Event('change', { bubbles: true }));
-      syncCustomSelect(select);
-      shell.classList.remove('open');
-    });
-    menu.appendChild(item);
-  });
+  menu.setAttribute('role', 'listbox');
+  menu.addEventListener('click', event => event.stopPropagation());
   select.parentNode.insertBefore(shell, select);
   shell.appendChild(select);
   shell.appendChild(trigger);
   shell.appendChild(menu);
   select.classList.add('custom-select-native');
   select.dataset.customSelectEnhanced = '1';
+  populateCustomSelectMenu(select, shell, menu);
   trigger.addEventListener('click', e => {
     e.stopPropagation();
     const nextOpen = !shell.classList.contains('open');
     closeCustomSelects(shell);
-    shell.classList.toggle('open', nextOpen);
+    setCustomSelectOpen(shell, nextOpen);
   });
   select.addEventListener('change', () => syncCustomSelect(select));
   syncCustomSelect(select);
@@ -3822,22 +4085,14 @@ function enhanceResponsiveTables(root = document) {
 function refreshCustomSelects() {
   document.querySelectorAll('select[data-custom-select-enhanced]').forEach(select => {
     const shell = select.closest('.custom-select');
-    const menu = shell && shell.querySelector('.custom-select-menu');
+    const menu = customSelectMenu(shell);
     if (!menu) return;
-    menu.innerHTML = '';
-    [...select.options].forEach(option => {
-      const item = document.createElement('div');
-      item.className = 'custom-select-option';
-      item.dataset.value = option.value;
-      item.textContent = option.textContent;
-      item.addEventListener('click', () => {
-        select.value = option.value;
-        select.dispatchEvent(new Event('change', { bubbles: true }));
-        syncCustomSelect(select);
-        shell.classList.remove('open');
-      });
-      menu.appendChild(item);
-    });
+    const searchText = shell.classList.contains('open') ? menu.querySelector('.custom-select-search')?.value : '';
+    populateCustomSelectMenu(select, shell, menu);
+    if (searchText) {
+      menu.querySelector('.custom-select-search').value = searchText;
+      filterCustomSelect(shell, searchText);
+    }
     syncCustomSelect(select);
   });
 }
@@ -3846,6 +4101,11 @@ function initCustomSelects() {
   enhanceResponsiveTables();
   const observer = new MutationObserver(mutations => {
     mutations.forEach(mutation => {
+      mutation.removedNodes.forEach(node => {
+        if (node.nodeType !== 1) return;
+        const shell = node.matches?.('.custom-select.open') ? node : node.querySelector?.('.custom-select.open');
+        if (shell && !shell.isConnected) setCustomSelectOpen(shell, false);
+      });
       mutation.addedNodes.forEach(node => {
         if (node.nodeType !== 1) return;
         if (node.matches && node.matches('select')) buildCustomSelect(node);
@@ -3857,6 +4117,46 @@ function initCustomSelects() {
   observer.observe(document.body, { childList: true, subtree: true });
   document.addEventListener('click', () => closeCustomSelects());
   document.addEventListener('keydown', e => { if (e.key === 'Escape') closeCustomSelects(); });
+  document.addEventListener('focusout', () => {
+    setTimeout(() => {
+      if (routingReloadDeferred) flushDeferredRoutingReload();
+      if (connectionsTableRefreshPending && isConnectionsTableActive() && !connectionRoutingEditorActive()) refreshConnectionsTable({auto:true});
+    }, 0);
+  });
+  document.querySelector('.section-panel[data-section="routing"]')?.addEventListener('input', trackRoutingDraft);
+  document.querySelector('.section-panel[data-section="routing"]')?.addEventListener('change', trackRoutingDraft);
+}
+
+let routingRuleDraftDirty = false;
+let routingSettingsDraftDirty = false;
+let routingReloadDeferred = false;
+let routingReloadSerial = 0;
+function trackRoutingDraft(event) {
+  if (event.target.closest('#splitRoutingSection, #experimentalFeatures')) routingSettingsDraftDirty = true;
+  if (event.target.closest('.feature-card')?.querySelector('#ruleFormTitle')) routingRuleDraftDirty = true;
+}
+function routingEditActive() {
+  const active = document.activeElement;
+  return routingRuleDraftDirty || routingSettingsDraftDirty || editingCell !== null || editingRuleIndex !== null || parovozikConsistDirty
+    || document.querySelector('.routing-target-select.open') !== null
+    || (active?.matches('input,select,textarea') && active.closest('.section-panel[data-section="routing"]'));
+}
+function routingSettingsEditActive() {
+  const active = document.activeElement;
+  return routingSettingsDraftDirty || parovozikConsistDirty
+    || document.querySelector('#rTorrentSocksTarget')?.closest('.custom-select.open') !== null
+    || (active?.matches('input,select,textarea') && active.closest('#splitRoutingSection, #experimentalFeatures'));
+}
+function applySavedRoutingSettings(sr) {
+  if (!sr) return;
+  MOCK.split_routing = sr;
+  if (!routingSettingsEditActive()) updateRoutingForm(sr);
+}
+function flushDeferredRoutingReload() {
+  if (routingReloadDeferred && !routingEditActive()) {
+    routingReloadDeferred = false;
+    loadRouting();
+  }
 }
 
 // ─── PROFILES TABLE ──────────────────────────────────────────────────
@@ -3906,21 +4206,45 @@ function profileMetricStyle(metric) {
   return visibleProfileMetrics.has(metric) ? '' : 'display:none';
 }
 
-function profileServiceTestsHtml(resourceTests) {
-  const tests = Array.isArray(resourceTests) ? resourceTests.filter(test => test.contract_version === 6) : [];
-  if (!tests.length) return '';
+function isCurrentSearchResourceTest(test) {
+  return test.id === 'youtube_thumbnails' ? test.contract_version === 1
+    : test.contract_version === 7 && (['telegram','ai'].includes(test.id) || String(test.id || '').startsWith('ping_'));
+}
+function hasCurrentThumbnailTest(resourceTests) {
+  return Array.isArray(resourceTests) && resourceTests.some(test => test.id === 'youtube_thumbnails' && isCurrentSearchResourceTest(test));
+}
+function hasInconclusiveTests(resourceTests) {
+  return Array.isArray(resourceTests) && resourceTests.some(test => isCurrentSearchResourceTest(test) && test.inconclusive === true);
+}
+function searchResourceEvidence(resourceTests) {
+  return (Array.isArray(resourceTests) ? resourceTests : []).filter(isCurrentSearchResourceTest).map(({id,contract_version,name,attempts,successes,stable,reachable,inconclusive,avg_ttfb_ms,error}) => ({id,contract_version,name,attempts,successes,stable,reachable,inconclusive,avg_ttfb_ms,error}));
+}
+
+function isFreshServiceTest(timestamp, now = Math.floor(Date.now()/1000)) {
+  return Number.isFinite(timestamp) && timestamp > 0 && timestamp <= now + 60 && now - timestamp <= 6 * 60 * 60;
+}
+
+function profileServiceTestsHtml(resourceTests, serviceTimestamp, now = Math.floor(Date.now()/1000)) {
+  const fresh = isFreshServiceTest(serviceTimestamp, now);
+  const tests = Array.isArray(resourceTests) ? resourceTests.filter(isCurrentSearchResourceTest) : [];
   const pingTests = tests.filter(test => String(test.id || '').startsWith('ping_'));
-  const pingOk = pingTests.some(test => test.reachable === true);
+  const pingUnknown = hasInconclusiveTests(pingTests);
+  const pingOk = !pingUnknown && pingTests.some(test => test.reachable === true);
   const pingMs = pingTests.filter(test => test.reachable && test.avg_ttfb_ms > 0).map(test => Number(test.avg_ttfb_ms));
   const pingTitle = pingTests.map(test => `${test.name}: ${test.reachable ? `${test.avg_ttfb_ms || '—'} ms` : (test.error || 'failed')}`).join(' · ');
-  const ping = pingTests.length ? `<span class="profile-service-test ${pingOk?'ok':'bad'}" title="${attrEscape(pingTitle)}">P${pingMs.length ? ` ${Math.round(pingMs.reduce((sum,value)=>sum+value,0)/pingMs.length)}` : ''}</span>` : '';
-  return `<div class="profile-service-tests">${ping}${[['youtube','YT'],['telegram','TG'],['ai','AI']].map(([id,label]) => {
+  const ping = pingTests.length ? `<span class="profile-service-test ${!fresh?'stale':pingUnknown?'unknown':pingOk?'ok':'bad'}" title="${attrEscape(!fresh ? t('Устаревший результат; требуется новая проверка') : pingUnknown ? t('Доступность не удалось подтвердить')+' · '+pingTitle : pingTitle)}">P${fresh && pingUnknown ? ' ?' : pingMs.length ? ` ${Math.round(pingMs.reduce((sum,value)=>sum+value,0)/pingMs.length)}` : ''}</span>` : '';
+  return `<div class="profile-service-tests">${ping}${[['youtube_thumbnails','YT'],['telegram','TG'],['ai','AI']].map(([id,label]) => {
     const result = tests.find(test => test.id === id);
-    if (!result) return '';
-    const ok = result.stable === true;
-    const skipped = Number(result.attempts || 0) === 0;
-    const title = `${result.name || label}: ${skipped ? (result.error || 'skipped') : `${result.successes || 0}/${result.attempts || 0}${result.avg_ttfb_ms ? `, ${result.avg_ttfb_ms} ms` : ''}${result.error ? `, ${result.error}` : ''}`}`;
-    return `<span class="profile-service-test ${skipped?'skipped':ok?'ok':'bad'}" title="${attrEscape(title)}">${label}</span>`;
+    if (!result) {
+      const stale = Array.isArray(resourceTests) && resourceTests.some(test => test.id === id || (id === 'youtube_thumbnails' && test.id === 'youtube'));
+      return `<span class="profile-service-test ${stale?'stale':'skipped'}" data-state="${stale?'stale':'not-tested'}" title="${attrEscape(label+': '+t(stale ? 'Устаревший результат; требуется новая проверка' : 'Не проверено'))}">${label}</span>`;
+    }
+    if (!fresh) return `<span class="profile-service-test stale" data-state="stale" title="${attrEscape(label+': '+t('Устаревший результат; требуется новая проверка'))}">${label}</span>`;
+    const inconclusive = result.inconclusive === true;
+    const ok = !inconclusive && result.stable === true;
+    const skipped = !inconclusive && Number(result.attempts || 0) === 0;
+    const title = `${result.name || label}: ${inconclusive ? `${t(id === 'youtube_thumbnails' ? 'Страницу канала/превью не удалось подтвердить' : 'Доступность не удалось подтвердить')} · ${t('Не подтверждает непригодность сервера')}${result.error ? ', '+result.error : ''}` : skipped ? t('Проверка пропущена')+(result.error ? ', '+result.error : '') : `${result.successes || 0}/${result.attempts || 0}${result.avg_ttfb_ms ? `, ${result.avg_ttfb_ms} ms` : ''}${result.error ? `, ${result.error}` : ''}`}`;
+    return `<span class="profile-service-test ${inconclusive?'unknown':skipped?'skipped':ok?'ok':'bad'}" data-state="${skipped?'skipped':'current'}" title="${attrEscape(title)}">${label}${inconclusive?' ?':''}</span>`;
   }).join('')}</div>`;
 }
 
@@ -3969,7 +4293,23 @@ async function deleteTelegramProbeSession() {
 // key values: 'id','name','protocol','last_latency_ms','last_download_mbps',
 // 'ewma_latency_ms','last_jitter_ms','last_loss_percent','consecutive_failures',
 // 'cooldown_until_unix','transport','address','port'
-let profileSortState = { key: null, dir: 'asc' };
+let profileSortState = { key: 'results', dir: 'desc' };
+
+function restoreProfileSort() {
+  let mode = 'results';
+  try {
+    const saved = localStorage.getItem('hr_profile_sort');
+    if (['import','results','latency','name'].includes(saved)) mode = saved;
+  } catch (_) {}
+  const select = document.getElementById('profileSort');
+  if (select) {
+    select.value = mode;
+    syncCustomSelect(select);
+  }
+  profileSortState = mode === 'import' ? {key:null,dir:'asc'}
+    : mode === 'results' ? {key:'results',dir:'desc'}
+    : {key:mode === 'latency' ? 'last_latency_ms' : 'name',dir:'asc'};
+}
 
 // Map column index → sort key. Must match thead order.
 const PROFILE_SORT_KEYS = [
@@ -3992,24 +4332,34 @@ function getSortValue(p, key) {
   return { missing, value: missing ? null : value };
 }
 
+function profileResultRank(profile) {
+  if (!isFreshServiceTest(profile.last_service_test_unix)) return {services:0,pingRank:1,pingMs:Infinity};
+  const tests = Array.isArray(profile.resource_tests) ? profile.resource_tests.filter(isCurrentSearchResourceTest) : [];
+  const services = ['youtube_thumbnails','telegram','ai'].filter(id => tests.some(test => test.id === id && test.inconclusive !== true && test.stable === true && Number(test.attempts) > 0)).length;
+  const pings = tests.filter(test => String(test.id || '').startsWith('ping_'));
+  const successful = pings.filter(test => test.inconclusive !== true && test.reachable === true && Number(test.attempts) > 0 && Number.isFinite(Number(test.avg_ttfb_ms)) && Number(test.avg_ttfb_ms) > 0);
+  if (successful.length) return {services,pingRank:0,pingMs:Math.round(successful.reduce((sum,test) => sum + Number(test.avg_ttfb_ms),0)/successful.length)};
+  if (pings.some(test => test.inconclusive !== true && test.reachable === true && Number(test.attempts) > 0)) return {services,pingRank:0,pingMs:Infinity};
+  const pingRank = pings.some(test => test.inconclusive !== true && Number(test.attempts) > 0 && test.reachable === false) ? 2 : 1;
+  return {services,pingRank,pingMs:Infinity};
+}
+
 function profileSuccessfulChecks(profile) {
-  const tests = Array.isArray(profile.resource_tests) ? profile.resource_tests.filter(test => test.contract_version === 6) : [];
-  const pingPassed = tests.some(test => String(test.id || '').startsWith('ping_') && test.reachable === true) ? 1 : 0;
-  return pingPassed + ['youtube','telegram','ai'].filter(id => tests.some(test => test.id === id && test.stable === true)).length;
+  const rank = profileResultRank(profile);
+  return rank.services + (rank.pingRank === 0 ? 1 : 0);
+}
+
+function profilePingMs(profile) {
+  return profileResultRank(profile).pingMs;
 }
 
 function applyProfileSort(data) {
   if (!profileSortState.key) return data;
   if (profileSortState.key === 'results') {
     return data.map((profile, index) => ({profile, index})).sort((a, b) => {
-      const passA = a.profile.last_service_test_success === true ? 2 : a.profile.last_service_test_success === false ? 1 : 0;
-      const passB = b.profile.last_service_test_success === true ? 2 : b.profile.last_service_test_success === false ? 1 : 0;
-      if (passA !== passB) return passB - passA;
-      const checks = profileSuccessfulChecks(b.profile) - profileSuccessfulChecks(a.profile);
-      if (checks) return checks;
-      const pingA = profilePingMs(a.profile);
-      const pingB = profilePingMs(b.profile);
-      return pingA - pingB || a.index - b.index;
+      const left = profileResultRank(a.profile);
+      const right = profileResultRank(b.profile);
+      return right.services - left.services || left.pingRank - right.pingRank || profilePingMs(a.profile) - profilePingMs(b.profile) || a.index - b.index;
     }).map(item => item.profile);
   }
   const dir = profileSortState.dir === 'asc' ? 1 : -1;
@@ -4026,14 +4376,6 @@ function applyProfileSort(data) {
     }
     return compared ? compared * dir : a.index - b.index;
   }).map(item => item.profile);
-}
-
-function profilePingMs(profile) {
-  const pings = (Array.isArray(profile.resource_tests) ? profile.resource_tests : [])
-    .filter(test => test.contract_version === 6 && String(test.id || '').startsWith('ping_') && test.reachable === true && Number(test.avg_ttfb_ms) > 0)
-    .map(test => Number(test.avg_ttfb_ms));
-  if (pings.length) return Math.round(pings.reduce((sum,value)=>sum+value,0)/pings.length);
-  return Number(profile.last_latency_ms) || Number.MAX_SAFE_INTEGER;
 }
 
 function sortByColumn(colIdx) {
@@ -4153,6 +4495,7 @@ function updateDeadServerBulkBar() {
   const restore = document.getElementById('deadServerRestoreSelected');
   if (move) move.style.display = live.length ? '' : 'none';
   if (restore) restore.style.display = dead.length ? '' : 'none';
+  safeSet('benchSelectionSearchHelp', t('Все выбранные, включая Dead Servers'));
 }
 
 function clearServerSelection() {
@@ -4196,15 +4539,14 @@ function renderProfileGroup(descriptor, index, descriptors) {
   const localRevalidate = source === null ? `<button class="btn btn-sm" data-testid="revalidate-ungrouped" onclick="revalidateUngroupedProfiles(this)" title="${attrEscape(t('Повторно разобрать локально сохранённые share-ссылки профилей без группы. Подписки и сеть не используются.'))}">↻ ${t('Проверить локальные профили')}</button>` : '';
   const groupIds = items.map(profile => profile.id);
   const benchmarkAction = sub ? `benchSubscription(${jsStringAttr(sub.url)})` : `benchGroup([${groupIds.join(',')}])`;
-  const groupBenchTitleRu = sub ? 'Quick Test подписки, до настроенного числа серверов параллельно' : 'Quick Test группы, до настроенного числа серверов параллельно';
-  const groupBenchTitleEn = sub ? 'Quick Test subscription, up to the configured parallel count' : 'Quick Test group, up to the configured parallel count';
-  const groupBenchTitle = t(groupBenchTitleRu);
+  const groupBenchTitle = dead ? 'Для Dead Servers' : sub ? 'Для всех серверов подписки' : 'Для всех серверов группы';
   const previous = sub ? descriptors.slice(0,index).reverse().find(group => subscriptionForGroup(group.source)) : null;
   const next = sub ? descriptors.slice(index+1).find(group => subscriptionForGroup(group.source)) : null;
   const previousUrl = previous ? subscriptionForGroup(previous.source)?.url : null;
   const nextUrl = next ? subscriptionForGroup(next.source)?.url : null;
   const subscriptionOrder = sub ? `<button class="btn-icon btn-sm" ${previousUrl?'': 'disabled'} onclick="moveSubscription(${jsStringAttr(sub.url)},${jsStringAttr(previousUrl || '')},'up',this)" title="${attrEscape(t('Переместить подписку выше'))}">↑</button><button class="btn-icon btn-sm" ${nextUrl?'': 'disabled'} onclick="moveSubscription(${jsStringAttr(sub.url)},${jsStringAttr(nextUrl || '')},'down',this)" title="${attrEscape(t('Переместить подписку ниже'))}">↓</button>` : '';
-  const groupActions = dead ? '' : `${subscriptionOrder}<button class="btn btn-sm" data-bench-scope="group" data-title-ru="${attrEscape(groupBenchTitleRu)}" data-title-en="${attrEscape(groupBenchTitleEn)}" onclick="${benchmarkAction}" title="${attrEscape(groupBenchTitle)}">⚡</button>
+  const searchAction = `<button class="btn btn-sm" data-bench-scope="${dead?'dead':sub?'subscription':'group'}" title="${attrEscape(t(groupBenchTitle))}" onclick="${dead ? `startServerSearch({profile_ids:[${groupIds.join(',')}],diagnostic:true})` : benchmarkAction}">⚡ ${t('Проверить сервисы')}</button>`;
+  const groupActions = dead ? searchAction : `${subscriptionOrder}${searchAction}
     ${subRefresh}
     ${localRevalidate}
     <button class="btn btn-sm" onclick="shareProfileGroup(${jsStringAttr(source || t('Без группы'))})">⤴ ${t('Поделиться / QR')}</button>
@@ -4228,9 +4570,9 @@ function renderProfileRow(p, groupKey, display) {
   return `<tr data-profile-row="${attrEscape(groupKey)}" class="${p.dead?'dead-server-row':''}" style="display:${display};${p.active?'background:var(--accent-soft)':''}">
     <td><span class="star ${p.favorite?'on':''}" onclick="toggleFav(${p.id})" title="${t('Избранное')}">★</span></td>
     <td data-profile-metric="id" class="mono" style="${profileMetricStyle('id')};color:var(--muted)">${p.id}</td>
-    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><button class="profile-name profile-name-edit" onclick="openProfileEditor(${p.id})" title="${attrEscape(t('Редактировать профиль'))}">${htmlEscape(p.name)}</button>${provenance}${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions"><input class="profile-select" type="checkbox" data-server-ref="${attrEscape(p.server_ref || '')}" ${selectedServerRefs.has(p.server_ref)?'checked':''} ${disabled?'disabled':''} onchange="toggleServerSelection(this.dataset.serverRef,this.checked)" aria-label="${attrEscape(t('Выбрать сервер'))}">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" data-profile-select onclick="selectActiveProfile(${p.id},${jsStringAttr(p.name)},this)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" data-bench-scope="single" data-title-ru="Quick Test только этого сервера" data-title-en="Quick Test this server only" onclick="benchOne(${p.id})" title="${attrEscape(t('Quick Test только этого сервера'))}">⚡</button><button class="btn-icon btn-sm" onclick="openProfileEditor(${p.id})" title="${t('Редактировать профиль')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
+    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><button class="profile-name profile-name-edit" onclick="openProfileEditor(${p.id})" title="${attrEscape(t('Редактировать профиль'))}">${htmlEscape(p.name)}</button>${provenance}${profileServiceTestsHtml(p.resource_tests,p.last_service_test_unix)}<div class="profile-row-actions"><input class="profile-select" type="checkbox" data-server-ref="${attrEscape(p.server_ref || '')}" ${selectedServerRefs.has(p.server_ref)?'checked':''} ${disabled?'disabled':''} onchange="toggleServerSelection(this.dataset.serverRef,this.checked)" aria-label="${attrEscape(t('Выбрать сервер'))}">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" data-profile-select onclick="selectActiveProfile(${p.id},${jsStringAttr(p.name)},this)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" data-bench-scope="single" data-title-ru="Для этого сервера" data-title-en="For this server" onclick="benchOne(${p.id})" title="${attrEscape(t('Для этого сервера'))}">⚡</button><button class="btn-icon btn-sm" onclick="openProfileEditor(${p.id})" title="${t('Редактировать профиль')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
     <td data-profile-metric="protocol" data-label="${attrEscape(t('Протокол'))}" style="${profileMetricStyle('protocol')}"><span class="badge badge-info" style="font-size:10px">${htmlEscape(p.protocol)}</span></td>
-    <td data-profile-metric="latency" data-label="${attrEscape(t('Задержка'))}" class="mono" style="${profileMetricStyle('latency')}">${p.last_latency_ms != null ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
+    <td data-profile-metric="latency" data-label="${attrEscape(t('Задержка'))}" class="mono" style="${profileMetricStyle('latency')}">${profileLatencyHtml(p)}</td>
     <td data-profile-metric="loss" data-label="${attrEscape(t('Потери'))}" class="mono" style="${profileMetricStyle('loss')}">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
     <td data-profile-metric="errors" data-label="${attrEscape(t('Ошибки'))}" class="mono" style="${profileMetricStyle('errors')};color:${(p.consecutive_failures ?? p.failure_count ?? 0)>3?'var(--danger)':'var(--fg)'}">${p.consecutive_failures ?? p.failure_count ?? 0}</td>
     <td data-profile-metric="cooldown" data-label="Cooldown" class="mono" style="${profileMetricStyle('cooldown')};font-size:11px">${p.cooldown_until_unix ? formatTime(p.cooldown_until_unix) : '—'}</td>
@@ -4254,6 +4596,11 @@ function renderProfiles(data) {
   syncProfileMetricSettings();
   updateDeadServerBulkBar();
   renderFavorites(MOCK.profiles);
+}
+
+function profileLatencyHtml(profile) {
+  const latency = profileSortState.key === 'results' ? profileResultRank(profile).pingMs : profile.last_latency_ms;
+  return Number.isFinite(latency) && latency > 0 ? latency+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—';
 }
 
 function moveSubscription(url, adjacentUrl, direction, button) {
@@ -4296,9 +4643,9 @@ function renderFavorites(data) {
   body.innerHTML = favorites.map(p => `<tr style="${p.active?'background:var(--accent-soft)':''}">
     <td><span class="star on" onclick="toggleFav(${p.id})" title="${t('Избранное')}">★</span></td>
     <td data-profile-metric="id" class="mono" style="${profileMetricStyle('id')};color:var(--muted)">${p.id}</td>
-    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><button class="profile-name profile-name-edit" onclick="openProfileEditor(${p.id})" title="${attrEscape(t('Редактировать профиль'))}">${htmlEscape(p.name)}</button>${profileServiceTestsHtml(p.resource_tests)}<div class="profile-row-actions">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" data-profile-select onclick="selectActiveProfile(${p.id},${jsStringAttr(p.name)},this)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" data-bench-scope="single" data-title-ru="Quick Test только этого сервера" data-title-en="Quick Test this server only" onclick="benchOne(${p.id})" title="${attrEscape(t('Quick Test только этого сервера'))}">⚡</button><button class="btn-icon btn-sm" onclick="openProfileEditor(${p.id})" title="${t('Редактировать профиль')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
+    <td class="profile-name-cell" style="font-weight:${p.active?'600':'400'}"><button class="profile-name profile-name-edit" onclick="openProfileEditor(${p.id})" title="${attrEscape(t('Редактировать профиль'))}">${htmlEscape(p.name)}</button>${profileServiceTestsHtml(p.resource_tests,p.last_service_test_unix)}<div class="profile-row-actions">${p.active?`<span class="badge badge-success">${t('Активен')}</span>`:p.dead?`<span class="badge badge-danger">${t('Дохлые серверы')}</span>`:`<button class="btn btn-sm" data-profile-select onclick="selectActiveProfile(${p.id},${jsStringAttr(p.name)},this)">${t('Выбрать')}</button>`}<button class="btn-icon btn-sm" data-bench-scope="single" data-title-ru="Для этого сервера" data-title-en="For this server" onclick="benchOne(${p.id})" title="${attrEscape(t('Для этого сервера'))}">⚡</button><button class="btn-icon btn-sm" onclick="openProfileEditor(${p.id})" title="${t('Редактировать профиль')}">✎</button><button class="btn-icon btn-sm" onclick="confirmCmd(t('Удалить профиль')+' '+${jsStringAttr(p.name)}+'?','/api/profiles/delete',{profile_id:${p.id}})" title="${t('Удалить')}">✕</button></div></td>
     <td data-profile-metric="protocol" style="${profileMetricStyle('protocol')}"><span class="badge badge-info" style="font-size:10px">${htmlEscape(p.protocol)}</span></td>
-    <td data-profile-metric="latency" class="mono" style="${profileMetricStyle('latency')}">${p.last_latency_ms != null ? p.last_latency_ms+'<span style="font-size:9px;color:var(--muted);margin-left:2px">ms</span>' : '—'}</td>
+    <td data-profile-metric="latency" class="mono" style="${profileMetricStyle('latency')}">${profileLatencyHtml(p)}</td>
     <td data-profile-metric="loss" class="mono" style="${profileMetricStyle('loss')}">${p.last_loss_percent != null ? p.last_loss_percent+'<span style="font-size:9px;color:var(--muted);margin-left:2px">%</span>' : '—'}</td>
     <td data-profile-metric="errors" class="mono" style="${profileMetricStyle('errors')};color:${(p.consecutive_failures ?? p.failure_count ?? 0)>3?'var(--danger)':'var(--fg)'}">${p.consecutive_failures ?? p.failure_count ?? 0}</td>
     <td data-profile-metric="cooldown" class="mono" style="${profileMetricStyle('cooldown')};font-size:11px">${p.cooldown_until_unix ? formatTime(p.cooldown_until_unix) : '—'}</td>
@@ -4308,6 +4655,12 @@ function renderFavorites(data) {
   applyProfileMetricVisibility();
 }
 function sortProfiles(mode) {
+  const select = document.getElementById('profileSort');
+  if (select && select.value !== mode) {
+    select.value = mode;
+    syncCustomSelect(select);
+  }
+  try { localStorage.setItem('hr_profile_sort',mode); } catch (_) {}
   // Map old dropdown values to column indices.
   const map = { 'latency': 4, 'name': 2 };
   if (mode === 'import') {
@@ -4449,7 +4802,7 @@ function openProfileEditor(profileId) {
     document.getElementById('profileEditorSave').disabled = false;
     profileEditorState.loaded = true;
     safeSet('profileEditorStatus',profileEditorState.subscriptionManaged ? t('Ссылка управляется подпиской и доступна только для просмотра. Имя можно изменить.') : '');
-    requestAnimationFrame(() => document.getElementById('profileEditorName')?.focus());
+    document.getElementById('profileEditorName')?.focus();
   }).catch(error => {
     if (!profileEditorState || profileEditorState.generation !== generation) return;
     profileEditorState.loaded = false;
@@ -4563,7 +4916,8 @@ function renderSubs(data) {
     <td class="mono">${s.profile_count}</td>
     <td class="mono">${formatTime(s.last_loaded_unix)}</td>
     <td style="color:${s.last_error?'var(--danger)':'var(--success)'}">${s.last_error ? htmlEscape(s.last_error) : 'OK'}</td>
-    <td><button class="btn btn-sm" data-url="${safeUrl}" onclick="refreshSubscriptionByButton(this)">↻</button>
+    <td><button class="btn btn-sm" data-bench-scope="subscription" data-url="${safeUrl}" title="${attrEscape(t('Для всех серверов подписки'))}" onclick="benchSubscription(this.dataset.url)">⚡ ${t('Проверить сервисы')}</button>
+    <button class="btn btn-sm" data-url="${safeUrl}" onclick="refreshSubscriptionByButton(this)">↻</button>
     <button class="btn-icon btn-sm" data-url="${safeUrl}" onclick="deleteSubscriptionByButton(this)">✕</button></td>
   </tr>`; }).join('');
 }
@@ -4666,8 +5020,10 @@ function routingServerByTarget(target) {
 function routingServerLabel(server) {
   const name = String(server?.name || server?.address || t('Сервер'));
   const protocol = String(server?.protocol || '');
+  const id = Number.isInteger(server?.id) ? `#${server.id} · ` : '';
   const active = server?.active === true ? ` · ${t('Активный сервер')}` : '';
-  return `${name}${protocol ? ` · ${protocol}` : ''}${active}`;
+  const dead = server?.dead === true ? ` · ${t('Дохлые серверы')} · ${t('резерв: текущий активный VPN')}` : '';
+  return `${id}${name}${protocol ? ` · ${protocol}` : ''}${active}${dead}`;
 }
 
 function routingTargetOptions(selectedTarget) {
@@ -4684,7 +5040,7 @@ function routingTargetServerOptions(selectedTarget) {
   const groups = new Map();
   (Array.isArray(MOCK.routing_servers) ? MOCK.routing_servers : []).forEach(server => {
     if (server == null || server.ref == null) return;
-    const group = String(server.group || t('Без группы'));
+    const group = shortGroupName(server.group || t('Без группы'));
     if (!groups.has(group)) groups.set(group, []);
     groups.get(group).push(server);
   });
@@ -4707,6 +5063,19 @@ function refreshRoutingTargetSelect(selectedTarget) {
   const selected = selectedTarget || select.value || 'active';
   select.innerHTML = routingTargetOptions(selected);
   select.value = selected;
+  if (select.dataset.customSelectEnhanced) refreshCustomSelects();
+}
+
+function refreshTorrentSocksTargetSelect(selectedTarget) {
+  const select = document.getElementById('rTorrentSocksTarget');
+  if (!select) return;
+  const selected = selectedTarget || select.value || 'direct';
+  const base = [['direct','DIRECT'],['active',t('Текущий активный VPN')],['reject','REJECT']];
+  if (MOCK.split_routing?.parovozik_enabled === true) base.push(['parovozik',t('Паровозик VPN')]);
+  else if (selected === 'parovozik') base.push(['parovozik',t('Паровозик VPN')]);
+  select.innerHTML = base.map(([value,label]) => `<option value="${attrEscape(value)}" ${selected===value?'selected':''}>${htmlEscape(label)}</option>`).join('') + routingTargetServerOptions(selected);
+  select.value = selected;
+  if (select.dataset.customSelectEnhanced) refreshCustomSelects();
 }
 
 function routingTargetPresentation(target) {
@@ -4742,7 +5111,8 @@ function submitRoutingRule() {
   }
   saveRoutingRulesToBackend(() => {
     resetRuleForm();
-    loadRouting();
+    routingRuleDraftDirty = false;
+    loadRouting({force:true});
   });
 }
 
@@ -4762,6 +5132,8 @@ function editRoutingRule(idx) {
 function cancelEditRule() {
   editingRuleIndex = null;
   resetRuleForm();
+  routingRuleDraftDirty = false;
+  flushDeferredRoutingReload();
 }
 
 function resetRuleForm() {
@@ -4780,14 +5152,16 @@ function resetRuleForm() {
 function toggleRoutingRule(idx, enabled) {
   if (idx < 0 || idx >= MOCK.routing_rules.length) return;
   MOCK.routing_rules[idx].enabled = enabled;
-  saveRoutingRulesToBackend(() => loadRouting());
+  saveRoutingRulesToBackend(() => loadRouting({force:true}));
 }
 
 function deleteRoutingRule(idx) {
   if (idx < 0 || idx >= MOCK.routing_rules.length) return;
+  closeCustomSelects();
   const removed = MOCK.routing_rules.splice(idx, 1)[0];
   if (editingRuleIndex === idx) { cancelEditRule(); }
-  saveRoutingRulesToBackend(() => { loadRouting(); showUndoRoutingRule(idx, removed); });
+  else if (editingRuleIndex !== null && editingRuleIndex > idx) editingRuleIndex--;
+  saveRoutingRulesToBackend(() => { loadRouting({force:true}); showUndoRoutingRule(idx, removed); });
 }
 
 let routingUndoTimer = null;
@@ -4796,7 +5170,7 @@ function showUndoRoutingRule(idx, rule) {
   if (!box || !rule) return;
   if (routingUndoTimer) clearTimeout(routingUndoTimer);
   box.style.display = '';
-  box.innerHTML = `${t('Правило удалено')}: <b>${rule.name || '—'}</b> <button class="btn btn-sm" style="margin-left:8px" onclick="restoreRoutingRule(${idx})">${t('Восстановить')}</button>`;
+  box.innerHTML = `${t('Правило удалено')}: <b>${htmlEscape(rule.name || '—')}</b> <button class="btn btn-sm" style="margin-left:8px" onclick="restoreRoutingRule(${idx})">${t('Восстановить')}</button>`;
   box._rule = rule; box._idx = idx;
   routingUndoTimer = setTimeout(() => { box.style.display = 'none'; box._rule = null; }, 15000);
 }
@@ -4807,7 +5181,7 @@ function restoreRoutingRule(idx) {
   MOCK.routing_rules.splice(Math.min(idx ?? box._idx ?? 0, MOCK.routing_rules.length), 0, rule);
   box.style.display = 'none'; box._rule = null;
   if (routingUndoTimer) clearTimeout(routingUndoTimer);
-  saveRoutingRulesToBackend(() => loadRouting());
+  saveRoutingRulesToBackend(() => loadRouting({force:true}));
 }
 
 function saveRoutingRulesToBackend(afterFn) {
@@ -4816,8 +5190,12 @@ function saveRoutingRulesToBackend(afterFn) {
       showToast('warning', `${t('Правила сохранены, но не применены')}: ${result.activation_error || t('требуется повторное применение')}`);
     } else {
       showToast('success', t('Правила сохранены и применены'));
+      showRoutingReconnectStatus(result);
     }
     if (afterFn) afterFn();
+  }).catch(error => {
+    showToast('error', error.message || t('Ошибка'));
+    loadRouting({force:true});
   });
 }
 
@@ -4859,10 +5237,11 @@ function renderManagedRoutingRules(rules, requiresApply) {
 function renderRoutingRules(data) {
   const body = document.getElementById('routingRulesBody');
   if(!body) return;
+  closeCustomSelects();
   const matchTarget = (MOCK.split_routing && MOCK.split_routing.match_target) || 'proxy';
   const matchLabel = matchTarget === 'direct' ? 'Всё напрямую' : 'Всё через VPN';
   const matchBadge = matchTarget === 'direct' ? 'success' : 'info';
-  const rulesCount = (data||[]).length;
+  const rulesCount = (data||[]).filter(r => r.kind !== 'managed-parovozik').length;
   // MATCH row: immutable first row, target dropdown locked when 0 rules
   let html = `<tr style="opacity:0.6;background:var(--surface2)">
     <td>—</td>
@@ -4888,6 +5267,7 @@ function renderRoutingRules(data) {
     const target = routingTargetPresentation(r.target);
     const targetBadge = r.target==='reject' || target.stale?'danger':r.target==='direct'?'success':'info';
     if (r.kind === 'managed-parovozik') {
+      if (MOCK.split_routing?.parovozik_enabled !== true) return '';
       const managedTarget = r.target === 'direct' ? 'DIRECT' : 'parovozik-vpn';
       return `<tr class="managed-routing-rule"><td><span class="badge">🚂 managed</span></td><td><strong>${htmlEscape(r.name)}</strong></td><td class="mono" style="font-size:12px">${htmlEscape(entriesShort)}</td><td><span class="badge badge-${targetBadge}">${managedTarget}</span></td><td>—</td><td>any</td><td>—</td></tr>`;
     }
@@ -4895,7 +5275,7 @@ function renderRoutingRules(data) {
     // Target cell: <select> if editing, otherwise clickable span
     let targetCell;
     if (ed && ed.row===i && ed.col==='target') {
-      targetCell = `<select onchange="inlineSaveSelect(${i},'target',this.value)" onblur="inlineCancelEdit()" class="badge badge-${targetBadge}" style="border:1px solid var(--accent);background:var(--surface1);font-weight:600;font-size:12px;border-radius:4px;padding:2px 6px">
+      targetCell = `<select onchange="inlineSaveSelect(${i},'target',this.value)" data-routing-target-select="1" data-searchable-select="1" data-custom-select-align="end" style="min-width:280px">
         ${routingTargetOptions(r.target)}
       </select>`;
     } else {
@@ -4922,11 +5302,12 @@ function renderRoutingRules(data) {
     <td class="mono" style="font-size:12px"><span class="cell-edit" onclick="inlineEditPorts(${i},this)">${portLabel}</span></td>
     <td style="font-size:12px">${protoCell}</td>
     <td style="white-space:nowrap">
-      <button class="btn-icon btn-sm" onclick="deleteRoutingRule(${i})" title="${t('Удалить')}">✕</button>
+      <button class="btn btn-sm btn-danger" type="button" onclick="deleteRoutingRule(${i})" title="${t('Удалить правило')}">${t('Удалить')}</button>
     </td>
   </tr>`}).join('');
   html += renderManagedRoutingRules(MOCK.managed_routing_rules, MOCK.geobase_requires_apply === true);
   body.innerHTML = html;
+  enhanceCustomSelects(body);
 }
 
 // ─── INLINE EDIT ─────────────────────────────────────────────────────
@@ -4937,11 +5318,16 @@ var editingCell = null;
 function inlineStartEdit(row, col) {
   editingCell = { row, col };
   renderRoutingRules(MOCK.routing_rules);
-  // Focus the select that just appeared
   const body = document.getElementById('routingRulesBody');
   if (body) {
-    const sel = body.querySelector('select.badge') || body.querySelector('td select');
-    if (sel) sel.focus();
+    requestAnimationFrame(() => {
+      const shell = body.querySelector('.custom-select.routing-target-select');
+      if (shell) shell.querySelector('.custom-select-trigger')?.click();
+      else {
+        const sel = body.querySelector('td select');
+        if (sel) sel.focus();
+      }
+    });
   }
 }
 
@@ -4951,6 +5337,7 @@ function inlineCancelEdit() {
     if (editingCell) {
       editingCell = null;
       renderRoutingRules(MOCK.routing_rules);
+      flushDeferredRoutingReload();
     }
   }, 100);
 }
@@ -4960,11 +5347,11 @@ function inlineSaveSelect(idx, field, value) {
   const r = MOCK.routing_rules[idx]; if (!r) return;
   if (field === 'target') r.target = value;
   else if (field === 'network') r.network = value;
-  saveRoutingRulesToBackend(() => loadRouting());
+  saveRoutingRulesToBackend(() => loadRouting({force:true}));
 }
 
 function inlineSaveAndReload(idx) {
-  saveRoutingRulesToBackend(() => loadRouting());
+  saveRoutingRulesToBackend(() => loadRouting({force:true}));
 }
 
 function inlineEditName(idx, el) {
@@ -4978,7 +5365,7 @@ function inlineEditName(idx, el) {
     inlineSaveAndReload(idx);
   };
   inp.onblur = save;
-  inp.onkeydown = (e) => { if (e.key==='Enter') save(); if (e.key==='Escape') loadRouting(); };
+  inp.onkeydown = (e) => { if (e.key==='Enter') save(); if (e.key==='Escape') loadRouting({force:true}); };
 }
 
 function inlineEditEntries(idx, el) {
@@ -4998,7 +5385,7 @@ function inlineEditEntries(idx, el) {
   ta.onblur = save;
   ta.onkeydown = (e) => {
     if (e.key==='Enter' && (e.ctrlKey||e.metaKey)) { e.preventDefault(); save(); }
-    if (e.key==='Escape') loadRouting();
+    if (e.key==='Escape') loadRouting({force:true});
   };
 }
 
@@ -5028,24 +5415,26 @@ function inlineEditPorts(idx, el) {
   inp.onblur = () => { if (!saved) setTimeout(save, 150); };
   sel.onchange = save;
   sel.onblur = () => { if (!saved) setTimeout(save, 150); };
-  inp.onkeydown = (e) => { if (e.key==='Enter') save(); if (e.key==='Escape') loadRouting(); };
+  inp.onkeydown = (e) => { if (e.key==='Enter') save(); if (e.key==='Escape') loadRouting({force:true}); };
 }
 
 function changeMatchTarget(target) {
-  api('POST','/api/routing/settings', {match_target: target, apply:true}).then(()=>{
+  api('POST','/api/routing/settings', {match_target: target, apply:true}).then(result=>{
     showToast('success', t('MATCH цель изменена и применена'));
-    loadRouting();
+    showRoutingReconnectStatus(result);
+    loadRouting({force:true});
   }).catch(err => {
     showToast('error', err.message || t('Ошибка'));
-    loadRouting();
+    loadRouting({force:true});
   });
 }
 
 function applyPreset(id, target) {
   const body = target ? {preset:id, target:target, apply:true} : {preset:id, apply:true};
-  api('POST','/api/routing-presets/apply', body).then(()=>{
+  api('POST','/api/routing-presets/apply', body).then(result=>{
     showToast('success', t('Пресет')+' '+id+' '+t('применён'));
-    loadRouting();
+    showRoutingReconnectStatus(result);
+    loadRouting({force:true});
   });
 }
 
@@ -5545,7 +5934,7 @@ function renderActiveConns(data) {
   body.innerHTML = data.slice(0,50).map(c => `<tr>
     <td>${countryFlag(c.country)} ${c.host}</td>
     <td class="mono">${c.source_ip}</td>
-    <td>${c.network}</td>
+    <td>${c.inbound === 'torrent-socks-in' ? '<span class="result-badge ok">Torrent SOCKS5</span> ' : ''}${htmlEscape(c.network)}</td>
     <td class="mono">${Array.isArray(c.chains) ? c.chains.join('→') : c.chains}</td>
     <td style="font-size:12px">${c.rule}</td>
     <td class="mono">${fmtBytes(c.upload)}</td>
@@ -5568,6 +5957,15 @@ let connectionsTableSearch = '';
 let connectionsTableOffset = 0;
 const CONNECTIONS_TABLE_PAGE_SIZE = 100;
 let connectionsTablePage = {total:0, filtered:0, offset:0, limit:CONNECTIONS_TABLE_PAGE_SIZE};
+
+function connectionRoutingSelectOpen() {
+  return document.querySelector('#connectionsRoutingBody .custom-select.open') !== null;
+}
+function connectionRoutingEditorActive() {
+  return connectionRoutingSelectOpen()
+    || document.querySelector('#resultModal #connectionRuleTarget') !== null
+    || document.querySelector('#connectionsRoutingBody input:focus, #connectionsRoutingBody select:focus, #connectionsRoutingBody textarea:focus') !== null;
+}
 
 function isConnectionsTableActive() {
   return document.querySelector('.section-panel[data-section="connections-table"]')?.classList.contains('open') === true;
@@ -5598,6 +5996,10 @@ function setVisualRoutingInterval(value) {
 
 function refreshConnectionsTable(options = {}) {
   if (!isConnectionsTableActive()) { stopConnectionsTableAutoRefresh(); return; }
+  if (connectionRoutingEditorActive()) {
+    connectionsTableRefreshPending = true;
+    return;
+  }
   if (visualRoutingRefreshInFlight) { connectionsTableRefreshPending = true; return; }
   visualRoutingRefreshInFlight = true;
   connectionsTableRefreshPending = false;
@@ -5610,11 +6012,13 @@ function refreshConnectionsTable(options = {}) {
     api('GET','/api/status',undefined,true),
   ]).then(([connectionsData, routingData, status]) => {
     if (!isConnectionsTableActive()) { stopConnectionsTableAutoRefresh(); return; }
+    if (connectionRoutingEditorActive()) { connectionsTableRefreshPending = true; return; }
     if (query !== connectionServerQuery(connectionsTableSearch) || offset !== connectionsTableOffset) {
       connectionsTableRefreshPending = true;
       return;
     }
     const connections = normalizeConnections(connectionsData, null);
+    MOCK.routing_servers = Array.isArray(routingData?.servers) ? routingData.servers : MOCK.routing_servers;
     connectionsTablePage = {
       total: Number(connectionsData.total || 0),
       filtered: Number(connectionsData.filtered || 0),
@@ -5628,7 +6032,7 @@ function refreshConnectionsTable(options = {}) {
     safeSet('connectionsTableUpdated', error.message || String(error));
   }).finally(() => {
     visualRoutingRefreshInFlight = false;
-    if (connectionsTableRefreshPending && isConnectionsTableActive()) refreshConnectionsTable();
+    if (connectionsTableRefreshPending && isConnectionsTableActive() && !connectionRoutingEditorActive()) refreshConnectionsTable({auto:true});
   });
 }
 
@@ -5643,6 +6047,7 @@ function serverByRouteSuffix(servers) {
 
 function describeConnectionRoute(conn, suffixMap, status) {
   const chains = Array.isArray(conn.chain_list) ? conn.chain_list : String(conn.chains || '').split(/\s*→\s*/).filter(Boolean);
+  if (chains.some(name => String(name).toUpperCase() === 'REJECT')) return {kind:'reject', badge:'bad', label:'REJECT', detail:`chain: ${chains.join(' → ')}`};
   const pinned = chains.find(name => /^srv-(route|out)-/.test(name));
   if (pinned) {
     const suffix = pinned.replace(/^srv-(route|out)-/, '');
@@ -5662,7 +6067,6 @@ function describeConnectionRoute(conn, suffixMap, status) {
     return {kind:'active', badge:'ok', label:`${t('Текущий активный VPN')}: ${active}${proto}`, detail:`chain: ${chains.join(' → ')}`};
   }
   if (chains.some(name => String(name).toUpperCase() === 'DIRECT')) return {kind:'direct', badge:'warn', label:'DIRECT', detail:`chain: ${chains.join(' → ')}`};
-  if (chains.some(name => String(name).toUpperCase() === 'REJECT')) return {kind:'reject', badge:'bad', label:'REJECT', detail:`chain: ${chains.join(' → ')}`};
   return {kind:'unknown', badge:'warn', label:chains[0] || '—', detail:chains.length ? `chain: ${chains.join(' → ')}` : t('цепочка не указана')};
 }
 
@@ -5690,8 +6094,9 @@ function buildVisualRoutingRows(connections, routingData, status) {
   connections.forEach(conn => {
     const site = visualRoutingSite(conn);
     const route = describeConnectionRoute(conn, suffixMap, status);
-    const item = groups.get(site) || {site, count:0, upload:0, download:0, sources:new Set(), ports:new Set(), networks:new Set(), countries:new Set(), rules:new Set(), routes:new Map(), details:new Set(), resource:site};
+    const item = groups.get(site) || {site, count:0, torrentCount:0, upload:0, download:0, sources:new Set(), ports:new Set(), networks:new Set(), countries:new Set(), rules:new Set(), routes:new Map(), details:new Set(), resource:site};
     item.count += 1;
+    if (conn.inbound === 'torrent-socks-in') item.torrentCount += 1;
     item.upload += Number(conn.upload || 0);
     item.download += Number(conn.download || 0);
     if (conn.source_ip) item.sources.add(conn.source_ip);
@@ -5760,7 +6165,7 @@ function renderConnectionsTableRows() {
     const rawResource = connectionRoutingResource(row);
     const actionable = !!rawResource;
     const resource = attrEscape(actionable ? rawResource : '');
-    const actionSelect = `<select class="form-control" style="min-width:150px;font-size:12px;padding:4px 8px" data-testid="connections-action" data-native-select="1" data-resource="${resource}" onchange="routeConnectionResource(this)" ${actionable?'':'disabled title="'+attrEscape(t('Fake-IP: ожидается восстановление домена'))+'"'}>
+    const actionSelect = `<select class="form-control" data-testid="connections-action" data-routing-target-select="1" data-searchable-select="1" data-custom-select-align="end" data-resource="${resource}" onchange="routeConnectionResource(this)" ${actionable?'':'disabled title="'+attrEscape(t('Fake-IP: ожидается восстановление домена'))+'"'}>
       <option value="">${htmlEscape(t('Следовать правилу…'))}</option>
       <option value="active">${htmlEscape(t('Текущий активный VPN'))}</option>
       <option value="direct">DIRECT</option>
@@ -5769,14 +6174,14 @@ function renderConnectionsTableRows() {
     </select>`;
     return `<tr>
       <td><strong>${countryFlag(Array.from(row.countries)[0])} ${htmlEscape(row.site)}</strong><div class="routing-route-detail">${htmlEscape(Array.from(row.countries).filter(Boolean).join(', ') || '—')}</div></td>
-      <td class="mono">${row.count}</td>
+      <td class="mono">${row.count}${row.torrentCount ? `<div><span class="result-badge ok">Torrent SOCKS5 · ${row.torrentCount}</span></div>` : ''}</td>
       <td>${routeHtml}<div class="routing-route-detail">${htmlEscape(details)}</div></td>
       <td class="mono">${htmlEscape(Array.from(row.sources).join(', ') || '—')}</td>
       <td class="mono">${htmlEscape(Array.from(row.networks).join(', ') || '—')} ${htmlEscape(Array.from(row.ports).join(', ') || '')}</td>
       <td>${htmlEscape(Array.from(row.rules).join(', ') || '—')}</td>
       <td class="mono">${htmlEscape(fmtBytes(row.upload))}</td>
       <td class="mono">${htmlEscape(fmtBytes(row.download))}</td>
-      <td style="min-width:220px"><div style="display:grid;gap:6px">${actionSelect}<button class="btn btn-sm" data-resource="${resource}" onclick="openConnectionRuleEditor(this)">✎ ${htmlEscape(t('Создать/изменить правило'))}</button><button class="btn btn-sm" data-resource="${resource}" onclick="explainConnectionResource(this)">? ${htmlEscape(t('Почему этот маршрут'))}</button><button class="btn btn-sm" data-resource="${resource}" onclick="reloadConnectionResource(this)">⟳ ${htmlEscape(t('Перезагрузить ресурс'))}</button></div></td>
+      <td style="min-width:280px"><div style="display:grid;gap:6px">${actionSelect}<button class="btn btn-sm" data-resource="${resource}" onclick="openConnectionRuleEditor(this)">✎ ${htmlEscape(t('Создать/изменить правило'))}</button><button class="btn btn-sm" data-resource="${resource}" onclick="explainConnectionResource(this)">? ${htmlEscape(t('Почему этот маршрут'))}</button><button class="btn btn-sm" data-resource="${resource}" data-source-ip="${attrEscape(row.sources.size===1 ? Array.from(row.sources)[0] : '')}" data-port="${attrEscape(row.ports.size===1 ? Array.from(row.ports)[0] : '')}" data-network="${attrEscape(row.networks.size===1 ? Array.from(row.networks)[0] : '')}" onclick="reloadConnectionResource(this)">⟳ ${htmlEscape(t('Применить правило и переподключить'))}</button></div></td>
     </tr>`;
   }).join('') || `<tr><td colspan="9" style="color:var(--muted)">${htmlEscape(connectionsTableSearch ? t('Поиск не дал результатов') : t('Активных соединений нет'))}</td></tr>`;
 }
@@ -5788,6 +6193,7 @@ function routeConnectionResource(select) {
   if (!resource) return showToast('error', t('Ресурс не определён'));
   const body = {resource, target, close_connections:true};
   select.disabled = true;
+  syncCustomSelect(select);
   api('POST','/api/routing/resource-route', body).then(r => {
     showToast('success', `${t('Маршрут применён')}: ${resource} → ${target}; ${t('закрыто соединений')}: ${r.closed_connections ?? 0}`);
     return refreshConnectionsTable();
@@ -5796,6 +6202,7 @@ function routeConnectionResource(select) {
   }).finally(() => {
     select.disabled = false;
     select.value = '';
+    syncCustomSelect(select);
   });
 }
 
@@ -5810,7 +6217,7 @@ function openConnectionRuleEditor(button) {
     </div>
     <div class="form-group">
       <label>${htmlEscape(t('Цель'))}</label>
-      <select id="connectionRuleTarget" class="form-control">
+      <select id="connectionRuleTarget" class="form-control" data-routing-target-select="1" data-searchable-select="1">
         <option value="active">${htmlEscape(t('Текущий активный VPN'))}</option>
         <option value="direct">DIRECT</option>
         <option value="reject">REJECT</option>
@@ -5834,10 +6241,22 @@ function submitConnectionRuleEditor() {
 function reloadConnectionResource(button) {
   const resource = String(button?.dataset?.resource || '').trim();
   if (!resource) return showToast('error', t('Ресурс не определён'));
-  api('POST','/api/mihomo-api/connections/close',{resource}).then(r => {
-    showToast('success', `${t('Ресурс перезагружен')}: ${resource}; ${t('закрыто соединений')}: ${r.closed ?? 0}`);
+  button.disabled = true;
+  const request = {resource};
+  if (button.dataset.sourceIp) request.source_ip = button.dataset.sourceIp;
+  if (/^\d+$/.test(button.dataset.port || '')) request.port = Number(button.dataset.port);
+  if (['tcp','udp'].includes(button.dataset.network)) request.network = button.dataset.network;
+  api('POST','/api/routing/resource-reload',request).then(result => {
+    const target = String(result.target || 'active');
+    const server = routingServerByTarget(target);
+    const fallback = result.fallback_active === true;
+    const targetLabel = result.runtime_evaluation === true ? t('Цель определяет Mihomo во время запроса') : server ? routingServerLabel(server) : routingTargetPresentation(target).label;
+    const fallbackText = fallback ? ` ${t('Выбранный сервер в Dead Servers; используется текущий активный VPN.')}` : '';
+    const closeText = result.closed_connections > 0 ? `${t('закрыто соединений')}: ${result.closed_connections}` : result.close_errors?.length ? `${t('закрыто соединений')}: 0` : t('Открытых совпадающих соединений не найдено');
+    const closeErrors = Array.isArray(result.close_errors) && result.close_errors.length ? ` ${t('Не все соединения закрыты')}: ${result.close_errors.length}.` : '';
+    showToast(closeErrors ? 'error' : fallback || result.runtime_evaluation ? 'warning' : 'success', `${t('Маршруты применены')}. ${t('Ресурс переподключён')}: ${resource} → ${targetLabel}; ${closeText}.${fallbackText}${closeErrors}`, 7000);
     return refreshConnectionsTable();
-  }).catch(e => showToast('error', e.message || String(e)));
+  }).catch(e => showToast('error', e.message || String(e))).finally(() => { button.disabled = false; });
 }
 function explainConnectionResource(button) {
   const resource = String(button?.dataset?.resource || '').trim();
@@ -5884,24 +6303,84 @@ let benchPollInFlight = false;
 let benchWasRunning = false;
 let benchResultFingerprint = '';
 let benchTerminalHideTimer = null;
+let benchLastStatus = null;
+const benchAvailabilityEvidence = new Map();
+function renderBenchSearchStatus(data) {
+  const search = data?.search;
+  const detail = document.getElementById('benchSearchStatus');
+  if (detail) {
+    detail.style.display = search ? 'block' : 'none';
+    if (search) {
+      const services = {all:'Ping+YT+TG+AI',youtube:'YT',telegram:'YT+TG',ai:'YT+TG+AI'}[search.required_services] || 'YT';
+      detail.textContent = `${t('Найдено')}: ${search.found_good}/${search.target_good} (${services}) · ${t('Предпроверено')}: ${search.preflight_completed} · ${t('Отсеяно предпроверкой')}: ${search.preflight_rejected} · ${t('Сервисы проверены')}: ${search.quick_completed}`;
+    }
+  }
+  const partialHelp = document.getElementById('benchSearchPartialHelp');
+  if (partialHelp) {
+    partialHelp.style.display = search ? 'block' : 'none';
+    if (search) {
+      const reason = {target_reached:'Поиск: цель достигнута',exhausted:'Поиск: кандидаты исчерпаны',cancelled:'Поиск отменён'}[search.finish_reason];
+      const verified = new Set((data.results || []).filter(result => typeof result.server_ref === 'string' && result.server_ref.startsWith('srv-v2-') && ['availability_quick','availability_full','search_availability'].includes(result.method) && result.resource_tests?.some(test => test.id === 'youtube_thumbnails' && isCurrentSearchResourceTest(test) && test.stable === true && test.inconclusive !== true && test.attempts > 0)).map(result => result.server_ref)).size;
+      partialHelp.textContent = `${t('Подтверждено YT (канал/превью)')}: ${verified} · ${t('YouTube не проверен')}: ${Math.max(0, (Number(data.total) || 0) - (Number(search.quick_completed) || 0))}. ${t('Частичный поиск: непроверенные и отсеянные предпроверкой не являются провалами сервисов.')}${reason ? ' '+t(reason)+'.' : ''}`;
+    }
+  }
+  const result = document.getElementById('benchResultStatus');
+  if (result) {
+    result.style.display = !data?.running && data?.total > 0 ? 'block' : 'none';
+    result.textContent = `${t('Проверено')}: ${search ? search.quick_completed : data?.completed ?? 0}/${data?.total ?? 0}${search ? ' · '+t('Найдено')+': '+search.found_good+'/'+search.target_good : ''}`;
+  }
+}
+function renderBenchConcurrencyStatus(data) {
+  const status = data?.concurrency_status;
+  const el = document.getElementById('benchConcurrencyStatus');
+  if (!el) return;
+  el.style.display = status || data?.requested_concurrency != null || data?.concurrency != null ? 'block' : 'none';
+  if (status) {
+    const labels = {memory_cap:'резерв памяти',candidate_count:'число кандидатов',target_slots:'оставшиеся места цели'};
+    const reasons = Array.isArray(status.limit_reasons) ? status.limit_reasons.slice(0,3).map(reason => labels[reason]).filter(Boolean).map(t) : [];
+    el.textContent = `${t('Запрошено')} ${status.requested} / ${t('доступно')} ${status.effective} / ${t('в работе')} ${status.active}; ${t('лимит допуска')} ${status.admission_limit}${reasons.length ? '; '+reasons.join(', ') : ''}`;
+  } else el.textContent = `${t('Запрошено')} ${data?.requested_concurrency ?? data?.concurrency ?? 1}${data?.requested_concurrency != null && data?.concurrency != null ? ' / '+t('доступно')+' '+data.concurrency : ''}`;
+}
+function boundedDiagnosticText(value, maxBytes = 2048) {
+  const bytes = new TextEncoder().encode(String(value ?? '').slice(0,maxBytes));
+  return new TextDecoder().decode(bytes.subarray(0,maxBytes), {stream:true});
+}
+function renderBenchDiagnostics(data) {
+  const results = Array.isArray(data?.results) ? data.results : [];
+  const availability = ['availability_quick','availability_full'].includes(data?.method) || results.some(result => hasCurrentThumbnailTest(result.resource_tests));
+  const inconclusive = availability ? Math.max(results.filter(result => hasInconclusiveTests(result.resource_tests)).length, Number(data?.summary?.inconclusive) || 0) : 0;
+  safeSet('benchInconclusive', String(inconclusive));
+  const status = document.getElementById('benchInconclusiveStatus');
+  if (status) {
+    status.style.display = inconclusive ? 'block' : 'none';
+    status.textContent = `${t('Проверку доступности не удалось подтвердить')}: ${inconclusive}. ${t('Не считается успехом или доказанным сбоем сервера')}.`;
+  }
+  const failures = Array.isArray(data?.preflight_failures) ? data.preflight_failures.slice(-20) : [];
+  const diagnostics = document.getElementById('benchPreflightDiagnostics');
+  if (diagnostics) diagnostics.style.display = failures.length ? 'block' : 'none';
+  const list = document.getElementById('benchPreflightFailures');
+  const phases = {setup:'Подготовка ядра',transport:'Транспорт'};
+  if (list) list.innerHTML = failures.map(failure => `<li><strong>#${htmlEscape(boundedDiagnosticText(failure.profile_id,32))} · ${htmlEscape(t(Object.hasOwn(phases,failure.phase) ? phases[failure.phase] : boundedDiagnosticText(failure.phase,64)))}</strong>: ${htmlEscape(boundedDiagnosticText(failure.error))}</li>`).join('');
+}
 function setKittRunning(running) {
   const el = document.getElementById('benchKitt');
   if (el) el.classList.toggle('running', running);
 }
 function updateBenchStatus(data) {
+  benchLastStatus = data;
+  if (data?.running) clearTimeout(benchTerminalHideTimer);
   const running = !!(data && data.running);
   const total = Number(data && (data.total || data.profile_count || 0)) || 0;
   const done = Number(data && (data.completed || data.done || (data.results && data.results.length) || 0)) || 0;
   const activeProfiles = data && Array.isArray(data.active_profiles) ? data.active_profiles.slice(0, 6) : [];
-  const current = data?.cancel_requested ? t('Останавливается…') : activeProfiles.length
-    ? `${t('В работе')}: ${activeProfiles.length} · ${activeProfiles.map(profile => profile.name).filter(Boolean).join(', ')}`
-    : (data && (data.current_profile || data.current_profile_name || data.current || '—')) || '—';
+  const current = data?.cancel_requested ? t('Останавливается…')
+    : data?.current_profile || data?.current_profile_name || data?.current || activeProfiles[0]?.name || '—';
   const pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
   const progressEl = document.getElementById('benchProgress');
   const kittEl = document.getElementById('benchKitt');
   const stopEl = document.getElementById('benchStop');
-  if (progressEl) progressEl.style.display = running ? 'block' : 'none';
-  setKittRunning(running && (data.method === 'quick' || data.method === 'full' || data.quick === true));
+  if (progressEl) progressEl.style.display = running || data?.search ? 'block' : 'none';
+  setKittRunning(running && ['availability_quick','availability_full'].includes(data.method));
   if (stopEl) {
     stopEl.style.display = running ? 'inline-flex' : 'none';
     stopEl.disabled = !!data?.cancel_requested;
@@ -5911,14 +6390,21 @@ function updateBenchStatus(data) {
   const counterEl = document.getElementById('benchCounter');
   if (counterEl) counterEl.textContent = done + '/' + total;
   const currentEl = document.getElementById('benchCurrent');
-  if (currentEl) currentEl.textContent = current;
+  if (currentEl) {
+    currentEl.textContent = !running && total ? t('Проверка завершена') : current;
+    currentEl.style.whiteSpace = 'nowrap';
+  }
   const results = data && Array.isArray(data.results) ? data.results : [];
   // Summary bar (passed/failed/avg) only for group tests, not single server.
   const isGroup = window.benchIsGroup !== false;
-  if (!running && results.length && isGroup) {
-    const passed = results.filter(r => r.success).length;
-    const failed = results.length - passed;
-    const avg = results.length ? Math.round(results.reduce((s,r)=>s+(r.latency_ms||0),0)/results.length) : 0;
+  renderBenchSearchStatus(data);
+  renderBenchConcurrencyStatus(data);
+  renderBenchDiagnostics(data);
+  if (!data?.search && !running && results.length && isGroup && ['availability_quick','availability_full'].includes(data.method)) {
+    const conclusive = results.filter(r => !hasInconclusiveTests(r.resource_tests));
+    const passed = conclusive.filter(r => r.success === true && hasCurrentThumbnailTest(r.resource_tests)).length;
+    const failed = conclusive.filter(r => r.success === false).length;
+    const avg = conclusive.length ? Math.round(conclusive.reduce((s,r)=>s+(r.latency_ms||0),0)/conclusive.length) : 0;
     const summaryEl = document.getElementById('benchSummary');
     if (summaryEl) summaryEl.style.display='grid';
     const passedEl = document.getElementById('benchPassed');
@@ -5927,21 +6413,17 @@ function updateBenchStatus(data) {
     if (failedEl) failedEl.textContent = failed;
     const avgEl = document.getElementById('benchAvg');
     if (avgEl) avgEl.textContent = avg ? avg + ' ms' : '— ms';
-  } else if (!isGroup) {
+  } else {
     const summaryEl = document.getElementById('benchSummary');
     if (summaryEl) summaryEl.style.display = 'none';
   }
-  // Merge bench results into MOCK.profiles and re-render the table so
-  // Raw benchmark metrics update in real time.
-  // EWMA and cooldown are updated by the backend (apply_bench_result) and
-  // will appear after the final refreshDashboard() below.
   mergeBenchResultsIntoProfiles(results);
   if (!running && benchWasRunning) {
     benchWasRunning = false;
     clearTimeout(benchPollTimer);
     benchPollTimer = null;
     clearTimeout(benchTerminalHideTimer);
-    if (progressEl && done) {
+    if (progressEl && done && !data?.search) {
       progressEl.style.display = 'block';
       benchTerminalHideTimer = setTimeout(() => { progressEl.style.display = 'none'; },1200);
     }
@@ -5952,20 +6434,23 @@ function updateBenchStatus(data) {
   }
 }
 
-/// Update MOCK.profiles in place with the latest bench results and
-/// re-render the profiles + favorites tables so metric columns reflect
-/// the test in real time. Only metrics enabled in the test settings
-/// sliders are updated — disabled metrics keep their previous value.
+// Public mapped IDs disambiguate aliases; lifecycle refs prevent ID-reuse attribution.
 function mergeBenchResultsIntoProfiles(results) {
   if (!results || !results.length) return;
-  const fingerprint = results.map(r => `${r.profile_id}:${r.timestamp || ''}:${r.success}:${r.latency_ms || 0}`).join('|');
+  const fingerprint = JSON.stringify([results.map(r => [r.profile_id,r.server_ref,r.timestamp,r.success,r.latency_ms,r.method,Array.isArray(r.resource_tests) ? r.resource_tests.map(test => [test.id,test.contract_version,test.inconclusive,test.stable,test.attempts,test.successes,test.error]) : null]),MOCK.profiles.map(profile => [profile.id,profile.server_ref])]);
   if (fingerprint === benchResultFingerprint) return;
   benchResultFingerprint = fingerprint;
   let changed = false;
   for (const r of results) {
-    const p = MOCK.profiles.find(p => p.id === r.profile_id);
+    if (['quick','full','search'].includes(r.method)) continue;
+    if (typeof r.server_ref !== 'string' || !r.server_ref.startsWith('srv-v2-')) continue;
+    const p = MOCK.profiles.find(p => p.id === r.profile_id && p.server_ref === r.server_ref);
     if (!p) continue;
-    if (r.success) {
+    const evidence = benchAvailabilityEvidence.get(p.id);
+    const serviceResult = ['availability_quick','availability_full','search_availability'].includes(r.method);
+    if (serviceResult && Math.max(Number(p.last_service_test_unix || 0), evidence?.server_ref === r.server_ref ? evidence.timestamp : 0) > Number(r.timestamp || 0)) continue;
+    const inconclusive = hasInconclusiveTests(r.resource_tests);
+    if (r.success && !inconclusive && !['availability_quick','availability_full','search_availability'].includes(r.method)) {
       p.last_latency_ms = r.latency_ms ?? p.last_latency_ms;
       p.last_jitter_ms = r.jitter_ms ?? p.last_jitter_ms;
       if (r.download_mbps != null) p.last_download_mbps = r.download_mbps;
@@ -5974,10 +6459,37 @@ function mergeBenchResultsIntoProfiles(results) {
       p.last_error = r.download_error || r.upload_error || null;
     }
     if (Array.isArray(r.resource_tests) && r.resource_tests.length) p.resource_tests = r.resource_tests;
-    if (r.method === 'quick' || r.method === 'full') p.last_service_test_success = r.success === true;
+    if (inconclusive || !hasCurrentThumbnailTest(r.resource_tests) || r.method === 'search_availability') p.last_service_test_success = null;
+    else if (r.method === 'availability_quick' || r.method === 'availability_full') p.last_service_test_success = r.success === true;
+    else p.last_service_test_success = null;
+    if (serviceResult && Number(r.timestamp) > 0 && hasCurrentThumbnailTest(r.resource_tests)) {
+      p.last_service_test_unix = Number(r.timestamp);
+      const resource_tests = searchResourceEvidence(r.resource_tests);
+      benchAvailabilityEvidence.set(r.profile_id, {server_ref:r.server_ref,timestamp:Number(r.timestamp),resource_tests,last_service_test_success:p.last_service_test_success});
+    }
     changed = true;
   }
   if (changed) renderProfiles(MOCK.profiles);
+}
+function overlayAvailabilityEvidence(profiles) {
+  // Only bridge an older stats response for the same numeric ID and lifecycle identity.
+  for (const [id,evidence] of benchAvailabilityEvidence) {
+    const profile = profiles.find(item => item.id === id);
+    if (!profile || profile.server_ref !== evidence.server_ref) {
+      benchAvailabilityEvidence.delete(id);
+      continue;
+    }
+    if (Number(profile.last_service_test_unix || 0) >= evidence.timestamp) {
+      evidence.timestamp = Number(profile.last_service_test_unix);
+      evidence.resource_tests = searchResourceEvidence(profile.resource_tests);
+      evidence.last_service_test_success = profile.last_service_test_success ?? null;
+      continue;
+    }
+    profile.resource_tests = evidence.resource_tests;
+    profile.last_service_test_success = evidence.last_service_test_success;
+    profile.last_service_test_unix = evidence.timestamp;
+  }
+  return profiles;
 }
 function scheduleBenchPoll(delay=1000) {
   clearTimeout(benchPollTimer);
@@ -6039,53 +6551,103 @@ function saveProfileTestSettings() {
   return apiAction('POST','/api/bench/settings',settings,t('Настройки сохранены'),loadProfileTestSettings);
 }
 
-/// Benchmark a single profile by id. Uses the method/probe/download settings
-/// from the test settings panel (falls back to defaults if not present).
+let serverSearchParameters = {stop_mode:'complete_scope',target_good:5,required_services:'all',fail_fast:false};
+function syncServerSearchParameters(changed) {
+  const controls = {stop_mode:'benchSearchStopMode',target_good:'benchSearchTarget',required_services:'benchSearchServices',fail_fast:'benchSearchFailFast'};
+  const valid = (key, value) => key === 'stop_mode' ? ['complete_scope','find_n'].includes(value)
+    : key === 'target_good' ? Number.isInteger(value) && value >= 1 && value <= 20
+    : key === 'required_services' ? ['all','youtube','telegram','ai'].includes(value) : typeof value === 'boolean';
+  for (const [key, id] of Object.entries(controls)) {
+    const control = document.getElementById(id);
+    if (!control) continue;
+    if (!changed) {
+      try {
+        const raw = localStorage.getItem('hr_search_'+key);
+        const stored = raw && raw.length <= 32 ? JSON.parse(raw) : null;
+        if (valid(key, stored)) serverSearchParameters[key] = stored;
+      } catch (_) {}
+      if (key === 'fail_fast') control.checked = serverSearchParameters[key];
+      else control.value = String(serverSearchParameters[key]);
+    } else if (changed === key) {
+      const value = key === 'fail_fast' ? control.checked : key === 'target_good' ? Number(control.value) : control.value;
+      if (valid(key, value)) serverSearchParameters[key] = value;
+    }
+    try { localStorage.setItem('hr_search_'+key, JSON.stringify(serverSearchParameters[key])); } catch (_) {}
+  }
+  const findN = document.getElementById('benchSearchStopMode')?.value === 'find_n';
+  document.getElementById('benchSearchTarget').disabled = !findN;
+  updateDeadServerBulkBar();
+}
+
+function openServerSearchParameters() {
+  navTo('profiles');
+  document.getElementById('testPanel').open = true;
+   document.getElementById('benchConcurrency').focus({preventScroll:true});
+}
+
 function benchOne(id) {
-  startBenchWithIds([id], 'quick');
+  startServerSearch({profile_ids:[id],diagnostic:MOCK.profiles.some(profile => profile.id === id && profile.dead)});
 }
 
-function quickBenchSelected() {
-  const profile_ids = selectedProfiles().map(profile => profile.id);
-  if (!profile_ids.length) return;
-  startBenchScope({profile_ids, method:'quick', test_download:false, test_upload:false}, true);
-}
-
-/// Benchmark all profiles in a group/subscription.
 function benchGroup(ids) {
-  if (!ids || !ids.length) return;
-  startBenchWithIds(ids, 'quick');
+  startServerSearch({profile_ids:ids});
 }
 
 function benchSubscription(subscriptionUrl) {
-  if (!subscriptionUrl) return;
-  startBenchScope({subscription_url:subscriptionUrl, method:'quick'}, true);
+  startServerSearch({subscription_url:subscriptionUrl});
 }
 
-function fullBenchAll() {
-  startBenchScope({method:'full'}, true);
-}
-
-function startBenchWithIds(ids, method) {
-  startBenchScope({profile_ids:ids, method:method || 'quick'}, ids.length > 1);
-}
-
-function startBenchScope(scope, isGroup) {
-  const body = Object.assign({
-    method: 'quick',
+function startServerSearch(scope) {
+  scope = scope || {};
+  const hasIds = Object.hasOwn(scope,'profile_ids');
+  const hasSubscription = Object.hasOwn(scope,'subscription_url');
+  const advanced = scope.advanced === true;
+  if (Object.hasOwn(scope,'advanced') && !advanced) return;
+  if (advanced && (hasIds || hasSubscription || Object.hasOwn(scope,'selected') || Object.hasOwn(scope,'diagnostic'))) return;
+  const stopMode = advanced ? document.getElementById('benchSearchStopMode')?.value : 'complete_scope';
+  if (!['complete_scope','find_n'].includes(stopMode)) {
+    showToast('error',t('Выберите режим остановки'));
+    return;
+  }
+  if (hasSubscription && (typeof scope.subscription_url !== 'string' || !scope.subscription_url || hasIds || scope.selected)) return;
+  if (scope.selected && hasIds) return;
+  const findN = advanced && stopMode === 'find_n';
+  const required_services = document.getElementById('benchSearchServices')?.value;
+  const fail_fast = document.getElementById('benchSearchFailFast')?.checked === true;
+  if (!['all','youtube','telegram','ai'].includes(required_services)) {
+    showToast('error',t('Выберите нужные сервисы'));
+    return;
+  }
+  const body = {
+    method: findN ? 'availability_quick' : 'availability_full',
     concurrency: benchConcurrency(),
     test_download: false,
     test_upload: false,
-  }, scope);
-  // Track whether this is a group test (for summary bar visibility).
-  window.benchIsGroup = isGroup;
-  const progressEl = document.getElementById('benchProgress');
-  if (progressEl) progressEl.style.display = 'block';
-  api('POST','/api/bench/start', body).then(() => {
+  };
+  if (scope.selected || hasIds) {
+    const ids = scope.selected ? selectedProfiles().map(profile => profile.id) : scope.profile_ids;
+    if (!Array.isArray(ids) || !ids.length || ids.some(id => !Number.isInteger(id) || id < 0)) return;
+    body.profile_ids = ids;
+  } else if (hasSubscription) body.subscription_url = scope.subscription_url;
+  if (findN) {
+    const target_good = Number(document.getElementById('benchSearchTarget')?.value);
+    if (!Number.isInteger(target_good) || target_good < 1 || target_good > 20) {
+      showToast('error',t('Укажите целое число серверов от 1 до 20'));
+      return;
+    }
+    body.search = {target_good,required_services,fail_fast};
+  } else body.service_checks = {required_services,fail_fast};
+  api('POST','/api/bench/start', body).then(result => {
+    window.benchIsGroup = !body.profile_ids || body.profile_ids.length > 1;
+    if (hasSubscription) sortProfiles('results');
+    clearTimeout(benchTerminalHideTimer);
+    const progressEl = document.getElementById('benchProgress');
+    if (progressEl) progressEl.style.display = 'block';
+    renderBenchConcurrencyStatus(result);
     benchResultFingerprint = '';
     benchWasRunning = true;
     pollBenchStatus();
-  }).catch(() => { if (progressEl) progressEl.style.display = 'none'; });
+  }).catch(() => {});
 }
 
 // ─── DNS ─────────────────────────────────────────────────────────────
@@ -6255,6 +6817,7 @@ function runNetworkDiagnostics() {
 }
 
 function showResultModal(title, html, extraClass) {
+  closeCustomSelects();
   document.getElementById('resultTitle').textContent = title;
   document.getElementById('resultBody').innerHTML = html;
   const modal = document.querySelector('#resultModal .modal');
@@ -6262,9 +6825,11 @@ function showResultModal(title, html, extraClass) {
   document.getElementById('resultModal').style.display = 'flex';
 }
 function closeResultModal() {
+  closeCustomSelects();
   document.getElementById('resultModal').style.display = 'none';
   const modal = document.querySelector('#resultModal .modal');
   if (modal) modal.className = 'modal modal-wide';
+  if (connectionsTableRefreshPending && isConnectionsTableActive()) queueMicrotask(() => refreshConnectionsTable({auto:true}));
 }
 
 // ─── TRACE ───────────────────────────────────────────────────────────
@@ -6420,6 +6985,50 @@ function loadDevices(notify=true) {
   })
     .catch(()=>{});
 }
+
+// ─── KEENETIC DIRECT POLICY AUTOMATION ──────────────────────────────
+let directPolicyEditing = false;
+function renderDirectPolicy(data) {
+  if (directPolicyEditing) return;
+  document.getElementById('directPolicyEnabled').checked = data.enabled === true;
+  const devices = Array.isArray(data.devices) ? data.devices : [];
+  const online = devices.filter(device => device.active === true);
+  const offline = devices.filter(device => device.active !== true);
+  const row = device => {
+    const connected = device.active === true;
+    const label = connected ? 'Подключено' : 'Не подключено';
+    return `<tr><td><label class="toggle"><input type="checkbox" data-policy-mac="${escapeHtml(device.mac)}" ${device.selected?'checked':''}><span class="slider"></span></label></td><td><span class="direct-policy-lamp ${connected?'online':'offline'}" role="img" aria-label="${label}" title="${label}"></span>${escapeHtml(device.name || '—')}</td><td class="mono">${escapeHtml(device.ip && device.ip !== '0.0.0.0' ? device.ip : '—')}</td><td class="mono">${escapeHtml(device.mac)}</td><td>${escapeHtml(device.policy === 'Policy0' ? 'XKeen' : device.policy ? device.policy : device.policy === null ? 'Не в сети' : 'Default Policy')}</td></tr>`;
+  };
+  document.getElementById('directPolicyDevices').innerHTML = online.map(row).join('') || '<tr><td colspan="5">Нет подключённых устройств</td></tr>';
+  document.getElementById('directPolicyOfflineDevices').innerHTML = offline.map(row).join('');
+  const disclosure = document.getElementById('directPolicyOffline');
+  disclosure.hidden = offline.length === 0;
+  if (!offline.length) disclosure.open = false;
+  document.getElementById('directPolicyOfflineSummary').textContent = `Не подключены (${offline.length})`;
+  const last = data.last_action ? `Последнее изменение: ${data.last_action}` : 'Политика ещё не менялась';
+  document.getElementById('directPolicyStatus').textContent = data.error ? `${last} · ${data.error}` : last;
+}
+async function loadDirectPolicy() {
+  try { renderDirectPolicy(await api('GET','/api/automation/direct-policy',undefined,true)); }
+  catch (_) { document.getElementById('directPolicyStatus').textContent = t('Не удалось загрузить устройства Keenetic'); }
+}
+async function saveDirectPolicy() {
+  const button = document.getElementById('directPolicySave');
+  if (button.disabled) return;
+  button.disabled = true;
+  const enabled = document.getElementById('directPolicyEnabled').checked;
+  const devices = Array.from(document.querySelectorAll('#directPolicyDevices input[data-policy-mac]:checked, #directPolicyOfflineDevices input[data-policy-mac]:checked')).map(input => input.dataset.policyMac);
+  try {
+    await api('POST','/api/automation/direct-policy',{enabled,devices});
+    directPolicyEditing = false;
+    await loadDirectPolicy();
+    showToast('success',t('Настройки сохранены'));
+  } catch (_) { /* api displays the error; preserve the draft */ }
+  finally { button.disabled = false; }
+}
+document.getElementById('directPolicyEnabled')?.addEventListener('change', () => { directPolicyEditing = true; });
+document.getElementById('directPolicyDevices')?.addEventListener('change', () => { directPolicyEditing = true; });
+document.getElementById('directPolicyOfflineDevices')?.addEventListener('change', () => { directPolicyEditing = true; });
 
 // ─── AUTO SETTINGS ───────────────────────────────────────────────────
 function saveAutoSettings() {
@@ -6645,6 +7254,12 @@ function loadFeatures(force = false) {
 }
 
 // ─── ROUTING SETTINGS SAVE ───────────────────────────────────────────
+function updateTorrentSocksPasswordHint() {
+  const password = document.getElementById('rTorrentSocksPassword')?.value || '';
+  const count = new TextEncoder().encode(password).length;
+  safeSet('rTorrentSocksPasswordLength', count ? `${t('Пароль SOCKS5: ')}${count}${t(' байт (минимум 12)')}` : '');
+  return count;
+}
 function saveRoutingSettings() {
   const sr = MOCK.split_routing || {};
   const body = {
@@ -6666,9 +7281,55 @@ function saveRoutingSettings() {
     parovozik_server_refs: [...parovozikSelectedRefs],
     match_target: sr.match_target || 'proxy',
   };
+  const torrentSettings = {
+    enabled: document.getElementById('rTorrentSocksEnabled')?.checked === true,
+    listen: document.getElementById('rTorrentSocksListen')?.value || '127.0.0.1',
+    port: +(document.getElementById('rTorrentSocksPort')?.value || 10812),
+    username: document.getElementById('rTorrentSocksUsername')?.value || '',
+    target: document.getElementById('rTorrentSocksTarget')?.value || 'direct',
+  };
+  const torrentPassword = document.getElementById('rTorrentSocksPassword')?.value || '';
+  const passwordBytes = updateTorrentSocksPasswordHint();
+  if (torrentSettings.enabled && !torrentPassword && sr.torrent_socks?.password_set !== true
+      || torrentPassword && (passwordBytes < 12 || passwordBytes > 512 || /[\x00-\x1f\x7f-\x9f]/u.test(torrentPassword))) {
+    showToast('error',t('Введите пароль SOCKS5 длиной от 12 до 512 байт'));
+    document.getElementById('rTorrentSocksPassword')?.focus();
+    return;
+  }
+  if (torrentPassword) torrentSettings.password = torrentPassword;
   body.apply = true;
-  api('POST','/api/routing/settings',body).then(() => {
+  body.torrent_socks = torrentSettings;
+  api('POST','/api/routing/settings',body).then(result => {
+    routingSettingsDraftDirty = false;
+    parovozikConsistDirty = false;
+    safeValue('rTorrentSocksPassword','');
+    updateTorrentSocksPasswordHint();
+    applySavedRoutingSettings(result.settings);
     showToast('success', t('Настройки маршрутизации сохранены и применены'));
+    showRoutingReconnectStatus(result);
+    refreshDashboard();
+  }).catch(()=>{});
+}
+
+function showRoutingReconnectStatus(result) {
+  const reconnect = result?.reconnect;
+  if (!reconnect || reconnect.scope === 'none') return;
+  if (reconnect.complete !== true) {
+    showToast('warning', t('Правило применено, но не все старые соединения переподключены'));
+    return;
+  }
+}
+
+function clearTorrentSocksCredentials() {
+  api('POST','/api/routing/settings',{
+    apply:true,
+    torrent_socks:{enabled:false,clear_credentials:true},
+  }).then(result => {
+    routingSettingsDraftDirty = false;
+    safeValue('rTorrentSocksPassword','');
+    updateTorrentSocksPasswordHint();
+    applySavedRoutingSettings(result.settings);
+    showToast('success',t('Учётные данные Torrent SOCKS5 очищены'));
     refreshDashboard();
   }).catch(()=>{});
 }
@@ -6722,8 +7383,9 @@ function renderParovozikServers(selectedRefs) {
 function saveParovozikConsist() {
   api('POST','/api/routing/settings',{parovozik_server_refs:[...parovozikSelectedRefs],apply:true}).then(result => {
     parovozikConsistDirty = false;
-    if (result.settings) updateRoutingForm(result.settings);
+    applySavedRoutingSettings(result.settings);
     showToast('success','Состав вагонов сохранён');
+    showRoutingReconnectStatus(result);
   }).catch(()=>{});
 }
 
@@ -6733,8 +7395,9 @@ function syncAutoVpnLearningToggles(enabled) {
 
 function resetRoutingDefaults() {
   if (!confirm(t('Сбросить настройки маршрутизации к заводским? Пользовательские правила будут удалены.'))) return;
-  api('POST','/api/routing/reset',{apply:true}).then(() => {
+  api('POST','/api/routing/reset',{apply:true}).then(result => {
     showToast('success', t('Штатные настройки применены'));
+    showRoutingReconnectStatus(result);
     loadRouting();
   }).catch(e => showToast('error', e.message || t('Ошибка')));
 }
@@ -6835,6 +7498,12 @@ const TOOLTIPS = {
   'rRedirPort': 'Порт TCP NAT REDIRECT listener Mihomo. Не меняйте без необходимости',
   'rPolicy': 'Имя traffic policy в Keenetic, к которой привязаны правила firewall',
   'rPortMode': 'All — проксировать все порты. AllowList — только указанные. DenyList — всё кроме указанных',
+  'rTorrentSocksEnabled': 'Открыть отдельный аутентифицированный SOCKS5 listener для торрент-клиента. Он работает независимо от прозрачного перехвата',
+  'rTorrentSocksListen': 'Только literal loopback/private IPv4. Для LAN-клиента укажите LAN-адрес роутера, не 0.0.0.0',
+  'rTorrentSocksPort': 'LAN-порт отдельного SOCKS5. TCP и UDP проверяются readiness-контрактом Mihomo',
+  'rTorrentSocksUsername': 'Обязательное имя пользователя SOCKS5. Credentials скрыты из generated config preview',
+  'rTorrentSocksPassword': 'Оставьте пустым, чтобы сохранить текущий пароль. Пароль никогда не возвращается API',
+  'rTorrentSocksTarget': 'DIRECT, текущее VPN, конкретный сервер, Паровозик или REJECT. Цель применяется только к этому listener',
   'rRuDirectMode': 'Выключено — RU Direct не действует. .ru и .рф — DOMAIN-SUFFIX для российских TLD. GEOSITE — category-ru из geosite.dat (включает vk.com, yandex.com и др.)',
   'rRuDirectExceptions': 'Домены, которые пойдут через VPN несмотря на RU Direct. Один на строку. Например: 2ip.ru',
   'ruleEntries': 'Домены, доменные зоны и IP-адреса. Примеры: geosite:youtube, googlevideo.com, geoip:us, ip-asn:15169, ru (DOMAIN-SUFFIX .ru), xn--p1ai (.рф)',
@@ -6950,8 +7619,10 @@ function normalizeProfiles(statsData, profilesData) {
    if (profilesData && Array.isArray(profilesData.profiles)) {
      return profilesData.profiles.map(p => {
        const {raw:_raw,...safeProfile} = p;
-       const st = statsMap[p.id];
-       if (!st) return Object.assign({dead:false}, safeProfile);
+        const candidateStats = statsMap[p.id];
+        const st = candidateStats && (!p.server_ref || !candidateStats.server_ref || candidateStats.server_ref === p.server_ref) ? candidateStats : null;
+         if (!st) return Object.assign({dead:false,last_service_test_unix:0}, safeProfile);
+        const resource_tests = Array.isArray(st.resource_tests) && st.resource_tests.length ? st.resource_tests : (Array.isArray(p.resource_tests) ? p.resource_tests : []);
        return Object.assign({}, safeProfile, {
         server_ref: p.server_ref || st.server_ref,
         dead: p.dead ?? st.dead ?? false,
@@ -6962,20 +7633,21 @@ function normalizeProfiles(statsData, profilesData) {
         last_upload_mbps: st.last_upload_mbps ?? null,
         last_loss_percent: st.last_loss_percent ?? null,
         success_count: st.success_count || 0,
-        failure_count: st.failure_count || 0,
-        last_service_test_success: st.last_service_test_success ?? null,
+         failure_count: st.failure_count || 0,
+          last_checked: st.last_checked || 0,
+          last_service_test_unix: st.last_service_test_unix || 0,
+         last_service_test_success: !hasCurrentThumbnailTest(resource_tests) || hasInconclusiveTests(resource_tests) ? null : st.last_service_test_success ?? null,
         ewma_latency_ms: st.ewma_latency_ms ?? null,
         ewma_download_mbps: st.ewma_download_mbps ?? null,
         consecutive_failures: st.consecutive_failures || 0,
         cooldown_until_unix: st.cooldown_until_unix || 0,
-         // Production contract marker: resource_tests: Array.isArray(st.resource_tests) ? st.resource_tests : []
-         resource_tests: Array.isArray(st.resource_tests) && st.resource_tests.length ? st.resource_tests : (Array.isArray(p.resource_tests) ? p.resource_tests : []),
+          resource_tests,
       });
     });
   }
   // Fallback: stats only — map profile_id → id so render works.
   if (statsData && Array.isArray(statsData.stats)) {
-    return statsData.stats.map(s => Object.assign({}, s, { id: s.profile_id }));
+    return statsData.stats.map(s => Object.assign({}, s, { id: s.profile_id, last_service_test_unix:s.last_service_test_unix || 0, last_service_test_success: !hasCurrentThumbnailTest(s.resource_tests) || hasInconclusiveTests(s.resource_tests) ? null : s.last_service_test_success }));
   }
   return PREVIEW_MODE ? MOCK.profiles : [];
 }
@@ -6990,9 +7662,59 @@ function updateStatusCards(s) {
   safeSet('sHttp', s.http_port ? ((s.listen_host || '127.0.0.1') + ':' + s.http_port) : 'disabled');
   safeSet('sVersion', s.mihomo_version || '—');
 }
+function renderDirectAvailability(data) {
+  const results = new Map((Array.isArray(data?.results) ? data.results : []).map(result => [result.id, result]));
+  document.querySelectorAll('[data-direct-site]').forEach(node => {
+    const result = results.get(node.dataset.directSite);
+    const state = result ? (result.ok === true ? 'ok' : 'bad') : 'unknown';
+    node.className = `direct-availability-site ${state}`;
+    const value = node.querySelector('span:last-child');
+    if (value) value.textContent = result ? (result.ok === true ? 'OK' : 'FAIL') : '—';
+    node.title = result?.error || (result?.elapsed_ms ? `${result.elapsed_ms} ms` : t('Не проверено'));
+  });
+  const botStatus = document.getElementById('directBotStatus');
+  if (botStatus && typeof data?.bot_configured === 'boolean') botStatus.textContent = !data.bot_configured ? t('Уведомления отключены') : data.bot_paired ? t('Бот привязан к личному чату') : t('Отправьте /start боту в личном чате для привязки');
+}
+async function loadDirectMonitor() {
+  try { renderDirectAvailability(await api('GET','/api/diagnostics/direct-monitor',undefined,true)); } catch (_) { /* monitor temporarily unavailable */ }
+}
+async function saveDirectBot() {
+  const input = document.getElementById('directBotToken');
+  const token = input?.value?.trim();
+  if (!token) { showToast('error',t('Введите токен бота')); return; }
+  try {
+    const data = await api('POST','/api/diagnostics/direct-monitor',{enabled:true,token});
+    if (input) input.value = '';
+    renderDirectAvailability(data);
+    showToast('success',t('Бот сохранён. Отправьте ему /start в личном чате.'));
+  } catch (_) { /* api shows error */ }
+}
+async function disableDirectBot() {
+  try { renderDirectAvailability(await api('POST','/api/diagnostics/direct-monitor',{enabled:false})); }
+  catch (_) { /* api shows error */ }
+}
+function runDirectAvailability() {
+  const button = document.getElementById('directAvailabilityButton');
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  button.textContent = t('Проверка…');
+  return api('GET','/api/diagnostics/direct-availability',undefined,true).then(data => {
+    renderDirectAvailability(data);
+    button.textContent = t('Проверить');
+  }).catch(() => {
+    renderDirectAvailability({results:[]});
+    button.textContent = t('Повторить');
+  }).finally(() => { button.disabled = false; });
+}
+async function pollDirectMonitor() {
+  await loadDirectMonitor();
+  setTimeout(pollDirectMonitor, 30000);
+}
+pollDirectMonitor();
 function updateRoutingForm(sr) {
   if (!sr) return;
   MOCK.split_routing = sr;
+  if (routingSettingsEditActive()) return;
   safeChecked('splitEnabled', sr.enabled);
   safeChecked('rAutoSwitch', sr.auto_switch);
   safeChecked('autoSwitchEnabled', sr.auto_switch);
@@ -7008,6 +7730,15 @@ function updateRoutingForm(sr) {
   safeValue('rRuDirectExceptions', Array.isArray(sr.ru_direct_exceptions) ? sr.ru_direct_exceptions.join('\n') : (sr.ru_direct_exceptions || ''));
   syncAutoVpnLearningToggles(sr.auto_vpn_learning_enabled === true);
   safeValue('rAutoVpnExceptions', Array.isArray(sr.auto_vpn_exceptions) ? sr.auto_vpn_exceptions.join('\n') : (sr.auto_vpn_exceptions || ''));
+  const torrent = sr.torrent_socks || {};
+  safeChecked('rTorrentSocksEnabled', torrent.enabled === true);
+  safeValue('rTorrentSocksListen', torrent.listen || '127.0.0.1');
+  safeValue('rTorrentSocksPort', torrent.port || 10812);
+  safeValue('rTorrentSocksUsername', torrent.username || '');
+  safeValue('rTorrentSocksPassword', '');
+  updateTorrentSocksPasswordHint();
+  refreshTorrentSocksTargetSelect(torrent.target || 'direct');
+  safeSet('rTorrentSocksPasswordStatus', torrent.password_set ? t('Пароль настроен') : t('Пароль не настроен'));
   safeChecked('rParovozikEnabled', sr.parovozik_enabled === true);
   safeValue('rParovozikDirect', Array.isArray(sr.parovozik_direct_domains) ? sr.parovozik_direct_domains.join('\n') : '');
   safeValue('rParovozikVpn', Array.isArray(sr.parovozik_vpn_domains) ? sr.parovozik_vpn_domains.join('\n') : '');
@@ -7016,7 +7747,7 @@ function updateRoutingForm(sr) {
   // Sync all custom selects with the freshly-loaded values.
   refreshCustomSelects();
   // Explicit per-select sync as a safety net.
-  ['rRuleSource','rPortMode','rRuDirectMode','rulePortMode','geoProvider'].forEach(id => {
+  ['rRuleSource','rPortMode','rRuDirectMode','rTorrentSocksTarget','rulePortMode','geoProvider'].forEach(id => {
     const el = document.getElementById(id);
     if (el && el.dataset.customSelectEnhanced) syncCustomSelect(el);
   });
@@ -7142,7 +7873,15 @@ function showMemoryBreakdown() {
 function normalizeProxyGroups(data) {
   const proxies = data && data.proxies ? data.proxies : data;
   if (!proxies || typeof proxies !== 'object') return [];
-  return Object.entries(proxies).map(([name,p]) => ({name, type:p.type, current:p.now || p.current || '', alive:p.alive !== false, delay:p.history && p.history[0] ? p.history[0].delay : p.delay}));
+  const mainHealthUrl = 'https://www.gstatic.com/generate_204?hincyray=main';
+  return Object.entries(proxies).filter(([name,p]) => name !== 'proxy-health' && p.hidden !== true).map(([name,p]) => {
+    const current = p.now || p.current || '';
+    const active = proxies['proxy-active'];
+    const mainHealth = active?.extra?.[mainHealthUrl];
+    const selectorAlive = p.type === 'Selector' && current === 'proxy-active' && mainHealth?.alive === true;
+    const history = name === 'proxy' && Array.isArray(mainHealth?.history) ? mainHealth.history : p.history;
+    return {name, type:p.type, current, alive:name === 'proxy' ? selectorAlive : p.alive === true, delay:Array.isArray(history) && history.length ? history[history.length - 1].delay : p.delay};
+  });
 }
 function normalizeConnections(data, limit = 50) {
   const list = data && (data.connections || data.active || data.data) || [];
@@ -7173,18 +7912,28 @@ function normalizeConnections(data, limit = 50) {
     };
   });
 }
-function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>null), api('GET','/api/profiles').catch(()=>null)]).then(([stats,profiles]) => { MOCK.profiles = normalizeProfiles(stats, profiles); const liveRefs = new Set(MOCK.profiles.map(profile => profile.server_ref).filter(Boolean)); [...selectedServerRefs].forEach(serverRef => { if (!liveRefs.has(serverRef)) selectedServerRefs.delete(serverRef); }); renderProfiles(MOCK.profiles); renderProfileLoggerProfiles(); }); }
-function loadRouting() { return api('GET','/api/routing').then(d => {
+function loadProfiles() { return Promise.all([api('GET','/api/stats').catch(()=>null), api('GET','/api/profiles').catch(()=>null)]).then(([stats,profiles]) => { MOCK.profiles = overlayAvailabilityEvidence(normalizeProfiles(stats, profiles)); const liveRefs = new Set(MOCK.profiles.map(profile => profile.server_ref).filter(Boolean)); [...selectedServerRefs].forEach(serverRef => { if (!liveRefs.has(serverRef)) selectedServerRefs.delete(serverRef); }); renderProfiles(MOCK.profiles); renderProfileLoggerProfiles(); }); }
+function loadRouting(options = {}) {
+  const serial = ++routingReloadSerial;
+  return api('GET','/api/routing').then(d => {
+  if (serial !== routingReloadSerial) return;
+  if (!options.force && routingEditActive()) {
+    routingReloadDeferred = true;
+    return;
+  }
+  routingReloadDeferred = false;
   MOCK.routing_rules = d.rules || d.routing_rules || [];
   MOCK.routing_servers = Array.isArray(d.servers) ? d.servers : [];
-  renderParovozikServers(parovozikConsistDirty ? [...parovozikSelectedRefs] : MOCK.split_routing?.parovozik_server_refs);
   MOCK.managed_routing_rules = d.managed_rules || [];
   MOCK.geobase_requires_apply = d.geobase_requires_apply === true;
-  MOCK.split_routing = d.settings || d.split_routing || MOCK.split_routing;
-  refreshRoutingTargetSelect(editingRuleIndex !== null ? MOCK.routing_rules[editingRuleIndex]?.target : 'active');
+  const settings = d.settings || d.split_routing;
+  const preserveSettings = routingSettingsEditActive();
+  if (settings && !preserveSettings) MOCK.split_routing = settings;
+  renderParovozikServers(parovozikConsistDirty ? [...parovozikSelectedRefs] : MOCK.split_routing?.parovozik_server_refs);
+  if (!routingRuleDraftDirty && editingRuleIndex === null) refreshRoutingTargetSelect('active');
   renderRoutingRules(MOCK.routing_rules);
   renderRuleChips(d.catalog || []);
-  if (d.settings || d.split_routing) updateRoutingForm(d.settings || d.split_routing);
+  if (settings && !preserveSettings) updateRoutingForm(settings);
   loadFirewallStatus();
   if (d.conflicts && d.conflicts.length) {
     d.conflicts.forEach(c => showToast('warning', c, 5000));
@@ -7419,6 +8168,7 @@ function init() {
   // MUST run before refreshDashboard so selects are enhanced before
   // async API data arrives and updateRoutingForm tries to sync them.
   initCustomSelects();
+  restoreProfileSort();
   document.querySelectorAll('.nav-group-header,.nav-sub-item,.sub-tab,.chip,.star,.cell-edit,.sidebar-collapse-btn,.lang-toggle,.logout-icon-collapsed').forEach(control => {
     if (!control.hasAttribute('tabindex')) control.tabIndex = 0;
     if (!control.hasAttribute('role')) control.setAttribute('role','button');
@@ -7744,7 +8494,7 @@ function loadTrash() {
         <td style="padding:4px 8px">${escapeHtml(e.name)}</td>
         <td style="padding:4px 8px">${e.still_in_profiles ? '✅ в подписке' : '❌ удалён'}</td>
         <td style="padding:4px 8px">${e.promoted_at_unix ? new Date(e.promoted_at_unix * 1000).toLocaleDateString('ru-RU') : '—'}</td>
-        <td style="padding:4px 8px;display:flex;gap:6px;flex-wrap:wrap">${e.profile_id == null ? '' : `<button class="btn" data-bench-scope="single" data-title-ru="Quick Test только этого сервера" data-title-en="Quick Test this server only" title="${attrEscape(t('Quick Test только этого сервера'))}" onclick="quickTestTrash(${e.profile_id})">⚡ Быстрый тест</button>`}<button class="btn" onclick="restoreTrash('${escapeAttr(e.server_ref)}')">↩ Восстановить</button></td>
+        <td style="padding:4px 8px;display:flex;gap:6px;flex-wrap:wrap">${e.profile_id == null ? '' : `<button class="btn" data-bench-scope="single" data-title-ru="Для этого сервера" data-title-en="For this server" title="${attrEscape(t('Для этого сервера'))}" onclick="startServerSearch({profile_ids:[${e.profile_id}],diagnostic:true})">⚡</button>`}<button class="btn" onclick="restoreTrash('${escapeAttr(e.server_ref)}')">↩ Восстановить</button></td>
       </tr>`).join('')}</tbody></table>`;
   }).catch(() => {});
 }
@@ -7753,13 +8503,9 @@ function restoreTrash(serverRef) {
   restoreDeadServers([serverRef]).catch(() => {});
 }
 
-function quickTestTrash(profileId) {
-  startBenchScope({profile_ids:[profileId],method:'quick',test_download:false,test_upload:false}, false);
-}
-
-function quickTestAllTrash() {
+function searchAllTrash() {
   const profile_ids = (window.trashEntries || []).map(entry => entry.profile_id).filter(id => id != null);
-  if (profile_ids.length) startBenchScope({profile_ids,method:'quick',test_download:false,test_upload:false}, true);
+  startServerSearch({profile_ids,diagnostic:true});
 }
 
 function restoreAllTrash() {
@@ -7781,6 +8527,7 @@ function purgeGoneTrash() {
 
 document.addEventListener('DOMContentLoaded', function() {
   initBenchConcurrency();
+  syncServerSearchParameters();
   // Init weekday chips click handlers.
   initDbWeekdayChips();
   // Lazy-load data when user navigates to deep-bench or trash.

@@ -10,6 +10,7 @@ const port = Number(process.env.PLAYWRIGHT_FIXTURE_PORT || 4173);
 
 const fixtureSubscriptionUrl = 'https://provider.example/sub/fixture-token';
 const fixtureSecondSubscriptionUrl = 'https://provider.example/sub/second-token';
+const fixtureServiceTime = Math.floor(Date.now()/1000);
 const profile = {
   id: 101,
   server_ref: 'srv-v2-fixture-subscription',
@@ -135,6 +136,7 @@ const profileDetails = new Map([
   }],
 ]);
 const deadServerRef = 'srv-v2-fixture-dead';
+const deadProfile = { ...manualProfile, id: 202, server_ref: deadServerRef, name: 'Fixture Dead', group: fixtureSubscriptionUrl, dead: true };
 let mihomoFeatures = {
   parameters: {
     unified_delay: true,
@@ -253,6 +255,7 @@ const routing = {
   servers: [
     {
       ref: 'srv-v1-fixture',
+      id: 101,
       name: 'Fixture Profile',
       protocol: 'VLESS',
       address: 'fixture.proxy.test',
@@ -261,12 +264,23 @@ const routing = {
     },
     {
       ref: 'srv-v1-wagon',
+      id: 102,
       name: 'Fixture Wagon',
       protocol: 'VLESS',
       address: 'wagon.proxy.test',
       group: fixtureSubscriptionUrl,
       active: false,
       dead: false,
+    },
+    {
+      ref: 'srv-v1-dead-route',
+      id: 404,
+      name: 'Very long unavailable route target that must remain readable',
+      protocol: 'VLESS',
+      address: 'dead-route.proxy.test',
+      group: 'Archived fixture routes',
+      active: false,
+      dead: true,
     },
   ],
   settings: {
@@ -284,6 +298,14 @@ const routing = {
     ru_direct_exceptions: [],
     auto_vpn_learning_enabled: false,
     auto_vpn_exceptions: [],
+    torrent_socks: {
+      enabled: true,
+      listen: '192.168.1.1',
+      port: 10812,
+      username: 'fixture-torrent',
+      password_set: true,
+      target: 'server:srv-v1-wagon',
+    },
   },
 };
 
@@ -308,21 +330,32 @@ const responses = new Map([
     model: 'Fixture Router',
   }],
   ['/api/memory-guard', { mihomo: { pid: 100, rss_kb: 1024 }, top_processes: [], warnings: [] }],
-  ['/api/stats', { stats: [{ profile_id: profile.id, last_latency_ms: 25, last_service_test_success: false, resource_tests: [
-    { contract_version: 6, id: 'ping_icmp', name: 'ICMP ping', attempts: 1, successes: 1, reachable: true, stable: true, avg_ttfb_ms: 22 },
-    { contract_version: 6, id: 'ping_tcp', name: 'TCP ping', attempts: 1, successes: 1, reachable: true, stable: true, avg_ttfb_ms: 25 },
-    { contract_version: 6, id: 'ping_proxy', name: 'Proxy HTTPS ping', attempts: 1, successes: 1, reachable: true, stable: true, avg_ttfb_ms: 28 },
-    { contract_version: 6, id: 'youtube', name: 'YouTube', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 120 },
-    { contract_version: 6, id: 'telegram', name: 'Telegram', attempts: 1, successes: 0, stable: false, avg_ttfb_ms: 240 },
-    { contract_version: 6, id: 'ai', name: 'AI Studio', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 180 },
+  ['/api/stats', { stats: [{ profile_id: profile.id, server_ref: profile.server_ref, last_checked: fixtureServiceTime, last_service_test_unix: fixtureServiceTime, last_latency_ms: 25, last_service_test_success: false, resource_tests: [
+    { contract_version: 7, id: 'ping_icmp', name: 'ICMP ping', attempts: 1, successes: 1, reachable: true, stable: true, avg_ttfb_ms: 22 },
+    { contract_version: 7, id: 'ping_tcp', name: 'TCP ping', attempts: 1, successes: 1, reachable: true, stable: true, avg_ttfb_ms: 25 },
+    { contract_version: 7, id: 'ping_proxy', name: 'Proxy HTTPS ping', attempts: 1, successes: 1, reachable: true, stable: true, avg_ttfb_ms: 28 },
+    { contract_version: 1, id: 'youtube_thumbnails', name: 'YouTube channel/thumbnails', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 120 },
+    { contract_version: 7, id: 'telegram', name: 'Telegram', attempts: 1, successes: 0, stable: false, avg_ttfb_ms: 240 },
+    { contract_version: 7, id: 'ai', name: 'AI Studio', attempts: 1, successes: 1, stable: true, avg_ttfb_ms: 180 },
   ] }] }],
-  ['/api/profiles', { profiles: [profile, manualProfile, secondSubscriptionProfile] }],
+  ['/api/profiles', { profiles: [profile, manualProfile, secondSubscriptionProfile, deadProfile] }],
   ['/api/routing', routing],
   ['/api/routing/connection-context', { servers: routing.servers }],
   ['/api/routing/preview', { requires_apply: true, core_restart: true, firewall_reload: true, desired_config_sha256: 'desired', applied_config_sha256: 'applied', changes: ['fixture change'], warnings: [] }],
   ['/api/onboarding/status', { ready: true, checks: [] }],
   ['/api/safe-mode', { enabled: false, suppressed: [] }],
   ['/api/memory-estimate', { risk: 'observed-ok', reasons: [] }],
+  ['/api/diagnostics/direct-availability', { ok: true, results: [
+    { id: 'google', name: 'Google', ok: true, status: 204, elapsed_ms: 42 },
+    { id: 'vk', name: 'Vk.ru', ok: true, status: 200, elapsed_ms: 55 },
+    { id: 'ya', name: 'ya.ru', ok: true, status: 200, elapsed_ms: 49 },
+    { id: 'youtube', name: 'YouTube', ok: false, status: 403, elapsed_ms: 61, error: 'HTTP 403' },
+  ] }],
+  ['/api/automation/direct-policy', { enabled: false, devices: [
+    { mac: '02:00:00:00:00:33', ip: '192.168.2.33', name: 'Fixture PC', policy: 'Policy0', selected: false, active: true },
+    { mac: '02:00:00:00:00:44', ip: '0.0.0.0', name: 'Offline PC', policy: 'Policy0', selected: true, active: false },
+  ], last_action: null, error: null }],
+  ['/api/diagnostics/direct-monitor', { ok: false, results: [], bot_configured: false, bot_paired: false, interval_seconds: 300 }],
   ['/api/subscriptions', { subscriptions: [{
     url: fixtureSubscriptionUrl,
     title: 'Fixture VPN',
@@ -367,6 +400,13 @@ const responses = new Map([
 ]);
 
 const requests = [];
+let benchMaxWorkers = 3;
+const initialStats = responses.get('/api/stats');
+const inconclusiveResourceTests = [
+  { contract_version: 1, id: 'youtube_thumbnails', name: 'YouTube channel/thumbnails', attempts: 1, successes: 0, reachable: false, stable: false, inconclusive: true, avg_ttfb_ms: 0, error: 'HTTP 200: LOGIN_REQUIRED; channel page/thumbnails not verified' },
+  { contract_version: 7, id: 'telegram', name: 'Telegram', attempts: 0, successes: 0, stable: false, error: 'skipped after YouTube inconclusive' },
+  { contract_version: 7, id: 'ai', name: 'AI Studio', attempts: 0, successes: 0, stable: false, error: 'skipped after YouTube inconclusive' },
+];
 
 async function readJson(request) {
   const chunks = [];
@@ -407,6 +447,9 @@ const server = http.createServer(async (request, response) => {
 
   if (request.method === 'POST' && url.pathname === '/__fixture/reset') {
     requests.length = 0;
+    routing.rules = [];
+    routing.settings.parovozik_enabled = false;
+    benchMaxWorkers = 3;
     for (const item of [profile, manualProfile]) {
       item.name = initialProfileNames.get(item.id);
       profileDetails.get(item.id).name = item.name;
@@ -418,6 +461,7 @@ const server = http.createServer(async (request, response) => {
       xhttp_tuning: { sc_max_each_post_bytes: '2048', sc_min_posts_interval_ms: null },
     });
     responses.set('/api/bench/status', { running: false, results: [] });
+    responses.set('/api/stats', initialStats);
     profileTestSettings = {
       promote_successful_tested_servers: false,
       auto_move_no_ping_to_dead_servers: false,
@@ -425,6 +469,63 @@ const server = http.createServer(async (request, response) => {
     responses.set('/api/bench/settings', { settings: profileTestSettings });
     profileDiagnostic = { active: null, completed: null, statusPolls: 0 };
     sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/__fixture/bench-memory') {
+    let body;
+    try {
+      body = await readJson(request);
+    } catch {
+      sendJson(response, 400, { error: 'fixture expected valid JSON' });
+      return;
+    }
+    if (!body || Object.keys(body).join(',') !== 'max_workers'
+        || (body.max_workers !== null && (!Number.isInteger(body.max_workers) || body.max_workers < 0 || body.max_workers > 6))) {
+      sendJson(response, 400, { error: 'fixture expected max_workers integer 0..6 or null for unknown memory' });
+      return;
+    }
+    benchMaxWorkers = body.max_workers;
+    sendJson(response, 200, { max_workers: benchMaxWorkers });
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/__fixture/bench-inconclusive') {
+    const serviceTime = Math.floor(Date.now()/1000);
+    const result = { profile_id: manualProfile.id, server_ref: manualProfile.server_ref, timestamp: serviceTime, method: 'search_availability', success: false, latency_ms: 0, resource_tests: inconclusiveResourceTests };
+    const status = {
+      running: false, method: 'availability_quick', total: 2, completed: 2, results: [result],
+      summary: { total: 1, passed: 0, failed: 0, inconclusive: 1, avg_latency_ms: 0 },
+      search: { target_good: 5, required_services: 'youtube', found_good: 0, preflight_completed: 2, preflight_rejected: 1, quick_completed: 1, finish_reason: 'exhausted' },
+      preflight_failures: [{ profile_id: secondSubscriptionProfile.id, phase: 'setup', error: 'Temporary core setup rejected; https://provider.example/sub/<token>' }],
+    };
+    // Canned API outcomes only; no native probe or upstream request is executed.
+    responses.set('/api/bench/status', status);
+    responses.set('/api/stats', { stats: [...initialStats.stats, { profile_id: manualProfile.id, server_ref: manualProfile.server_ref, last_checked: serviceTime, last_service_test_unix: serviceTime, last_service_test_success: false, resource_tests: inconclusiveResourceTests }] });
+    sendJson(response, 200, status);
+    return;
+  }
+
+  if (request.method === 'POST' && url.pathname === '/__fixture/bench-full') {
+    const timestamp = Math.floor(Date.now()/1000);
+    const policy = responses.get('/api/bench/status').service_checks || {required_services:'all',fail_fast:false};
+    const serviceCount = {all:3,youtube:1,telegram:2,ai:3}[policy.required_services];
+    const results = [manualProfile,secondSubscriptionProfile].map((profile,index) => ({
+      profile_id:profile.id,server_ref:profile.server_ref,profile_name:profile.name,timestamp,method:'availability_full',success:index === 0,latency_ms:0,
+      resource_tests:[['youtube_thumbnails',1,'YouTube channel/thumbnails'],['telegram',7,'Telegram'],['ai',7,'AI Studio']].map(([id,contract_version,name],service) => {
+        const requested = service < serviceCount && !(policy.fail_fast && index !== 0 && service > 0);
+        const stable = requested && (index === 0 || service === 1);
+        return {id,contract_version,name,attempts:requested ? 1 : 0,successes:stable ? 1 : 0,stable,inconclusive:false,error:requested ? (stable ? null : 'Fixture service check failed') : 'Fixture service not requested or skipped'};
+      }),
+    }));
+    const status = {running:false,method:'availability_full',total:2,completed:2,search:null,preflight_failures:[],results,
+      summary:{total:2,passed:1,failed:1,inconclusive:0,avg_latency_ms:0}};
+    responses.set('/api/bench/status',status);
+    responses.set('/api/stats',{stats:[...initialStats.stats,...results.map(result => ({
+      profile_id:result.profile_id,server_ref:result.server_ref,last_checked:timestamp,last_service_test_unix:timestamp,
+      last_service_test_success:null,resource_tests:result.resource_tests,
+    }))]});
+    sendJson(response,200,status);
     return;
   }
 
@@ -449,8 +550,30 @@ const server = http.createServer(async (request, response) => {
     }
     requests.push({ method: request.method, path: url.pathname, body });
 
+    if (request.method === 'POST' && url.pathname === '/api/automation/direct-policy') {
+      sendJson(response, 200, { enabled: body?.enabled, selected: body?.devices?.length });
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/diagnostics/direct-monitor') {
+      sendJson(response, 200, { bot_configured:body?.enabled === true, bot_paired:false });
+      return;
+    }
+
     if (request.method === 'POST' && url.pathname === '/api/routing/resource-route') {
       sendJson(response, 200, { ok: true, closed_connections: 1 });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/mihomo-api/connections/close') {
+      sendJson(response, 200, { closed: 1, errors: [] });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/routing/resource-reload') {
+      sendJson(response, 200, {
+        ok: true, resource: body?.resource, target: 'server:srv-v1-dead-route',
+        fallback_active: true, runtime_evaluation: false, applied: true, core_status: 'running', firewall_status: 'running',
+        generation: 1, closed_connections: 1, close_errors: [], gc_warning: null,
+      });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/profile-diagnostics/start') {
@@ -557,8 +680,89 @@ const server = http.createServer(async (request, response) => {
       sendJson(response, 200, { settings: profileTestSettings });
       return;
     }
+    if (request.method === 'POST' && url.pathname === '/api/bench/start') {
+      const search = body?.search ?? undefined;
+      const policy = body?.service_checks ?? undefined;
+      const services = ['all', 'youtube', 'telegram', 'ai'];
+      const allowedKeys = ['method', 'search', 'service_checks', 'concurrency', 'test_download', 'test_upload', 'subscription_url', 'profile_ids'];
+      if (!body || Object.keys(body).some(key => !allowedKeys.includes(key))
+          || !['quick','full','availability_quick','availability_full'].includes(body.method) || body.test_download !== false || body.test_upload !== false
+          || !Number.isInteger(body.concurrency) || body.concurrency < 1 || body.concurrency > 6
+          || (Object.hasOwn(body, 'profile_ids') && (!Array.isArray(body.profile_ids) || !body.profile_ids.length || body.profile_ids.some(id => !Number.isInteger(id) || id < 0)))
+          || (policy !== undefined && (typeof policy !== 'object' || Array.isArray(policy)
+            || Object.keys(policy).sort().join(',') !== 'fail_fast,required_services'
+            || !services.includes(policy.required_services) || typeof policy.fail_fast !== 'boolean'
+            || !['availability_quick','availability_full'].includes(body.method) || search !== undefined))
+          || (search !== undefined && (typeof search !== 'object' || Array.isArray(search)
+            || !['required_services,target_good','fail_fast,required_services,target_good'].includes(Object.keys(search).sort().join(','))
+            || !['quick','availability_quick'].includes(body.method)
+            || !Number.isInteger(search.target_good) || search.target_good < 1 || search.target_good > 20
+            || !services.includes(search.required_services)
+            || (Object.hasOwn(search, 'fail_fast') && typeof search.fail_fast !== 'boolean')
+            || (body.method === 'quick' && search.fail_fast === false)
+            || Object.hasOwn(body, 'profile_ids') || Object.hasOwn(body, 'subscription_url')))
+          || (Object.hasOwn(body, 'subscription_url') && ![fixtureSubscriptionUrl, fixtureSecondSubscriptionUrl].includes(body.subscription_url))
+          || (Object.hasOwn(body, 'subscription_url') && Object.hasOwn(body, 'profile_ids'))) {
+        sendJson(response, 400, { error: 'fixture expected an exact service policy or bounded global discovery request and one candidate scope' });
+        return;
+      }
+      // Only initialize orchestration state; tests supply status, never network results.
+      const total = body.profile_ids?.length || 3;
+      const memoryLimit = Math.min(body.concurrency, benchMaxWorkers ?? 0);
+      const needed = Math.min(body.concurrency, total);
+      if (memoryLimit === 0 || (policy !== undefined && memoryLimit < needed)) {
+        sendJson(response, 503, { error: `Requested ${needed} workers, memory permits ${memoryLimit}; reduce parallelism or free memory` });
+        return;
+      }
+      const effective = Math.min(memoryLimit, total);
+      const admission = Math.min(effective, search?.target_good || effective);
+      const reasons = [];
+      if (memoryLimit < body.concurrency) reasons.push('memory_cap');
+      if (total < body.concurrency) reasons.push('candidate_count');
+      if (admission < effective) reasons.push('target_slots');
+      responses.set('/api/bench/status', {
+        running: true, method: body.method, total, completed: 0, results: [],
+        summary: { total: 0, passed: 0, failed: 0, inconclusive: 0, avg_latency_ms: 0 }, preflight_failures: [],
+        concurrency_status: { requested: body.concurrency, effective, active: Math.min(1, admission), admission_limit: admission, limit_reasons: reasons },
+        service_checks: policy || (['availability_quick','availability_full'].includes(body.method) && !search ? {required_services:'all',fail_fast:body.method === 'availability_quick'} : null),
+        search: search ? { ...search, fail_fast: search.fail_fast ?? true, found_good: 0, preflight_completed: 0, preflight_rejected: 0, quick_completed: 0, finish_reason: null } : null,
+      });
+      sendJson(response, 200, { started: true, requested_concurrency: body.concurrency, concurrency: effective });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/bench/stop') {
+      const status = responses.get('/api/bench/status');
+      responses.set('/api/bench/status', { ...status, running: false, search: status.search ? { ...status.search, finish_reason: 'cancelled' } : null });
+      sendJson(response, 200, { stopped: !!status.running });
+      return;
+    }
     if (request.method === 'POST' && url.pathname === '/api/routing/rules') {
+      routing.rules = Array.isArray(body?.rules) ? body.rules : routing.rules;
       sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/routing/settings') {
+      const torrent = body?.torrent_socks;
+      if (torrent) {
+        const clearCredentials = torrent.clear_credentials === true;
+        routing.settings.torrent_socks = {
+          ...routing.settings.torrent_socks,
+          ...torrent,
+          username: clearCredentials ? '' : (torrent.username ?? routing.settings.torrent_socks.username),
+          password_set: clearCredentials ? false : Boolean(torrent.password) || routing.settings.torrent_socks.password_set,
+        };
+        delete routing.settings.torrent_socks.password;
+        delete routing.settings.torrent_socks.clear_credentials;
+      }
+      Object.entries(body || {}).forEach(([key, value]) => {
+        if (!['apply','torrent_socks'].includes(key)) routing.settings[key] = value;
+      });
+      sendJson(response, 200, { settings: routing.settings, applied: body?.apply === true });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/routing/reset') {
+      routing.settings.torrent_socks = { enabled:false, port:10812, username:'', password_set:false, target:'direct' };
+      sendJson(response, 200, { reset:true, applied:body?.apply === true });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/routing/apply') {
@@ -624,7 +828,10 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/routing/explain') {
-      sendJson(response, 200, { decision: 'active', resource: body?.resource, reason: 'fixture' });
+      sendJson(response, 200, {
+        decision: 'matched', resource: body?.resource, reason: 'fixture',
+        target: body?.resource === 'chatgpt.com' ? 'server:srv-v1-dead-route' : 'active',
+      });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/profiles/update') {

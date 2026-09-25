@@ -61,9 +61,21 @@ struct LoginSourceState {
     blocked_until_unix: u64,
 }
 
+impl LoginSourceState {
+    fn compact(&mut self, now: u64) -> bool {
+        self.failures
+            .retain(|timestamp| now.saturating_sub(*timestamp) <= LOGIN_WINDOW_SECS);
+        if self.blocked_until_unix <= now {
+            self.blocked_until_unix = 0;
+        }
+        self.blocked_until_unix > now || !self.failures.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LoginLimiter {
     sources: HashMap<IpAddr, LoginSourceState>,
+    overflow: LoginSourceState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,13 +94,19 @@ impl LoginLimiter {
     /// The caller must hold the limiter's owning lock for this call.
     pub fn reserve_attempt(&mut self, source: IpAddr, now: u64) -> Result<LoginReservation, u64> {
         self.compact(now);
-        let state = self.sources.entry(source).or_default();
+        let state = if self.sources.contains_key(&source)
+            || (self.sources.len() < MAX_LOGIN_SOURCES
+                && self.overflow.blocked_until_unix <= now
+                && self.overflow.failures.is_empty())
+        {
+            self.sources.entry(source).or_default()
+        } else {
+            // Keep unseen sources together until overflow expires, even if a slot opens.
+            &mut self.overflow
+        };
         if state.blocked_until_unix > now {
             return Err(state.blocked_until_unix - now);
         }
-        state
-            .failures
-            .retain(|timestamp| now.saturating_sub(*timestamp) <= LOGIN_WINDOW_SECS);
         state.failures.push_back(now);
         let retry_after_on_failure = if state.failures.len() >= LOGIN_MAX_FAILURES {
             state.blocked_until_unix = now.saturating_add(LOGIN_BLOCK_SECS);
@@ -104,19 +122,12 @@ impl LoginLimiter {
 
     pub fn record_success(&mut self, source: IpAddr) {
         self.sources.remove(&source);
+        // One successful source must not clear other sources' shared overflow budget.
     }
 
     fn compact(&mut self, now: u64) {
-        self.sources.retain(|_, state| {
-            state.blocked_until_unix > now
-                || state
-                    .failures
-                    .iter()
-                    .any(|timestamp| now.saturating_sub(*timestamp) <= LOGIN_WINDOW_SECS)
-        });
-        if self.sources.len() > MAX_LOGIN_SOURCES {
-            self.sources.clear();
-        }
+        self.sources.retain(|_, state| state.compact(now));
+        self.overflow.compact(now);
     }
 }
 
@@ -338,6 +349,86 @@ mod tests {
             .filter(|admitted| *admitted)
             .count();
         assert_eq!(admitted, LOGIN_MAX_FAILURES);
+    }
+
+    #[test]
+    fn login_limiter_bounds_sources_and_preserves_blocks_under_overflow() {
+        let mut limiter = LoginLimiter::default();
+        let source = |index: usize| IpAddr::V4(Ipv4Addr::from(index as u32));
+        for index in 0..MAX_LOGIN_SOURCES {
+            for _ in 0..LOGIN_MAX_FAILURES {
+                limiter
+                    .reserve_attempt(source(index), 100)
+                    .expect("reserve");
+            }
+        }
+        for index in MAX_LOGIN_SOURCES..MAX_LOGIN_SOURCES + LOGIN_MAX_FAILURES {
+            let reservation = limiter
+                .reserve_attempt(source(index), 100)
+                .expect("overflow");
+            assert_eq!(
+                reservation.retry_after_on_failure(),
+                (index == MAX_LOGIN_SOURCES + LOGIN_MAX_FAILURES - 1).then_some(LOGIN_BLOCK_SECS)
+            );
+            assert_eq!(limiter.sources.len(), MAX_LOGIN_SOURCES);
+        }
+        for index in 0..MAX_LOGIN_SOURCES + LOGIN_MAX_FAILURES + 10 {
+            assert_eq!(
+                limiter.reserve_attempt(source(index), 101),
+                Err(LOGIN_BLOCK_SECS - 1)
+            );
+        }
+        limiter.record_success(source(MAX_LOGIN_SOURCES));
+        limiter.record_success(source(0));
+        assert_eq!(limiter.sources.len(), MAX_LOGIN_SOURCES - 1);
+        assert_eq!(
+            limiter.reserve_attempt(source(0), 101),
+            Err(LOGIN_BLOCK_SECS - 1)
+        );
+        assert_eq!(
+            limiter.reserve_attempt(source(MAX_LOGIN_SOURCES + 20), 101),
+            Err(LOGIN_BLOCK_SECS - 1)
+        );
+        let reservation = limiter
+            .reserve_attempt(source(MAX_LOGIN_SOURCES + 20), 100 + LOGIN_BLOCK_SECS)
+            .expect("expired blocks release capacity");
+        assert_eq!(reservation.retry_after_on_failure(), None);
+        assert_eq!(limiter.sources.len(), 1);
+        assert_eq!(limiter.overflow.blocked_until_unix, 0);
+        assert!(limiter.overflow.failures.is_empty());
+    }
+
+    #[test]
+    fn login_limiter_prunes_expired_failures_and_releases_overflow() {
+        let mut limiter = LoginLimiter::default();
+        for index in 0..MAX_LOGIN_SOURCES {
+            limiter
+                .reserve_attempt(IpAddr::V4(Ipv4Addr::from(index as u32)), 100)
+                .expect("reserve");
+        }
+        let unseen = IpAddr::V4(Ipv4Addr::from(MAX_LOGIN_SOURCES as u32));
+        limiter.reserve_attempt(unseen, 101).expect("overflow");
+        limiter.compact(100 + LOGIN_WINDOW_SECS);
+        assert_eq!(limiter.sources.len(), MAX_LOGIN_SOURCES);
+        limiter.compact(101 + LOGIN_WINDOW_SECS);
+        assert!(limiter.sources.is_empty());
+        assert_eq!(limiter.overflow.failures.len(), 1);
+        limiter.compact(102 + LOGIN_WINDOW_SECS);
+        assert!(limiter.overflow.failures.is_empty());
+        assert_eq!(
+            limiter
+                .reserve_attempt(unseen, 102 + LOGIN_WINDOW_SECS)
+                .expect("released overflow")
+                .retry_after_on_failure(),
+            None
+        );
+        assert!(limiter.sources.contains_key(&unseen));
+
+        limiter
+            .reserve_attempt(unseen, 103 + LOGIN_WINDOW_SECS)
+            .expect("recent attempt");
+        limiter.compact(103 + 2 * LOGIN_WINDOW_SECS);
+        assert_eq!(limiter.sources[&unseen].failures.len(), 1);
     }
 
     #[test]

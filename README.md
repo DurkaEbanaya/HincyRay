@@ -1,4 +1,6 @@
-# HincyRay v1.3.6
+# HincyRay v1.3.28
+
+Local v1.3.28, dated 2026-09-25, shows green/red connection indicators for Keenetic devices in “Zигануть Vсеми руками” and keeps disconnected devices in a collapsed list while preserving MAC selection. Details: [v1.3.28](docs/releases/v1.3.28.md). The versioned GitHub Release artifact has not been published.
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -9,6 +11,10 @@ HincyRay is a lightweight VPN/proxy client for Keenetic routers. It ships a rout
 The daemon uses **Mihomo (Clash.Meta)** as the single proxy core, supporting VLESS (Reality/xhttp), VMess, Trojan, Shadowsocks, ShadowsocksR, Snell, HTTP, SOCKS, AnyTLS, Hysteria v1/v2 (port hopping), WireGuard, TUIC, SSH, MASQUE, OpenVPN, and Tailscale. Transparent proxying via iptables NAT REDIRECT (TCP) + TPROXY (UDP) — no tun2socks, no TUN device.
 
 ## How it works
+
+v1.3.12 is a verified, deployed local correction: explicit **Check Services** actions attempt YouTube, Telegram, and AI Studio for the chosen scope instead of inheriting global Find N/short-circuit settings. All final gates passed (674 Rust / 88 browser tests / 131 frontend routes). A real complete-service test passed all three on active profile 88; read-only live Chromium confirmed its green indicators and profile 431's existing red results. [YouTube previews](docs/youtube-availability.md) remain contract 1, not video playback or Mihomo health.
+
+Final artifact, rollback, router E2E, service smoke, and live UI evidence are in [the v1.3.12 record](docs/releases/v1.3.12.md). Historical v1.3.7-v1.3.11 evidence remains unchanged. GitHub publication remains pending and unauthorized; no v1.3.12 asset availability is claimed. `HINCYRAY_BIN_PATH` remains the offline artifact path.
 
 ```
 Device on Keenetic "HincyRay" policy
@@ -42,6 +48,110 @@ Devices not assigned to the policy keep their normal route — no interference w
 Keenetic's `ndm` daemon recreates all iptables chains on config changes, WAN events, and DHCP renewals. HincyRay installs a hook script at `/opt/etc/ndm/netfilter.d/hincyray.sh` that **ndm itself calls** after every firewall reload, reinstalling all rules atomically. A 10-second watchdog acts as a safety net.
 
 ## Features
+
+### v1.3.24
+
+The status cards include a Direct availability check. It runs bounded direct requests, without SOCKS or HTTP proxy, to Google, VK, ya.ru, and YouTube in parallel and shows each result independently.
+
+### v1.3.23
+
+Results ordering is the initial profile-table view. The chosen order, including Import order when explicitly selected, persists across page reloads. An accepted subscription Check Services start selects and saves Results order, so returning to the page shows the expected ranking without another click.
+
+### v1.3.22
+
+An accepted subscription Check Services run selects Results order. Within each subscription, profiles with more passed YouTube preview, Telegram, and AI checks appear first; ties use fresh ping, while untested/stale and unreachable entries remain distinct at the end. The Ping cell in this mode shows the same fresh measurement used for sorting.
+
+### v1.3.21
+
+Torrent SOCKS5 flows are labeled in both connection tables. Changing the Torrent SOCKS5 target reconnects only its inbound connections; changing applied general routing rules reconnects existing connections so they pick up the new route. A partial reconnect is reported instead of silently claiming success.
+
+### v1.3.20
+
+Torrent SOCKS5 now shows a live password byte count and explains that an empty New password field preserves only an already configured password. Invalid first-time and too-short passwords are rejected in the browser before applying unrelated routing settings.
+
+### v1.3.19
+
+Torrent SOCKS5 can be enabled while Web UI authentication is disabled, and panel authentication can be disabled without stopping an existing authenticated Torrent SOCKS5 listener. The separate SOCKS5 credentials remain required.
+
+### v1.3.18
+
+Server-target pickers in routing rules, connections, and Torrent SOCKS open as a centered searchable dialog. Refreshes defer while routing edits or dialogs are active, rule removal has a visible Undo action, and disabled Parovozik rules are hidden. The wagon list starts collapsed. The Steam memory incident and the limits of current evidence are recorded separately in the release note; no automatic memory recovery is enabled.
+
+### v1.3.17
+
+Torrent clients can use a dedicated authenticated SOCKS5 listener whose identity is routed independently of domains, ports, or encrypted BitTorrent payloads. TCP and client-supported SOCKS5 UDP share one listener in the existing Mihomo process; target changes do not require changing the client. Credentials are never returned by the API or config preview, and listener/state lifecycle changes are validated and rolled back transactionally.
+
+### v1.3.16
+
+The canonical `proxy` dataplane is now a selector over `proxy-active` and `REJECT`; a hidden isolated sensor measures the active VPN without directly changing routing. The watchdog counts only fresh URL-specific samples, uses three-failure/two-success hysteresis, preserves fail-closed state across reloads, restarts, updates, and rollback, and isolates slower pinned/Parovozik health namespaces. This prevents a saturated pinned transfer from turning one delayed 3-second probe into an immediate cross-VPN outage.
+
+### v1.3.15
+
+The canonical active, pinned-server, exact-current-server, and Parovozik VPN groups put `REJECT` first. Mihomo skips it while a VPN member is healthy, but its all-unhealthy first-member behavior now rejects locally instead of falling through to WAN or repeatedly dialing a dead upstream. Delay diagnostics test the raw active outbound rather than poisoning aggregate group state, and the UI renders rejected chains and unknown health conservatively.
+
+### v1.3.14
+
+Routing target selection now uses one wide searchable grouped picker for new and existing rules and connection actions. Entries show profile IDs, long names without clipping, and Dead Servers/fallback state. Connection polling pauses while the picker is open.
+
+The typed resource-reload action serializes configuration mutation, applies desired routing, then closes matching Mihomo connections by sniffed host or destination IP with source, port, and network qualifiers. Closure is bounded and errors are redacted. GeoIP, GeoSite, and rule-set decisions remain Mihomo runtime decisions instead of being presented as a definite target. Persistence failures roll memory back, and device-route apply ensures the core is running before transparent routing is enabled.
+
+### v1.3.13
+
+Ordinary actions send `availability_full` with optional strict `service_checks`: ordered `youtube` (YT), `telegram` (YT+TG), or `ai`/`all` (YT+TG+AI), plus boolean `fail_fast`. Shared GUI choices apply across all scopes; All and fail-fast are selectable in ordinary and advanced modes. Missing/null policy retains shipped full/all defaults. Ordinary checks have no `search` or discovery preflight; only the separate explicit advanced global Find N action has a candidate target.
+
+Explicit ordinary policy admits exactly `min(requested workers, candidates)` or rejects with HTTP 503 before reservation, preserving an existing job rather than silently reducing workers. The unchanged 80 MiB reserve + 48 MiB/worker estimate requires 272 MiB available for four; unknown/zero budgets reject. Legacy/adaptive caps and remaining-target bounds remain. Contract-1 thumbnail probes no longer wait for the native YouTube mutex: each worker owns private core/config/captures and bounded decoding with cancellation guards. Native contract-7 playback and the shared Telegram SQLite session remain serialized. Four actual concurrent successful router transfers are not yet proven; no native video, new authentication/runtime, generic health, or automatic lifecycle action is added.
+
+The live four-candidate request was rejected before reservation with memory permitting three; the existing idle job was preserved. A subsequent ordinary `availability_full` request for `[88]`, concurrency four, and explicit YT/no-fail-fast policy admitted exactly one for one candidate (not memory-reduced four-candidate work), with no search/preflight. Contract-1 previews passed once; TG/AI were unrequested, not false-green passes. Durable lifecycle and desired routing/settings projections stayed unchanged, allowing expected cache/stats/traffic updates. Separate real desktop/mobile DOM confirmed enabled All/fail-fast controls, green/current YT and gray/skipped TG/AI on 88, and closed technical details without sidebar clutter, mobile overflow, or JS errors. Intercepted single/global builders received mock 503 without forwarding mutations; v1.3.13 All/TG/AI positives and dynamic fail-fast sequences remain unverified. Older full-service/live UI evidence below is historical.
+
+### v1.3.12
+
+All/global, subscription, group, single-profile, favorite, selected, and explicit Dead Servers lightning actions consistently mean **Check Services**. They send `availability_full` without `search`, attempt all three services, and bypass the generic discovery preflight. Persisted global target 5, Find N prefix, or fail-fast settings cannot silently change an explicit diagnostic. Find N is a separate opt-in advanced global action with collapsed parameters. Technical explanations live outside the sidebar in collapsed Profiles details; sidebar activity shows only name/count, Stop, and animation. Actual passes/failures show green/red, unknown stays amber, and gray means stale/no-attempt/skipped. Native contract-7/contract-6 history is not converted into thumbnail success.
+
+The minimal Trash lookup fix canonicalizes profiles once, preserving first-alias and legacy-orphan behavior; the live 519-entry response now succeeds within a five-second request budget. Active profile 88 passed real channel/three-preview, authorized Telegram media, and AI region checks with matching public service timestamp/ref. Read-only live Chromium verified green/red states, collapsed details, no mobile overflow, and no JavaScript errors; it did not click a lightning action, so scope request transport is fixture coverage, not live-click evidence.
+
+The prior direct full test of Obhod 10 primary 431 (old connection aliases 93/100) failed all three services. Its healthy pinned group selects active-88 fallback, not a repaired primary; provider/protocol/network cause remains unproven. The old Find N single-click did not test YouTube. No native video pass, automatic quality/Dead Servers/AutoSelect action, quantitative speedup, or full-state byte isolation is claimed. Details: [check semantics](docs/youtube-availability.md), [`CHANGELOG.md`](CHANGELOG.md), and [`docs/releases/v1.3.12.md`](docs/releases/v1.3.12.md).
+
+### v1.3.11
+
+Restores subscription/group header lightning actions for the whole selected scope and their table presentation. Every profile has fixed neutral YT/TG/AI indicators with explicit not-tested, stale, skipped, or current state. Fresh completed results overlay safely after profile loading only when canonical lifecycle-v2 ref and exact ID match; service freshness uses public `last_service_test_unix`, not generic health activity. Status exposes canonical `server_ref`, never private raw identity.
+
+Preflight diagnostics preserve HTTP/curl errors and append fixed-category upstream deadline evidence from a private, bounded 64 KiB warning-log tail, without raw core addresses. TLS EOF before service testing is not "YouTube bad": 335 rejected preflights mean services were untested, not 335 proven false failures or dead servers. Sampled transport deadlines and an established TCP socket do not prove the credentials/server/network cause; a fresh reparse of profile 93 generated byte-identical config, with no observed persisted-field loss. Protocol, SNI, certificate verification, and timeouts are not changed without proof.
+
+Complete scope retains per-candidate Quick YouTube/Telegram short-circuit or Full continued checking; Find N retains preflight, history ordering, and goals. Contract-1 previews remain weaker evidence without native promotion, automatic Dead Servers, AutoSelect, or generic health updates; native contract-7 API/history stay separate. Live profile 93 preserved TLS EOF and added `[deadline_exceeded]` without testing YouTube; the final active-profile-88 smoke reached target 1 with three decoded previews, matching canonical ref and public service timestamp. Lifecycle/order/dead and routing intent stayed unchanged. Browser overlay behavior passed fixture tests; actual live DOM was not exercised. See [semantics](docs/youtube-availability.md), [`CHANGELOG.md`](CHANGELOG.md), and [`docs/releases/v1.3.11.md`](docs/releases/v1.3.11.md). No quantitative speedup or playback repair is claimed.
+
+### v1.3.10
+
+All user-facing search scopes use **YouTube channel and previews**: validate the public MrBeast channel and successfully fetch/decode previews for three distinct videos. The new `availability_quick`/`availability_full` methods and `search_availability` results use `youtube_thumbnails` contract 1. Shared completion/failure policies and Find N prefixes remain available; search offers no alternate YouTube verification method.
+
+This check makes no Innertube request, video download, cookie/session import, JavaScript execution, or authentication workaround. Preview success proves only page/image access, not playback or account access. Native contract-7 `quick`/`full` API/history remain separate for concrete shipped/persisted compatibility. Availability stores resource diagnostics, not generic EWMA health or native overall success, and never triggers native promotion, automatic Dead Servers movement, or AutoSelect.
+
+All final-version gates passed (668 Rust / 67 browser tests / 131 UI routes); the hash-verified deployment passed router E2E. A live target-1 search on active profile 88 confirmed the MrBeast channel and three distinct decoded previews, reached the target without cancellation, and preserved active identity, order, and Dead Servers projections. Resources, search bookkeeping, and background traffic accounting may change; no full-state byte isolation, quantitative speedup, or traffic-cost comparison is claimed. See [bounds and evidence](docs/youtube-availability.md), [`CHANGELOG.md`](CHANGELOG.md), and [`docs/releases/v1.3.10.md`](docs/releases/v1.3.10.md).
+
+### v1.3.9
+
+v1.3.9 changes adaptive preflight to accept any completed HTTPS response with HTTP status 200-599 as transport reachability, retrying once on an alternate domain through the same isolated Mihomo core. This is not a YouTube pass. Private core files survive until child reap; status keeps at most 20 preflight diagnostics with redacted errors bounded to 2 KiB, without health/Dead Servers penalties.
+
+The native YouTube probe uses direct VISIONOS Innertube without mandatory web watch/bootstrap or a JavaScript runtime. Only a successful video-MIME media transfer of at least 16 KiB can pass. Bot/login refusal, HTTP 429, and client-compatibility refusals are **inconclusive**: the UI shows amber/unknown, summaries do not turn unknown or stale legacy evidence into failure or success, and unknown evidence cannot drive promotion, Dead Servers, or AutoSelect. Unknown history stays unknown; native resource contract 7 makes contract-6 evidence stale, while the defaulted `inconclusive` field tolerates old saves.
+
+Linux core spawning now uses a persistent bounded owner thread so HTTP-thread exit cannot trigger Mihomo's `PDEATHSIG`; daemon-death cleanup and actual child ownership remain intact. All required gates passed (649 Rust / 66 browser tests / 131 UI routes), and the hash-verified deployment passed router E2E. Live diagnostics kept bot refusal unknown, found no good server, and preserved active identity, order, and Dead Servers. Authorized manual clock correction did not resolve the bot refusal or the other candidate's TLS EOF. NTP was initially unsynchronized, then independently verified twice as accurate/synchronized via `pool.ntp.org` at 17:34 UTC, within one second of the host; reboot persistence remains unverified.
+
+No anonymous media bytes, playback fix, blanket false-rejection result, or quantitative speedup is claimed. No cookie/session import, authentication workaround, captcha, JavaScript, or yt-dlp runtime is added. Details: [probe semantics](docs/adaptive-discovery.md), [`CHANGELOG.md`](CHANGELOG.md), and [`docs/releases/v1.3.9.md`](docs/releases/v1.3.9.md). `HINCYRAY_BIN_PATH` matches the offline artifact workflow; GitHub publication and future asset availability remain pending and unauthorized.
+
+### v1.3.8
+
+v1.3.8 unifies global, selected, subscription, group, and single-profile testing behind one action and browser-stored parameters. **Complete scope** uses all native service checks with either YouTube/Telegram failure short-circuiting (existing Quick internally) or continued checking (existing Full internally). **Find N** uses a target of 1-20 and a supported YouTube, YouTube+Telegram, or YouTube+Telegram+AI Studio prefix. Unsupported combinations are not offered; explicit Dead Servers diagnostics always complete their scope.
+
+The scheduler now waits for temporary target slots instead of permanently retiring workers. Status distinguishes requested workers, effective workers, active work, and the admission limit, with memory, candidate-count, and target-slot reasons. Startup admission estimates an 80 MiB router reserve and 48 MiB per worker; an unknown budget or a known budget permitting zero workers returns HTTP 503. This is not a continuous memory-reserve guarantee. YouTube and Telegram remain serialized: requesting four workers does not mean four concurrent YouTube checks.
+
+All required gates passed: 625 Rust tests, 63 browser tests, and a frontend contract covering 131 routes. The hash-verified artifact is deployed with core/firewall running and router E2E passed. Controlled three-candidate YouTube searches observed peak active work of three for target 3 and one for target 1, without changing active identity, profile order, or Dead Servers membership. These observations are not parallel YouTube checks or a quantified speedup.
+
+Details and runtime coverage limits: [unified search and discovery](docs/adaptive-discovery.md), [`CHANGELOG.md`](CHANGELOG.md), and [`docs/releases/v1.3.8.md`](docs/releases/v1.3.8.md). GitHub publication is pending; no v1.3.8 download availability is claimed. The installer version matches the verified local artifact; `HINCYRAY_BIN_PATH` remains the offline installation path.
+
+### v1.3.7
+
+v1.3.7 adds **Find Servers** for all live profiles, a selection, or one subscription, with a target of 1-20 and YouTube, YouTube+Telegram, or YouTube+Telegram+AI Studio requirements. Fresh service history affects ordering only; every counted server is measured again. Canonical aliases count once, and endpoint/provenance diversification plus rotating exploration broadens coverage. Preflight rejection is not health or Dead Servers evidence, and discovery never activates, promotes, or moves profiles.
+
+This version also preserves login blocks on throttle-table overflow, treats unavailable or malformed Mihomo controller observations as inconclusive without health penalties or failover, redacts benchmark status and safely remaps result identities, and prevents delayed navigation focus from stealing focus from an input. Details: [adaptive discovery](docs/adaptive-discovery.md), [`CHANGELOG.md`](CHANGELOG.md), and [`docs/releases/v1.3.7.md`](docs/releases/v1.3.7.md). Verified local artifact, gates, and router deployment evidence are recorded there; GitHub publication remains pending.
 
 ### v1.3.6
 
@@ -403,12 +513,13 @@ cargo clippy --all-targets --no-default-features --bin hincyray -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 python3 scripts/frontend-contract-test.py
+python3 scripts/installer-lifecycle-contract-test.py
 npm ci
 npm run test:browser
 git diff --check
 ```
 
-The Playwright command runs the fixture-backed browser smoke suite. Current v1.3.6 release evidence is recorded in [`docs/releases/v1.3.6.md`](docs/releases/v1.3.6.md).
+The Playwright command runs the fixture-backed browser smoke suite. All final v1.3.13 gates passed (685 Rust / 92 browser tests / 131 routes), separately from pre-version development evidence; artifact/deployment, router E2E, live HTTP 503 preservation, and single-profile YT-only smoke are in [`docs/releases/v1.3.13.md`](docs/releases/v1.3.13.md). Separate deployed-page DOM and intercepted builder evidence is recorded there, not treated as accepted backend starts. Passed v1.3.12 gates (674 Rust / 88 browser tests / 131 frontend routes), artifact/deployment, full-service smoke, and read-only live UI remain unchanged in [`docs/releases/v1.3.12.md`](docs/releases/v1.3.12.md).
 
 ## Installation
 

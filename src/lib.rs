@@ -1,6 +1,7 @@
 // Shared modules: available in every build, including the lightweight
 // `hincyray` router daemon built with `--no-default-features`.
 pub mod benchmark;
+pub mod direct_monitor;
 pub mod geobase;
 pub mod hincyray;
 pub mod hincyray_api;
@@ -9,6 +10,7 @@ pub mod hincyray_routing;
 pub mod hincyray_security;
 pub mod hincyray_webui;
 pub mod mihomo_config;
+pub mod policy_automation;
 pub mod profiles;
 pub mod telegram_probe;
 pub mod xray_config;

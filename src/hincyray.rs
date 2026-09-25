@@ -37,35 +37,38 @@ use qrcode::{QrCode, render::svg};
 use tempfile::NamedTempFile;
 
 use crate::benchmark::{
-    BenchCompleteCallback, BenchJob, BenchMethod, BenchResult, DEFAULT_DOWNLOAD_URL,
-    DEFAULT_PROBE_URL, DEFAULT_UPLOAD_URL, MAX_DEEP_BENCH_STABILITY_MINUTES,
+    AdaptiveSearchOptions, BenchCompleteCallback, BenchJob, BenchMethod, BenchResult,
+    DEFAULT_DOWNLOAD_URL, DEFAULT_PROBE_URL, DEFAULT_UPLOAD_URL, MAX_DEEP_BENCH_STABILITY_MINUTES,
     MIN_DEEP_BENCH_STABILITY_MINUTES, QUICK_RESOURCE_CONTRACT_VERSION, QuickProbeConfig,
-    ResourceTestResult, SharedJob, new_bench_job, probe_youtube_via_socks, run_bench,
+    ResourceTestResult, SearchProgress, SharedJob, new_bench_job, probe_youtube_via_socks,
+    run_bench,
 };
+use crate::direct_monitor::DirectMonitor;
 use crate::geobase::{
     self, Classification, DomainClassification, GeoBaseArtifactKind, GeoBaseGenerationInput,
     GeoBaseListMetadata, GeoBaseSource, GeoBaseSourceKind, GeoBaseStatus, GeoBaseStore,
     GeoBaseUpsertRequest, StaticRouteEntry,
 };
 use crate::hincyray_api::{
-    ActiveProfileApplyStatusResponse, ApiContractDescriptor, ConnectionPageResponse,
-    ConnectionQueryRequest, DeviceTrafficRequest, DeviceTrafficResponse, DeviceTrafficSummary,
-    MemoryEstimateResponse, MihomoDnsParameters, MihomoExperimentalParameters,
-    MihomoExternalControllerRuntime, MihomoParameters, MihomoParametersResponse,
-    MihomoParametersRuntime, MihomoParametersUpdateRequest, MihomoPerProxyParameters,
-    MihomoSnifferParameters, OnboardingStatusResponse, ProfileDetail, ProfileDetailResponse,
-    ProfileDiagnosticConnection, ProfileDiagnosticDiscardRequest, ProfileDiagnosticDiscardResponse,
-    ProfileDiagnosticEnvironment, ProfileDiagnosticEvent, ProfileDiagnosticLatestStats,
-    ProfileDiagnosticMemory, ProfileDiagnosticProfile, ProfileDiagnosticReport,
-    ProfileDiagnosticReportResponse, ProfileDiagnosticServiceResult,
+    ActiveProfileApplyStatusResponse, ApiContractDescriptor, BenchStatusResult,
+    ConnectionPageResponse, ConnectionQueryRequest, DeviceTrafficRequest, DeviceTrafficResponse,
+    DeviceTrafficSummary, MemoryEstimateResponse, MihomoDnsParameters,
+    MihomoExperimentalParameters, MihomoExternalControllerRuntime, MihomoParameters,
+    MihomoParametersResponse, MihomoParametersRuntime, MihomoParametersUpdateRequest,
+    MihomoPerProxyParameters, MihomoSnifferParameters, OnboardingStatusResponse, ProfileDetail,
+    ProfileDetailResponse, ProfileDiagnosticConnection, ProfileDiagnosticDiscardRequest,
+    ProfileDiagnosticDiscardResponse, ProfileDiagnosticEnvironment, ProfileDiagnosticEvent,
+    ProfileDiagnosticLatestStats, ProfileDiagnosticMemory, ProfileDiagnosticProfile,
+    ProfileDiagnosticReport, ProfileDiagnosticReportResponse, ProfileDiagnosticServiceResult,
     ProfileDiagnosticSessionRequest, ProfileDiagnosticSessionStatus, ProfileDiagnosticStartRequest,
     ProfileDiagnosticStartResponse, ProfileDiagnosticStatusResponse, ProfileDiagnosticSummary,
     ProfileRevalidationError, ProfileSafeFields, ProfileTestSettings, ProfileTestSettingsResponse,
     ProfileTestSettingsUpdateRequest, ProfileUpdateRequest, ProfileUpdateResponse,
     ProfilesRevalidateResponse, ReadinessCheck, RoutingConnectionContextResponse,
-    RoutingPreviewDiff, RoutingPreviewResponse, RoutingServerSummary, RoutingSummaryResponse,
-    SafeModeRequest, SafeModeResponse, SubscriptionMoveRequest, SubscriptionMoveResponse,
-    XhttpTuning, api_endpoint_contracts, openapi_document,
+    RoutingPreviewDiff, RoutingPreviewResponse, RoutingResourceReloadRequest,
+    RoutingResourceReloadResponse, RoutingServerSummary, RoutingSummaryResponse, SafeModeRequest,
+    SafeModeResponse, SubscriptionMoveRequest, SubscriptionMoveResponse,
+    TorrentSocksSettingsUpdate, XhttpTuning, api_endpoint_contracts, openapi_document,
 };
 use crate::hincyray_mihomo_api::{
     MAX_DIAGNOSTIC_CONNECTIONS_JSON_BYTES, mihomo_api_delay, mihomo_api_delete, mihomo_api_get,
@@ -87,9 +90,9 @@ use crate::hincyray_security::{
 };
 use crate::hincyray_webui::index_html;
 use crate::mihomo_config::{
-    DIRECT_NAME, MihomoFeatures, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME, PROXY_NAME,
-    PinnedServerRoute, REJECT_NAME, build_mihomo_config, build_mihomo_router_config,
-    read_xhttp_tuning, update_xhttp_tuning,
+    DIRECT_NAME, MihomoFeatures, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME, PROXY_HEALTH_NAME,
+    PROXY_NAME, PinnedServerRoute, REJECT_NAME, TORRENT_SOCKS_LISTENER, build_mihomo_config,
+    build_mihomo_router_config, main_fallback_health_url, read_xhttp_tuning, update_xhttp_tuning,
 };
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionMetadata, SubscriptionSource,
@@ -101,7 +104,8 @@ use crate::telegram_probe::{
     revoke_and_delete as telegram_revoke_and_delete, save_config as save_telegram_config,
 };
 use crate::xray_config::{
-    DNS_INBOUND_PORT, DnsSettings, PortMode, QuicMode, RouterExtra, XrayRouteRule,
+    DNS_INBOUND_PORT, DnsSettings, PortMode, QuicMode, RouterExtra, TorrentSocksInbound,
+    XrayRouteRule,
 };
 use crate::xray_config::{GeoBaseRuleBehavior, GeoBaseRuleProvider, GeoBaseRuleTarget};
 
@@ -173,6 +177,10 @@ const PAROVOZIK_VPN_FILE: &str = "parovozik-vpn.txt";
 
 /// Global shutdown flag set by the SIGTERM/SIGINT handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn shutting_down() -> bool {
+    SHUTDOWN.load(Ordering::Acquire)
+}
 static ACTIVE_LARGE_HTTP_BODIES: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_DNS_RESOLVERS: AtomicUsize = AtomicUsize::new(0);
 static LOG_ROTATION_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -329,6 +337,7 @@ pub fn run() -> Result<(), String> {
 
     // Start watchdog on router targets.
     let watchdog_handle = start_watchdog(daemon.clone(), mihomo_log_path, mihomo_log_cursor)?;
+    let direct_monitor_handle = daemon.direct_monitor.start()?;
 
     let listener = TcpListener::bind(&listen).map_err(|error| format!("bind {listen}: {error}"))?;
     listener
@@ -384,6 +393,7 @@ pub fn run() -> Result<(), String> {
 
     eprintln!("hincyray: shutting down...");
     cancel_and_join_bench_workers(&daemon);
+    join_watchdog_bounded(direct_monitor_handle);
     join_watchdog_bounded(watchdog_handle);
     cancel_and_join_profile_diagnostics(&daemon);
     // Reap Mihomo after the bounded diagnostic worker has stopped so its final
@@ -532,6 +542,7 @@ pub struct Daemon {
     profile_diagnostic_join: Arc<Mutex<()>>,
     geoip_cache: Arc<Mutex<Option<GeoIpCacheEntry>>>,
     password_work: Arc<PasswordWorkLimiter>,
+    direct_monitor: Arc<DirectMonitor>,
     state_path: PathBuf,
     mihomo_config_path: PathBuf,
     geobase_store_root: PathBuf,
@@ -583,6 +594,10 @@ struct DaemonInner {
     /// Reset to 0 on success. When it reaches the threshold (3), the
     /// watchdog triggers a failover to the next-best profile.
     failover_fail_count: u32,
+    failover_recovery_count: u32,
+    failover_health_sample: Option<String>,
+    failover_health_identity: Option<(u64, String)>,
+    proxy_rejected: bool,
     /// v0.6.1: previous `/proc/stat` aggregate sample for CPU usage
     /// delta computation. `None` on first call → usage returns 0%.
     prev_cpu: Option<CpuTimes>,
@@ -1118,6 +1133,9 @@ pub struct HincyrayState {
     /// Full profile test.
     #[serde(default)]
     pub profile_test_settings: ProfileTestSettings,
+    /// Bounded rotating exploration position; preflight failures are not health/dead evidence.
+    #[serde(default)]
+    pub profile_search_cursor: u64,
     /// Opaque canonical server references assigned to the virtual
     /// "Dead Servers" lifecycle group. Profile provenance remains in
     /// `Profile.group`; lifecycle membership survives subscription refresh,
@@ -1179,6 +1197,7 @@ impl Default for HincyrayState {
             safe_mode_enabled: false,
             deep_bench: DeepBenchSettings::default(),
             profile_test_settings: ProfileTestSettings::default(),
+            profile_search_cursor: 0,
             dead_server_refs: std::collections::HashSet::new(),
             dead_promoted_at: std::collections::HashMap::new(),
             quality_history: Vec::new(),
@@ -1595,7 +1614,7 @@ pub struct DeviceRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
     /// "direct", "active", "best", "reject", or "server:<ref>".
-    #[serde(default = "default_routing_target")]
+    #[serde(default = "default_torrent_routing_target")]
     pub target: String,
 }
 
@@ -1765,6 +1784,8 @@ pub struct ProfileStats {
     #[serde(default)]
     pub last_checked_unix: u64,
     #[serde(default)]
+    pub last_service_test_unix: u64,
+    #[serde(default)]
     pub resource_tests: Vec<ResourceTestResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_service_test_success: Option<bool>,
@@ -1794,6 +1815,49 @@ pub struct ProfileStats {
 /// Keenetic "HincyRay" policy is transparent-proxied via iptables NAT
 /// REDIRECT (TCP) + mangle TPROXY (UDP) to Mihomo's redirect/tproxy
 /// listeners. Direct SOCKS clients keep using the active server.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TorrentSocksSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_torrent_socks_listen")]
+    pub listen: String,
+    #[serde(default = "default_torrent_socks_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_routing_target")]
+    pub target: String,
+}
+
+impl Default for TorrentSocksSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_torrent_socks_listen(),
+            port: default_torrent_socks_port(),
+            username: String::new(),
+            password: String::new(),
+            target: default_torrent_routing_target(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TorrentSocksSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TorrentSocksSettings")
+            .field("enabled", &self.enabled)
+            .field("listen", &self.listen)
+            .field("port", &self.port)
+            .field("username", &"<redacted>")
+            .field("password", &"<redacted>")
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SplitRoutingSettings {
     #[serde(default)]
@@ -1876,6 +1940,9 @@ pub struct SplitRoutingSettings {
     /// Empty string (old state) is migrated in `load_state()`.
     #[serde(default)]
     pub match_target: String,
+    /// Dedicated authenticated SOCKS5 inbound for a cooperating torrent client.
+    #[serde(default)]
+    pub torrent_socks: TorrentSocksSettings,
 }
 
 impl Default for SplitRoutingSettings {
@@ -1907,6 +1974,7 @@ impl Default for SplitRoutingSettings {
             parovozik_server_refs: Vec::new(),
             parovozik_last_checked_unix: HashMap::new(),
             match_target: String::new(),
+            torrent_socks: TorrentSocksSettings::default(),
         }
     }
 }
@@ -1936,6 +2004,14 @@ fn split_routing_settings_response(settings: &SplitRoutingSettings) -> Value {
         "parovozik_vpn_domains": settings.parovozik_vpn_domains,
         "parovozik_server_refs": settings.parovozik_server_refs,
         "match_target": settings.match_target,
+        "torrent_socks": {
+            "enabled": settings.torrent_socks.enabled,
+            "listen": settings.torrent_socks.listen,
+            "port": settings.torrent_socks.port,
+            "username": settings.torrent_socks.username,
+            "password_set": !settings.torrent_socks.password.is_empty(),
+            "target": settings.torrent_socks.target,
+        },
     })
 }
 
@@ -1949,6 +2025,18 @@ fn default_vpn_subnet() -> String {
 
 fn default_redirect_port() -> u16 {
     10810
+}
+
+fn default_torrent_socks_port() -> u16 {
+    10812
+}
+
+fn default_torrent_socks_listen() -> String {
+    "127.0.0.1".to_owned()
+}
+
+fn default_torrent_routing_target() -> String {
+    "direct".to_owned()
 }
 
 fn default_policy_name() -> String {
@@ -2006,6 +2094,8 @@ fn default_routing_target() -> String {
 }
 
 const MAX_PINNED_SERVERS: usize = 16;
+const MAX_RESOURCE_CONNECTION_CLOSES: usize = 20;
+const MAX_TORRENT_CONNECTION_CLOSES: usize = 128;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct ServerRouteRegistryEntry {
@@ -2258,6 +2348,9 @@ fn sync_server_route_registry(state: &mut HincyrayState) {
                 .iter()
                 .map(|route| route.target.as_str()),
         )
+        .chain(std::iter::once(
+            state.split_routing.torrent_socks.target.as_str(),
+        ))
         .filter_map(|target| match RoutingTarget::parse(target).ok()? {
             RoutingTarget::Server(server_ref) => Some(server_ref),
             _ => None,
@@ -2410,6 +2503,7 @@ impl Daemon {
             .unwrap_or_else(|| Path::new("."))
             .join("geobases");
         let geobase_store = GeoBaseStore::new(&geobase_store_root);
+        let direct_monitor = DirectMonitor::new(&state_path, state.socks_port);
         Self {
             inner: Arc::new(Mutex::new(DaemonInner {
                 state,
@@ -2418,6 +2512,10 @@ impl Daemon {
                 bench: BenchRuntime::new(),
                 dirty: false,
                 failover_fail_count: 0,
+                failover_recovery_count: 0,
+                failover_health_sample: None,
+                failover_health_identity: None,
+                proxy_rejected: false,
                 prev_cpu: None,
                 prev_cpu_per_core: Vec::new(),
                 sessions: HashMap::new(),
@@ -2437,6 +2535,7 @@ impl Daemon {
             profile_diagnostic_join: Arc::new(Mutex::new(())),
             geoip_cache: Arc::new(Mutex::new(None)),
             password_work: Arc::new(PasswordWorkLimiter::new(MAX_CONCURRENT_PASSWORD_OPS)),
+            direct_monitor,
             state_path,
             mihomo_config_path,
             geobase_store_root,
@@ -2489,6 +2588,52 @@ fn daemon_mihomo_controller(
 /// approach.
 struct CoreManager {
     child: Option<Child>,
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_core_on_persistent_thread(command: Command) -> std::io::Result<Child> {
+    struct SpawnRequest {
+        command: Command,
+        reply: mpsc::SyncSender<std::io::Result<Child>>,
+    }
+    static OWNER: Mutex<Option<mpsc::SyncSender<SpawnRequest>>> = Mutex::new(None);
+
+    let mut owner = lock(&OWNER);
+    if owner.is_none() {
+        let (sender, requests) = mpsc::sync_channel::<SpawnRequest>(1);
+        // Linux PDEATHSIG follows the creating thread, not just its process.
+        // Keep that one thread alive across HTTP caller exits and core restarts.
+        thread::Builder::new()
+            .name("mihomo-spawn".to_owned())
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                while let Ok(mut request) = requests.recv() {
+                    let result = request.command.spawn();
+                    if let Err(mpsc::SendError(Ok(mut child))) = request.reply.send(result) {
+                        // A vanished caller must not leave an untracked core.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+            })?;
+        // Failed thread creation leaves None so a later start can retry.
+        *owner = Some(sender);
+    }
+    // Rendezvous transfers ownership only to a receiver that actually takes it.
+    let (reply, result) = mpsc::sync_channel(0);
+    if owner
+        .as_ref()
+        .expect("initialized spawn owner")
+        .send(SpawnRequest { command, reply })
+        .is_err()
+    {
+        *owner = None;
+        return Err(std::io::Error::other("Mihomo spawn owner exited"));
+    }
+    drop(owner);
+    result
+        .recv()
+        .map_err(|_| std::io::Error::other("Mihomo spawn owner dropped reply"))?
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2548,6 +2693,18 @@ impl CoreSocketContract {
                         .ok_or_else(|| "Mihomo TPROXY port overflows u16".to_owned())?,
                 });
             }
+        }
+        if state.split_routing.torrent_socks.enabled {
+            sockets.extend([
+                ExpectedSocket {
+                    protocol: SocketProtocol::Tcp,
+                    port: state.split_routing.torrent_socks.port,
+                },
+                ExpectedSocket {
+                    protocol: SocketProtocol::Udp,
+                    port: state.split_routing.torrent_socks.port,
+                },
+            ]);
         }
         if let Some((address, _)) = controller {
             sockets.push(ExpectedSocket {
@@ -2666,9 +2823,11 @@ impl CoreManager {
                 });
             }
         }
-        let child = cmd
-            .spawn()
-            .map_err(|error| format!("mihomo spawn: {error}"))?;
+        #[cfg(target_os = "linux")]
+        let child = spawn_core_on_persistent_thread(cmd);
+        #[cfg(not(target_os = "linux"))]
+        let child = cmd.spawn();
+        let child = child.map_err(|error| format!("mihomo spawn: {error}"))?;
         self.child = Some(child);
         Ok(())
     }
@@ -3871,7 +4030,7 @@ fn load_state_with_hasher(
                     error
                 );
                 let backup = state_path.with_extension("json.corrupt");
-                let _ = fs::write(&backup, &text);
+                let _ = write_private_file(&backup, text.as_bytes());
                 eprintln!("hincyray: corrupted state saved to {}", backup.display());
                 (
                     HincyrayState::default(),
@@ -3961,6 +4120,7 @@ fn load_state_with_hasher(
         &state.server_route_registry,
         &state.routing_rules,
         &state.device_routes,
+        &state.split_routing.torrent_socks.target,
     ))
     .unwrap_or_default();
     sync_server_route_registry(&mut state);
@@ -3978,11 +4138,17 @@ fn load_state_with_hasher(
             &mut route.target,
         );
     }
+    migrate_legacy_target(
+        &state.profiles,
+        &state.server_route_registry,
+        &mut state.split_routing.torrent_socks.target,
+    );
     let routing_identity_changed = routing_identity_before
         != serde_json::to_string(&(
             &state.server_route_registry,
             &state.routing_rules,
             &state.device_routes,
+            &state.split_routing.torrent_socks.target,
         ))
         .unwrap_or_default();
 
@@ -4269,8 +4435,32 @@ fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String>
     compacted.web_ui_auth.password.clear();
     let text = serde_json::to_string_pretty(&compacted).map_err(|error| error.to_string())?;
     let tmp = state_path.with_extension("tmp");
-    fs::write(&tmp, &text).map_err(|error| error.to_string())?;
-    fs::rename(&tmp, state_path).map_err(|error| error.to_string())
+    write_private_file(&tmp, text.as_bytes())?;
+    fs::rename(&tmp, state_path).map_err(|error| error.to_string())?;
+    set_private_file_permissions(state_path)
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    set_private_file_permissions(path)
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// v0.19.8: Flush state to disk only if the `dirty` flag is set.
@@ -4319,10 +4509,12 @@ fn atomic_write_config_with(
         let mut temp = NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
         temp.write_all(config_yaml)
             .map_err(|error| error.to_string())?;
+        set_private_file_permissions(temp.path())?;
         temp.as_file()
             .sync_all()
             .map_err(|error| error.to_string())?;
         publish(temp, path)?;
+        set_private_file_permissions(path)?;
         fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| error.to_string())?;
@@ -4350,7 +4542,7 @@ fn build_daemon_config(
     };
 
     let effective_features = effective_mihomo_features(state);
-    if !state.split_routing.enabled {
+    if !state.split_routing.enabled && !state.split_routing.torrent_socks.enabled {
         return build_mihomo_config(
             active_profile,
             &state.listen_host,
@@ -4359,11 +4551,76 @@ fn build_daemon_config(
         );
     }
 
-    // Split routing: build the full router config.
+    // The dedicated SOCKS listener reuses router proxy groups even when
+    // transparent split routing is disabled. This keeps fixed-server and
+    // canonical active targets fail-closed without changing normal SOCKS rules.
     validate_routing_targets(state, &state.routing_rules, &state.device_routes)?;
+    validate_torrent_socks_settings(state)?;
+    if !state.split_routing.enabled {
+        let mut pinned_routes = Vec::new();
+        let mut parovozik_vpn_outbounds = Vec::new();
+        if state.split_routing.torrent_socks.target.trim() == "parovozik" {
+            for server_ref in state
+                .split_routing
+                .parovozik_server_refs
+                .iter()
+                .take(MAX_PAROVOZIK_SERVERS)
+            {
+                let (group, _) = resolve_target(
+                    state,
+                    active_profile,
+                    &format!("server:{server_ref}"),
+                    &mut pinned_routes,
+                )?;
+                if group != PROXY_NAME && !parovozik_vpn_outbounds.contains(&group) {
+                    parovozik_vpn_outbounds.push(group);
+                }
+            }
+        }
+        let (proxy, _) = resolve_target(
+            state,
+            active_profile,
+            &state.split_routing.torrent_socks.target,
+            &mut pinned_routes,
+        )?;
+        let parovozik_target = proxy == PAROVOZIK_PROXY_GROUP;
+        let extra = RouterExtra {
+            torrent_socks: Some(TorrentSocksInbound {
+                listen: state.split_routing.torrent_socks.listen.clone(),
+                port: state.split_routing.torrent_socks.port,
+                username: state.split_routing.torrent_socks.username.clone(),
+                password: state.split_routing.torrent_socks.password.clone(),
+                proxy: proxy.clone(),
+            }),
+            parovozik_vpn_target: if parovozik_target {
+                PAROVOZIK_PROXY_GROUP.to_owned()
+            } else {
+                String::new()
+            },
+            parovozik_vpn_outbounds,
+            match_target: "proxy".to_owned(),
+            ..RouterExtra::default()
+        };
+        return build_mihomo_router_config(
+            active_profile,
+            &[],
+            &pinned_routes,
+            &[],
+            &state.listen_host,
+            state.socks_port,
+            None,
+            false,
+            state.split_routing.quic_mode.clone(),
+            active_profile.block_quic,
+            &extra,
+            &effective_features,
+        );
+    }
+
+    // Split routing: build the full router config.
     let mut managed_providers = geobase_rule_providers.to_vec();
     managed_providers.extend(parovozik_rule_providers(state)?);
-    let (extra_profiles, mut pinned_routes, mut routes, active_block_quic, extra) =
+    let (extra_profiles, mut pinned_routes, mut routes, active_block_quic, mut extra) =
         build_routing_context(
             state,
             active_profile,
@@ -4394,6 +4651,22 @@ fn build_daemon_config(
     }
     // Device rules first, then general rules.
     routes.splice(0..0, device_rules);
+
+    if state.split_routing.torrent_socks.enabled {
+        let (proxy, _) = resolve_target(
+            state,
+            active_profile,
+            &state.split_routing.torrent_socks.target,
+            &mut pinned_routes,
+        )?;
+        extra.torrent_socks = Some(TorrentSocksInbound {
+            listen: state.split_routing.torrent_socks.listen.clone(),
+            port: state.split_routing.torrent_socks.port,
+            username: state.split_routing.torrent_socks.username.clone(),
+            password: state.split_routing.torrent_socks.password.clone(),
+            proxy,
+        });
+    }
 
     build_mihomo_router_config(
         active_profile,
@@ -4549,6 +4822,7 @@ fn build_routing_context<'a>(
         match_target: state.split_routing.match_target.clone(),
         mihomo_home: geo_dir_from_state(state),
         geobase_rule_providers: geobase_rule_providers.to_vec(),
+        torrent_socks: None,
     };
     Ok((
         extra_profiles,
@@ -4586,7 +4860,7 @@ fn resolve_target<'a>(
                 return Ok((PROXY_NAME.to_owned(), Some(active)));
             }
             if canonical_profile_raw(active) == entry.canonical_raw {
-                return Ok((PROXY_ACTIVE_NAME.to_owned(), Some(profile)));
+                return Ok((PROXY_NAME.to_owned(), Some(profile)));
             }
             let suffix = &server_ref[7..];
             let outbound = format!("srv-out-{suffix}");
@@ -4618,6 +4892,13 @@ fn validate_routing_targets(
                 .iter()
                 .filter(|r| r.enabled)
                 .map(|r| r.target.as_str()),
+        )
+        .chain(
+            state
+                .split_routing
+                .torrent_socks
+                .enabled
+                .then_some(state.split_routing.torrent_socks.target.as_str()),
         )
     {
         match RoutingTarget::parse(target)? {
@@ -4683,10 +4964,98 @@ fn validate_routing_targets(
     Ok(())
 }
 
+fn validate_torrent_socks_settings(state: &HincyrayState) -> Result<(), String> {
+    let api_port = std::env::var("HINCYRAY_LISTEN")
+        .unwrap_or_else(|_| DEFAULT_LISTEN.to_owned())
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .ok_or_else(|| "HINCYRAY_LISTEN must include a valid TCP port".to_owned())?;
+    validate_torrent_socks_settings_with_api_port(state, api_port)
+}
+
+fn validate_torrent_socks_settings_with_api_port(
+    state: &HincyrayState,
+    api_port: u16,
+) -> Result<(), String> {
+    let settings = &state.split_routing.torrent_socks;
+    if settings.listen.len() > 64
+        || settings.username.len() > 128
+        || settings.password.len() > 512
+        || settings.listen.chars().any(char::is_control)
+        || settings.username.chars().any(char::is_control)
+        || settings.password.chars().any(char::is_control)
+    {
+        return Err("torrent SOCKS settings exceed their bounded contract".to_owned());
+    }
+    let listen_ip = settings
+        .listen
+        .parse::<Ipv4Addr>()
+        .map_err(|_| "torrent SOCKS listen must be a literal IPv4 address".to_owned())?;
+    if !(listen_ip.is_loopback() || listen_ip.is_private()) {
+        return Err("torrent SOCKS listen must be loopback or private IPv4".to_owned());
+    }
+    if settings.port == 0 {
+        return Err("torrent SOCKS port must be between 1 and 65535".to_owned());
+    }
+    let target = RoutingTarget::parse(&settings.target)?;
+    if matches!(target, RoutingTarget::LegacyProfile(_)) {
+        return Err("torrent SOCKS target uses an unmigrated profile id".to_owned());
+    }
+    if !settings.enabled {
+        return Ok(());
+    }
+    let tproxy_port = state
+        .split_routing
+        .redirect_port
+        .checked_add(1)
+        .ok_or_else(|| "Mihomo TPROXY port overflows u16".to_owned())?;
+    let mut reserved = vec![
+        state.socks_port,
+        DNS_INBOUND_PORT,
+        state.split_routing.redirect_port,
+        tproxy_port,
+        9090,
+        api_port,
+    ];
+    if let Some(port) = state.http_port {
+        reserved.push(port);
+    }
+    for tunnel in &state.mihomo_features.tunnels {
+        if let Some(port) = tunnel
+            .address
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+        {
+            reserved.push(port);
+        }
+    }
+    if reserved.contains(&settings.port) {
+        return Err(format!(
+            "torrent SOCKS port {} conflicts with another HincyRay listener",
+            settings.port
+        ));
+    }
+    for (name, value, min, max) in [
+        ("username", settings.username.as_str(), 1usize, 128usize),
+        ("password", settings.password.as_str(), 12usize, 512usize),
+    ] {
+        if value.len() < min || value.len() > max || value.chars().any(char::is_control) {
+            return Err(format!(
+                "torrent SOCKS {name} must contain {min}-{max} bytes without control characters"
+            ));
+        }
+    }
+    if matches!(target, RoutingTarget::Parovozik) && !state.split_routing.parovozik_enabled {
+        return Err("torrent SOCKS cannot target disabled Parovozik".to_owned());
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum PinnedRouteTransition {
     Fallback,
     Recovery,
+    Rejected,
 }
 
 fn detect_pinned_route_transition(
@@ -4701,6 +5070,9 @@ fn detect_pinned_route_transition(
         (Some(PROXY_ACTIVE_NAME), now) if now == pinned_outbound => {
             Some(PinnedRouteTransition::Recovery)
         }
+        (Some(old), REJECT_NAME) if old != REJECT_NAME => Some(PinnedRouteTransition::Rejected),
+        (Some(REJECT_NAME), now) if now == pinned_outbound => Some(PinnedRouteTransition::Recovery),
+        (Some(REJECT_NAME), PROXY_ACTIVE_NAME) => Some(PinnedRouteTransition::Fallback),
         _ => None,
     }
 }
@@ -4725,6 +5097,13 @@ fn pinned_route_observer_catalog(state: &HincyrayState) -> Vec<(String, String, 
                 .iter()
                 .filter(|route| route.enabled)
                 .map(|route| route.target.as_str()),
+        )
+        .chain(
+            state
+                .split_routing
+                .torrent_socks
+                .enabled
+                .then_some(state.split_routing.torrent_socks.target.as_str()),
         )
     {
         let Ok(RoutingTarget::Server(server_ref)) = RoutingTarget::parse(target) else {
@@ -4799,9 +5178,62 @@ fn observe_pinned_routes(daemon: &Daemon, ec_addr: &str, ec_secret: Option<&str>
                     "hincyray: pinned server {display} recovered, restored preferred route from active server {active_display}"
                 )
             }
+            Some(PinnedRouteTransition::Rejected) => eprintln!(
+                "hincyray: pinned server {display} and active fallback unavailable; route is fail-closed"
+            ),
             None => {}
         }
     }
+}
+
+fn set_proxy_selector(ec_addr: &str, ec_secret: Option<&str>, target: &str) -> Result<(), String> {
+    if !matches!(target, PROXY_ACTIVE_NAME | REJECT_NAME) {
+        return Err("invalid canonical proxy selector target".to_owned());
+    }
+    let path = format!(
+        "/proxies/{}",
+        utf8_percent_encode(PROXY_NAME, NON_ALPHANUMERIC)
+    );
+    let body = json!({"name": target}).to_string();
+    mihomo_api_put(ec_addr, ec_secret, &path, Some(&body))
+}
+
+fn validate_proxy_selector(
+    controller: Option<&(String, Option<String>)>,
+) -> Result<Option<String>, String> {
+    let Some((addr, secret)) = controller else {
+        return Ok(None);
+    };
+    let path = format!(
+        "/proxies/{}",
+        utf8_percent_encode(PROXY_NAME, NON_ALPHANUMERIC)
+    );
+    let group = mihomo_api_get_json(addr, secret.as_deref(), &path)?;
+    if group.get("type").and_then(Value::as_str) != Some("Selector") {
+        return Err("canonical proxy group is not a selector".to_owned());
+    }
+    let members = group
+        .get("all")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "canonical proxy selector has no member list".to_owned())?;
+    if members.len() != 2
+        || members[0].as_str() != Some(PROXY_ACTIVE_NAME)
+        || members[1].as_str() != Some(REJECT_NAME)
+    {
+        return Err("canonical proxy selector has an unsafe member list".to_owned());
+    }
+    let target = proxy_selector_target(&group)
+        .ok_or_else(|| "canonical proxy selector has an unsafe target".to_owned())?;
+    Ok(Some(target.to_owned()))
+}
+
+fn active_state_health_sample(
+    controller: Option<&(String, Option<String>)>,
+    url: &str,
+) -> Option<String> {
+    let (addr, secret) = controller?;
+    let active = mihomo_api_get_json(addr, secret.as_deref(), "/proxies/proxy-active").ok()?;
+    active_health_sample_for_url(&active, url)
 }
 
 /// Extract the parent directory of the configured geo asset path to pass
@@ -5668,6 +6100,7 @@ fn dispatch_from(
         ("POST", "/api/routing/settings") => handle_routing_settings(body, daemon),
         ("POST", "/api/routing/rules") => handle_routing_rules(body, daemon),
         ("POST", "/api/routing/resource-route") => handle_routing_resource_route(body, daemon),
+        ("POST", "/api/routing/resource-reload") => handle_routing_resource_reload(body, daemon),
         ("POST", "/api/routing/catalog/refresh") => handle_routing_catalog_refresh(body, daemon),
         ("POST", "/api/routing/apply") => handle_routing_apply(daemon),
         ("POST", "/api/routing/reset") => handle_routing_reset(body, daemon),
@@ -5694,6 +6127,28 @@ fn dispatch_from(
         ("POST", "/api/dns") => handle_dns_set(body, daemon),
         ("GET", "/api/dns/leak-test") => handle_dns_leak_test(daemon),
         ("GET", "/api/dns/diagnostics") => handle_dns_diagnostics(daemon),
+        ("GET", "/api/diagnostics/direct-availability") => {
+            handle_direct_availability_diagnostics(daemon)
+        }
+        ("GET", "/api/diagnostics/direct-monitor") => {
+            json_response(&daemon.direct_monitor.status())
+        }
+        ("GET", "/api/automation/direct-policy") => match daemon.direct_monitor.policy().status() {
+            Ok(status) => json_response(&status),
+            Err(error) => json_error(503, &error),
+        },
+        ("POST", "/api/automation/direct-policy") => {
+            match daemon.direct_monitor.policy().configure(body) {
+                Ok(status) => json_response(&status),
+                Err(error) => json_error(400, &error),
+            }
+        }
+        ("POST", "/api/diagnostics/direct-monitor") => {
+            match daemon.direct_monitor.configure(body) {
+                Ok(value) => json_response(&value),
+                Err(error) => (400, "application/json", json!({"error":error}).to_string()),
+            }
+        }
         ("GET", "/api/diagnostics/dns") => handle_dns_diagnostics_v2(daemon),
         ("GET", "/api/diagnostics/udp-quic") => handle_udp_quic_diagnostics(daemon),
         ("GET", "/api/memory-guard") => handle_memory_guard(daemon),
@@ -6090,6 +6545,7 @@ fn redact_mihomo_config(value: &mut serde_yaml::Value) -> Result<(), String> {
         match key.to_ascii_lowercase().as_str() {
             "proxies" => redact_yaml_sequence(child, redact_mihomo_proxy),
             "proxy-groups" => redact_yaml_sequence(child, redact_proxy_group),
+            "listeners" => redact_yaml_sequence(child, redact_mihomo_listener),
             "proxy-providers" | "rule-providers" => redact_provider_map(child),
             "dns" => redact_dns_config(child),
             "tunnels" => redact_yaml_sequence(child, redact_tunnel),
@@ -6122,7 +6578,6 @@ const ROOT_DIAGNOSTIC_FIELDS: &[&str] = &[
     "ipv6",
     "geo-auto-update",
     "socks-port",
-    "listeners",
     "rules",
     "sub-rules",
     "sniffer",
@@ -6139,6 +6594,22 @@ const ROOT_DIAGNOSTIC_FIELDS: &[&str] = &[
     "external-controller",
     "external-controller-cors",
 ];
+
+fn redact_mihomo_listener(value: &mut serde_yaml::Value) {
+    redact_mapping_fields(
+        value,
+        &[
+            "name",
+            "type",
+            "listen",
+            "port",
+            "udp",
+            "proxy",
+            "rule",
+            "routing-mark",
+        ],
+    );
+}
 
 fn redact_yaml_sequence(value: &mut serde_yaml::Value, redact_item: fn(&mut serde_yaml::Value)) {
     let Some(sequence) = value.as_sequence_mut() else {
@@ -6563,7 +7034,7 @@ fn validate_mihomo_config_yaml_with_timeout(
     timeout: Duration,
 ) -> Value {
     let temp_path = unique_temp_path("hincyray-validate", "yaml");
-    if let Err(error) = fs::write(&temp_path, config_yaml) {
+    if let Err(error) = write_private_file(&temp_path, config_yaml.as_bytes()) {
         return json!({"ok": false, "supported": true, "stage": "write-temp", "error": error.to_string()});
     }
     let mut cmd = Command::new(binary_path);
@@ -6965,10 +7436,10 @@ fn validation_error(result: &Value) -> String {
 fn wait_for_core_readiness(
     daemon: &Daemon,
     controller: Option<&(String, Option<String>)>,
+    state: &HincyrayState,
 ) -> Result<(), String> {
     let (contract, enforce_socket_ownership) = {
-        let inner = lock(&daemon.inner);
-        let contract = CoreSocketContract::from_state(&inner.state, controller);
+        let contract = CoreSocketContract::from_state(state, controller);
         (contract, daemon_enforces_socket_ownership(daemon))
     };
     let contract = match contract {
@@ -6993,8 +7464,9 @@ fn wait_for_core_readiness_locked(
     inner: &mut DaemonInner,
     daemon: &Daemon,
     controller: Option<&(String, Option<String>)>,
+    state: &HincyrayState,
 ) -> Result<(), String> {
-    let contract = match CoreSocketContract::from_state(&inner.state, controller) {
+    let contract = match CoreSocketContract::from_state(state, controller) {
         Ok(contract) => contract,
         Err(error) => {
             let stop_result = inner.core.stop();
@@ -7126,7 +7598,11 @@ fn hot_reload_or_restart_core_locked(
         Ok(status) => status,
         Err(error) => {
             eprintln!("hincyray: tracked Mihomo ownership check failed, restarting: {error}");
-            return inner.core.restart(&state.mihomo_path, config_path, geo_dir);
+            let result = inner.core.restart(&state.mihomo_path, config_path, geo_dir);
+            if result.is_ok() {
+                inner.core_generation = inner.core_generation.saturating_add(1);
+            }
+            return result;
         }
     };
     let result = if running
@@ -7141,6 +7617,34 @@ fn hot_reload_or_restart_core_locked(
         inner.core_generation = inner.core_generation.saturating_add(1);
     }
     result
+}
+
+fn restart_core_with_selector_locked(
+    inner: &mut DaemonInner,
+    daemon: &Daemon,
+    binary_path: &str,
+    config_path: &Path,
+    geo_dir: Option<&str>,
+    desired_target: &str,
+) -> Result<(), String> {
+    inner.core.restart(binary_path, config_path, geo_dir)?;
+    inner.core_generation = inner.core_generation.saturating_add(1);
+    let controller = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
+    let state = inner.state.clone();
+    let result = wait_for_core_readiness_locked(inner, daemon, controller.as_ref(), &state)
+        .and_then(|()| validate_proxy_selector(controller.as_ref()).map(|_| ()))
+        .and_then(|()| {
+            let (addr, secret) = controller
+                .as_ref()
+                .ok_or_else(|| "Mihomo controller is unavailable".to_owned())?;
+            set_proxy_selector(addr, secret.as_deref(), desired_target)
+        });
+    if result.is_err() {
+        let _ = inner.core.stop();
+        return result;
+    }
+    inner.proxy_rejected = desired_target == REJECT_NAME;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -7179,12 +7683,22 @@ impl FirewallRuntimeIdentity {
 struct ActivationRuntimeIdentity {
     core_running: bool,
     firewall: FirewallRuntimeIdentity,
+    proxy_rejected: bool,
+    failover_fail_count: u32,
+    failover_recovery_count: u32,
+    failover_health_sample: Option<String>,
+    failover_health_identity: Option<(u64, String)>,
 }
 
 fn capture_activation_runtime(inner: &mut DaemonInner) -> ActivationRuntimeIdentity {
     ActivationRuntimeIdentity {
         core_running: inner.core.is_running(),
         firewall: FirewallRuntimeIdentity::capture(&inner.firewall),
+        proxy_rejected: inner.proxy_rejected,
+        failover_fail_count: inner.failover_fail_count,
+        failover_recovery_count: inner.failover_recovery_count,
+        failover_health_sample: inner.failover_health_sample.clone(),
+        failover_health_identity: inner.failover_health_identity.clone(),
     }
 }
 
@@ -7234,6 +7748,10 @@ fn restore_previous_activation_locked(
                 &daemon.mihomo_config_path,
                 geo_dir.as_deref(),
             )
+            .and_then(|()| {
+                wait_for_core_readiness_locked(inner, daemon, controller.as_ref(), state)
+            })
+            .and_then(|()| validate_proxy_selector(controller.as_ref()).map(|_| ()))
         } else {
             inner.core.stop()
         }
@@ -7281,13 +7799,42 @@ fn restore_previous_activation_locked(
             .unwrap_or_else(|| state.split_routing.vpn_subnet.clone());
         inner.firewall.stop(&current_subnet)
     };
-    let complete = config_result.is_ok() && core_result.is_ok() && firewall_result.is_ok();
+    let selector_result =
+        if config_result.is_ok() && core_result.is_ok() && previous_runtime.core_running {
+            let controller = daemon_mihomo_controller(daemon, &state.mihomo_features);
+            let target = if previous_runtime.proxy_rejected {
+                REJECT_NAME
+            } else {
+                PROXY_ACTIVE_NAME
+            };
+            if let Some((addr, secret)) = controller.as_ref() {
+                let result = set_proxy_selector(addr, secret.as_deref(), target);
+                if result.is_err() {
+                    let _ = inner.core.stop();
+                }
+                result
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
+    let complete = config_result.is_ok()
+        && core_result.is_ok()
+        && firewall_result.is_ok()
+        && selector_result.is_ok();
+    inner.proxy_rejected = previous_runtime.proxy_rejected;
+    inner.failover_fail_count = previous_runtime.failover_fail_count;
+    inner.failover_recovery_count = previous_runtime.failover_recovery_count;
+    inner.failover_health_sample = previous_runtime.failover_health_sample.clone();
+    inner.failover_health_identity = previous_runtime.failover_health_identity.clone();
     (
         format!(
-            "config={}, core={}, firewall={}",
+            "config={}, core={}, firewall={}, selector={}",
             result_label(&config_result),
             result_label(&core_result),
-            result_label(&firewall_result)
+            result_label(&firewall_result),
+            result_label(&selector_result)
         ),
         complete,
     )
@@ -7335,12 +7882,29 @@ fn activate_current_config_locked(
     configure_firewall: bool,
     projection: GeoBaseProjection,
 ) -> Result<ActivationResult, String> {
+    activate_current_config_locked_with_rollback(
+        daemon,
+        start_if_stopped,
+        configure_firewall,
+        projection,
+        None,
+    )
+}
+
+fn activate_current_config_locked_with_rollback(
+    daemon: &Daemon,
+    start_if_stopped: bool,
+    configure_firewall: bool,
+    projection: GeoBaseProjection,
+    rollback_state: Option<HincyrayState>,
+) -> Result<ActivationResult, String> {
     let (state, previous_runtime) = {
         let mut inner = lock(&daemon.inner);
         let state = inner.state.clone();
         let runtime = capture_activation_runtime(&mut inner);
         (state, runtime)
     };
+    let rollback_state = rollback_state.unwrap_or_else(|| state.clone());
     let (mut config_yaml, generation, activated_bases) = config_plan(&state, daemon, projection)?;
     write_parovozik_provider_files(&state)?;
     let geo_dir = geo_dir_from_state(&state);
@@ -7360,6 +7924,11 @@ fn activate_current_config_locked(
     atomic_write_config(&daemon.mihomo_config_path, config_yaml.as_bytes())?;
 
     let should_run = previous_runtime.core_running || start_if_stopped;
+    let desired_target = if previous_runtime.proxy_rejected {
+        REJECT_NAME
+    } else {
+        PROXY_ACTIVE_NAME
+    };
     let controller = daemon_mihomo_controller(daemon, &state.mihomo_features);
     let activation = (|| -> Result<(String, String), String> {
         if should_run {
@@ -7373,7 +7942,12 @@ fn activate_current_config_locked(
                 geo_dir.as_deref(),
             )?;
             drop(inner);
-            wait_for_core_readiness(daemon, controller.as_ref())?;
+            wait_for_core_readiness(daemon, controller.as_ref(), &state)?;
+            validate_proxy_selector(controller.as_ref())?;
+            if let Some((addr, secret)) = controller.as_ref() {
+                set_proxy_selector(addr, secret.as_deref(), desired_target)?;
+            }
+            lock(&daemon.inner).proxy_rejected = desired_target == REJECT_NAME;
         }
 
         let firewall_status = if configure_firewall {
@@ -7445,7 +8019,12 @@ fn activate_current_config_locked(
                         geo_dir.as_deref(),
                     )?;
                     drop(inner);
-                    wait_for_core_readiness(daemon, controller.as_ref())?;
+                    wait_for_core_readiness(daemon, controller.as_ref(), &final_state)?;
+                    validate_proxy_selector(controller.as_ref())?;
+                    if let Some((addr, secret)) = controller.as_ref() {
+                        set_proxy_selector(addr, secret.as_deref(), desired_target)?;
+                    }
+                    lock(&daemon.inner).proxy_rejected = desired_target == REJECT_NAME;
                 }
             }
             if state.split_routing.enabled {
@@ -7472,7 +8051,7 @@ fn activate_current_config_locked(
                 daemon,
                 previous_config.as_deref(),
                 &previous_runtime,
-                &state,
+                &rollback_state,
             );
             return Err(format!("{error}; rollback: {rollback}"));
         }
@@ -7485,7 +8064,7 @@ fn activate_current_config_locked(
                     daemon,
                     previous_config.as_deref(),
                     &previous_runtime,
-                    &state,
+                    &rollback_state,
                 );
                 return Err(format!("{error}; rollback: {rollback}"));
             }
@@ -7561,14 +8140,64 @@ fn handle_profile_test_settings_set(body: &str, daemon: &Daemon) -> (u16, &'stat
 
 fn handle_bench_status(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
-    let job = inner.bench.snapshot();
+    let mut job = inner.bench.snapshot();
+    drop(inner);
+    remap_completed_bench_result_ids(daemon, &mut job.results);
+    {
+        let inner = lock(&daemon.inner);
+        // A removed/edited identity must not attach its retained result to a reused numeric ID.
+        let current = inner
+            .state
+            .profiles
+            .iter()
+            .map(|profile| (profile.id, profile_server_ref(profile)))
+            .collect::<HashMap<_, _>>();
+        job.results.retain(|result| {
+            current
+                .get(&result.profile_id)
+                .is_some_and(|server_ref| *server_ref == profile_test_result_server_ref(result))
+        });
+    }
+    for result in &mut job.results {
+        result.profile_name = redact_diagnostic_text(&result.profile_name);
+        for error in [
+            &mut result.error,
+            &mut result.download_error,
+            &mut result.upload_error,
+        ] {
+            *error = error.as_deref().map(redact_diagnostic_text);
+        }
+        for test in &mut result.resource_tests {
+            test.name = redact_diagnostic_text(&test.name);
+            test.error = test.error.as_deref().map(redact_diagnostic_text);
+        }
+    }
+    job.current_profile_name = job
+        .current_profile_name
+        .as_deref()
+        .map(redact_diagnostic_text);
+    for profile in &mut job.active_profiles {
+        profile.name = redact_diagnostic_text(&profile.name);
+    }
+    for failure in &mut job.preflight_failures {
+        failure.error = redact_diagnostic_text(&failure.error);
+    }
     let method = job.method.map(|m| m.as_str().to_owned());
     let summary = bench_summary(&job);
+    let concurrency_status = bench_concurrency_status(&job);
     let active_profiles = job
         .active_profiles
         .iter()
         .take(6)
         .cloned()
+        .collect::<Vec<_>>();
+    let results = job
+        .results
+        .into_iter()
+        .map(|result| BenchStatusResult {
+            server_ref: profile_test_result_server_ref(&result),
+            result,
+        })
         .collect::<Vec<_>>();
     let response = json!({
         "running": job.running,
@@ -7578,9 +8207,12 @@ fn handle_bench_status(daemon: &Daemon) -> (u16, &'static str, String) {
         "current_profile_id": job.current_profile_id,
         "current_profile_name": job.current_profile_name,
         "active_profiles": active_profiles,
+        "concurrency_status": concurrency_status,
         "last_updated": job.last_updated,
         "cancel_requested": job.cancel_requested,
-        "results": job.results,
+        "search": job.search,
+        "preflight_failures": job.preflight_failures,
+        "results": results,
         "summary": summary,
     });
     (200, "application/json", response.to_string())
@@ -7588,15 +8220,24 @@ fn handle_bench_status(daemon: &Daemon) -> (u16, &'static str, String) {
 
 fn bench_summary(job: &BenchJob) -> Value {
     let total = job.results.len();
-    let passed = job.results.iter().filter(|r| r.success).count();
-    let failed = total.saturating_sub(passed);
+    let passed = job
+        .results
+        .iter()
+        .filter(|r| r.success && !r.resource_tests.iter().any(|test| test.inconclusive))
+        .count();
+    let inconclusive = job
+        .results
+        .iter()
+        .filter(|result| result.resource_tests.iter().any(|test| test.inconclusive))
+        .count();
+    let failed = total.saturating_sub(passed + inconclusive);
     let avg_latency = if passed == 0 {
         0.0
     } else {
         let sum: u64 = job
             .results
             .iter()
-            .filter(|r| r.success)
+            .filter(|r| r.success && !r.resource_tests.iter().any(|test| test.inconclusive))
             .map(|r| r.latency_ms as u64)
             .sum();
         sum as f32 / passed as f32
@@ -7605,8 +8246,50 @@ fn bench_summary(job: &BenchJob) -> Value {
         "total": total,
         "passed": passed,
         "failed": failed,
+        "inconclusive": inconclusive,
         "avg_latency_ms": avg_latency,
     })
+}
+
+fn bench_concurrency_status(job: &BenchJob) -> Value {
+    let admission_limit = job.search.as_ref().map_or(job.worker_count, |search| {
+        job.worker_count
+            .min(search.target_good.saturating_sub(search.found_good))
+    });
+    let mut limit_reasons = Vec::new();
+    if job.memory_limited {
+        limit_reasons.push("memory_cap");
+    }
+    if job.total < job.requested_concurrency {
+        limit_reasons.push("candidate_count");
+    }
+    if admission_limit < job.worker_count {
+        limit_reasons.push("target_slots");
+    }
+    json!({"requested":job.requested_concurrency,"effective":job.worker_count,
+        "active":job.active_profiles.len(),"admission_limit":admission_limit,
+        "limit_reasons":limit_reasons})
+}
+
+fn completed_bench_allows_auto_select(job: &BenchJob) -> bool {
+    !job.running
+        && job.search.is_none()
+        && !job.method.is_some_and(BenchMethod::is_availability)
+        && !job.results.iter().any(|result| {
+            matches!(
+                result.method.as_str(),
+                "availability_quick" | "availability_full" | "search_availability"
+            )
+        })
+        && !job.cancel_requested
+        && !job.results.iter().any(|result| {
+            result
+                .resource_tests
+                .iter()
+                .any(|test| test.inconclusive || test.id == "youtube_thumbnails")
+        })
+        && job.total > 0
+        && job.completed == job.total
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7619,6 +8302,14 @@ fn current_profile_test_resource<'a>(
     result: &'a BenchResult,
     id: &str,
 ) -> Option<&'a ResourceTestResult> {
+    if !matches!(result.method.as_str(), "quick" | "full")
+        || result
+            .resource_tests
+            .iter()
+            .any(|test| test.id == "youtube_thumbnails")
+    {
+        return None;
+    }
     result
         .resource_tests
         .iter()
@@ -7634,8 +8325,9 @@ fn profile_test_rank(result: &BenchResult) -> Option<ProfileTestRank> {
         .filter_map(|id| current_profile_test_resource(result, id))
         .any(|test| test.attempts > 0 && test.reachable);
     let service_passed = |id| {
-        current_profile_test_resource(result, id)
-            .is_some_and(|test| test.attempts > 0 && test.successes > 0 && test.stable)
+        current_profile_test_resource(result, id).is_some_and(|test| {
+            test.attempts > 0 && test.successes > 0 && test.stable && !test.inconclusive
+        })
     };
     if !ping_passed || !service_passed("youtube") {
         return None;
@@ -7660,6 +8352,9 @@ fn profile_test_rank(result: &BenchResult) -> Option<ProfileTestRank> {
 
 fn profile_test_result_is_completely_unresponsive(result: &BenchResult) -> bool {
     if !matches!(result.method.as_str(), "quick" | "full") {
+        return false;
+    }
+    if result.resource_tests.iter().any(|test| test.inconclusive) {
         return false;
     }
     let all_pings_failed = ["ping_icmp", "ping_tcp", "ping_proxy"]
@@ -7887,11 +8582,60 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             "application/json",
             json!({
                 "error": "unknown method",
-                "supported": ["tcp", "head", "get", "quick", "full"],
+                "supported": ["tcp", "head", "get", "quick", "full", "availability_quick", "availability_full"],
             })
             .to_string(),
         );
     };
+    let search = match value.get("search").filter(|value| !value.is_null()) {
+        None => None,
+        Some(search_value) => {
+            let options =
+                match serde_json::from_value::<AdaptiveSearchOptions>(search_value.clone()) {
+                    Ok(options) => options,
+                    Err(_) => return json_error(400, "invalid search options"),
+                };
+            if let Err(error) = options.validate() {
+                return json_error(400, &error);
+            }
+            if !matches!(method, BenchMethod::Quick | BenchMethod::AvailabilityQuick) {
+                return json_error(400, "search requires quick method or availability_quick");
+            }
+            if method == BenchMethod::Quick && !options.fail_fast {
+                return json_error(400, "search.fail_fast=false requires availability_quick");
+            }
+            if value.get("test_download").and_then(Value::as_bool) == Some(true)
+                || value.get("test_upload").and_then(Value::as_bool) == Some(true)
+            {
+                return json_error(400, "search does not support speed stages");
+            }
+            Some(options)
+        }
+    };
+    let service_checks = match value.get("service_checks").filter(|value| !value.is_null()) {
+        None => None,
+        Some(options) => {
+            let options = match serde_json::from_value::<crate::benchmark::ServiceCheckOptions>(
+                options.clone(),
+            ) {
+                Ok(options) => options,
+                Err(_) => return json_error(400, "invalid service_checks options"),
+            };
+            if !method.is_availability() {
+                return json_error(400, "service_checks requires an availability method");
+            }
+            if search.is_some() {
+                return json_error(400, "search and service_checks are mutually exclusive");
+            }
+            Some(options)
+        }
+    };
+    if method.is_availability()
+        && (value.get("test_download").and_then(Value::as_bool) == Some(true)
+            || value.get("test_upload").and_then(Value::as_bool) == Some(true))
+    {
+        return json_error(400, "availability tests do not support speed stages");
+    }
     let probe_url = value
         .get("probe_url")
         .and_then(Value::as_str)
@@ -7913,12 +8657,12 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
     let test_download = value
         .get("test_download")
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(search.is_none() && !method.is_availability());
     let test_upload = value
         .get("test_upload")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let requested_concurrency = match value.get("concurrency") {
+    let requested_concurrency = match value.get("concurrency").filter(|value| !value.is_null()) {
         None => 1,
         Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
             Some(value @ 1..=6) => value,
@@ -7936,7 +8680,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         .map(str::trim)
         .filter(|url| !url.is_empty())
         .map(str::to_owned);
-    let requested_ids = match value.get("profile_ids") {
+    let requested_ids = match value.get("profile_ids").filter(|value| !value.is_null()) {
         None => None,
         Some(Value::Array(values)) => {
             let mut ids = Vec::with_capacity(values.len());
@@ -7961,23 +8705,24 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
     let on_result = Box::new(move |result: BenchResult| {
         apply_bench_result(&daemon_for_callback, result);
     });
-    let on_complete = matches!(method, BenchMethod::Quick | BenchMethod::Full).then(|| {
-        let daemon = daemon.clone();
-        Box::new(move |mut results: Vec<BenchResult>| {
-            if let Err(error) = apply_profile_test_post_actions(&daemon, &results) {
-                eprintln!("hincyray: profile test post-processing failed: {error}");
-            }
-            remap_completed_bench_result_ids(&daemon, &mut results);
-            results
-        }) as BenchCompleteCallback
-    });
-    let quick_probe =
-        matches!(method, BenchMethod::Quick | BenchMethod::Full).then(|| QuickProbeConfig {
-            telegram_session_path: telegram_session_path(&daemon.state_path)
-                .to_string_lossy()
-                .into_owned(),
-            telegram: load_telegram_config(&telegram_config_path(&daemon.state_path)).ok(),
+    let on_complete =
+        (search.is_none() && matches!(method, BenchMethod::Quick | BenchMethod::Full)).then(|| {
+            let daemon = daemon.clone();
+            Box::new(move |mut results: Vec<BenchResult>| {
+                if let Err(error) = apply_profile_test_post_actions(&daemon, &results) {
+                    eprintln!("hincyray: profile test post-processing failed: {error}");
+                }
+                remap_completed_bench_result_ids(&daemon, &mut results);
+                results
+            }) as BenchCompleteCallback
         });
+    let quick_probe = method.is_service().then(|| QuickProbeConfig {
+        telegram_session_path: telegram_session_path(&daemon.state_path)
+            .to_string_lossy()
+            .into_owned(),
+        telegram: load_telegram_config(&telegram_config_path(&daemon.state_path)).ok(),
+        service_checks: None,
+    });
     let snapshot = {
         let mut inner = lock(&daemon.inner);
         if inner.bench.is_running() {
@@ -7988,7 +8733,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
                     .to_string(),
             );
         }
-        let profiles = match select_profiles_for_quick_bench(
+        let mut profiles = match select_profiles_for_quick_bench(
             &inner.state,
             subscription_url.as_deref(),
             requested_ids.as_deref(),
@@ -7996,6 +8741,15 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             Ok(profiles) => profiles,
             Err((status, error)) => return json_error(status, &error),
         };
+        if let Some(options) = &search {
+            profiles = order_adaptive_search_candidates(
+                &inner.state,
+                profiles,
+                options,
+                unix_now(),
+                method,
+            );
+        }
         if profiles.is_empty() {
             return json_error(400, "no profiles to benchmark; import first");
         }
@@ -8010,7 +8764,35 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         } else {
             requested_concurrency
         };
+        if concurrency == 0 {
+            return json_error(
+                503,
+                "not enough known available memory for one benchmark worker and router reserve",
+            );
+        }
+        if let Err(error) = validate_bench_worker_admission(
+            requested_concurrency,
+            profiles.len(),
+            concurrency,
+            service_checks.is_some(),
+        ) {
+            return json_error(503, &error);
+        }
         let job = new_bench_job(method, profiles.len(), concurrency);
+        {
+            let mut job = lock(&job);
+            job.requested_concurrency = requested_concurrency;
+            job.memory_limited = concurrency < requested_concurrency;
+            job.service_checks = service_checks;
+        }
+        if let Some(options) = &search {
+            lock(&job).search = Some(SearchProgress {
+                target_good: options.target_good,
+                required_services: options.required_services.clone(),
+                fail_fast: Some(options.fail_fast),
+                ..Default::default()
+            });
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         if inner
             .bench
@@ -8018,6 +8800,15 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             .is_err()
         {
             return json_error(409, "benchmark already running; call /api/bench/stop first");
+        }
+        let previous_cursor = inner.state.profile_search_cursor;
+        if search.is_some() {
+            inner.state.profile_search_cursor = previous_cursor.wrapping_add(1);
+            if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+                inner.state.profile_search_cursor = previous_cursor;
+                inner.bench.release_reservation(&job);
+                return json_error(500, &error);
+            }
         }
         let handle = match run_bench(
             profiles,
@@ -8037,6 +8828,10 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             Ok(handle) => handle,
             Err(error) => {
                 inner.bench.release_reservation(&job);
+                if search.is_some() {
+                    inner.state.profile_search_cursor = previous_cursor;
+                    let _ = persist_state(&daemon.state_path, &inner.state);
+                }
                 return json_error(500, &error);
             }
         };
@@ -8050,8 +8845,163 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
         "running": snapshot.running,
         "requested_concurrency": requested_concurrency,
         "concurrency": snapshot.worker_count,
+        "search": snapshot.search,
     });
     (200, "application/json", response.to_string())
+}
+
+fn order_adaptive_search_candidates(
+    state: &HincyrayState,
+    profiles: Vec<Profile>,
+    options: &AdaptiveSearchOptions,
+    now: u64,
+    method: BenchMethod,
+) -> Vec<Profile> {
+    // History changes priority only. Legacy/general TCP timestamps cannot establish service freshness.
+    const FRESHNESS_SECS: u64 = 6 * 60 * 60;
+    let required = match options.required_services.as_str() {
+        "youtube" => 1,
+        "telegram" => 2,
+        _ => 3,
+    };
+    let mut history = HashMap::<String, (u64, u8, u32)>::new();
+    // Availability history stays unknown until it has its own ordering contract.
+    for stats in state.stats.iter().filter(|_| !method.is_availability()) {
+        let checked = stats.last_service_test_unix;
+        if checked == 0 || checked > now || now - checked > FRESHNESS_SECS {
+            continue;
+        }
+        let service = |id: &str| {
+            stats.resource_tests.iter().find(|test| {
+                test.contract_version == QUICK_RESOURCE_CONTRACT_VERSION && test.id == id
+            })
+        };
+        // Thumbnail availability is not native playback history, even with native TG/AI results.
+        if stats
+            .resource_tests
+            .iter()
+            .any(|test| test.id == "youtube_thumbnails")
+        {
+            continue;
+        }
+        let ping = stats.resource_tests.iter().any(|test| {
+            test.contract_version == QUICK_RESOURCE_CONTRACT_VERSION
+                && matches!(test.id.as_str(), "ping_icmp" | "ping_tcp" | "ping_proxy")
+                && test.attempts > 0
+                && test.successes > 0
+                && test.reachable
+        });
+        let tier = if ping {
+            ["youtube", "telegram", "ai"]
+                .into_iter()
+                .take_while(|id| {
+                    service(id).is_some_and(|test| {
+                        test.attempts > 0 && test.successes > 0 && test.stable && !test.inconclusive
+                    })
+                })
+                .count() as u8
+        } else {
+            0
+        };
+        // An unrequested/skipped service is unknown, not negative evidence.
+        let known = tier >= required
+            || ["youtube", "telegram", "ai"]
+                .into_iter()
+                .take(usize::from(required))
+                .any(|id| {
+                    service(id).is_some_and(|test| {
+                        test.attempts > 0
+                            && !test.inconclusive
+                            && (!test.stable || test.successes == 0)
+                    })
+                });
+        if !known {
+            continue;
+        }
+        let latency = service("ping_proxy")
+            .map(|test| test.avg_ttfb_ms)
+            .filter(|value| *value > 0)
+            .unwrap_or(u32::MAX);
+        let server_ref =
+            lifecycle_ref_for_canonical(&canonical_lifecycle_identity_from_raw(&stats.profile_raw));
+        history
+            .entry(server_ref)
+            .and_modify(|current| {
+                if checked > current.0 || (checked == current.0 && tier > current.1) {
+                    *current = (checked, tier, latency);
+                }
+            })
+            .or_insert((checked, tier, latency));
+    }
+    let mut seen = HashSet::new();
+    let mut lanes: [Vec<Profile>; 3] = Default::default();
+    for profile in profiles {
+        if profile_is_dead(state, &profile) {
+            continue;
+        }
+        let server_ref = lifecycle_ref_for_canonical(&canonical_lifecycle_identity(&profile));
+        if !seen.insert(server_ref.clone()) {
+            continue;
+        }
+        let lane = match history.get(&server_ref) {
+            Some((_, tier, _)) if *tier >= required => 0,
+            None => 1,
+            _ => 2,
+        };
+        lanes[lane].push(profile);
+    }
+    lanes[0].sort_by_key(|profile| {
+        let server_ref = lifecycle_ref_for_canonical(&canonical_lifecycle_identity(profile));
+        let (_, tier, latency) = history[&server_ref];
+        (std::cmp::Reverse(tier), latency)
+    });
+    // Round-robin endpoint+provenance buckets so credential variants don't monopolize discovery.
+    let mut queues: [VecDeque<Profile>; 3] = Default::default();
+    for (lane, profiles) in lanes.into_iter().enumerate() {
+        let mut buckets = Vec::<VecDeque<Profile>>::new();
+        let mut indexes = HashMap::new();
+        for profile in profiles {
+            let key = (
+                profile.group.clone().unwrap_or_default(),
+                profile.address.trim().to_ascii_lowercase(),
+                profile.port,
+            );
+            let index = *indexes.entry(key).or_insert_with(|| {
+                buckets.push(VecDeque::new());
+                buckets.len() - 1
+            });
+            buckets[index].push_back(profile);
+        }
+        let mut buckets = VecDeque::from(buckets);
+        while let Some(mut bucket) = buckets.pop_front() {
+            if let Some(profile) = bucket.pop_front() {
+                queues[lane].push_back(profile);
+            }
+            if !bucket.is_empty() {
+                buckets.push_back(bucket);
+            }
+        }
+    }
+    if !queues[1].is_empty() {
+        let rotate = ((state.profile_search_cursor / 4) % queues[1].len() as u64) as usize;
+        queues[1].rotate_left(rotate);
+    }
+    let mut ordered = Vec::new();
+    while queues.iter().any(|queue| !queue.is_empty()) {
+        // One exploration slot per four candidates prevents unknown entries starving behind incumbents.
+        let preferred = if (ordered.len() as u64 + state.profile_search_cursor) % 4 == 3 {
+            [1, 0, 2]
+        } else {
+            [0, 1, 2]
+        };
+        for lane in preferred {
+            if let Some(profile) = queues[lane].pop_front() {
+                ordered.push(profile);
+                break;
+            }
+        }
+    }
+    ordered
 }
 
 fn benchmark_uses_temporary_core(
@@ -8064,14 +9014,28 @@ fn benchmark_uses_temporary_core(
 
 fn memory_bounded_bench_concurrency(requested: usize, available_kb: u64) -> usize {
     if available_kb == 0 {
-        return requested;
+        return 0;
     }
     let workers = available_kb
         .saturating_sub(BENCH_MEMORY_RESERVE_KB)
         .checked_div(BENCH_WORKER_MEMORY_BUDGET_KB)
-        .unwrap_or(0)
-        .max(1) as usize;
+        .unwrap_or(0) as usize;
     requested.min(workers)
+}
+
+fn validate_bench_worker_admission(
+    requested: usize,
+    profile_count: usize,
+    concurrency: usize,
+    exact_workers: bool,
+) -> Result<(), String> {
+    let needed = requested.min(profile_count);
+    if exact_workers && concurrency < needed {
+        return Err(format!(
+            "Requested {needed} workers, memory permits {concurrency}; reduce parallelism or free memory"
+        ));
+    }
+    Ok(())
 }
 
 fn select_profiles_for_quick_bench(
@@ -8129,7 +9093,12 @@ fn handle_bench_stop(daemon: &Daemon) -> (u16, &'static str, String) {
         let mut inner = lock(&daemon.inner);
         let snapshot = inner.bench.snapshot();
         let running = snapshot.running;
-        let cancellable = running && snapshot.completed < snapshot.total;
+        let cancellable = running
+            && snapshot.completed < snapshot.total
+            && snapshot
+                .search
+                .as_ref()
+                .is_none_or(|search| search.found_good < search.target_good);
         if cancellable {
             inner.bench.request_cancel();
         }
@@ -8328,10 +9297,22 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
 
     {
         let stats_entry = &mut inner.state.stats[stats_idx];
-        if matches!(result.method.as_str(), "quick" | "full") {
+        if matches!(
+            result.method.as_str(),
+            "quick"
+                | "full"
+                | "search"
+                | "availability_quick"
+                | "availability_full"
+                | "search_availability"
+        ) {
             stats_entry.resource_tests = result.resource_tests.clone();
-            stats_entry.last_service_test_success = Some(result.success);
+            stats_entry.last_service_test_success =
+                (matches!(result.method.as_str(), "quick" | "full")
+                    && !result.resource_tests.iter().any(|test| test.inconclusive))
+                .then_some(result.success);
             stats_entry.last_checked_unix = now;
+            stats_entry.last_service_test_unix = now;
             let _ = persist_state(&daemon.state_path, &inner.state);
             return;
         }
@@ -8416,6 +9397,7 @@ fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
                 "failure_count": stat.map(|s| s.failure_count).unwrap_or(0),
                 "last_error": stat.and_then(|s| s.last_error.clone()),
                 "last_checked": stat.map(|s| s.last_checked_unix).unwrap_or(0),
+                "last_service_test_unix": stat.map(|s| s.last_service_test_unix).unwrap_or(0),
                 "resource_tests": stat.map(|s| s.resource_tests.clone()).unwrap_or_default(),
                 "last_service_test_success": stat.and_then(|s| s.last_service_test_success),
                 "ewma_latency_ms": stat.filter(|s| s.has_ewma).map(|s| s.ewma_latency_ms),
@@ -8741,6 +9723,18 @@ fn handle_profile_delete(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
             json!({"error": "profile not found", "profile_id": id}).to_string(),
         );
     }
+    if inner
+        .state
+        .profiles
+        .iter()
+        .find(|profile| profile.id == id)
+        .is_some_and(|profile| profile_has_enabled_pinned_route(&inner.state, profile))
+    {
+        return json_error(
+            409,
+            "profile is referenced by an enabled fixed-server route; retarget it before deletion",
+        );
+    }
 
     let was_active = inner.state.active_profile_id == Some(id);
     push_undo_snapshot(&mut inner.state, format!("Delete profile #{id}"));
@@ -8915,6 +9909,13 @@ fn profile_has_enabled_pinned_route(state: &HincyrayState, profile: &Profile) ->
                 .filter(|route| route.enabled)
                 .map(|route| route.target.as_str()),
         )
+        .chain(
+            state
+                .split_routing
+                .torrent_socks
+                .enabled
+                .then_some(state.split_routing.torrent_socks.target.as_str()),
+        )
         .filter_map(|target| match RoutingTarget::parse(target).ok()? {
             RoutingTarget::Server(server_ref) => Some(server_ref),
             _ => None,
@@ -8994,6 +9995,9 @@ fn migrate_profile_identity(state: &mut HincyrayState, old: &Profile, replacemen
                     .iter_mut()
                     .map(|route| &mut route.target),
             )
+            .chain(std::iter::once(
+                &mut state.split_routing.torrent_socks.target,
+            ))
         {
             if let Ok(RoutingTarget::Server(server_ref)) = RoutingTarget::parse(target)
                 && old_routing_refs.contains(&server_ref)
@@ -9158,7 +10162,11 @@ fn apply_profile_dataplane_locked(
         &daemon.mihomo_config_path,
         geo_dir.as_deref(),
     )?;
-    wait_for_core_readiness_locked(inner, daemon, controller.as_ref())
+    wait_for_core_readiness_locked(inner, daemon, controller.as_ref(), &state)?;
+    if let Some(target) = validate_proxy_selector(controller.as_ref())? {
+        inner.proxy_rejected = target == REJECT_NAME;
+    }
+    Ok(())
 }
 
 fn handle_profile_update(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
@@ -9775,6 +10783,10 @@ fn handle_profile_group_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
         Err(response) => return response,
     };
 
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
     let mut inner = lock(&daemon.inner);
     if !inner
         .state
@@ -9786,6 +10798,15 @@ fn handle_profile_group_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
             404,
             "application/json",
             json!({"error": "profile group not found", "group": group}).to_string(),
+        );
+    }
+    if inner.state.profiles.iter().any(|profile| {
+        profile.group.as_deref() == Some(group.as_str())
+            && profile_has_enabled_pinned_route(&inner.state, profile)
+    }) {
+        return json_error(
+            409,
+            "group contains a profile referenced by an enabled fixed-server route; retarget it before deletion",
         );
     }
 
@@ -10152,6 +11173,13 @@ fn handle_deep_bench_history(daemon: &Daemon) -> (u16, &'static str, String) {
 
 fn handle_trash_list(daemon: &Daemon) -> (u16, &'static str, String) {
     let inner = lock(&daemon.inner);
+    // Canonicalize once, rather than once per dead entry while holding the daemon lock.
+    let mut profiles_by_ref = HashMap::new();
+    for profile in &inner.state.profiles {
+        profiles_by_ref
+            .entry(profile_server_ref(profile))
+            .or_insert(profile);
+    }
     let entries: Vec<Value> = inner
         .state
         .dead_server_refs
@@ -10163,11 +11191,7 @@ fn handle_trash_list(daemon: &Daemon) -> (u16, &'static str, String) {
                 .get(server_ref)
                 .copied()
                 .unwrap_or(0);
-            let profile = inner
-                .state
-                .profiles
-                .iter()
-                .find(|profile| profile_server_ref(profile) == *server_ref);
+            let profile = profiles_by_ref.get(server_ref).copied();
             json!({
                 "server_ref": server_ref,
                 "name": profile.map(|p| p.name.clone()).unwrap_or_else(|| "(gone)".to_owned()),
@@ -10208,7 +11232,9 @@ fn dead_membership_affects_running_dataplane(
     state: &HincyrayState,
     changed_refs: &HashSet<String>,
 ) -> bool {
-    if !state.split_routing.enabled || state.active_profile_id.is_none() || changed_refs.is_empty()
+    if (!state.split_routing.enabled && !state.split_routing.torrent_socks.enabled)
+        || state.active_profile_id.is_none()
+        || changed_refs.is_empty()
     {
         return false;
     }
@@ -10223,6 +11249,13 @@ fn dead_membership_affects_running_dataplane(
                 .iter()
                 .filter(|route| route.enabled)
                 .map(|route| route.target.as_str()),
+        )
+        .chain(
+            state
+                .split_routing
+                .torrent_socks
+                .enabled
+                .then_some(state.split_routing.torrent_socks.target.as_str()),
         )
         .filter_map(|target| match RoutingTarget::parse(target).ok()? {
             RoutingTarget::Server(server_ref) => {
@@ -10394,6 +11427,14 @@ fn handle_trash_clear(daemon: &Daemon) -> (u16, &'static str, String) {
         .filter(|profile| dead_refs.contains(&profile_server_ref(profile)))
         .map(|profile| profile.raw.clone())
         .collect();
+    if candidate.profiles.iter().any(|profile| {
+        removed_raws.contains(&profile.raw) && profile_has_enabled_pinned_route(&candidate, profile)
+    }) {
+        return json_error(
+            409,
+            "Dead Servers contains a profile referenced by an enabled fixed-server route",
+        );
+    }
     let removed_profiles = removed_raws.len();
     let removed_entries = dead_refs.len();
     if removed_entries == 0 {
@@ -10490,6 +11531,16 @@ fn replace_subscription_profiles(
     if fresh.is_empty() {
         return Err(format!(
             "refusing to replace subscription {url} with an empty profile set"
+        ));
+    }
+    let fresh_identities: HashSet<String> = fresh.iter().map(canonical_profile_raw).collect();
+    if state.profiles.iter().any(|profile| {
+        profile.group.as_deref() == Some(url)
+            && profile_has_enabled_pinned_route(state, profile)
+            && !fresh_identities.contains(&canonical_profile_raw(profile))
+    }) {
+        return Err(format!(
+            "subscription {url} refresh would remove a profile referenced by an enabled fixed-server route"
         ));
     }
     let active_raw = state
@@ -10645,6 +11696,13 @@ fn refresh_all_subscriptions(daemon: &Daemon) -> RefreshResult {
 
     for source in &subs {
         let outcome = load_subscription_for_daemon(source, &proxy_info, &hwid);
+        let _apply = match daemon.apply.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                errors.push("config apply lock is poisoned".to_owned());
+                continue;
+            }
+        };
         let mut inner = lock(&daemon.inner);
         let previous_raw: HashSet<String> = inner
             .state
@@ -10851,6 +11909,10 @@ fn handle_subscriptions_refresh_one(body: &str, daemon: &Daemon) -> (u16, &'stat
     let outcome = load_subscription_for_daemon(&source, &proxy_info, &hwid);
     let now = unix_now();
 
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
     let mut inner = lock(&daemon.inner);
     let previous_raw: HashSet<String> = inner
         .state
@@ -11034,6 +12096,10 @@ fn handle_subscriptions_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
         );
     }
 
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
     let mut inner = lock(&daemon.inner);
 
     // Confirm the URL is a known saved subscription.
@@ -11043,6 +12109,15 @@ fn handle_subscriptions_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
             404,
             "application/json",
             json!({"error": "subscription not found", "url": url}).to_string(),
+        );
+    }
+    if inner.state.profiles.iter().any(|profile| {
+        profile.group.as_deref() == Some(url)
+            && profile_has_enabled_pinned_route(&inner.state, profile)
+    }) {
+        return json_error(
+            409,
+            "subscription contains a profile referenced by an enabled fixed-server route; retarget it before deletion",
         );
     }
 
@@ -11272,22 +12347,24 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
         )
     };
     let mut rules = rules;
-    rules.push(RoutingRule {
-        enabled: parovozik_enabled,
-        name: "Паровозик Direct".to_owned(),
-        target: "direct".to_owned(),
-        domains: parovozik_direct_domains,
-        kind: "managed-parovozik".to_owned(),
-        ..RoutingRule::default()
-    });
-    rules.push(RoutingRule {
-        enabled: parovozik_enabled,
-        name: "Паровозик VPN".to_owned(),
-        target: "parovozik".to_owned(),
-        domains: parovozik_vpn_domains,
-        kind: "managed-parovozik".to_owned(),
-        ..RoutingRule::default()
-    });
+    if parovozik_enabled {
+        rules.push(RoutingRule {
+            enabled: true,
+            name: "Паровозик Direct".to_owned(),
+            target: "direct".to_owned(),
+            domains: parovozik_direct_domains,
+            kind: "managed-parovozik".to_owned(),
+            ..RoutingRule::default()
+        });
+        rules.push(RoutingRule {
+            enabled: true,
+            name: "Паровозик VPN".to_owned(),
+            target: "parovozik".to_owned(),
+            domains: parovozik_vpn_domains,
+            kind: "managed-parovozik".to_owned(),
+            ..RoutingRule::default()
+        });
+    }
     let manifest = match daemon.geobase_store().load_manifest() {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -11577,6 +12654,7 @@ fn handle_routing_connection_context(daemon: &Daemon) -> (u16, &'static str, Str
                 address: profile.address.clone(),
                 group: profile.group.clone(),
                 active: active_canonical.as_deref() == Some(canonical.as_str()),
+                dead: profile_is_dead(&inner.state, profile),
             })
         })
         .collect();
@@ -11912,79 +12990,131 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
             json!({"error": "invalid JSON body"}).to_string(),
         );
     };
+    let Some(object) = value.as_object() else {
+        return json_error(400, "routing settings body must be an object");
+    };
+    const ROUTING_SETTINGS_KEYS: &[&str] = &[
+        "apply",
+        "enabled",
+        "auto_switch",
+        "block_quic_global",
+        "rule_source",
+        "vpn_subnet",
+        "redirect_port",
+        "policy_name",
+        "quic_mode",
+        "port_mode",
+        "proxy_ports",
+        "bypass_ports",
+        "geo_asset_path",
+        "ru_direct_mode",
+        "ru_direct_exceptions",
+        "auto_vpn_learning_enabled",
+        "auto_vpn_exceptions",
+        "parovozik_enabled",
+        "parovozik_direct_domains",
+        "parovozik_vpn_domains",
+        "parovozik_server_refs",
+        "match_target",
+        "torrent_socks",
+    ];
+    if let Some(key) = object
+        .keys()
+        .find(|key| !ROUTING_SETTINGS_KEYS.contains(&key.as_str()))
+    {
+        return json_error(400, &format!("unknown routing settings field {key:?}"));
+    }
+    if value.get("apply").is_some_and(|value| !value.is_boolean()) {
+        return json_error(400, "apply must be boolean");
+    }
     let apply_requested = value.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    let torrent_update = match value.get("torrent_socks") {
+        Some(value) => match serde_json::from_value::<TorrentSocksSettingsUpdate>(value.clone()) {
+            Ok(update) => Some(update),
+            Err(error) => return json_error(400, &format!("invalid torrent_socks: {error}")),
+        },
+        None => None,
+    };
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
     let (previous_state, settings) = {
         let mut inner = lock(&daemon.inner);
         let previous_state = inner.state.clone();
+        let mut candidate = inner.state.clone();
         if let Some(v) = value.get("enabled").and_then(Value::as_bool) {
-            inner.state.split_routing.enabled = v;
+            candidate.split_routing.enabled = v;
             // Transparent proxy requires DNS — force enabled alongside
             // split routing so the state matches the firewall DNAT rules.
             if v {
-                inner.state.dns_settings.enabled = true;
+                candidate.dns_settings.enabled = true;
             }
         }
         if let Some(v) = value.get("auto_switch").and_then(Value::as_bool) {
-            inner.state.split_routing.auto_switch = v;
+            candidate.split_routing.auto_switch = v;
         }
         if let Some(v) = value.get("block_quic_global").and_then(Value::as_bool) {
-            inner.state.split_routing.block_quic_global = v;
+            candidate.split_routing.block_quic_global = v;
         }
         if let Some(v) = value.get("rule_source").and_then(Value::as_str) {
-            inner.state.split_routing.rule_source = v.trim().to_owned();
+            candidate.split_routing.rule_source = v.trim().to_owned();
         }
         if let Some(v) = value
             .get("vpn_subnet")
             .and_then(Value::as_str)
             .filter(|v| !v.trim().is_empty())
         {
-            inner.state.split_routing.vpn_subnet = v.trim().to_owned();
+            candidate.split_routing.vpn_subnet = v.trim().to_owned();
         }
         if let Some(v) = value.get("redirect_port").and_then(Value::as_u64) {
-            inner.state.split_routing.redirect_port = v as u16;
+            let Ok(port) = u16::try_from(v) else {
+                return json_error(400, "redirect_port must be between 0 and 65535");
+            };
+            candidate.split_routing.redirect_port = port;
         }
         if let Some(v) = value
             .get("policy_name")
             .and_then(Value::as_str)
             .filter(|v| !v.trim().is_empty())
         {
-            inner.state.split_routing.policy_name = v.trim().to_owned();
+            candidate.split_routing.policy_name = v.trim().to_owned();
         }
         if let Some(v) = value.get("quic_mode").and_then(Value::as_str) {
-            inner.state.split_routing.quic_mode = match v {
+            candidate.split_routing.quic_mode = match v {
                 "proxy" => QuicMode::Proxy,
                 _ => QuicMode::Block,
             };
         }
         if let Some(v) = value.get("port_mode").and_then(Value::as_str) {
-            inner.state.split_routing.port_mode = match v {
+            candidate.split_routing.port_mode = match v {
                 "allow_list" => PortMode::AllowList,
                 "deny_list" => PortMode::DenyList,
                 _ => PortMode::All,
             };
         }
         if let Some(v) = value.get("proxy_ports").and_then(Value::as_array) {
-            inner.state.split_routing.proxy_ports = v
+            candidate.split_routing.proxy_ports = v
                 .iter()
                 .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
                 .filter(|s| !s.is_empty())
                 .collect();
         }
         if let Some(v) = value.get("bypass_ports").and_then(Value::as_array) {
-            inner.state.split_routing.bypass_ports = v
+            candidate.split_routing.bypass_ports = v
                 .iter()
                 .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
                 .filter(|s| !s.is_empty())
                 .collect();
         }
         if let Some(v) = value.get("geo_asset_path").and_then(Value::as_str) {
-            inner.state.split_routing.geo_asset_path = v.trim().to_owned();
+            candidate.split_routing.geo_asset_path = v.trim().to_owned();
         }
         if let Some(v) = value.get("ru_direct_mode").and_then(Value::as_str) {
-            inner.state.split_routing.ru_direct_mode = v.trim().to_owned();
+            candidate.split_routing.ru_direct_mode = v.trim().to_owned();
         }
         if let Some(v) = value.get("ru_direct_exceptions").and_then(Value::as_array) {
-            inner.state.split_routing.ru_direct_exceptions = v
+            candidate.split_routing.ru_direct_exceptions = v
                 .iter()
                 .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
                 .filter(|s| !s.is_empty())
@@ -11994,18 +13124,18 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
             .get("auto_vpn_learning_enabled")
             .and_then(Value::as_bool)
         {
-            inner.state.split_routing.auto_vpn_learning_enabled = v;
+            candidate.split_routing.auto_vpn_learning_enabled = v;
         }
         if let Some(v) = value.get("auto_vpn_exceptions").and_then(Value::as_array) {
             let items: Vec<String> = v
                 .iter()
                 .filter_map(|item| normalize_auto_vpn_domain(item.as_str()?))
                 .collect();
-            inner.state.split_routing.auto_vpn_exceptions = dedup_limited_domains(items);
-            prune_auto_vpn_metadata(&mut inner.state.split_routing);
+            candidate.split_routing.auto_vpn_exceptions = dedup_limited_domains(items);
+            prune_auto_vpn_metadata(&mut candidate.split_routing);
         }
         if let Some(v) = value.get("parovozik_enabled").and_then(Value::as_bool) {
-            inner.state.split_routing.parovozik_enabled = v;
+            candidate.split_routing.parovozik_enabled = v;
         }
         if let Some(v) = value
             .get("parovozik_direct_domains")
@@ -12015,48 +13145,90 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
                 .iter()
                 .filter_map(|item| item.as_str().map(str::to_owned))
                 .collect();
-            inner.state.split_routing.parovozik_direct_domains =
-                normalize_parovozik_domains(&items);
+            candidate.split_routing.parovozik_direct_domains = normalize_parovozik_domains(&items);
         }
         if let Some(v) = value.get("parovozik_vpn_domains").and_then(Value::as_array) {
             let items: Vec<String> = v
                 .iter()
                 .filter_map(|item| item.as_str().map(str::to_owned))
                 .collect();
-            inner.state.split_routing.parovozik_vpn_domains = normalize_parovozik_domains(&items);
+            candidate.split_routing.parovozik_vpn_domains = normalize_parovozik_domains(&items);
         }
         if let Some(v) = value.get("parovozik_server_refs").and_then(Value::as_array) {
             let items: Vec<String> = v
                 .iter()
                 .filter_map(|item| item.as_str().map(str::to_owned))
                 .collect();
-            let mut candidate = inner.state.clone();
             sync_server_route_registry(&mut candidate);
             let refs = match normalize_parovozik_server_refs(&candidate, &items) {
                 Ok(refs) => refs,
                 Err(error) => return json_error(400, &error),
             };
-            inner.state.server_route_registry = candidate.server_route_registry;
-            inner.state.split_routing.parovozik_server_refs = refs;
+            candidate.split_routing.parovozik_server_refs = refs;
         }
         if let Some(v) = value.get("match_target").and_then(Value::as_str) {
             let target = v.trim().to_ascii_lowercase();
             // Validate: when no routing rules exist, can't set to "direct"
             // (would leave router with no VPN routing at all).
-            if target == "direct" && inner.state.routing_rules.is_empty() {
+            if target == "direct" && candidate.routing_rules.is_empty() {
                 return (
                 400,
                 "application/json",
                 json!({"error": "нельзя установить MATCH,direct когда нет правил маршрутизации — весь трафик пойдёт напрямую"}).to_string(),
             );
             }
-            inner.state.split_routing.match_target = if target == "direct" {
+            candidate.split_routing.match_target = if target == "direct" {
                 "direct".to_owned()
             } else {
                 "proxy".to_owned()
             };
         }
+        if let Some(update) = torrent_update {
+            if update.clear_credentials == Some(true)
+                && (update.username.is_some() || update.password.is_some())
+            {
+                return json_error(
+                    400,
+                    "clear_credentials cannot be combined with replacement credentials",
+                );
+            }
+            let settings = &mut candidate.split_routing.torrent_socks;
+            if update.clear_credentials == Some(true) {
+                settings.username.clear();
+                settings.password.clear();
+            }
+            if let Some(enabled) = update.enabled {
+                settings.enabled = enabled;
+            }
+            if let Some(listen) = update.listen {
+                settings.listen = listen.trim().to_owned();
+            }
+            if let Some(port) = update.port {
+                settings.port = port;
+            }
+            if let Some(username) = update.username {
+                settings.username = username.trim().to_owned();
+            }
+            if let Some(password) = update.password.filter(|password| !password.is_empty()) {
+                settings.password = password;
+            }
+            if let Some(target) = update.target {
+                settings.target = target.trim().to_owned();
+            }
+        }
+        sync_server_route_registry(&mut candidate);
+        if let Err(error) = validate_routing_targets(
+            &candidate,
+            &candidate.routing_rules,
+            &candidate.device_routes,
+        )
+        .and_then(|()| validate_torrent_socks_settings(&candidate))
+        {
+            return json_error(400, &error);
+        }
+        inner.state = candidate;
         if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            inner.state = previous_state;
             return (
                 500,
                 "application/json",
@@ -12066,9 +13238,24 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
         (previous_state, inner.state.split_routing.clone())
     };
     if apply_requested {
-        return match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
+        let reconnect_scope = routing_settings_reconnect_scope(&previous_state, &settings, object);
+        return match activate_current_config_locked_with_rollback(
+            daemon,
+            false,
+            true,
+            GeoBaseProjection::Desired,
+            Some(previous_state.clone()),
+        ) {
             Ok(result) => {
                 let settings = split_routing_settings_response(&settings);
+                let reconnect = reconnect_after_routing_change(
+                    daemon,
+                    if result.core_status == "running" {
+                        reconnect_scope
+                    } else {
+                        RoutingReconnectScope::None
+                    },
+                );
                 (
                     200,
                     "application/json",
@@ -12079,6 +13266,7 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
                         "firewall_status": result.firewall_status,
                         "generation": result.generation,
                         "gc_warning": result.gc_warning,
+                        "reconnect": reconnect,
                     })
                     .to_string(),
                 )
@@ -12095,6 +13283,143 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
         "application/json",
         json!({"settings": settings, "applied": false, "requires_apply": true}).to_string(),
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutingReconnectScope {
+    None,
+    Torrent,
+    All,
+}
+
+fn routing_settings_reconnect_scope(
+    previous: &HincyrayState,
+    next: &SplitRoutingSettings,
+    request: &serde_json::Map<String, Value>,
+) -> RoutingReconnectScope {
+    let old = serde_json::to_value(&previous.split_routing).unwrap_or(Value::Null);
+    let new = serde_json::to_value(next).unwrap_or(Value::Null);
+    if request.keys().any(|key| {
+        key != "apply"
+            && key != "torrent_socks"
+            && routing_setting_affects_dataplane(key)
+            && old.get(key) != new.get(key)
+    }) {
+        RoutingReconnectScope::All
+    } else if previous.split_routing.torrent_socks.enabled
+        && (previous.split_routing.torrent_socks.target != next.torrent_socks.target
+            || previous.split_routing.torrent_socks.enabled != next.torrent_socks.enabled
+            || previous.split_routing.torrent_socks.listen != next.torrent_socks.listen
+            || previous.split_routing.torrent_socks.port != next.torrent_socks.port
+            || previous.split_routing.torrent_socks.username != next.torrent_socks.username
+            || previous.split_routing.torrent_socks.password != next.torrent_socks.password)
+    {
+        RoutingReconnectScope::Torrent
+    } else {
+        RoutingReconnectScope::None
+    }
+}
+
+fn routing_setting_affects_dataplane(key: &str) -> bool {
+    matches!(
+        key,
+        "enabled"
+            | "block_quic_global"
+            | "rule_source"
+            | "vpn_subnet"
+            | "redirect_port"
+            | "policy_name"
+            | "quic_mode"
+            | "port_mode"
+            | "proxy_ports"
+            | "bypass_ports"
+            | "geo_asset_path"
+            | "ru_direct_mode"
+            | "ru_direct_exceptions"
+            | "auto_vpn_exceptions"
+            | "parovozik_enabled"
+            | "parovozik_direct_domains"
+            | "parovozik_vpn_domains"
+            | "parovozik_server_refs"
+            | "match_target"
+    )
+}
+
+fn torrent_connection_ids(connections: &Value) -> Vec<String> {
+    connections
+        .get("connections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|connection| {
+            connection
+                .pointer("/metadata/inboundName")
+                .and_then(Value::as_str)
+                == Some(TORRENT_SOCKS_LISTENER)
+        })
+        .filter_map(|connection| {
+            connection
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn reconnect_after_routing_change(daemon: &Daemon, scope: RoutingReconnectScope) -> Value {
+    if scope == RoutingReconnectScope::None {
+        return json!({"scope":"none", "complete":true, "closed":0});
+    }
+    let label = if scope == RoutingReconnectScope::All {
+        "all"
+    } else {
+        "torrent"
+    };
+    let Some((addr, secret)) = ({
+        let inner = lock(&daemon.inner);
+        daemon_mihomo_controller(daemon, &inner.state.mihomo_features)
+    }) else {
+        return json!({"scope":label, "complete":false, "closed":0, "error":"Mihomo controller unavailable"});
+    };
+    if scope == RoutingReconnectScope::All {
+        return match mihomo_api_delete(&addr, secret.as_deref(), "/connections") {
+            Ok(_) => json!({"scope":label, "complete":true, "closed":"all"}),
+            Err(_) => {
+                json!({"scope":label, "complete":false, "closed":0, "error":"could not close Mihomo connections"})
+            }
+        };
+    }
+    let connections = match mihomo_api_get_connections_json(&addr, secret.as_deref()) {
+        Ok(connections) => connections,
+        Err(_) => {
+            return json!({"scope":label, "complete":false, "closed":0, "error":"could not read Mihomo connections"});
+        }
+    };
+    let ids = torrent_connection_ids(&connections);
+    if ids.len() > MAX_TORRENT_CONNECTION_CLOSES {
+        return json!({"scope":label, "complete":false, "closed":0, "error":"too many Torrent SOCKS5 connections to reconnect"});
+    }
+    let total = ids.len();
+    let mut closed = 0;
+    let mut failed = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for id in ids {
+        if Instant::now() >= deadline {
+            failed += 1;
+            break;
+        }
+        let path = format!(
+            "/connections/{}",
+            utf8_percent_encode(&id, NON_ALPHANUMERIC)
+        );
+        if mihomo_api_delete(&addr, secret.as_deref(), &path).is_ok() {
+            closed += 1;
+        } else {
+            failed += 1;
+            break;
+        }
+    }
+    json!({"scope":label, "complete":failed == 0 && closed == total, "closed":closed, "failed":failed})
 }
 
 fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
@@ -12138,6 +13463,10 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
     if let Err(error) = validate_router_routing_rules(&rules) {
         return (400, "application/json", json!({"error": error}).to_string());
     }
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
     let (previous_state, saved_rules, removes_rules) = {
         let mut inner = lock(&daemon.inner);
         let mut candidate = inner.state.clone();
@@ -12150,6 +13479,7 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         inner.state.server_route_registry = candidate.server_route_registry;
         inner.state.routing_rules = rules;
         if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            inner.state = previous_state;
             return (
                 500,
                 "application/json",
@@ -12168,20 +13498,34 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
     };
 
     if apply_requested {
-        return match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
-            Ok(result) => (
-                200,
-                "application/json",
-                json!({
-                    "rules": saved_rules,
-                    "applied": true,
-                    "core_status": result.core_status,
-                    "firewall_status": result.firewall_status,
-                    "generation": result.generation,
-                    "gc_warning": result.gc_warning,
-                })
-                .to_string(),
-            ),
+        return match activate_current_config_locked(daemon, false, true, GeoBaseProjection::Desired)
+        {
+            Ok(result) => {
+                let reconnect = reconnect_after_routing_change(
+                    daemon,
+                    if result.core_status == "running"
+                        && previous_state.routing_rules != saved_rules
+                    {
+                        RoutingReconnectScope::All
+                    } else {
+                        RoutingReconnectScope::None
+                    },
+                );
+                (
+                    200,
+                    "application/json",
+                    json!({
+                        "rules": saved_rules,
+                        "applied": true,
+                        "core_status": result.core_status,
+                        "firewall_status": result.firewall_status,
+                        "generation": result.generation,
+                        "gc_warning": result.gc_warning,
+                        "reconnect": reconnect,
+                    })
+                    .to_string(),
+                )
+            }
             Err(error) if removes_rules => (
                 200,
                 "application/json",
@@ -12282,6 +13626,10 @@ fn handle_routing_resource_route(body: &str, daemon: &Daemon) -> (u16, &'static 
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| format!("Resource route: {}", resource.value));
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
 
     let previous_state = {
         let mut inner = lock(&daemon.inner);
@@ -12302,6 +13650,7 @@ fn handle_routing_resource_route(body: &str, daemon: &Daemon) -> (u16, &'static 
         let previous_state = inner.state.clone();
         inner.state = candidate;
         if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            inner.state = previous_state;
             return (
                 500,
                 "application/json",
@@ -12311,17 +13660,17 @@ fn handle_routing_resource_route(body: &str, daemon: &Daemon) -> (u16, &'static 
         previous_state
     };
 
-    let activation = match activate_current_config(daemon, false, true, GeoBaseProjection::Desired)
-    {
-        Ok(result) => result,
-        Err(error) => {
-            let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
-            return json_error(500, &format!("{error}; state rollback: {rollback}"));
-        }
-    };
+    let activation =
+        match activate_current_config_locked(daemon, false, true, GeoBaseProjection::Desired) {
+            Ok(result) => result,
+            Err(error) => {
+                let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
+                return json_error(500, &format!("{error}; state rollback: {rollback}"));
+            }
+        };
 
     let close_result = if close_connections {
-        close_resource_connections(daemon, &resource, source_ip)
+        close_resource_connections(daemon, &resource, source_ip, None, None)
     } else {
         ResourceCloseResult::default()
     };
@@ -12343,6 +13692,113 @@ fn handle_routing_resource_route(body: &str, daemon: &Daemon) -> (u16, &'static 
         "gc_warning": activation.gc_warning,
     });
     (status, "application/json", response.to_string())
+}
+
+fn handle_routing_resource_reload(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let request = match serde_json::from_str::<RoutingResourceReloadRequest>(body) {
+        Ok(request) => request,
+        Err(error) => return json_error(400, &format!("invalid request: {error}")),
+    };
+    let Some(resource) = normalize_routing_resource(&request.resource) else {
+        return json_error(400, "resource is not a routable host or IP");
+    };
+    let source_ip = request
+        .source_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(source_ip) = source_ip
+        && source_ip.parse::<IpAddr>().is_err()
+    {
+        return json_error(400, "source_ip is not a valid IP address");
+    }
+    let network = request
+        .network
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(network.as_str(), "" | "tcp" | "udp") {
+        return json_error(400, "network must be tcp or udp");
+    }
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    let (target, fallback_active, runtime_evaluation) = {
+        let inner = lock(&daemon.inner);
+        let request = TraceRequest {
+            host: if resource.kind == RoutingResourceKind::Domain {
+                resource.value.clone()
+            } else {
+                String::new()
+            },
+            ip: if resource.kind == RoutingResourceKind::Ip {
+                resource.value.clone()
+            } else {
+                String::new()
+            },
+            source_ip: source_ip.unwrap_or("").to_owned(),
+            port: request.port,
+            network: network.clone(),
+        };
+        let trace = trace_routing_decision(&inner.state, &request);
+        let runtime_evaluation = trace_requires_mihomo_runtime(&trace);
+        let target = trace
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("active")
+            .to_owned();
+        let fallback_active = match RoutingTarget::parse(&target) {
+            Ok(RoutingTarget::Server(server_ref)) => inner
+                .state
+                .server_route_registry
+                .iter()
+                .find(|entry| entry.server_ref == server_ref)
+                .and_then(|entry| {
+                    inner
+                        .state
+                        .profiles
+                        .iter()
+                        .find(|profile| canonical_profile_raw(profile) == entry.canonical_raw)
+                })
+                .is_some_and(|profile| profile_is_dead(&inner.state, profile)),
+            _ => false,
+        };
+        (target, fallback_active, runtime_evaluation)
+    };
+    let activation =
+        match activate_current_config_locked(daemon, false, true, GeoBaseProjection::Desired) {
+            Ok(result) => result,
+            Err(error) => return json_error(500, &error),
+        };
+    let close_result = close_resource_connections(
+        daemon,
+        &resource,
+        source_ip,
+        request.port,
+        (!network.is_empty()).then_some(network.as_str()),
+    );
+    let ok = close_result.errors.is_empty();
+    let status = if ok { 200 } else { 207 };
+    let response = RoutingResourceReloadResponse {
+        ok,
+        resource: resource.value,
+        target,
+        fallback_active,
+        runtime_evaluation,
+        applied: true,
+        core_status: activation.core_status,
+        firewall_status: activation.firewall_status,
+        generation: activation.generation,
+        closed_connections: close_result.closed,
+        close_errors: close_result.errors,
+        gc_warning: activation.gc_warning,
+    };
+    match serde_json::to_string(&response) {
+        Ok(body) => (status, "application/json", body),
+        Err(error) => json_error(500, &format!("serialize response: {error}")),
+    }
 }
 
 #[derive(Default)]
@@ -12428,18 +13884,29 @@ fn handle_routing_catalog_refresh(body: &str, daemon: &Daemon) -> (u16, &'static
 
 fn handle_routing_apply(daemon: &Daemon) -> (u16, &'static str, String) {
     match activate_current_config(daemon, true, true, GeoBaseProjection::Desired) {
-        Ok(result) => (
-            200,
-            "application/json",
-            json!({
-                "applied": true,
-                "core_status": result.core_status,
-                "firewall_status": result.firewall_status,
-                "generation": result.generation,
-                "gc_warning": result.gc_warning,
-            })
-            .to_string(),
-        ),
+        Ok(result) => {
+            let reconnect = reconnect_after_routing_change(
+                daemon,
+                if result.core_status == "running" {
+                    RoutingReconnectScope::All
+                } else {
+                    RoutingReconnectScope::None
+                },
+            );
+            (
+                200,
+                "application/json",
+                json!({
+                    "applied": true,
+                    "core_status": result.core_status,
+                    "firewall_status": result.firewall_status,
+                    "generation": result.generation,
+                    "gc_warning": result.gc_warning,
+                    "reconnect": reconnect,
+                })
+                .to_string(),
+            )
+        }
         Err(error) => json_error(500, &error),
     }
 }
@@ -12461,6 +13928,10 @@ fn handle_routing_reset(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         }
     };
     let apply_requested = value.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
     let previous_state = {
         let mut inner = lock(&daemon.inner);
         let previous_state = inner.state.clone();
@@ -12484,6 +13955,7 @@ fn handle_routing_reset(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         s.bypass_ports = Vec::new();
         s.quic_mode = QuicMode::Block;
         s.block_quic_global = false;
+        s.torrent_socks = TorrentSocksSettings::default();
 
         // Reset routing rules to just QUIC Block (system-level).
         inner.state.routing_rules = vec![RoutingRule {
@@ -12501,6 +13973,7 @@ fn handle_routing_reset(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         }];
 
         if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            inner.state = previous_state;
             return (
                 500,
                 "application/json",
@@ -12511,20 +13984,32 @@ fn handle_routing_reset(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
     };
 
     if apply_requested {
-        return match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
-            Ok(result) => (
-                200,
-                "application/json",
-                json!({
-                    "reset": true,
-                    "applied": true,
-                    "core_status": result.core_status,
-                    "firewall_status": result.firewall_status,
-                    "generation": result.generation,
-                    "gc_warning": result.gc_warning,
-                })
-                .to_string(),
-            ),
+        return match activate_current_config_locked(daemon, false, true, GeoBaseProjection::Desired)
+        {
+            Ok(result) => {
+                let reconnect = reconnect_after_routing_change(
+                    daemon,
+                    if result.core_status == "running" {
+                        RoutingReconnectScope::All
+                    } else {
+                        RoutingReconnectScope::None
+                    },
+                );
+                (
+                    200,
+                    "application/json",
+                    json!({
+                        "reset": true,
+                        "applied": true,
+                        "core_status": result.core_status,
+                        "firewall_status": result.firewall_status,
+                        "generation": result.generation,
+                        "gc_warning": result.gc_warning,
+                        "reconnect": reconnect,
+                    })
+                    .to_string(),
+                )
+            }
             Err(error) => {
                 let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
                 json_error(500, &format!("{error}; state rollback: {rollback}"))
@@ -12585,6 +14070,10 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
     }
 
     let apply_requested = value.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
 
     let target_override = value.get("target").and_then(Value::as_str).map(|s| {
         let t = s.trim().to_ascii_lowercase();
@@ -12636,6 +14125,7 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
         }
 
         if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            inner.state = previous_state;
             return (
                 500,
                 "application/json",
@@ -12646,25 +14136,37 @@ fn handle_routing_preset_apply(body: &str, daemon: &Daemon) -> (u16, &'static st
     };
 
     if apply_requested {
-        return match activate_current_config(daemon, false, true, GeoBaseProjection::Desired) {
-            Ok(result) => (
-                200,
-                "application/json",
-                json!({
-                    "saved": true,
-                    "applied": true,
-                    "preset": preset.id,
-                    "rules_added": preset.rules.len(),
-                    "rules_cleared": preset.clear_existing,
-                    "port_mode": preset.port_mode,
-                    "target_override": target_override,
-                    "core_status": result.core_status,
-                    "firewall_status": result.firewall_status,
-                    "generation": result.generation,
-                    "gc_warning": result.gc_warning,
-                })
-                .to_string(),
-            ),
+        return match activate_current_config_locked(daemon, false, true, GeoBaseProjection::Desired)
+        {
+            Ok(result) => {
+                let reconnect = reconnect_after_routing_change(
+                    daemon,
+                    if result.core_status == "running" {
+                        RoutingReconnectScope::All
+                    } else {
+                        RoutingReconnectScope::None
+                    },
+                );
+                (
+                    200,
+                    "application/json",
+                    json!({
+                        "saved": true,
+                        "applied": true,
+                        "preset": preset.id,
+                        "rules_added": preset.rules.len(),
+                        "rules_cleared": preset.clear_existing,
+                        "port_mode": preset.port_mode,
+                        "target_override": target_override,
+                        "core_status": result.core_status,
+                        "firewall_status": result.firewall_status,
+                        "generation": result.generation,
+                        "gc_warning": result.gc_warning,
+                        "reconnect": reconnect,
+                    })
+                    .to_string(),
+                )
+            }
             Err(error) => {
                 let rollback = restore_state_after_failed_policy_change(daemon, previous_state);
                 json_error(500, &format!("{error}; state rollback: {rollback}"))
@@ -13515,6 +15017,10 @@ fn trace_routing_decision(state: &HincyrayState, request: &TraceRequest) -> Valu
     })
 }
 
+fn trace_requires_mihomo_runtime(trace: &Value) -> bool {
+    trace.get("decision").and_then(Value::as_str) == Some("requires_mihomo_geo_eval")
+}
+
 #[derive(Default)]
 struct TraceMatch {
     exact: bool,
@@ -13529,7 +15035,12 @@ fn trace_ports_match(rule: &RoutingRule, port: Option<u16>) -> bool {
     let Some(port) = port else {
         return false;
     };
-    rule.ports.iter().any(|spec| port_matches_spec(port, spec))
+    let listed = rule.ports.iter().any(|spec| port_matches_spec(port, spec));
+    if rule.port_mode == "exclude" {
+        !listed
+    } else {
+        listed
+    }
 }
 
 fn port_matches_spec(port: u16, spec: &str) -> bool {
@@ -13548,7 +15059,7 @@ fn port_matches_spec(port: u16, spec: &str) -> bool {
 
 fn trace_network_matches(rule: &RoutingRule, network: &str) -> bool {
     let wanted = rule.network.trim().to_ascii_lowercase();
-    wanted.is_empty() || network.is_empty() || wanted == network
+    wanted.is_empty() || wanted == "any" || network.is_empty() || wanted == network
 }
 
 fn trace_domain_match(rule: &RoutingRule, host: &str) -> TraceMatch {
@@ -16765,6 +18276,17 @@ fn filter_connection_ids(
     destination_ip: Option<&str>,
     source_ip: Option<&str>,
 ) -> Vec<String> {
+    filter_connection_ids_with_route(conns, host, destination_ip, source_ip, None, None)
+}
+
+fn filter_connection_ids_with_route(
+    conns: &Value,
+    host: Option<&str>,
+    destination_ip: Option<&str>,
+    source_ip: Option<&str>,
+    port: Option<u16>,
+    network: Option<&str>,
+) -> Vec<String> {
     let host = host.unwrap_or("").trim().to_ascii_lowercase();
     let destination_ip = destination_ip.unwrap_or("").trim();
     let source_ip = source_ip.unwrap_or("").trim();
@@ -16780,6 +18302,11 @@ fn filter_connection_ids(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_ascii_lowercase();
+            let sniff_host = metadata
+                .get("sniffHost")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
             let conn_source = metadata
                 .get("sourceIP")
                 .and_then(Value::as_str)
@@ -16789,11 +18316,27 @@ fn filter_connection_ids(
                 .or_else(|| metadata.get("remoteDestination"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let host_ok =
-                host.is_empty() || conn_host == host || conn_host.ends_with(&format!(".{host}"));
+            let conn_port = metadata
+                .get("destinationPort")
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+                })
+                .and_then(|value| u16::try_from(value).ok());
+            let conn_network = metadata
+                .get("network")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let host_matches =
+                |candidate: &str| candidate == host || candidate.ends_with(&format!(".{host}"));
+            let host_ok = host.is_empty() || host_matches(&conn_host) || host_matches(&sniff_host);
             let destination_ok = destination_ip.is_empty() || conn_destination == destination_ip;
             let source_ok = source_ip.is_empty() || conn_source == source_ip;
-            (host_ok && destination_ok && source_ok)
+            let port_ok = port.is_none() || conn_port == port;
+            let network_ok = network.is_none_or(|network| conn_network == network);
+            (host_ok && destination_ok && source_ok && port_ok && network_ok)
                 .then(|| conn.get("id").and_then(Value::as_str).map(str::to_owned))
                 .flatten()
         })
@@ -16804,6 +18347,8 @@ fn close_resource_connections(
     daemon: &Daemon,
     resource: &RoutingResource,
     source_ip: Option<&str>,
+    port: Option<u16>,
+    network: Option<&str>,
 ) -> ResourceCloseResult {
     let (addr, secret) = match mihomo_controller_for_daemon(daemon) {
         Ok(ec) => ec,
@@ -16824,22 +18369,35 @@ fn close_resource_connections(
         }
     };
     let ids = match resource.kind {
-        RoutingResourceKind::Domain => {
-            filter_connection_ids(&conns, Some(&resource.value), None, source_ip)
-        }
-        RoutingResourceKind::Ip => {
-            filter_connection_ids(&conns, None, Some(&resource.value), source_ip)
-        }
+        RoutingResourceKind::Domain => filter_connection_ids_with_route(
+            &conns,
+            Some(&resource.value),
+            None,
+            source_ip,
+            port,
+            network,
+        ),
+        RoutingResourceKind::Ip => filter_connection_ids_with_route(
+            &conns,
+            None,
+            Some(&resource.value),
+            source_ip,
+            port,
+            network,
+        ),
     };
     let mut result = ResourceCloseResult::default();
-    for id in ids {
+    for id in ids.into_iter().take(MAX_RESOURCE_CONNECTION_CLOSES) {
         let path = format!(
             "/connections/{}",
             utf8_percent_encode(&id, NON_ALPHANUMERIC)
         );
         match mihomo_api_delete(&addr, secret.as_deref(), &path) {
             Ok(_) => result.closed += 1,
-            Err(error) => result.errors.push(format!("{id}: {error}")),
+            Err(error) => result.errors.push(bounded_diagnostic_bytes(
+                &redact_diagnostic_text(&format!("{id}: {error}")),
+                512,
+            )),
         }
     }
     result
@@ -16881,7 +18439,7 @@ fn handle_mihomo_api_delay(body: &str, daemon: &Daemon) -> (u16, &'static str, S
     let name = req
         .get("name")
         .and_then(Value::as_str)
-        .unwrap_or(PROXY_NAME);
+        .unwrap_or(PROXY_ACTIVE_NAME);
     let url = req
         .get("url")
         .and_then(Value::as_str)
@@ -17607,7 +19165,8 @@ fn handle_unlock_check(body: &str, daemon: &Daemon) -> (u16, &'static str, Strin
 
 fn unlock_probe_from_resource_test(result: ResourceTestResult) -> Value {
     json!({
-        "reachable": result.stable,
+        "reachable": result.stable && !result.inconclusive,
+        "inconclusive": result.inconclusive,
         "elapsed_ms": result.avg_ttfb_ms,
         "attempts": result.attempts,
         "successes": result.successes,
@@ -19492,6 +21051,64 @@ fn handle_dns_diagnostics(daemon: &Daemon) -> (u16, &'static str, String) {
     )
 }
 
+fn handle_direct_availability_diagnostics(daemon: &Daemon) -> (u16, &'static str, String) {
+    json_response(&daemon.direct_monitor.refresh())
+}
+
+pub(crate) fn direct_availability_probe(id: &str, name: &str, url: &str) -> Value {
+    let started = std::time::Instant::now();
+    let output = Command::new("curl")
+        .args([
+            "-4",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-redirs",
+            "3",
+            "--connect-timeout",
+            "3",
+            "--max-time",
+            "5",
+            "--noproxy",
+            "*",
+            "--output",
+            "/dev/null",
+            "--write-out",
+            "%{http_code}",
+            url,
+        ])
+        .output();
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    match output {
+        Ok(output) => {
+            let status = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u16>()
+                .ok();
+            let ok =
+                output.status.success() && status.is_some_and(|code| (200..400).contains(&code));
+            let error = if ok {
+                None
+            } else {
+                Some(if let Some(code) = status {
+                    format!("HTTP {code}")
+                } else {
+                    bounded_diagnostic_string(&String::from_utf8_lossy(&output.stderr), 160)
+                })
+            };
+            json!({"id": id, "name": name, "ok": ok, "status": status, "elapsed_ms": elapsed_ms, "error": error})
+        }
+        Err(error) => json!({
+            "id": id,
+            "name": name,
+            "ok": false,
+            "status": null,
+            "elapsed_ms": elapsed_ms,
+            "error": bounded_diagnostic_string(&error.to_string(), 160),
+        }),
+    }
+}
+
 fn handle_dns_diagnostics_v2(daemon: &Daemon) -> (u16, &'static str, String) {
     let (split_enabled, dns_port, core_running, remote_servers, local_servers) = {
         let mut inner = lock(&daemon.inner);
@@ -19748,6 +21365,58 @@ fn handle_backup_create(daemon: &Daemon) -> (u16, &'static str, String) {
     }
 }
 
+fn apply_restored_state(
+    daemon: &Daemon,
+    mut restored: HincyrayState,
+    backup_reason: &str,
+) -> Result<String, String> {
+    if restored.split_routing.enabled {
+        restored.dns_settings.enabled = true;
+    }
+    if restored.web_ui_auth.enabled && !restored.web_ui_auth.has_password() {
+        return Err("restored Web UI authentication is enabled without a password".to_owned());
+    }
+    sync_server_route_registry(&mut restored);
+    validate_routing_targets(&restored, &restored.routing_rules, &restored.device_routes)?;
+    validate_torrent_socks_settings(&restored)?;
+
+    let _apply = daemon
+        .apply
+        .lock()
+        .map_err(|_| "config apply lock is poisoned".to_owned())?;
+    let (previous_state, was_running) = {
+        let mut inner = lock(&daemon.inner);
+        let previous_state = inner.state.clone();
+        create_state_backup(&daemon.state_path, &previous_state, backup_reason)?;
+        let was_running = inner.core.is_running();
+        inner.state = restored;
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            inner.state = previous_state;
+            return Err(format!("persist restored state: {error}"));
+        }
+        (previous_state, was_running)
+    };
+
+    match activate_current_config_locked_with_rollback(
+        daemon,
+        was_running,
+        true,
+        GeoBaseProjection::Applied,
+        Some(previous_state.clone()),
+    ) {
+        Ok(result) => {
+            lock(&daemon.inner).sessions.clear();
+            Ok(result.core_status)
+        }
+        Err(error) => {
+            let state_rollback = restore_state_after_failed_policy_change(daemon, previous_state);
+            Err(format!(
+                "apply restored state: {error}; state rollback: {state_rollback}"
+            ))
+        }
+    }
+}
+
 fn handle_backup_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return (
@@ -19777,7 +21446,7 @@ fn handle_backup_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
             );
         }
     };
-    let mut restored: HincyrayState = match deserialize_persisted_state(&text) {
+    let restored: HincyrayState = match deserialize_persisted_state(&text) {
         Ok(state) => state,
         Err(error) => {
             return (
@@ -19787,37 +21456,13 @@ fn handle_backup_restore(body: &str, daemon: &Daemon) -> (u16, &'static str, Str
             );
         }
     };
-    if restored.split_routing.enabled {
-        restored.dns_settings.enabled = true;
-    }
-    let mut inner = lock(&daemon.inner);
-    let was_running = inner.core.is_running();
-    let _ = create_state_backup(&daemon.state_path, &inner.state, "pre-restore");
-    inner.state = restored;
-    inner.sessions.clear();
-    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
-        return (
-            500,
-            "application/json",
-            json!({"error": format!("persist restored state: {error}")}).to_string(),
-        );
-    }
-    let restart = if was_running {
-        restart_core_locked(&mut inner, daemon).map(|()| inner.core.status().to_owned())
-    } else {
-        regenerate_config(&inner.state, daemon).map(|_| inner.core.status().to_owned())
-    };
-    match restart {
+    match apply_restored_state(daemon, restored, "pre-restore") {
         Ok(core_status) => (
             200,
             "application/json",
             json!({"restored": file, "core_status": core_status}).to_string(),
         ),
-        Err(error) => (
-            500,
-            "application/json",
-            json!({"restored": file, "error": error}).to_string(),
-        ),
+        Err(error) => (500, "application/json", json!({"error": error}).to_string()),
     }
 }
 
@@ -19919,7 +21564,7 @@ fn handle_backup_webdav_download(body: &str, daemon: &Daemon) -> (u16, &'static 
         value.get("password").and_then(Value::as_str),
     ) {
         Ok(text) => {
-            let mut restored: HincyrayState = match deserialize_persisted_state(&text) {
+            let restored: HincyrayState = match deserialize_persisted_state(&text) {
                 Ok(state) => state,
                 Err(error) => {
                     return (
@@ -19929,25 +21574,14 @@ fn handle_backup_webdav_download(body: &str, daemon: &Daemon) -> (u16, &'static 
                     );
                 }
             };
-            if restored.split_routing.enabled {
-                restored.dns_settings.enabled = true;
+            match apply_restored_state(daemon, restored, "pre-webdav-restore") {
+                Ok(core_status) => (
+                    200,
+                    "application/json",
+                    json!({"downloaded": true, "core_status": core_status}).to_string(),
+                ),
+                Err(error) => json_error(500, &error),
             }
-            let mut inner = lock(&daemon.inner);
-            let was_running = inner.core.is_running();
-            let _ = create_state_backup(&daemon.state_path, &inner.state, "pre-webdav-restore");
-            inner.state = restored;
-            inner.sessions.clear();
-            let _ = persist_state(&daemon.state_path, &inner.state);
-            if was_running {
-                let _ = restart_core_locked(&mut inner, daemon);
-            } else {
-                let _ = regenerate_config(&inner.state, daemon);
-            }
-            (
-                200,
-                "application/json",
-                json!({"downloaded": true}).to_string(),
-            )
         }
         Err(error) => (502, "application/json", json!({"error": error}).to_string()),
     }
@@ -19979,7 +21613,8 @@ fn create_state_backup(
         .collect();
     let path = dir.join(format!("state-{}-{safe_reason}.json", unix_now()));
     let text = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+    write_private_file(&path, text.as_bytes())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     prune_state_backups(state_path, MAX_BACKUPS)?;
     Ok(path)
 }
@@ -20040,8 +21675,10 @@ fn webdav_put(
     password: Option<&str>,
     body: String,
 ) -> Result<u16, String> {
+    require_https_url(url, "WebDAV")?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.put(url).body(body);
@@ -20060,8 +21697,10 @@ fn webdav_put(
 }
 
 fn webdav_get(url: &str, username: Option<&str>, password: Option<&str>) -> Result<String, String> {
+    require_https_url(url, "WebDAV")?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.get(url);
@@ -20093,14 +21732,30 @@ fn webdav_get(url: &str, username: Option<&str>, password: Option<&str>) -> Resu
     }
 }
 
+fn require_https_url(value: &str, label: &str) -> Result<(), String> {
+    let url = url::Url::parse(value).map_err(|error| format!("invalid {label} URL: {error}"))?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Err(format!("{label} URL must use HTTPS"));
+    }
+    Ok(())
+}
+
 fn restart_core_locked(inner: &mut MutexGuard<DaemonInner>, daemon: &Daemon) -> Result<(), String> {
+    let desired_target = if inner.proxy_rejected {
+        REJECT_NAME
+    } else {
+        PROXY_ACTIVE_NAME
+    };
     let geo_dir = geo_dir_from_state(&inner.state);
     let (binary_path, config_path) = regenerate_config(&inner.state, daemon)?;
-    inner
-        .core
-        .restart(&binary_path, &config_path, geo_dir.as_deref())?;
-    let controller = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
-    wait_for_core_readiness_locked(inner, daemon, controller.as_ref())
+    restart_core_with_selector_locked(
+        inner,
+        daemon,
+        &binary_path,
+        &config_path,
+        geo_dir.as_deref(),
+        desired_target,
+    )
 }
 
 /// Authenticate a user and return a bounded-lifetime cryptographic session.
@@ -20261,6 +21916,7 @@ fn handle_auth_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
         None
     };
     let mut inner = lock(&daemon.inner);
+    let previous_auth = inner.state.web_ui_auth.clone();
     let mut invalidate_sessions = false;
     let requested_enabled = value.get("enabled").and_then(Value::as_bool);
     if let Some(username) = value.get("username").and_then(Value::as_str) {
@@ -20276,6 +21932,7 @@ fn handle_auth_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
         invalidate_sessions = true;
     }
     if requested_enabled == Some(true) && !inner.state.web_ui_auth.has_password() {
+        inner.state.web_ui_auth = previous_auth;
         return json_error(400, "cannot enable authentication without a password");
     }
     if let Some(enabled) = requested_enabled {
@@ -20286,6 +21943,7 @@ fn handle_auth_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
         inner.sessions.clear();
     }
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        inner.state.web_ui_auth = previous_auth;
         return (
             500,
             "application/json",
@@ -20402,8 +22060,13 @@ fn handle_device_routes_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
         .get("enabled")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
 
     let mut inner = lock(&daemon.inner);
+    let previous_state = inner.state.clone();
     let mut candidate = inner.state.clone();
     sync_server_route_registry(&mut candidate);
     // Upsert: find existing by IP, or push new.
@@ -20432,6 +22095,7 @@ fn handle_device_routes_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
     inner.state = candidate;
 
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        inner.state = previous_state;
         return (
             500,
             "application/json",
@@ -20476,8 +22140,13 @@ fn handle_device_routes_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
         );
     };
     let ip = ip.trim();
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
 
     let mut inner = lock(&daemon.inner);
+    let previous_state = inner.state.clone();
     let before = inner.state.device_routes.len();
     inner.state.device_routes.retain(|dr| dr.ip != ip);
     let after = inner.state.device_routes.len();
@@ -20491,6 +22160,7 @@ fn handle_device_routes_delete(body: &str, daemon: &Daemon) -> (u16, &'static st
     }
 
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        inner.state = previous_state;
         return (
             500,
             "application/json",
@@ -20537,13 +22207,34 @@ fn handle_devices_scan(_daemon: &Daemon) -> (u16, &'static str, String) {
 
 /// Apply device routing changes: regenerate Mihomo config and restart core.
 fn handle_device_routes_apply(daemon: &Daemon) -> (u16, &'static str, String) {
-    let mut inner = lock(&daemon.inner);
-    match restart_core_locked(&mut inner, daemon) {
-        Ok(()) => (
-            200,
-            "application/json",
-            json!({"status": "applied", "core_status": inner.core.status()}).to_string(),
-        ),
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    match activate_current_config_locked(daemon, true, true, GeoBaseProjection::Desired) {
+        Ok(result) => {
+            let reconnect = reconnect_after_routing_change(
+                daemon,
+                if result.core_status == "running" {
+                    RoutingReconnectScope::All
+                } else {
+                    RoutingReconnectScope::None
+                },
+            );
+            (
+                200,
+                "application/json",
+                json!({
+                    "status": "applied",
+                    "core_status": result.core_status,
+                    "firewall_status": result.firewall_status,
+                    "generation": result.generation,
+                    "gc_warning": result.gc_warning,
+                    "reconnect": reconnect,
+                })
+                .to_string(),
+            )
+        }
         Err(e) => (
             500,
             "application/json",
@@ -20960,14 +22651,12 @@ fn handle_update_check(daemon: &Daemon) -> (u16, &'static str, String) {
 /// binary, restarts the core, and verifies the new process is alive.
 /// On failure, rolls back to the previous binary.
 fn handle_update_apply(daemon: &Daemon) -> (u16, &'static str, String) {
-    let (socks_port, core_running, mihomo_path, config_path, geo_dir) = {
+    let (socks_port, core_running, mihomo_path) = {
         let mut inner = lock(&daemon.inner);
         (
             inner.state.socks_port,
             inner.core.is_running(),
             inner.state.mihomo_path.clone(),
-            daemon.mihomo_config_path.clone(),
-            geo_dir_from_state(&inner.state),
         )
     };
     if !core_running {
@@ -21000,48 +22689,57 @@ fn handle_update_apply(daemon: &Daemon) -> (u16, &'static str, String) {
         );
     }
 
-    // Download and install (network I/O + file ops, no lock).
+    // Serialize backup, live replacement, verified restart, and rollback.
+    let _apply = match daemon.apply.lock() {
+        Ok(lock) => lock,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
     let new_version = match download_and_install_mihomo(&release, &mihomo_path, socks_port) {
         Ok(v) => v,
         Err(e) => return (500, "application/json", json!({"error": e}).to_string()),
     };
 
-    // Restart core with new binary (needs lock).
+    // Restart core with the new binary behind the shared apply boundary.
     let mut inner = lock(&daemon.inner);
-    if let Err(e) = inner
-        .core
-        .restart(&mihomo_path, &config_path, geo_dir.as_deref())
-    {
-        // Core restart failed — attempt rollback.
-        eprintln!("hincyray: core restart after update failed ({e}), rolling back");
-        let backup_path = format!("{mihomo_path}.bak");
-        let _ = fs::copy(&backup_path, &mihomo_path);
-        let _ = inner
-            .core
-            .restart(&mihomo_path, &config_path, geo_dir.as_deref());
+    let desired_target = if inner.proxy_rejected {
+        REJECT_NAME
+    } else {
+        PROXY_ACTIVE_NAME
+    };
+    let geo_dir = geo_dir_from_state(&inner.state);
+    let config_path = daemon.mihomo_config_path.clone();
+    if let Err(error) = restart_core_with_selector_locked(
+        &mut inner,
+        daemon,
+        &mihomo_path,
+        &config_path,
+        geo_dir.as_deref(),
+        desired_target,
+    ) {
+        eprintln!("hincyray: core restart after update failed ({error}), rolling back");
+        let rollback = fs::copy(format!("{mihomo_path}.bak"), &mihomo_path)
+            .map_err(|rollback_error| format!("restore backup binary: {rollback_error}"))
+            .and_then(|_| {
+                restart_core_with_selector_locked(
+                    &mut inner,
+                    daemon,
+                    &mihomo_path,
+                    &config_path,
+                    geo_dir.as_deref(),
+                    desired_target,
+                )
+            });
+        if rollback.is_err() {
+            let _ = inner.core.stop();
+        }
         return (
             500,
             "application/json",
-            json!({"error": format!("core restart failed after update, rolled back: {e}")})
-                .to_string(),
-        );
-    }
-
-    // Wait and verify the new core is alive.
-    drop(inner);
-    thread::sleep(Duration::from_secs(3));
-    let mut inner = lock(&daemon.inner);
-    if !inner.core.is_running() {
-        eprintln!("hincyray: core died after update, rolling back");
-        let backup_path = format!("{mihomo_path}.bak");
-        let _ = fs::copy(&backup_path, &mihomo_path);
-        let _ = inner
-            .core
-            .restart(&mihomo_path, &config_path, geo_dir.as_deref());
-        return (
-            500,
-            "application/json",
-            json!({"error": "core died after update, rolled back to previous version"}).to_string(),
+            json!({"error": format!(
+                "core verification failed after update: {error}; rollback: {}",
+                result_label(&rollback)
+            )})
+            .to_string(),
         );
     }
 
@@ -21711,7 +23409,8 @@ fn apply_active_profile_locked(
             geo_dir.as_deref(),
         )?;
         set_active_profile_apply_stage(daemon, profile_id, "waiting-core");
-        wait_for_core_readiness_locked(inner, daemon, controller.as_ref())?;
+        wait_for_core_readiness_locked(inner, daemon, controller.as_ref(), &state)?;
+        validate_proxy_selector(controller.as_ref())?;
         persist_attempted = true;
         set_active_profile_apply_stage(daemon, profile_id, "saving-state");
         persist_state(&daemon.state_path, &inner.state)?;
@@ -21722,6 +23421,23 @@ fn apply_active_profile_locked(
         {
             return Err("injected active profile persist failure after write".to_owned());
         }
+        let (addr, secret) = controller
+            .as_ref()
+            .ok_or_else(|| "Mihomo controller is unavailable".to_owned())?;
+        set_proxy_selector(addr, secret.as_deref(), PROXY_ACTIVE_NAME)?;
+        inner.proxy_rejected = false;
+        inner.failover_fail_count = 0;
+        inner.failover_recovery_count = 0;
+        inner.failover_health_sample =
+            active_state_health_sample(controller.as_ref(), &main_fallback_health_url());
+        inner.failover_health_identity = inner.state.active_profile_id.and_then(|id| {
+            inner
+                .state
+                .profiles
+                .iter()
+                .find(|profile| profile.id == id)
+                .map(|profile| (inner.core_generation, profile_server_ref(profile)))
+        });
         Ok(())
     })();
 
@@ -21986,112 +23702,178 @@ fn start_watchdog(
             // Health check runs on every tick when the core is running and
             // no benchmark is in progress. The `auto_switch` flag controls
             // *what happens on failure*: when enabled, the watchdog switches
-            // to the next-best profile; when disabled, it just logs — the
-            // Mihomo direct-fallback proxy group already routes traffic to
-            // DIRECT when the upstream proxy is unreachable, preventing
-            // connection storms.
+            // to the next-best profile; when disabled, it just logs. Mihomo's
+            // canonical proxy group rejects new proxy-routed connections when
+            // the upstream is unavailable, so a health flap cannot bypass VPN.
             if !bench_running && !deep_bench_running && core_running {
                 if let Some(ref addr) = ec_addr {
-                    // v0.19.9: External controller enabled — read Mihomo
-                    // fallback group state instead of triggering our own
-                    // delay test. Rationale: the auto-generated fallback
-                    // group `proxy` already runs a delay test every
-                    // `interval` seconds (default 10s) and switches to
-                    // DIRECT when proxy-active is unreachable. Triggering
-                    // a second delay test from the daemon doubles upstream
-                    // load (two `https://www.gstatic.com/generate_204`
-                    // requests every 10s) and can worsen upstream
-                    // flapping. Instead, we read `now` and `alive` from
-                    // `/proxies/proxy` — a cheap loopback EC query. The
-                    // fallback group is our source of truth: it knows
-                    // better than we do whether proxy-active is healthy.
-                    //
-                    // Health is `true` only when the fallback group is
-                    // `alive` AND currently routing through `proxy-active`
-                    // (not DIRECT). When mihomo switches to DIRECT, we
-                    // detect that as a proxy failure.
-                    let group_state =
-                        mihomo_api_get_json(addr, ec_secret.as_deref(), "/proxies/proxy");
-                    let active_state =
-                        mihomo_api_get_json(addr, ec_secret.as_deref(), "/proxies/proxy-active");
-                    let healthy = group_state
+                    let _apply = match daemon.apply.lock() {
+                        Ok(lock) => lock,
+                        Err(_) => {
+                            eprintln!("hincyray: health observation skipped because config apply lock is poisoned");
+                            continue;
+                        }
+                    };
+                    let observation_identity = {
+                        let inner = lock(&daemon.inner);
+                        inner.state.active_profile_id.and_then(|id| {
+                            inner
+                                .state
+                                .profiles
+                                .iter()
+                                .find(|profile| profile.id == id)
+                                .map(|profile| (inner.core_generation, profile_server_ref(profile)))
+                        })
+                    };
+                    // The hidden fallback group owns health measurement only.
+                    // The canonical `proxy` selector changes only after fresh,
+                    // consecutive samples, so one loaded-link timeout cannot
+                    // instantly disconnect every VPN-routed client.
+                    let snapshot = mihomo_api_get_json(addr, ec_secret.as_deref(), "/proxies");
+                    let proxy_state = |name: &str| {
+                        snapshot
+                            .as_ref()
+                            .map_err(Clone::clone)
+                            .and_then(|root| {
+                                root.get("proxies")
+                                    .and_then(|proxies| proxies.get(name))
+                                    .cloned()
+                                    .ok_or_else(|| format!("Mihomo proxy state missing {name}"))
+                            })
+                    };
+                    let group_state = proxy_state(PROXY_HEALTH_NAME);
+                    let active_state = proxy_state(PROXY_ACTIVE_NAME);
+                    let selector_state = proxy_state(PROXY_NAME);
+                    let health_url = main_fallback_health_url();
+                    let health = group_state
                         .as_ref()
                         .ok()
                         .zip(active_state.as_ref().ok())
-                        .is_some_and(|(group, active)| {
-                            fallback_routes_through_live_active(group, active)
+                        .and_then(|(group, active)| {
+                            fallback_upstream_health(group, active, &health_url)
                         });
-                    // Read the last known latency from proxy-active history
-                    // for logging purposes. This does not trigger a new
-                    // upstream request — `history` is populated by the
-                    // fallback group's own delay test.
-                    let latency_ms: Option<u64> = if healthy {
-                        active_state.as_ref().ok().and_then(|v| {
-                            v.get("history")
-                                .and_then(Value::as_array)
-                                .and_then(|h| h.last())
-                                .and_then(|last| last.get("delay"))
-                                .and_then(Value::as_u64)
+                    let sample = active_state
+                        .as_ref()
+                        .ok()
+                        .and_then(|active| active_health_sample_for_url(active, &health_url));
+                    let selector_target = selector_state
+                        .as_ref()
+                        .ok()
+                        .and_then(proxy_selector_target);
+                    let current_identity = {
+                        let inner = lock(&daemon.inner);
+                        inner.state.active_profile_id.and_then(|id| {
+                            inner
+                                .state
+                                .profiles
+                                .iter()
+                                .find(|profile| profile.id == id)
+                                .map(|profile| (inner.core_generation, profile_server_ref(profile)))
                         })
-                    } else {
-                        None
                     };
-                    let failed_active_raw = {
-                        let mut inner = lock(&daemon.inner);
-                        if healthy {
-                            if inner.failover_fail_count > 0 {
-                                match latency_ms {
-                                    Some(ms) => {
-                                        eprintln!("hincyray: health check recovered ({ms}ms)");
-                                    }
-                                    None => {
-                                        eprintln!("hincyray: health check recovered");
+                    if let (Some(healthy), Some(sample), Some(selector_target)) =
+                        (health, sample, selector_target)
+                    {
+                        enum SelectorAction {
+                            Reject(Option<String>),
+                            Recover,
+                        }
+                        let action = {
+                            let mut inner = lock(&daemon.inner);
+                            if observation_identity.is_none()
+                                || observation_identity != current_identity
+                                || inner.failover_health_identity.as_ref()
+                                    != observation_identity.as_ref()
+                            {
+                                inner.failover_health_identity = current_identity;
+                                inner.failover_health_sample = Some(sample);
+                                inner.failover_fail_count = 0;
+                                inner.failover_recovery_count = 0;
+                                inner.proxy_rejected = selector_target == REJECT_NAME;
+                                continue;
+                            }
+                            inner.proxy_rejected = selector_target == REJECT_NAME;
+                            let current_auto_switch = inner.state.split_routing.auto_switch;
+                            let fresh = inner.failover_health_sample.as_deref()
+                                != Some(sample.as_str());
+                            let had_failures = inner.failover_fail_count > 0;
+                            let transition = {
+                                let DaemonInner {
+                                    failover_health_sample,
+                                    failover_fail_count,
+                                    failover_recovery_count,
+                                    ..
+                                } = &mut *inner;
+                                advance_proxy_health_state(
+                                    failover_health_sample,
+                                    failover_fail_count,
+                                    failover_recovery_count,
+                                    sample,
+                                    healthy,
+                                    selector_target,
+                                )
+                            };
+                            if fresh && healthy {
+                                failover_rejected_profiles.clear();
+                                if selector_target == PROXY_ACTIVE_NAME {
+                                    inner.proxy_rejected = false;
+                                    if had_failures {
+                                        match active_health_latency_for_url(
+                                            active_state.as_ref().expect("checked above"),
+                                            &health_url,
+                                        ) {
+                                            Some(ms) => eprintln!(
+                                                "hincyray: health check recovered ({ms}ms)"
+                                            ),
+                                            None => eprintln!("hincyray: health check recovered"),
+                                        }
                                     }
                                 }
-                            }
-                            inner.failover_fail_count = 0;
-                            failover_rejected_profiles.clear();
-                            None
-                        } else {
-                            let prev_count = inner.failover_fail_count;
-                            inner.failover_fail_count += 1;
-                            const FAILOVER_THRESHOLD: u32 = 3;
-                            if prev_count == 0 {
-                                let reason = match group_state.as_ref() {
-                                    Ok(v) => {
-                                        let now =
-                                            v.get("now").and_then(Value::as_str).unwrap_or("?");
-                                        let alive = v
-                                            .get("alive")
-                                            .and_then(Value::as_bool)
-                                            .unwrap_or(false);
-                                        let active_alive = active_state
-                                            .as_ref()
-                                            .ok()
-                                            .and_then(|value| value.get("alive"))
-                                            .and_then(Value::as_bool)
-                                            .unwrap_or(false);
-                                        format!(
-                                            "now={now} alive={alive} active_alive={active_alive}"
-                                        )
-                                    }
-                                    Err(error) => error.to_string(),
-                                };
+                            } else if fresh && !healthy && !had_failures {
                                 eprintln!(
-                                    "hincyray: health check failed (1/{FAILOVER_THRESHOLD}) — fallback group: {reason}"
+                                    "hincyray: health check failed (1/{PROXY_FAILURE_THRESHOLD})"
                                 );
                             }
-                            if inner.failover_fail_count >= FAILOVER_THRESHOLD {
-                                if auto_switch {
-                                    let active_raw = active_profile_id.and_then(|id| {
-                                        inner
-                                            .state
-                                            .profiles
-                                            .iter()
-                                            .find(|profile| profile.id == id)
-                                            .map(|profile| profile.raw.clone())
-                                    });
-                                    if let Some(ref raw) = active_raw {
+                            match transition {
+                                ProxyHealthTransition::Reject => {
+                                    let active_raw = current_auto_switch
+                                        .then(|| {
+                                            inner.state.active_profile_id.and_then(|id| {
+                                                inner
+                                                    .state
+                                                    .profiles
+                                                    .iter()
+                                                    .find(|profile| profile.id == id)
+                                                    .map(|profile| profile.raw.clone())
+                                            })
+                                        })
+                                        .flatten();
+                                    Some(SelectorAction::Reject(active_raw))
+                                }
+                                ProxyHealthTransition::Recover => Some(SelectorAction::Recover),
+                                ProxyHealthTransition::None => None,
+                            }
+                        };
+                        let mut failed_for_failover = None;
+                        match action {
+                            Some(SelectorAction::Reject(failed_raw)) => {
+                                if selector_target != REJECT_NAME
+                                    && let Err(error) = set_proxy_selector(
+                                        addr,
+                                        ec_secret.as_deref(),
+                                        REJECT_NAME,
+                                    )
+                                {
+                                    eprintln!(
+                                        "hincyray: failed to engage fail-closed selector: {error}"
+                                    );
+                                    continue;
+                                }
+                                {
+                                    let mut inner = lock(&daemon.inner);
+                                    inner.proxy_rejected = true;
+                                    inner.failover_fail_count = PROXY_FAILURE_THRESHOLD;
+                                    if let Some(ref raw) = failed_raw {
                                         record_profile_health_failure(
                                             &mut inner.state,
                                             raw,
@@ -22099,35 +23881,49 @@ fn start_watchdog(
                                         );
                                         inner.dirty = true;
                                     }
-                                    inner.failover_fail_count = 0;
-                                    active_raw
-                                } else {
-                                    if prev_count < FAILOVER_THRESHOLD {
+                                }
+                                eprintln!(
+                                    "hincyray: proxy traffic is fail-closed after {PROXY_FAILURE_THRESHOLD} fresh failed health samples"
+                                );
+                                failed_for_failover = failed_raw;
+                            }
+                            Some(SelectorAction::Recover) => {
+                                match set_proxy_selector(
+                                    addr,
+                                    ec_secret.as_deref(),
+                                    PROXY_ACTIVE_NAME,
+                                ) {
+                                    Ok(()) => {
+                                        let mut inner = lock(&daemon.inner);
+                                        inner.proxy_rejected = false;
+                                        inner.failover_recovery_count = 0;
                                         eprintln!(
-                                            "hincyray: proxy unreachable, \
-                                             mihomo fallback to DIRECT (auto-switch disabled)"
+                                            "hincyray: proxy selector recovered after {PROXY_RECOVERY_THRESHOLD} fresh successful health samples"
                                         );
                                     }
-                                    inner.failover_fail_count = FAILOVER_THRESHOLD;
-                                    None
+                                    Err(error) => eprintln!(
+                                        "hincyray: failed to recover proxy selector: {error}"
+                                    ),
                                 }
-                            } else {
-                                None
                             }
+                            None => {}
                         }
-                    };
-                    if let Some(failed_raw) = failed_active_raw {
-                        let _ = attempt_verified_failover(
-                            &daemon,
-                            &failed_raw,
-                            &mut failover_rejected_profiles,
-                        );
+                        drop(_apply);
+                        if let Some(failed_raw) = failed_for_failover {
+                            let _ = attempt_verified_failover(
+                                &daemon,
+                                &failed_raw,
+                                &mut failover_rejected_profiles,
+                            );
+                        }
+                    } else {
+                        // Local EC/schema failures are not evidence against the upstream profile.
+                        eprintln!("hincyray: upstream health inconclusive (controller unavailable or invalid state)");
                     }
                 } else {
                     // Fallback: no external controller, use SOCKS curl.
-                    // Note: when the mihomo direct-fallback group switches
-                    // to DIRECT, SOCKS health check will pass (through
-                    // DIRECT). Enable EC for accurate proxy health monitoring.
+                    // Without EC, a SOCKS failure still indicates that the
+                    // fail-closed proxy group cannot reach the upstream.
                     let healthy = socks_health_check(socks_port);
                     let failed_active_raw = {
                         let mut inner = lock(&daemon.inner);
@@ -22168,8 +23964,8 @@ fn start_watchdog(
                                 } else {
                                     if prev_count < FAILOVER_THRESHOLD {
                                         eprintln!(
-                                            "hincyray: proxy unreachable, \
-                                             mihomo fallback to DIRECT (auto-switch disabled)"
+                                             "hincyray: proxy unreachable, \
+                                              proxy traffic is fail-closed (auto-switch disabled)"
                                         );
                                     }
                                     inner.failover_fail_count = FAILOVER_THRESHOLD;
@@ -22207,11 +24003,12 @@ fn start_watchdog(
             stop_if_shutting_down!();
             // --- Phase 5: Auto-select after benchmark ---
             if bench_was_running && !bench_running && auto_select {
-                eprintln!("hincyray: benchmark finished, auto-selecting lowest-latency profile");
                 let best_id = {
                     let inner = lock(&daemon.inner);
-                    find_best_profile(&inner.state, &HashSet::new())
-                        .filter(|best_id| Some(*best_id) != inner.state.active_profile_id)
+                    if completed_bench_allows_auto_select(&inner.bench.snapshot()) {
+                        find_best_profile(&inner.state, &HashSet::new())
+                            .filter(|best_id| Some(*best_id) != inner.state.active_profile_id)
+                    } else { None }
                 };
                 if let Some(best_id) = best_id {
                     eprintln!("hincyray: auto-switching to profile {best_id}");
@@ -22238,6 +24035,15 @@ fn start_watchdog(
                                     "hincyray: new Mihomo {} available, auto-installing...",
                                     release.tag_name
                                 );
+                                let _apply = match daemon.apply.lock() {
+                                    Ok(lock) => lock,
+                                    Err(_) => {
+                                        eprintln!(
+                                            "hincyray: Mihomo auto-update skipped: config apply lock is poisoned"
+                                        );
+                                        continue;
+                                    }
+                                };
                                 match download_and_install_mihomo(
                                     &release,
                                     &mihomo_path,
@@ -22247,31 +24053,56 @@ fn start_watchdog(
                                         stop_if_shutting_down!();
                                         let mut inner = lock(&daemon.inner);
                                         let geo_dir = geo_dir_from_state(&inner.state);
-                                        let restart = inner.core.restart(
+                                        let desired_target = if inner.proxy_rejected {
+                                            REJECT_NAME
+                                        } else {
+                                            PROXY_ACTIVE_NAME
+                                        };
+                                        let restart = restart_core_with_selector_locked(
+                                            &mut inner,
+                                            &daemon,
                                             &mihomo_path,
                                             &daemon.mihomo_config_path,
                                             geo_dir.as_deref(),
+                                            desired_target,
                                         );
-                                        let controller = daemon_mihomo_controller(
-                                            &daemon,
-                                            &inner.state.mihomo_features,
-                                        );
-                                        if let Err(e) = restart.and_then(|()| {
-                                            wait_for_core_readiness_locked(
-                                                &mut inner,
-                                                &daemon,
-                                                controller.as_ref(),
-                                            )
-                                        }) {
+                                        if let Err(e) = restart {
                                             eprintln!(
                                                 "hincyray: core restart after auto-update failed: {e}"
                                             );
+                                            let rollback = fs::copy(
+                                                format!("{mihomo_path}.bak"),
+                                                &mihomo_path,
+                                            )
+                                            .map_err(|error| {
+                                                format!("restore backup binary: {error}")
+                                            })
+                                            .and_then(|_| {
+                                                restart_core_with_selector_locked(
+                                                    &mut inner,
+                                                    &daemon,
+                                                    &mihomo_path,
+                                                    &daemon.mihomo_config_path,
+                                                    geo_dir.as_deref(),
+                                                    desired_target,
+                                                )
+                                            });
+                                            if let Err(rollback_error) = rollback {
+                                                eprintln!(
+                                                    "hincyray: Mihomo auto-update rollback failed: {rollback_error}"
+                                                );
+                                                let _ = inner.core.stop();
+                                            }
+                                            inner.state.last_update_check_unix = now;
+                                            inner.dirty = true;
+                                        } else {
+                                            inner.proxy_rejected = desired_target == REJECT_NAME;
+                                            inner.state.mihomo_version = Some(new_version.clone());
+                                            inner.state.update_available_version = None;
+                                            inner.state.last_update_check_unix = now;
+                                            inner.dirty = true;
+                                            eprintln!("hincyray: Mihomo auto-updated to {new_version}");
                                         }
-                                        inner.state.mihomo_version = Some(new_version.clone());
-                                        inner.state.update_available_version = None;
-                                        inner.state.last_update_check_unix = now;
-                                        inner.dirty = true;
-                                        eprintln!("hincyray: Mihomo auto-updated to {new_version}");
                                     }
                                     Err(e) => {
                                         eprintln!("hincyray: auto-update install failed: {e}");
@@ -22715,10 +24546,90 @@ fn start_watchdog(
         .map_err(|error| format!("spawn watchdog: {error}"))
 }
 
-fn fallback_routes_through_live_active(group: &Value, active: &Value) -> bool {
-    group.get("alive").and_then(Value::as_bool) == Some(true)
-        && group.get("now").and_then(Value::as_str) == Some(PROXY_ACTIVE_NAME)
-        && active.get("alive").and_then(Value::as_bool) == Some(true)
+fn proxy_selector_target(group: &Value) -> Option<&str> {
+    match group.get("now").and_then(Value::as_str)? {
+        target @ (PROXY_ACTIVE_NAME | REJECT_NAME) => Some(target),
+        _ => None,
+    }
+}
+
+fn active_health_for_url(active: &Value, url: &str) -> Option<bool> {
+    active.get("extra")?.get(url)?.get("alive")?.as_bool()
+}
+
+fn active_health_latency_for_url(active: &Value, url: &str) -> Option<u64> {
+    active
+        .get("extra")?
+        .get(url)?
+        .get("history")?
+        .as_array()?
+        .last()?
+        .get("delay")?
+        .as_u64()
+}
+
+fn active_health_sample_for_url(active: &Value, url: &str) -> Option<String> {
+    active
+        .get("extra")?
+        .get(url)?
+        .get("history")?
+        .as_array()?
+        .last()?
+        .get("time")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProxyHealthTransition {
+    None,
+    Reject,
+    Recover,
+}
+
+const PROXY_FAILURE_THRESHOLD: u32 = 3;
+const PROXY_RECOVERY_THRESHOLD: u32 = 2;
+
+fn advance_proxy_health_state(
+    last_sample: &mut Option<String>,
+    failures: &mut u32,
+    recoveries: &mut u32,
+    sample: String,
+    healthy: bool,
+    selector_target: &str,
+) -> ProxyHealthTransition {
+    if last_sample.as_deref() == Some(sample.as_str()) {
+        return ProxyHealthTransition::None;
+    }
+    *last_sample = Some(sample);
+    if healthy {
+        *failures = 0;
+        if selector_target == REJECT_NAME {
+            *recoveries = recoveries.saturating_add(1);
+            if *recoveries >= PROXY_RECOVERY_THRESHOLD {
+                return ProxyHealthTransition::Recover;
+            }
+        } else {
+            *recoveries = 0;
+        }
+    } else {
+        *recoveries = 0;
+        *failures = failures.saturating_add(1);
+        if *failures >= PROXY_FAILURE_THRESHOLD && selector_target != REJECT_NAME {
+            return ProxyHealthTransition::Reject;
+        }
+    }
+    ProxyHealthTransition::None
+}
+
+fn fallback_upstream_health(group: &Value, active: &Value, url: &str) -> Option<bool> {
+    group.get("alive").and_then(Value::as_bool)?;
+    let active_alive = active_health_for_url(active, url)?;
+    let target = group.get("now").and_then(Value::as_str)?;
+    if !matches!(target, PROXY_ACTIVE_NAME | REJECT_NAME) {
+        return None;
+    }
+    Some(target == PROXY_ACTIVE_NAME && active_alive)
 }
 
 fn maintenance_due(settings: &MaintenanceSettings, now: u64) -> bool {
@@ -22960,7 +24871,12 @@ fn run_deep_bench(
         last_updated: started_unix,
         cancel_requested: false,
         results: Vec::new(),
+        search: None,
+        service_checks: None,
+        preflight_failures: Vec::new(),
         worker_count: 1,
+        requested_concurrency: 1,
+        memory_limited: false,
     }));
     let on_result: Box<dyn Fn(crate::benchmark::BenchResult) + Send + Sync> = Box::new(|_| {});
     // Update status to Phase A.
@@ -23538,6 +25454,7 @@ mod tests {
             successes: u32::from(passed),
             reachable: passed,
             stable: passed,
+            inconclusive: false,
             avg_ttfb_ms: if passed { 10 } else { 0 },
             max_ttfb_ms: if passed { 10 } else { 0 },
             avg_download_kbps: 0.0,
@@ -23581,6 +25498,515 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inconclusive_bench_summary_is_neither_passed_nor_failed() {
+        let profile = profile_test_fixture_profile(0, "Unknown", "manual");
+        let passed = profile_test_fixture_result(&profile, true, true, true, true, 40);
+        let failed = profile_test_fixture_result(&profile, false, false, false, false, 0);
+        let mut unknown = passed.clone();
+        unknown.latency_ms = 999;
+        unknown.resource_tests[3].inconclusive = true;
+        let mut unknown_failed = unknown.clone();
+        unknown_failed.success = false;
+        assert_eq!(
+            bench_summary(&BenchJob {
+                results: vec![passed, failed, unknown, unknown_failed],
+                ..Default::default()
+            }),
+            json!({"total": 4, "passed": 1, "failed": 1, "inconclusive": 2, "avg_latency_ms": 40.0})
+        );
+    }
+
+    #[test]
+    fn inconclusive_youtube_cannot_rank_for_promotion() {
+        let profile = profile_test_fixture_profile(0, "Unknown", "manual");
+        for method in ["quick", "full"] {
+            let mut result = profile_test_fixture_result(&profile, true, true, true, true, 10);
+            result.method = method.to_owned();
+            assert!(profile_test_rank(&result).is_some());
+            result.resource_tests[3].inconclusive = true;
+            assert_eq!(profile_test_rank(&result), None, "{method}");
+        }
+    }
+
+    #[test]
+    fn inconclusive_service_prevents_dead_evidence_even_when_all_pings_fail() {
+        let profile = profile_test_fixture_profile(0, "Unknown", "manual");
+        for method in ["quick", "full"] {
+            let mut result = profile_test_fixture_result(&profile, false, false, false, false, 0);
+            result.method = method.to_owned();
+            assert!(profile_test_result_is_completely_unresponsive(&result));
+            result.resource_tests[3].inconclusive = true;
+            assert!(!profile_test_result_is_completely_unresponsive(&result));
+        }
+    }
+
+    #[test]
+    fn inconclusive_completed_ordinary_bench_disallows_auto_select() {
+        let profile = profile_test_fixture_profile(0, "Unknown", "manual");
+        for method in [BenchMethod::Quick, BenchMethod::Full] {
+            let mut result = profile_test_fixture_result(&profile, true, true, true, true, 10);
+            result.method = method.as_str().to_owned();
+            let mut job = BenchJob {
+                method: Some(method),
+                total: 1,
+                completed: 1,
+                results: vec![result],
+                ..Default::default()
+            };
+            assert!(completed_bench_allows_auto_select(&job));
+            job.results[0].resource_tests[3].inconclusive = true;
+            assert!(!completed_bench_allows_auto_select(&job));
+        }
+    }
+
+    #[test]
+    fn availability_completed_bench_never_allows_auto_select() {
+        let profile = profile_test_fixture_profile(0, "Available", "manual");
+        for method in [
+            BenchMethod::AvailabilityQuick,
+            BenchMethod::AvailabilityFull,
+        ] {
+            let mut result = profile_test_fixture_result(&profile, true, true, true, true, 10);
+            result.method = method.as_str().to_owned();
+            result.resource_tests[3].id = "youtube_thumbnails".to_owned();
+            result.resource_tests[3].contract_version =
+                crate::benchmark::YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+            for completed in [0, 1] {
+                let mut job = BenchJob {
+                    method: Some(method),
+                    total: 1,
+                    completed,
+                    results: vec![result.clone()],
+                    ..Default::default()
+                };
+                assert!(!completed_bench_allows_auto_select(&job));
+                job.method = None;
+                assert!(!completed_bench_allows_auto_select(&job));
+            }
+        }
+    }
+
+    #[test]
+    fn availability_resources_preserve_generic_health_and_persist_unknown_overall() {
+        for method in [
+            "availability_quick",
+            "availability_full",
+            "search_availability",
+        ] {
+            for success in [false, true] {
+                let (_dir, daemon) = test_daemon();
+                let profile = profile_test_fixture_profile(0, "Available", "manual");
+                let before = ProfileStats {
+                    profile_raw: profile.raw.clone(),
+                    last_latency_ms: 91,
+                    last_jitter_ms: 12,
+                    last_download_mbps: 23.0,
+                    last_upload_mbps: 4.0,
+                    last_loss_percent: 5.0,
+                    success_count: 6,
+                    failure_count: 7,
+                    last_error: Some("previous health error".to_owned()),
+                    last_checked_unix: 90_000,
+                    last_service_test_unix: 89_000,
+                    last_service_test_success: Some(true),
+                    ewma_latency_ms: 81.0,
+                    ewma_download_mbps: 21.0,
+                    consecutive_failures: 2,
+                    cooldown_until_unix: 110_000,
+                    has_latency: true,
+                    has_jitter: true,
+                    has_download: true,
+                    has_upload: true,
+                    has_loss: true,
+                    has_ewma: true,
+                    ..Default::default()
+                };
+                {
+                    let mut inner = lock(&daemon.inner);
+                    inner.state.profiles = vec![profile.clone()];
+                    inner.state.stats.push(before.clone());
+                    inner.state.metrics_history.push(MetricSample {
+                        timestamp: 90_000,
+                        profile_id: 0,
+                        passed: true,
+                        latency_ms: 91,
+                        download_mbps: 23.0,
+                    });
+                }
+                let metrics = serde_json::to_value(&lock(&daemon.inner).state.metrics_history)
+                    .expect("previous metrics");
+                let mut result = profile_test_fixture_result(&profile, true, true, true, true, 10);
+                result.method = method.to_owned();
+                result.success = success;
+                result.timestamp = 100_000;
+                result.download_mbps = Some(999.0);
+                result.upload_mbps = Some(999.0);
+                result.resource_tests[3].id = "youtube_thumbnails".to_owned();
+                result.resource_tests[3].contract_version =
+                    crate::benchmark::YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+                let mut expected = before;
+                expected.resource_tests = result.resource_tests.clone();
+                expected.last_service_test_success = None;
+                expected.last_service_test_unix = result.timestamp;
+                expected.last_checked_unix = result.timestamp;
+                apply_bench_result(&daemon, result);
+                let persisted = load_state(&daemon.state_path);
+                assert_eq!(
+                    serde_json::to_value(&persisted.stats[0]).expect("saved stats"),
+                    serde_json::to_value(expected).expect("expected stats"),
+                    "{method}: {success}"
+                );
+                assert_eq!(
+                    serde_json::to_value(&lock(&daemon.inner).state.metrics_history)
+                        .expect("live metrics after availability test"),
+                    metrics
+                );
+                assert!(persisted.dead_server_refs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn availability_weak_youtube_cannot_promote_or_classify_dead() {
+        let first = profile_test_fixture_profile(0, "First", "manual");
+        let weak = profile_test_fixture_profile(1, "Weak", "manual");
+        for method in [
+            "availability_quick",
+            "availability_full",
+            "search_availability",
+            "quick",
+            "full",
+        ] {
+            for passed in [false, true] {
+                let mut result =
+                    profile_test_fixture_result(&weak, passed, passed, passed, passed, 10);
+                result.method = method.to_owned();
+                result.resource_tests[3].id = "youtube_thumbnails".to_owned();
+                result.resource_tests[3].contract_version =
+                    crate::benchmark::YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+                assert!(current_profile_test_resource(&result, "youtube").is_none());
+                assert_eq!(profile_test_rank(&result), None);
+                assert!(!profile_test_result_is_completely_unresponsive(&result));
+                let (_dir, daemon) = test_daemon();
+                {
+                    let mut inner = lock(&daemon.inner);
+                    inner.state.profiles = vec![first.clone(), weak.clone()];
+                    inner.state.profile_test_settings = ProfileTestSettings {
+                        promote_successful_tested_servers: true,
+                        auto_move_no_ping_to_dead_servers: true,
+                    };
+                }
+                apply_profile_test_post_actions(&daemon, &[result]).expect("weak post actions");
+                let inner = lock(&daemon.inner);
+                assert_eq!(inner.state.profiles[0].raw, first.raw);
+                assert!(inner.state.dead_server_refs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn availability_thumbnail_and_native_history_contracts_do_not_substitute() {
+        let profiles = (0..2)
+            .map(|id| profile_test_fixture_profile(id, "History", "manual"))
+            .collect::<Vec<_>>();
+        let native = profile_test_fixture_result(&profiles[1], true, true, true, true, 10);
+        assert!(current_profile_test_resource(&native, "youtube").is_some());
+        assert!(current_profile_test_resource(&native, "youtube_thumbnails").is_none());
+        let native_state = HincyrayState {
+            stats: vec![ProfileStats {
+                profile_raw: profiles[1].raw.clone(),
+                last_service_test_unix: 100_000,
+                resource_tests: native.resource_tests.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for method in [BenchMethod::Quick, BenchMethod::AvailabilityQuick] {
+            let ordered = order_adaptive_search_candidates(
+                &native_state,
+                profiles.clone(),
+                &AdaptiveSearchOptions {
+                    target_good: 1,
+                    required_services: "youtube".to_owned(),
+                    fail_fast: true,
+                },
+                100_000,
+                method,
+            );
+            assert_eq!(
+                ordered.iter().map(|profile| profile.id).collect::<Vec<_>>(),
+                if method.is_availability() {
+                    vec![0, 1]
+                } else {
+                    vec![1, 0]
+                }
+            );
+        }
+        for passed in [false, true] {
+            let mut weak = native.clone();
+            weak.resource_tests[3] = profile_test_fixture_resource("youtube_thumbnails", passed);
+            weak.resource_tests[3].contract_version =
+                crate::benchmark::YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+            assert!(current_profile_test_resource(&weak, "youtube").is_none());
+            assert!(current_profile_test_resource(&weak, "youtube_thumbnails").is_none());
+            // Even mixed native TG/AI failures must not turn weak YouTube into native history.
+            for tg_ai_passed in [false, true] {
+                weak.resource_tests[4] = profile_test_fixture_resource("telegram", tg_ai_passed);
+                weak.resource_tests[5] = profile_test_fixture_resource("ai", tg_ai_passed);
+                let state = HincyrayState {
+                    stats: vec![ProfileStats {
+                        profile_raw: profiles[1].raw.clone(),
+                        last_service_test_unix: 100_000,
+                        resource_tests: weak.resource_tests.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                for required_services in ["youtube", "telegram", "ai"] {
+                    for method in [BenchMethod::Quick, BenchMethod::AvailabilityQuick] {
+                        let ordered = order_adaptive_search_candidates(
+                            &state,
+                            profiles.clone(),
+                            &AdaptiveSearchOptions {
+                                target_good: 1,
+                                required_services: required_services.to_owned(),
+                                fail_fast: true,
+                            },
+                            100_000,
+                            method,
+                        );
+                        assert_eq!(
+                            ordered.iter().map(|profile| profile.id).collect::<Vec<_>>(),
+                            vec![0, 1]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inconclusive_service_bench_persists_unknown_without_generic_cooldown() {
+        for method in ["quick", "full"] {
+            for success in [false, true] {
+                let (_dir, daemon) = test_daemon();
+                let profile = profile_test_fixture_profile(0, "Unknown", "manual");
+                {
+                    let mut inner = lock(&daemon.inner);
+                    inner.state.profiles = vec![profile.clone()];
+                    inner.state.stats.push(ProfileStats {
+                        profile_raw: profile.raw.clone(),
+                        last_service_test_success: Some(true),
+                        ..Default::default()
+                    });
+                }
+                let mut result = profile_test_fixture_result(&profile, true, true, true, true, 10);
+                result.method = method.to_owned();
+                result.success = success;
+                result.timestamp = 100_000;
+                result.resource_tests[3].inconclusive = true;
+                let resources = serde_json::to_value(&result.resource_tests).expect("resources");
+                apply_bench_result(&daemon, result);
+                let persisted = load_state(&daemon.state_path);
+                let stats = &persisted.stats[0];
+                assert_eq!(stats.last_service_test_success, None);
+                assert_eq!(stats.last_service_test_unix, 100_000);
+                assert_eq!(stats.last_checked_unix, 100_000);
+                assert!(stats.resource_tests[3].inconclusive);
+                assert_eq!(
+                    serde_json::to_value(&stats.resource_tests).expect("saved resources"),
+                    resources
+                );
+                assert_eq!(stats.success_count, 0);
+                assert_eq!(stats.failure_count, 0);
+                assert_eq!(stats.consecutive_failures, 0);
+                assert_eq!(stats.cooldown_until_unix, 0);
+                assert_eq!(stats.last_error, None);
+                assert!(!stats.has_latency);
+                assert!(persisted.metrics_history.is_empty());
+                assert!(persisted.dead_server_refs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn inconclusive_fresh_search_history_keeps_unknown_priority() {
+        let profiles = (0..2)
+            .map(|id| profile_test_fixture_profile(id, "Unknown", "manual"))
+            .collect::<Vec<_>>();
+        for stable in [false, true] {
+            let mut youtube = profile_test_fixture_resource("youtube", stable);
+            youtube.inconclusive = true;
+            let mut state = HincyrayState {
+                stats: vec![ProfileStats {
+                    profile_raw: profiles[0].raw.clone(),
+                    last_service_test_unix: 100_000,
+                    resource_tests: vec![
+                        profile_test_fixture_resource("ping_proxy", true),
+                        youtube,
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            for required_services in ["youtube", "telegram", "ai"] {
+                let options = AdaptiveSearchOptions {
+                    target_good: 1,
+                    required_services: required_services.to_owned(),
+                    fail_fast: true,
+                };
+                let ordered = order_adaptive_search_candidates(
+                    &state,
+                    profiles.clone(),
+                    &options,
+                    100_000,
+                    BenchMethod::Quick,
+                );
+                assert_eq!(
+                    ordered.iter().map(|profile| profile.id).collect::<Vec<_>>(),
+                    vec![0, 1]
+                );
+            }
+            state.stats[0].resource_tests[1] = profile_test_fixture_resource("youtube", false);
+            let ordered = order_adaptive_search_candidates(
+                &state,
+                profiles.clone(),
+                &AdaptiveSearchOptions {
+                    target_good: 1,
+                    required_services: "youtube".to_owned(),
+                    fail_fast: true,
+                },
+                100_000,
+                BenchMethod::Quick,
+            );
+            assert_eq!(
+                ordered.iter().map(|profile| profile.id).collect::<Vec<_>>(),
+                vec![1, 0]
+            );
+        }
+    }
+
+    #[test]
+    fn inconclusive_status_redacts_bounded_preflight_failures() {
+        let (_dir, daemon) = test_daemon();
+        let profile = profile_test_fixture_profile(0, "Unknown", "manual");
+        lock(&daemon.inner).state.profiles = vec![profile.clone()];
+        let mut result = profile_test_fixture_result(&profile, true, true, true, true, 10);
+        result.resource_tests[3].inconclusive = true;
+        let error = format!(
+            "https://provider.example/sub/token password=fixture-secret {}",
+            "x".repeat(4096)
+        );
+        let job = Arc::new(Mutex::new(BenchJob {
+            total: 25,
+            completed: 25,
+            results: vec![result],
+            preflight_failures: (5..25)
+                .map(|profile_id| crate::benchmark::PreflightFailure {
+                    profile_id,
+                    phase: if profile_id % 2 == 0 {
+                        "setup"
+                    } else {
+                        "https"
+                    }
+                    .to_owned(),
+                    error: error.clone(),
+                })
+                .collect(),
+            ..Default::default()
+        }));
+        lock(&daemon.inner).bench.job = Some(Arc::clone(&job));
+        let (status, content_type, body) = dispatch("GET", "/api/bench/status", "", &daemon);
+        assert_eq!(status, 200);
+        assert_eq!(content_type, "application/json");
+        assert!(!body.contains("/sub/token"));
+        assert!(!body.contains("fixture-secret"));
+        let response: Value = serde_json::from_str(&body).expect("status");
+        let failures = response["preflight_failures"].as_array().expect("failures");
+        assert_eq!(failures.len(), 20);
+        assert_eq!(failures[0]["profile_id"], 5);
+        assert_eq!(failures[19]["profile_id"], 24);
+        for failure in failures {
+            assert!(matches!(failure["phase"].as_str(), Some("setup" | "https")));
+            let error = failure["error"].as_str().expect("error");
+            assert!(error.contains("<redacted>"));
+            assert!(error.len() <= 2048);
+        }
+        assert_eq!(response["summary"]["passed"], 0);
+        assert_eq!(response["summary"]["failed"], 0);
+        assert_eq!(response["summary"]["inconclusive"], 1);
+        assert_eq!(
+            response["results"][0]["resource_tests"][3]["inconclusive"],
+            true
+        );
+        assert_eq!(lock(&job).preflight_failures[0].error, error);
+    }
+
+    #[test]
+    fn inconclusive_and_preflight_status_schema_contracts() {
+        let schemas = &openapi_document()["components"]["schemas"];
+        assert_eq!(
+            schemas["BenchStatusResponse"]["properties"]["preflight_failures"]["maxItems"],
+            20
+        );
+        assert_eq!(
+            schemas["BenchSummary"]["properties"]["inconclusive"]["type"],
+            "integer"
+        );
+        let resource = &schemas["BenchResult"]["definitions"]["ResourceTestResult"];
+        assert_eq!(resource["properties"]["inconclusive"]["type"], "boolean");
+        assert_eq!(resource["properties"]["inconclusive"]["default"], false);
+        assert!(schemas["PreflightFailure"].is_object());
+        assert_eq!(
+            schemas["PreflightFailure"]["properties"]["error"]["maxLength"],
+            2048
+        );
+        assert_eq!(
+            schemas["BenchStatusResult"]["properties"]["server_ref"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schemas["BenchStatusResult"]["properties"]["server_ref"]["pattern"],
+            "^srv-v2-[0-9a-f]{32}$"
+        );
+        assert!(
+            schemas["BenchStatusResult"]["properties"]
+                .get("profile_raw")
+                .is_none()
+        );
+        assert!(
+            schemas["BenchStatusResponse"]["properties"]["results"]["items"]
+                .to_string()
+                .contains("BenchStatusResult")
+        );
+    }
+
+    #[test]
+    fn inconclusive_defaults_false_in_legacy_persisted_resources() {
+        let (_dir, daemon) = test_daemon();
+        let profile = profile_test_fixture_profile(0, "Legacy", "manual");
+        let state = HincyrayState {
+            profiles: vec![profile.clone()],
+            stats: vec![ProfileStats {
+                profile_raw: profile.raw,
+                resource_tests: vec![profile_test_fixture_resource("youtube", true)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut legacy = serde_json::to_value(state).expect("legacy state");
+        legacy["stats"][0]["resource_tests"][0]
+            .as_object_mut()
+            .expect("resource")
+            .remove("inconclusive");
+        fs::write(&daemon.state_path, legacy.to_string()).expect("save legacy state");
+        let loaded = load_state(&daemon.state_path);
+        assert_eq!(loaded.stats[0].resource_tests.len(), 1);
+        assert!(!loaded.stats[0].resource_tests[0].inconclusive);
+        assert!(loaded.stats[0].resource_tests[0].stable);
+    }
+
     fn diagnostic_controller(daemon: &Daemon, responses: Vec<Value>) -> JoinHandle<()> {
         let listener = TcpListener::bind("127.0.0.1:0").expect("diagnostic controller");
         daemon.set_mihomo_controller_override(
@@ -23604,6 +26030,42 @@ mod tests {
                 .expect("write controller response");
             }
         })
+    }
+
+    fn serve_selector_controller_request(listener: &TcpListener) {
+        let (mut stream, _) = listener.accept().expect("controller request");
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("request header");
+            request.push(byte[0]);
+        }
+        let request = String::from_utf8_lossy(&request);
+        if request.starts_with("GET /proxies/proxy ") {
+            let body = json!({
+                "type": "Selector",
+                "all": [PROXY_ACTIVE_NAME, REJECT_NAME],
+                "now": PROXY_ACTIVE_NAME,
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("selector response");
+        } else if request.starts_with("PUT /proxies/proxy ") {
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("selector update response");
+        } else {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .expect("controller response");
+        }
     }
 
     #[cfg(unix)]
@@ -23632,14 +26094,9 @@ mod tests {
                 .to_string(),
         );
         let controller_worker = thread::spawn(move || {
-            let (mut stream, _) = controller.accept().expect("readiness request");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).expect("read readiness request");
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                )
-                .expect("readiness response");
+            for _ in 0..4 {
+                serve_selector_controller_request(&controller);
+            }
         });
         (dir, daemon, controller_worker)
     }
@@ -23715,6 +26172,8 @@ mod tests {
         state.split_routing.enabled = true;
         state.split_routing.redirect_port = 12090;
         state.split_routing.tproxy_available = false;
+        state.split_routing.torrent_socks.enabled = true;
+        state.split_routing.torrent_socks.port = 12092;
         let controller = ("127.0.0.1:19090".to_owned(), None);
         let contract = CoreSocketContract::from_state(&state, Some(&controller)).expect("contract");
         for expected in [
@@ -23741,6 +26200,14 @@ mod tests {
             ExpectedSocket {
                 protocol: SocketProtocol::Tcp,
                 port: 19090,
+            },
+            ExpectedSocket {
+                protocol: SocketProtocol::Tcp,
+                port: 12092,
+            },
+            ExpectedSocket {
+                protocol: SocketProtocol::Udp,
+                port: 12092,
             },
         ] {
             assert!(contract.sockets.contains(&expected), "missing {expected:?}");
@@ -23833,6 +26300,60 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn core_survives_http_spawn_caller_thread_exit() {
+        let dir = TempDir::new().expect("temp dir");
+        let script = dir.path().join("exec-sleep.sh");
+        let config = dir.path().join("config.yaml");
+        fs::write(&script, "#!/bin/sh\nexec sleep 30\n").expect("helper script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::write(&config, "test\n").expect("config");
+
+        for _ in 0..10 {
+            let script = script.clone();
+            let config = config.clone();
+            let (mut core, caller_tid) = thread::Builder::new()
+                .name("http-core-start-test".to_owned())
+                .spawn(move || {
+                    // SAFETY: gettid has no preconditions.
+                    let tid = unsafe { libc::gettid() };
+                    let mut core = CoreManager::new();
+                    core.start(script.to_str().expect("script path"), &config, None)
+                        .expect("start core from HTTP caller");
+                    (core, tid)
+                })
+                .expect("HTTP caller")
+                .join()
+                .expect("HTTP caller exit");
+            // join can return just before the kernel finishes exiting the thread.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Path::new(&format!("/proc/self/task/{caller_tid}")).exists() {
+                assert!(Instant::now() < deadline, "caller TID did not exit");
+                thread::yield_now();
+            }
+            let pid = core.child.as_ref().expect("tracked child").id() as i32;
+            // A stop notification proves liveness after caller exit; a queued
+            // PDEATHSIG instead yields a terminal SIGKILL status, without sleeps.
+            // SAFETY: pid is our tracked child and status points to valid storage.
+            let (signalled, waited, status) = unsafe {
+                let signalled = libc::kill(pid, libc::SIGSTOP);
+                let mut status = 0;
+                let waited = libc::waitpid(pid, &mut status, libc::WUNTRACED);
+                (signalled, waited, status)
+            };
+            assert_eq!(signalled, 0, "stop tracked child");
+            assert_eq!(waited, pid, "observe tracked child");
+            assert!(
+                libc::WIFSTOPPED(status),
+                "core died after HTTP caller exit: wait status {status}"
+            );
+            assert_eq!(core.pid(), Some(pid as u32));
+            core.stop().expect("kill and reap stopped core");
+            assert!(core.child.is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_pdeathsig_helper() {
         let Ok(pid_path) = std::env::var("HINCYRAY_PDEATHSIG_HELPER_PID") else {
             return;
@@ -23899,6 +26420,12 @@ mod tests {
         let defaults = SplitRoutingSettings::default();
         assert!(!defaults.auto_vpn_learning_enabled);
         assert_eq!(defaults.ru_direct_mode, "off");
+        assert!(!defaults.torrent_socks.enabled);
+        assert_eq!(defaults.torrent_socks.listen, "127.0.0.1");
+        assert_eq!(defaults.torrent_socks.port, 10812);
+        assert_eq!(defaults.torrent_socks.target, "direct");
+        assert!(defaults.torrent_socks.username.is_empty());
+        assert!(defaults.torrent_socks.password.is_empty());
 
         let absent: SplitRoutingSettings = serde_json::from_str("{}").expect("deserialize");
         assert!(!absent.auto_vpn_learning_enabled);
@@ -24392,7 +26919,10 @@ mod tests {
             fs::read(&daemon.mihomo_config_path).expect("rolled back config"),
             b"OLD exact bytes\n"
         );
-        assert!(lock(&daemon.inner).core.is_running());
+        assert!(
+            !lock(&daemon.inner).core.is_running(),
+            "an unverifiable restored selector contract must remain stopped"
+        );
         let manifest = geobase_store(&daemon).load_manifest().expect("manifest");
         assert_ne!(manifest.applied_generation, manifest.generation);
         let _ = lock(&daemon.inner).core.stop();
@@ -24626,14 +27156,9 @@ mod tests {
                 .to_string(),
         );
         let controller_worker = thread::spawn(move || {
-            let (mut stream, _) = controller.accept().expect("readiness request");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).expect("read readiness request");
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                )
-                .expect("readiness response");
+            for _ in 0..3 {
+                serve_selector_controller_request(&controller);
+            }
         });
         create_geobase_config_generation(&daemon, "authoritative", true);
         let desired = geobase_store(&daemon)
@@ -25609,19 +28134,26 @@ mod tests {
     }
 
     #[test]
-    fn parovozik_settings_are_disabled_by_default_and_project_two_managed_rules() {
+    fn parovozik_managed_rules_are_visible_only_when_enabled() {
         let (_dir, daemon) = test_daemon();
         assert!(!lock(&daemon.inner).state.split_routing.parovozik_enabled);
         let (status, _, body) = handle_routing_get(&daemon);
         assert_eq!(status, 200);
         let response: Value = serde_json::from_str(&body).expect("routing response");
         let rules = response["rules"].as_array().expect("rules");
-        let parovozik: Vec<&Value> = rules
+        assert!(rules.iter().all(|rule| rule["kind"] != "managed-parovozik"));
+        lock(&daemon.inner).state.split_routing.parovozik_enabled = true;
+        let (status, _, body) = handle_routing_get(&daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("routing response");
+        let parovozik: Vec<&Value> = response["rules"]
+            .as_array()
+            .expect("rules")
             .iter()
             .filter(|rule| rule["kind"] == "managed-parovozik")
             .collect();
         assert_eq!(parovozik.len(), 2);
-        assert!(parovozik.iter().all(|rule| rule["enabled"] == false));
+        assert!(parovozik.iter().all(|rule| rule["enabled"] == true));
         assert!(
             parovozik
                 .iter()
@@ -25956,6 +28488,7 @@ mod tests {
             successes: 1,
             reachable: true,
             stable: true,
+            inconclusive: false,
             avg_ttfb_ms: 123,
             max_ttfb_ms: 160,
             avg_download_kbps: 1024.0,
@@ -26915,6 +29448,8 @@ mod tests {
     #[test]
     fn routing_settings_response_omits_internal_probe_caches() {
         let mut settings = SplitRoutingSettings::default();
+        settings.torrent_socks.username = "torrent-user".to_owned();
+        settings.torrent_socks.password = "SECRET_TORRENT_PASSWORD".to_owned();
         settings
             .auto_vpn_last_checked_unix
             .insert("auto.internal".to_owned(), 1);
@@ -26926,6 +29461,9 @@ mod tests {
         assert_eq!(response["enabled"], false);
         assert!(response.get("auto_vpn_last_checked_unix").is_none());
         assert!(response.get("parovozik_last_checked_unix").is_none());
+        assert_eq!(response["torrent_socks"]["password_set"], true);
+        assert!(response["torrent_socks"].get("password").is_none());
+        assert!(!response.to_string().contains("SECRET_TORRENT_PASSWORD"));
     }
 
     #[test]
@@ -27207,6 +29745,161 @@ mod tests {
     }
 
     #[test]
+    fn bench_status_omits_connection_identity_and_redacts_diagnostic_strings() {
+        let (_dir, daemon) = test_daemon();
+        let profile = sample_profile(0, "Safe", "example.com");
+        lock(&daemon.inner).state.profiles = vec![profile.clone()];
+        let mut result = profile_test_fixture_result(&profile, true, true, true, true, 10);
+        result.profile_name = "password=secret-canary-name".to_owned();
+        result.error = Some("https://provider.example/sub/secret-canary-token".to_owned());
+        result.resource_tests[0].error = Some("token=secret-canary-resource".to_owned());
+        let job = new_bench_job(BenchMethod::Quick, 1, 1);
+        lock(&job).results.push(result);
+        lock(&daemon.inner).bench.job = Some(job);
+        let (_, _, body) = handle_bench_status(&daemon);
+        assert!(!body.contains("profile_raw"));
+        assert!(!body.contains("secret-canary"));
+        assert!(!body.contains(&profile.raw));
+        let response: Value = serde_json::from_str(&body).expect("status JSON");
+        assert_eq!(response["results"][0]["profile_id"], 0);
+        assert_eq!(
+            response["results"][0]["server_ref"],
+            profile_server_ref(&profile)
+        );
+        assert!(
+            response["results"][0]["server_ref"]
+                .as_str()
+                .expect("public lifecycle ref")
+                .starts_with("srv-v2-")
+        );
+        assert!(response["results"][0].get("result").is_none());
+    }
+
+    #[test]
+    fn fallback_health_requires_valid_controller_evidence() {
+        let url = main_fallback_health_url();
+        let live = json!({
+            "alive": false,
+            "extra": {
+                url.clone(): {
+                    "alive": true,
+                    "history": [{"time":"2026-09-21T12:00:00Z","delay":123}]
+                },
+                "https://www.gstatic.com/generate_204?hincyray=pinned": {
+                    "alive": false,
+                    "history": [{"time":"2026-09-21T12:00:01Z","delay":0}]
+                }
+            }
+        });
+        assert_eq!(
+            fallback_upstream_health(&json!({"alive":true,"now":"proxy-active"}), &live, &url),
+            Some(true)
+        );
+        assert_eq!(
+            fallback_upstream_health(&json!({"alive":false,"now":"proxy-active"}), &live, &url),
+            Some(true)
+        );
+        assert_eq!(
+            fallback_upstream_health(&json!({"alive":false,"now":"REJECT"}), &live, &url),
+            Some(false)
+        );
+        let dead = json!({"extra": {url.clone(): {"alive":false,"history":[]}}});
+        assert_eq!(
+            fallback_upstream_health(&json!({"alive":true,"now":"proxy-active"}), &dead, &url),
+            Some(false)
+        );
+        assert_eq!(active_health_latency_for_url(&live, &url), Some(123));
+        assert_eq!(
+            active_health_sample_for_url(&live, &url).as_deref(),
+            Some("2026-09-21T12:00:00Z")
+        );
+        for group in [
+            json!({}),
+            json!({"alive":"true","now":"proxy-active"}),
+            json!({"alive":true,"now":"unexpected"}),
+        ] {
+            assert_eq!(fallback_upstream_health(&group, &live, &url), None);
+        }
+        assert_eq!(
+            fallback_upstream_health(
+                &json!({"alive":true,"now":"proxy-active"}),
+                &json!({"history":[]}),
+                &url
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn proxy_health_state_counts_only_fresh_samples_and_recovers_with_hysteresis() {
+        let mut sample = None;
+        let mut failures = 0;
+        let mut recoveries = 0;
+        assert_eq!(
+            advance_proxy_health_state(
+                &mut sample,
+                &mut failures,
+                &mut recoveries,
+                "f1".to_owned(),
+                false,
+                PROXY_ACTIVE_NAME,
+            ),
+            ProxyHealthTransition::None
+        );
+        assert_eq!(failures, 1);
+        assert_eq!(
+            advance_proxy_health_state(
+                &mut sample,
+                &mut failures,
+                &mut recoveries,
+                "f1".to_owned(),
+                false,
+                PROXY_ACTIVE_NAME,
+            ),
+            ProxyHealthTransition::None
+        );
+        assert_eq!(failures, 1, "duplicate watchdog poll must not count twice");
+        for (fresh, expected) in [
+            ("f2", ProxyHealthTransition::None),
+            ("f3", ProxyHealthTransition::Reject),
+        ] {
+            assert_eq!(
+                advance_proxy_health_state(
+                    &mut sample,
+                    &mut failures,
+                    &mut recoveries,
+                    fresh.to_owned(),
+                    false,
+                    PROXY_ACTIVE_NAME,
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            advance_proxy_health_state(
+                &mut sample,
+                &mut failures,
+                &mut recoveries,
+                "s1".to_owned(),
+                true,
+                REJECT_NAME,
+            ),
+            ProxyHealthTransition::None
+        );
+        assert_eq!(
+            advance_proxy_health_state(
+                &mut sample,
+                &mut failures,
+                &mut recoveries,
+                "s2".to_owned(),
+                true,
+                REJECT_NAME,
+            ),
+            ProxyHealthTransition::Recover
+        );
+    }
+
+    #[test]
     fn bench_status_preserves_current_profile_and_bounds_active_profiles() {
         let (_dir, daemon) = test_daemon();
         let job: SharedJob = Arc::new(Mutex::new(BenchJob {
@@ -27242,6 +29935,929 @@ mod tests {
             dispatch("POST", "/api/bench/start", r#"{"method":"quic"}"#, &daemon);
         assert_eq!(status, 400);
         assert!(body.contains("unknown method"));
+    }
+
+    #[test]
+    fn discovery_options_accept_all_targets_and_service_prefixes() {
+        let profiles = (0..5)
+            .map(|id| profile_test_fixture_profile(id, &format!("Server {id}"), "manual"))
+            .collect::<Vec<_>>();
+        let mut state = HincyrayState {
+            profiles: profiles.clone(),
+            ..Default::default()
+        };
+        for (id, youtube, telegram, ai) in [
+            (1, true, false, false),
+            (2, true, true, false),
+            (3, true, true, true),
+            (4, false, true, true),
+        ] {
+            state.stats.push(ProfileStats {
+                profile_raw: profiles[id].raw.clone(),
+                last_service_test_unix: 100_000,
+                resource_tests: profile_test_fixture_result(
+                    &profiles[id],
+                    true,
+                    youtube,
+                    telegram,
+                    ai,
+                    10,
+                )
+                .resource_tests,
+                ..Default::default()
+            });
+        }
+        for (required_services, expected) in [
+            ("youtube", vec![3, 2, 1, 0, 4]),
+            ("telegram", vec![3, 2, 0, 1, 4]),
+            ("ai", vec![3, 0, 1, 2, 4]),
+        ] {
+            for target_good in 1..=20 {
+                let options = AdaptiveSearchOptions {
+                    target_good,
+                    required_services: required_services.to_owned(),
+                    fail_fast: true,
+                };
+                options.validate().expect("valid discovery options");
+                let ids = order_adaptive_search_candidates(
+                    &state,
+                    profiles.clone(),
+                    &options,
+                    100_000,
+                    BenchMethod::Quick,
+                )
+                .into_iter()
+                .map(|profile| profile.id)
+                .collect::<Vec<_>>();
+                assert_eq!(ids, expected, "{required_services}, target {target_good}");
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_history_uses_six_hour_service_timestamp_not_tcp_timestamp() {
+        let now = 100_000;
+        let profiles = (0..3)
+            .map(|id| profile_test_fixture_profile(id, &format!("Server {id}"), "manual"))
+            .collect::<Vec<_>>();
+        let options = AdaptiveSearchOptions {
+            target_good: 1,
+            required_services: "youtube".to_owned(),
+            fail_fast: true,
+        };
+        for (checked, expected) in [
+            (now, vec![1, 0, 2]),
+            (now - 6 * 60 * 60, vec![1, 0, 2]),
+            (now - 6 * 60 * 60 - 1, vec![0, 1, 2]),
+            (0, vec![0, 1, 2]),
+            (now + 1, vec![0, 1, 2]),
+        ] {
+            let state = HincyrayState {
+                stats: vec![ProfileStats {
+                    profile_raw: profiles[1].raw.clone(),
+                    last_checked_unix: if checked == now { 0 } else { now },
+                    last_service_test_unix: checked,
+                    resource_tests: profile_test_fixture_result(
+                        &profiles[1],
+                        true,
+                        true,
+                        true,
+                        true,
+                        10,
+                    )
+                    .resource_tests,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let ids = order_adaptive_search_candidates(
+                &state,
+                profiles.clone(),
+                &options,
+                now,
+                BenchMethod::Quick,
+            )
+            .into_iter()
+            .map(|profile| profile.id)
+            .collect::<Vec<_>>();
+            assert_eq!(ids, expected, "service timestamp {checked}");
+        }
+    }
+
+    #[test]
+    fn discovery_skipped_and_legacy_resources_are_unknown_not_failures() {
+        let profiles = (0..2)
+            .map(|id| profile_test_fixture_profile(id, &format!("Server {id}"), "manual"))
+            .collect::<Vec<_>>();
+        let mut skipped = profile_test_fixture_resource("telegram", false);
+        skipped.attempts = 0;
+        let mut legacy = profile_test_fixture_resource("telegram", false);
+        legacy.contract_version = QUICK_RESOURCE_CONTRACT_VERSION - 1;
+        for resources in [
+            vec![],
+            vec![skipped],
+            vec![legacy],
+            vec![profile_test_fixture_resource("youtube", true)],
+        ] {
+            let state = HincyrayState {
+                stats: vec![ProfileStats {
+                    profile_raw: profiles[0].raw.clone(),
+                    last_service_test_unix: 100_000,
+                    resource_tests: resources,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let ids = order_adaptive_search_candidates(
+                &state,
+                profiles.clone(),
+                &AdaptiveSearchOptions {
+                    target_good: 1,
+                    required_services: "telegram".to_owned(),
+                    fail_fast: true,
+                },
+                100_000,
+                BenchMethod::Quick,
+            )
+            .into_iter()
+            .map(|profile| profile.id)
+            .collect::<Vec<_>>();
+            assert_eq!(
+                ids,
+                vec![0, 1],
+                "unknown history must keep exploration order"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_deduplicates_canonical_aliases_and_uses_alias_history() {
+        let original = profile_test_fixture_profile(1, "Original", "first");
+        let mut alias = original.clone();
+        alias.id = 2;
+        alias.name = "Renamed".to_owned();
+        alias.raw = original.raw.replace("#Original", "#Renamed");
+        alias.group = Some("second".to_owned());
+        let unknown = profile_test_fixture_profile(0, "Unknown", "manual");
+        let state = HincyrayState {
+            stats: vec![ProfileStats {
+                profile_raw: alias.raw.clone(),
+                last_service_test_unix: 100_000,
+                resource_tests: profile_test_fixture_result(&alias, true, true, true, true, 10)
+                    .resource_tests,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(profile_server_ref(&original), profile_server_ref(&alias));
+        let ordered = order_adaptive_search_candidates(
+            &state,
+            vec![unknown, original, alias],
+            &AdaptiveSearchOptions {
+                target_good: 20,
+                required_services: "ai".to_owned(),
+                fail_fast: true,
+            },
+            100_000,
+            BenchMethod::Quick,
+        );
+        assert_eq!(
+            ordered.iter().map(|profile| profile.id).collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert_eq!(ordered[0].group.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn discovery_filters_dead_profiles_even_in_explicit_scope() {
+        let (_dir, daemon) = test_daemon();
+        let mut dead = profile_test_fixture_profile(0, "Dead", "manual");
+        let mut alias = dead.clone();
+        alias.id = 1;
+        alias.raw = dead.raw.replace("#Dead", "#Alias");
+        alias.name = "Alias".to_owned();
+        dead.selected = false;
+        let mut state = HincyrayState {
+            profiles: vec![
+                dead.clone(),
+                alias,
+                profile_test_fixture_profile(2, "Live", "manual"),
+            ],
+            ..Default::default()
+        };
+        state.dead_server_refs.insert(profile_server_ref(&dead));
+        let options = AdaptiveSearchOptions {
+            target_good: 1,
+            required_services: "youtube".to_owned(),
+            fail_fast: true,
+        };
+        for ids in [None, Some(&[0, 1, 2][..])] {
+            let candidates = select_profiles_for_quick_bench(&state, None, ids).expect("scope");
+            let ordered = order_adaptive_search_candidates(
+                &state,
+                candidates,
+                &options,
+                100_000,
+                BenchMethod::Quick,
+            );
+            assert_eq!(
+                ordered.iter().map(|profile| profile.id).collect::<Vec<_>>(),
+                vec![2]
+            );
+        }
+        lock(&daemon.inner).state = state;
+        let (status, _, body) = handle_bench_start(
+            r#"{"method":"quick","profile_ids":[0,1],"search":{"target_good":1,"required_services":"youtube"}}"#,
+            &daemon,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("no profiles to benchmark"));
+        assert_eq!(lock(&daemon.inner).state.profile_search_cursor, 0);
+        assert!(!lock(&daemon.inner).bench.is_running());
+    }
+
+    #[test]
+    fn discovery_round_robins_credential_variants_by_endpoint_and_group() {
+        let profiles = (0..8)
+            .map(|id| {
+                let (address, group) = match id {
+                    0..=2 => ("shared.example", "first"),
+                    3..=4 => ("other.example", "first"),
+                    5..=6 => ("shared.example", "second"),
+                    _ => ("shared.example", "first"),
+                };
+                let mut profile = profile_test_fixture_profile(id, &format!("Variant {id}"), group);
+                profile.address = address.to_owned();
+                profile.port = Some(if id == 7 { 8443 } else { 443 });
+                profile.raw = format!(
+                    "vless://11111111-1111-1111-1111-{id:012}@{address}:{}?security=tls#Variant{id}",
+                    profile.port.expect("port"),
+                );
+                profile
+            })
+            .collect::<Vec<_>>();
+        for outcome in [None, Some(true), Some(false)] {
+            let state = HincyrayState {
+                stats: outcome.map_or_else(Vec::new, |passed| {
+                    profiles
+                        .iter()
+                        .map(|profile| ProfileStats {
+                            profile_raw: profile.raw.clone(),
+                            last_service_test_unix: 100_000,
+                            resource_tests: profile_test_fixture_result(
+                                profile, true, passed, passed, passed, 10,
+                            )
+                            .resource_tests,
+                            ..Default::default()
+                        })
+                        .collect()
+                }),
+                ..Default::default()
+            };
+            let ids = order_adaptive_search_candidates(
+                &state,
+                profiles.clone(),
+                &AdaptiveSearchOptions {
+                    target_good: 1,
+                    required_services: "youtube".to_owned(),
+                    fail_fast: true,
+                },
+                100_000,
+                BenchMethod::Quick,
+            )
+            .into_iter()
+            .map(|profile| profile.id)
+            .collect::<Vec<_>>();
+            assert_eq!(ids, vec![0, 3, 5, 7, 1, 4, 6, 2], "lane {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn discovery_cursor_rotates_unknowns_into_early_exploration_slots() {
+        let profiles = (0..12)
+            .map(|id| profile_test_fixture_profile(id, &format!("Server {id}"), "manual"))
+            .collect::<Vec<_>>();
+        let mut state = HincyrayState {
+            stats: profiles[..8]
+                .iter()
+                .map(|profile| ProfileStats {
+                    profile_raw: profile.raw.clone(),
+                    last_service_test_unix: 100_000,
+                    resource_tests: profile_test_fixture_result(
+                        profile, true, true, true, true, 10,
+                    )
+                    .resource_tests,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut explored = HashSet::new();
+        for cursor in 0..16 {
+            state.profile_search_cursor = cursor;
+            let ordered = order_adaptive_search_candidates(
+                &state,
+                profiles.clone(),
+                &AdaptiveSearchOptions {
+                    target_good: 1,
+                    required_services: "ai".to_owned(),
+                    fail_fast: true,
+                },
+                100_000,
+                BenchMethod::Quick,
+            );
+            assert_eq!(ordered.len(), profiles.len());
+            // Target 1 stops at the first successful incumbent. A rejected unknown
+            // is admitted only if it precedes that incumbent; inspect real admissions.
+            explored.extend(
+                ordered
+                    .iter()
+                    .take_while(|profile| profile.id >= 8)
+                    .map(|profile| profile.id),
+            );
+        }
+        assert_eq!(explored, HashSet::from([8, 9, 10, 11]));
+    }
+
+    #[test]
+    fn discovery_cursor_state_roundtrips_and_legacy_state_defaults_to_zero() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("state.json");
+        for cursor in [0, 17, u64::MAX] {
+            let state = HincyrayState {
+                profile_search_cursor: cursor,
+                ..Default::default()
+            };
+            persist_state(&path, &state).expect("persist search cursor");
+            assert_eq!(load_state(&path).profile_search_cursor, cursor);
+        }
+        let mut legacy = serde_json::to_value(HincyrayState::default()).expect("state JSON");
+        legacy
+            .as_object_mut()
+            .expect("state object")
+            .remove("profile_search_cursor");
+        fs::write(&path, legacy.to_string()).expect("legacy state");
+        assert_eq!(load_state(&path).profile_search_cursor, 0);
+    }
+
+    #[test]
+    fn service_checks_start_strictly_validates_policy_method_and_search_conflict() {
+        let (_dir, daemon) = test_daemon();
+        for options in [
+            json!({}),
+            json!([]),
+            json!(true),
+            json!({"required_services": "youtube"}),
+            json!({"fail_fast": false}),
+            json!({"required_services": "YT", "fail_fast": false}),
+            json!({"required_services": "unknown", "fail_fast": false}),
+            json!({"required_services": "youtube", "fail_fast": "false"}),
+            json!({"required_services": "youtube", "fail_fast": null}),
+            json!({"required_services": "youtube", "fail_fast": false, "extra": true}),
+        ] {
+            let body = json!({"method": "availability_full", "service_checks": options});
+            let (status, _, response) = handle_bench_start(&body.to_string(), &daemon);
+            assert_eq!(status, 400, "{body}: {response}");
+            assert!(response.contains("invalid service_checks"), "{response}");
+            assert!(
+                serde_json::from_value::<crate::hincyray_api::BenchStartRequest>(body).is_err()
+            );
+        }
+        let options = json!({"required_services": "all", "fail_fast": false});
+        for method in ["tcp", "head", "get", "quick", "full"] {
+            let (status, _, response) = handle_bench_start(
+                &json!({"method": method, "service_checks": options}).to_string(),
+                &daemon,
+            );
+            assert_eq!(status, 400);
+            assert!(response.contains("requires an availability method"));
+        }
+        let (status, _, response) = handle_bench_start(
+            &json!({"method": "availability_quick", "service_checks": options,
+                "search": {"target_good": 1, "required_services": "all", "fail_fast": false}})
+            .to_string(),
+            &daemon,
+        );
+        assert_eq!(status, 400);
+        assert!(response.contains("mutually exclusive"));
+        assert!(!lock(&daemon.inner).bench.is_running());
+        assert_eq!(lock(&daemon.inner).state.profile_search_cursor, 0);
+    }
+
+    #[test]
+    fn service_checks_and_adaptive_policy_roundtrip_and_reach_ordinary_empty_scope() {
+        let (_dir, daemon) = test_daemon();
+        for required in ["all", "youtube", "telegram", "ai"] {
+            for fail_fast in [false, true] {
+                for method in ["availability_full", "availability_quick"] {
+                    let body = json!({"method": method, "concurrency": 4,
+                        "service_checks": {"required_services": required, "fail_fast": fail_fast}});
+                    let request = serde_json::from_value::<crate::hincyray_api::BenchStartRequest>(
+                        body.clone(),
+                    )
+                    .expect("typed policy");
+                    assert_eq!(
+                        serde_json::to_value(request.service_checks).expect("serialize policy"),
+                        body["service_checks"]
+                    );
+                    let (status, _, response) = handle_bench_start(&body.to_string(), &daemon);
+                    assert_eq!(status, 400);
+                    assert!(response.contains("no profiles to benchmark"), "{response}");
+                }
+                let body = json!({"method": "availability_quick", "search": {
+                    "target_good": 20, "required_services": required, "fail_fast": fail_fast}});
+                let request =
+                    serde_json::from_value::<crate::hincyray_api::BenchStartRequest>(body.clone())
+                        .expect("typed search policy");
+                assert_eq!(
+                    serde_json::to_value(request.search).expect("serialize search"),
+                    body["search"]
+                );
+                let (status, _, response) = handle_bench_start(&body.to_string(), &daemon);
+                assert_eq!(status, 400);
+                assert!(response.contains("no profiles to benchmark"), "{response}");
+            }
+        }
+        let request: crate::hincyray_api::BenchStartRequest =
+            serde_json::from_value(json!({"method": "availability_full"})).expect("missing policy");
+        assert!(request.service_checks.is_none());
+        let (status, _, response) = handle_bench_start(
+            r#"{"method":"availability_full","service_checks":null}"#,
+            &daemon,
+        );
+        assert_eq!(status, 400);
+        assert!(response.contains("no profiles to benchmark"));
+        for fail_fast in [json!("false"), json!(1), json!(null)] {
+            let (status, _, response) = handle_bench_start(
+                &json!({"method": "availability_quick", "search": {
+                "target_good": 1, "required_services": "all", "fail_fast": fail_fast}})
+                .to_string(),
+                &daemon,
+            );
+            assert!(response.contains("invalid search options"));
+            assert_eq!(status, 400);
+        }
+        let (status, _, response) = handle_bench_start(
+            r#"{"method":"quick","search":{"target_good":1,"required_services":"all","fail_fast":false}}"#,
+            &daemon,
+        );
+        assert_eq!(status, 400);
+        assert!(response.contains("search.fail_fast=false requires availability_quick"));
+        assert!(!lock(&daemon.inner).bench.is_running());
+        assert_eq!(lock(&daemon.inner).state.profile_search_cursor, 0);
+    }
+
+    #[test]
+    fn discovery_start_rejects_invalid_search_options_without_starting_workers() {
+        let (_dir, daemon) = test_daemon();
+        let mut cases = Vec::new();
+        for target in [
+            json!(0),
+            json!(21),
+            json!(-1),
+            json!("1"),
+            json!(1.0),
+            json!(1.5),
+            Value::Null,
+        ] {
+            cases.push(json!({"target_good": target, "required_services": "youtube"}));
+        }
+        for service in [
+            json!("unknown"),
+            json!("YouTube"),
+            json!("youtube,telegram"),
+            json!(""),
+            json!(1),
+            Value::Null,
+        ] {
+            cases.push(json!({"target_good": 1, "required_services": service}));
+        }
+        cases.extend([
+            json!({"target_good": 1, "required_services": "youtube", "unknown": true}),
+            json!({"target_good": 1}),
+            json!({"required_services": "youtube"}),
+            json!({}),
+            json!([]),
+            json!("search"),
+            json!(true),
+        ]);
+        for search in cases {
+            let body = json!({"method": "quick", "search": search}).to_string();
+            let (status, _, response) = handle_bench_start(&body, &daemon);
+            assert_eq!(status, 400, "{body}: {response}");
+            assert!(
+                !response.contains("no profiles"),
+                "must reject options before scope: {body}"
+            );
+            assert!(!lock(&daemon.inner).bench.is_running());
+            assert_eq!(lock(&daemon.inner).state.profile_search_cursor, 0);
+        }
+    }
+
+    #[test]
+    fn discovery_start_requires_quick_and_rejects_speed_stages() {
+        let (_dir, daemon) = test_daemon();
+        let search = json!({"target_good": 1, "required_services": "youtube"});
+        for method in [
+            "tcp",
+            "head",
+            "get",
+            "full",
+            "availability_full",
+            "search",
+            "search_availability",
+            "unknown",
+        ] {
+            let body = json!({"method": method, "search": search}).to_string();
+            let (status, _, response) = handle_bench_start(&body, &daemon);
+            assert_eq!(status, 400, "{body}: {response}");
+            assert!(
+                response.contains(
+                    if matches!(method, "search" | "search_availability" | "unknown") {
+                        "unknown method"
+                    } else {
+                        "search requires quick method"
+                    }
+                ),
+                "{response}"
+            );
+        }
+        for stage in ["test_download", "test_upload"] {
+            let mut body = json!({"method": "quick", "search": search});
+            body[stage] = json!(true);
+            let (status, _, response) = handle_bench_start(&body.to_string(), &daemon);
+            assert_eq!(status, 400);
+            assert!(response.contains("search does not support speed stages"));
+        }
+        assert!(!lock(&daemon.inner).bench.is_running());
+    }
+
+    #[test]
+    fn discovery_start_valid_options_and_null_defaults_reach_empty_scope() {
+        let (_dir, daemon) = test_daemon();
+        let mut bodies = vec![
+            json!({}),
+            json!({"search": null, "concurrency": null, "profile_ids": null}),
+            json!({"method": "full", "search": null, "test_download": true}),
+        ];
+        for target_good in 1..=20 {
+            for required_services in ["youtube", "telegram", "ai"] {
+                bodies.push(json!({
+                    "method": "quick",
+                    "search": {"target_good": target_good, "required_services": required_services},
+                    "concurrency": null,
+                    "profile_ids": null,
+                }));
+            }
+        }
+        for body in bodies {
+            let (status, _, response) = handle_bench_start(&body.to_string(), &daemon);
+            assert_eq!(status, 400, "{body}: {response}");
+            let response: Value = serde_json::from_str(&response).expect("start response");
+            assert_eq!(
+                response["error"], "no profiles to benchmark; import first",
+                "{body}"
+            );
+            assert!(!lock(&daemon.inner).bench.is_running());
+            assert_eq!(lock(&daemon.inner).state.profile_search_cursor, 0);
+        }
+    }
+
+    #[test]
+    fn availability_start_validates_speed_scope_and_occupied_job_without_probes() {
+        let (_dir, daemon) = test_daemon();
+        for method in ["availability_quick", "availability_full"] {
+            for stage in ["test_download", "test_upload"] {
+                let mut body = json!({"method": method});
+                body[stage] = json!(true);
+                let (status, _, response) = handle_bench_start(&body.to_string(), &daemon);
+                assert_eq!(status, 400);
+                assert!(response.contains("availability tests do not support speed stages"));
+            }
+            let body = json!({"method": method, "profile_ids": [999]});
+            let (status, _, response) = handle_bench_start(&body.to_string(), &daemon);
+            assert_eq!(status, 404, "{response}");
+        }
+        for required_services in ["youtube", "telegram", "ai"] {
+            let mut body = json!({
+                "method": "availability_quick",
+                "search": {"target_good": 1, "required_services": required_services},
+                "profile_ids": [],
+            });
+            let (status, _, response) = handle_bench_start(&body.to_string(), &daemon);
+            assert_eq!(status, 400);
+            assert!(
+                response.contains("profile_ids must not be empty"),
+                "{response}"
+            );
+            for stage in ["test_download", "test_upload"] {
+                body[stage] = json!(true);
+                let (status, _, response) = handle_bench_start(&body.to_string(), &daemon);
+                assert_eq!(status, 400);
+                assert!(response.contains("search does not support speed stages"));
+                body[stage] = json!(false);
+            }
+        }
+        lock(&daemon.inner).bench.job = Some(Arc::new(Mutex::new(BenchJob {
+            running: true,
+            ..Default::default()
+        })));
+        for body in [
+            json!({"method": "availability_quick"}),
+            json!({"method": "availability_full"}),
+            json!({"method": "availability_quick", "search": {"target_good": 1, "required_services": "ai"}}),
+        ] {
+            let (status, _, response) = handle_bench_start(&body.to_string(), &daemon);
+            assert_eq!(status, 409, "{response}");
+        }
+        assert_eq!(lock(&daemon.inner).state.profile_search_cursor, 0);
+    }
+
+    #[test]
+    fn discovery_status_exposes_progress_and_selected_service_success_summary() {
+        let (_dir, daemon) = test_daemon();
+        let profile = profile_test_fixture_profile(0, "YouTube only", "manual");
+        lock(&daemon.inner).state.profiles = vec![profile.clone()];
+        let mut selected = profile_test_fixture_result(&profile, true, true, false, false, 40);
+        selected.method = "search".to_owned();
+        selected.success = true;
+        let mut rejected = profile_test_fixture_result(&profile, true, false, false, false, 999);
+        rejected.method = "search".to_owned();
+        let progress = SearchProgress {
+            target_good: 1,
+            required_services: "youtube".to_owned(),
+            fail_fast: None,
+            found_good: 1,
+            preflight_completed: 3,
+            preflight_rejected: 1,
+            quick_completed: 2,
+            finish_reason: Some("target_reached".to_owned()),
+        };
+        lock(&daemon.inner).bench.job = Some(Arc::new(Mutex::new(BenchJob {
+            method: Some(BenchMethod::Quick),
+            total: 10,
+            completed: 3,
+            search: Some(progress.clone()),
+            results: vec![selected, rejected],
+            ..Default::default()
+        })));
+        let (status, _, body) = dispatch("GET", "/api/bench/status", "", &daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("status response");
+        assert_eq!(
+            response["search"],
+            serde_json::to_value(progress).expect("progress JSON")
+        );
+        assert_eq!(
+            response["summary"],
+            json!({"total": 2, "passed": 1, "failed": 1, "inconclusive": 0, "avg_latency_ms": 40.0})
+        );
+        assert_eq!(response["results"][0]["method"], "search");
+        assert_eq!(response["results"][0]["success"], true);
+        assert_eq!(response["results"][0]["resource_tests"][4]["stable"], false);
+    }
+
+    #[test]
+    fn availability_status_preserves_namespace_remaps_ids_and_redacts_results() {
+        let (_dir, daemon) = test_daemon();
+        let profile = profile_test_fixture_profile(1, "Available", "manual");
+        let mut current = profile.clone();
+        current.id = 9;
+        lock(&daemon.inner).state.profiles = vec![current];
+        for namespace in [
+            "availability_quick",
+            "availability_full",
+            "search_availability",
+        ] {
+            let mut result = profile_test_fixture_result(&profile, true, true, true, true, 40);
+            result.method = namespace.to_owned();
+            result.resource_tests[3].id = "youtube_thumbnails".to_owned();
+            result.resource_tests[3].contract_version =
+                crate::benchmark::YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+            result.resource_tests[3].error =
+                Some("https://provider.example/sub/<token>".to_owned());
+            let method = if namespace == "availability_full" {
+                BenchMethod::AvailabilityFull
+            } else {
+                BenchMethod::AvailabilityQuick
+            };
+            let search = (namespace == "search_availability").then(|| SearchProgress {
+                target_good: 1,
+                required_services: "youtube".to_owned(),
+                fail_fast: None,
+                found_good: 1,
+                preflight_completed: 3,
+                preflight_rejected: 1,
+                quick_completed: 2,
+                finish_reason: Some("target_reached".to_owned()),
+            });
+            lock(&daemon.inner).bench.job = Some(Arc::new(Mutex::new(BenchJob {
+                method: Some(method),
+                total: 10,
+                completed: 3,
+                results: vec![result],
+                search: search.clone(),
+                ..Default::default()
+            })));
+            let (status, _, body) = handle_bench_status(&daemon);
+            assert_eq!(status, 200);
+            let response: Value = serde_json::from_str(&body).expect("availability status");
+            assert_eq!(response["method"], method.as_str());
+            assert_eq!(response["results"][0]["method"], namespace);
+            assert_eq!(response["results"][0]["profile_id"], 9);
+            assert_eq!(
+                response["results"][0]["resource_tests"][3]["id"],
+                "youtube_thumbnails"
+            );
+            assert_eq!(
+                response["results"][0]["resource_tests"][3]["contract_version"],
+                1
+            );
+            assert!(response["results"][0].get("profile_raw").is_none());
+            assert_eq!(
+                response["search"],
+                serde_json::to_value(search).expect("search progress JSON")
+            );
+            assert_eq!(response["summary"]["passed"], 1);
+            assert_eq!(response["summary"]["total"], 1);
+            assert!(!body.contains("/sub/<token>"), "{body}");
+        }
+    }
+
+    #[test]
+    fn discovery_status_does_not_attach_removed_identity_to_reused_id() {
+        let (_dir, daemon) = test_daemon();
+        let removed = profile_test_fixture_profile(0, "Removed", "manual");
+        let mut replacement = profile_test_fixture_profile(1, "Replacement", "manual");
+        replacement.id = 0;
+        let result = profile_test_fixture_result(&removed, true, true, true, true, 10);
+        lock(&daemon.inner).state.profiles = vec![replacement];
+        let job = new_bench_job(BenchMethod::Quick, 1, 1);
+        lock(&job).results.push(result);
+        lock(&daemon.inner).bench.job = Some(job);
+        let (_, _, body) = handle_bench_status(&daemon);
+        let response: Value = serde_json::from_str(&body).expect("status JSON");
+        assert_eq!(response["results"], json!([]));
+    }
+
+    #[test]
+    fn bench_status_server_ref_survives_reindexing_with_identical_names() {
+        let (_dir, daemon) = test_daemon();
+        let original = profile_test_fixture_profile(7, "Same name", "manual");
+        let mut other = profile_test_fixture_profile(8, "Same name", "manual");
+        let result = profile_test_fixture_result(&original, true, true, true, true, 10);
+        let expected_ref = profile_test_result_server_ref(&result);
+        let job = new_bench_job(BenchMethod::Quick, 1, 1);
+        lock(&job).results.push(result);
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![original.clone(), other.clone()];
+            inner.bench.job = Some(Arc::clone(&job));
+        }
+        let (_, _, body) = handle_bench_status(&daemon);
+        let before: Value = serde_json::from_str(&body).expect("original status");
+        assert_eq!(before["results"][0]["profile_id"], 7);
+        assert_eq!(before["results"][0]["server_ref"], expected_ref);
+
+        let mut reindexed = original;
+        reindexed.id = 8;
+        other.id = 7;
+        lock(&daemon.inner).state.profiles = vec![other, reindexed];
+        let (_, _, body) = handle_bench_status(&daemon);
+        let after: Value = serde_json::from_str(&body).expect("reindexed status");
+        assert_eq!(after["results"][0]["profile_id"], 8);
+        assert_eq!(after["results"][0]["server_ref"], expected_ref);
+        assert_eq!(
+            before["results"][0]["server_ref"],
+            after["results"][0]["server_ref"]
+        );
+        assert!(after["results"][0].get("profile_raw").is_none());
+        assert_eq!(lock(&job).results[0].profile_id, 7);
+    }
+
+    #[test]
+    fn watchdog_auto_select_excludes_discovery_partial_and_cancelled_jobs() {
+        let mut job = BenchJob {
+            total: 2,
+            completed: 2,
+            ..Default::default()
+        };
+        assert!(completed_bench_allows_auto_select(&job));
+        job.search = Some(SearchProgress {
+            finish_reason: Some("exhausted".to_owned()),
+            ..Default::default()
+        });
+        assert!(!completed_bench_allows_auto_select(&job));
+        job.search = None;
+        job.cancel_requested = true;
+        assert!(!completed_bench_allows_auto_select(&job));
+        job.cancel_requested = false;
+        job.completed = 1;
+        assert!(!completed_bench_allows_auto_select(&job));
+        job.completed = 2;
+        job.running = true;
+        assert!(!completed_bench_allows_auto_select(&job));
+        assert!(!completed_bench_allows_auto_select(&BenchJob::default()));
+    }
+
+    #[test]
+    fn concurrency_status_distinguishes_memory_candidates_and_remaining_target() {
+        let job = new_bench_job(BenchMethod::Quick, 10, 3);
+        let mut job = lock(&job);
+        job.requested_concurrency = 4;
+        job.memory_limited = true;
+        job.search = Some(SearchProgress {
+            target_good: 1,
+            ..Default::default()
+        });
+        job.active_profiles
+            .push(crate::benchmark::ActiveBenchProfile {
+                id: 0,
+                name: "Server".to_owned(),
+            });
+        assert_eq!(
+            bench_concurrency_status(&job),
+            json!({"requested":4,"effective":3,
+            "active":1,"admission_limit":1,"limit_reasons":["memory_cap","target_slots"]})
+        );
+        job.search.as_mut().expect("search").target_good = 5;
+        assert_eq!(bench_concurrency_status(&job)["admission_limit"], 3);
+        assert_eq!(
+            bench_concurrency_status(&job)["limit_reasons"],
+            json!(["memory_cap"])
+        );
+        job.search = None;
+        job.memory_limited = false;
+        job.total = 1;
+        job.worker_count = 1;
+        assert_eq!(
+            bench_concurrency_status(&job)["limit_reasons"],
+            json!(["candidate_count"])
+        );
+        assert_eq!(
+            bench_concurrency_status(&BenchJob::default()),
+            json!({"requested":0,
+            "effective":0,"active":0,"admission_limit":0,"limit_reasons":[]})
+        );
+    }
+
+    #[test]
+    fn discovery_result_persists_resources_without_overall_health_and_tcp_preserves_service_time() {
+        let (_dir, daemon) = test_daemon();
+        let profile = profile_test_fixture_profile(0, "YouTube only", "manual");
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![profile.clone()];
+            inner.state.stats.push(ProfileStats {
+                profile_raw: profile.raw.clone(),
+                last_service_test_success: Some(true),
+                last_service_test_unix: 99_000,
+                resource_tests: vec![profile_test_fixture_resource("youtube", false)],
+                ..Default::default()
+            });
+        }
+        let mut result = profile_test_fixture_result(&profile, true, true, false, false, 40);
+        result.method = "search".to_owned();
+        result.success = true;
+        result.timestamp = 100_000;
+        let resources = serde_json::to_value(&result.resource_tests).expect("resources JSON");
+        for success in [true, false] {
+            result.success = success;
+            apply_bench_result(&daemon, result.clone());
+            let persisted = load_state(&daemon.state_path);
+            let stats = &persisted.stats[0];
+            assert_eq!(
+                serde_json::to_value(&stats.resource_tests).expect("saved resources"),
+                resources
+            );
+            assert_eq!(stats.last_service_test_success, None);
+            assert_eq!(stats.last_service_test_unix, 100_000);
+            assert_eq!(stats.last_checked_unix, 100_000);
+            assert_eq!(stats.success_count, 0);
+            assert_eq!(stats.failure_count, 0);
+            assert!(!stats.has_latency);
+            assert!(persisted.metrics_history.is_empty());
+        }
+        result.method = "tcp".to_owned();
+        result.resource_tests.clear();
+        for (success, timestamp) in [(true, 100_001), (false, 100_002)] {
+            result.success = success;
+            result.timestamp = timestamp;
+            apply_bench_result(&daemon, result.clone());
+            let persisted = load_state(&daemon.state_path);
+            let stats = &persisted.stats[0];
+            assert_eq!(stats.last_checked_unix, timestamp);
+            assert_eq!(stats.last_service_test_unix, 100_000);
+            assert_eq!(stats.last_service_test_success, None);
+            assert_eq!(
+                serde_json::to_value(&stats.resource_tests).expect("preserved resources"),
+                resources
+            );
+        }
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.stats[0].success_count, 1);
+        assert_eq!(inner.state.stats[0].failure_count, 1);
+        assert_eq!(inner.state.metrics_history.len(), 2);
     }
 
     #[test]
@@ -27289,11 +30905,89 @@ mod tests {
     }
 
     #[test]
+    fn service_checks_worker_admission_requires_requested_workers_within_scope() {
+        let budget = memory_bounded_bench_concurrency(4, 224 * 1024);
+        assert_eq!(budget, 3);
+        assert_eq!(
+            validate_bench_worker_admission(4, 10, budget, true),
+            Err(
+                "Requested 4 workers, memory permits 3; reduce parallelism or free memory"
+                    .to_owned()
+            )
+        );
+        let budget = memory_bounded_bench_concurrency(4, 272 * 1024);
+        assert_eq!(budget, 4);
+        assert!(validate_bench_worker_admission(4, 10, budget, true).is_ok());
+        let budget = memory_bounded_bench_concurrency(4, 128 * 1024);
+        assert_eq!(budget, 1);
+        assert!(validate_bench_worker_admission(4, 1, budget, true).is_ok());
+        let job = new_bench_job(BenchMethod::AvailabilityFull, 1, budget);
+        assert_eq!(lock(&job).worker_count, 1);
+        for available_kb in [0, 127 * 1024] {
+            let budget = memory_bounded_bench_concurrency(4, available_kb);
+            assert_eq!(budget, 0);
+            assert!(validate_bench_worker_admission(4, 1, budget, true).is_err());
+        }
+        let budget = memory_bounded_bench_concurrency(4, 224 * 1024);
+        assert!(validate_bench_worker_admission(4, 10, budget, false).is_ok());
+        for method in [
+            BenchMethod::AvailabilityFull,
+            BenchMethod::AvailabilityQuick,
+            BenchMethod::Quick,
+        ] {
+            let job = new_bench_job(method, 10, budget);
+            assert_eq!(
+                lock(&job).worker_count,
+                3,
+                "legacy/adaptive memory cap is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn service_checks_search_schema_matches_typed_request() {
+        let schemas = &openapi_document()["components"]["schemas"];
+        let search = &schemas["AdaptiveSearchOptions"];
+        assert_eq!(search["additionalProperties"], false);
+        assert_eq!(
+            search["properties"]["required_services"]["pattern"],
+            "^(all|youtube|telegram|ai)$"
+        );
+        assert_eq!(search["properties"]["fail_fast"]["type"], "boolean");
+        assert_eq!(search["properties"]["fail_fast"]["default"], true);
+        assert_eq!(
+            search["properties"]["target_good"]["minimum"].as_f64(),
+            Some(1.0)
+        );
+        assert_eq!(
+            search["properties"]["target_good"]["maximum"].as_f64(),
+            Some(20.0)
+        );
+        assert_eq!(
+            schemas["BenchStartRequest"]["definitions"]["AdaptiveSearchOptions"]["properties"],
+            search["properties"]
+        );
+        let policy = &schemas["ServiceCheckOptions"];
+        assert_eq!(policy["additionalProperties"], false);
+        assert_eq!(
+            policy["required"],
+            json!(["fail_fast", "required_services"])
+        );
+        assert_eq!(policy["properties"]["fail_fast"]["type"], "boolean");
+        assert_eq!(
+            schemas["ServiceCheckPrefix"]["enum"],
+            json!(["all", "youtube", "telegram", "ai"])
+        );
+    }
+
+    #[test]
     fn temporary_core_bench_concurrency_preserves_router_memory_reserve() {
         assert_eq!(memory_bounded_bench_concurrency(6, 160 * 1024), 1);
         assert_eq!(memory_bounded_bench_concurrency(6, 224 * 1024), 3);
         assert_eq!(memory_bounded_bench_concurrency(4, 512 * 1024), 4);
-        assert_eq!(memory_bounded_bench_concurrency(3, 0), 3);
+        assert_eq!(memory_bounded_bench_concurrency(3, 0), 0);
+        assert_eq!(memory_bounded_bench_concurrency(4, 127 * 1024), 0);
+        assert_eq!(memory_bounded_bench_concurrency(4, 128 * 1024), 1);
         assert!(benchmark_uses_temporary_core(
             BenchMethod::Quick,
             false,
@@ -27921,6 +31615,7 @@ mod tests {
                 successes: 2,
                 reachable: true,
                 stable: true,
+                inconclusive: false,
                 avg_ttfb_ms: 120,
                 max_ttfb_ms: 140,
                 avg_download_kbps: 800.0,
@@ -27940,6 +31635,7 @@ mod tests {
         assert_eq!(stat.resource_tests.len(), 1);
         assert_eq!(stat.resource_tests[0].id, "youtube");
         assert_eq!(stat.last_service_test_success, Some(true));
+        assert_eq!(stat.last_service_test_unix, 1_700_000_000);
         assert_eq!(stat.success_count, 0);
         assert_eq!(stat.failure_count, 0);
         assert!(inner.state.metrics_history.is_empty());
@@ -27969,6 +31665,8 @@ mod tests {
         assert_eq!(stat.success_count, 0);
         assert_eq!(stat.failure_count, 1);
         assert_eq!(stat.last_error.as_deref(), Some("tcp connect failed"));
+        assert_eq!(stat.last_service_test_success, Some(true));
+        assert_eq!(stat.last_service_test_unix, 1_700_000_000);
         assert_eq!(inner.state.metrics_history.len(), 1);
     }
 
@@ -28202,6 +31900,233 @@ mod tests {
         assert_eq!(
             inner.state.split_routing.geo_asset_path,
             "/opt/etc/hincyray"
+        );
+    }
+
+    #[test]
+    fn torrent_socks_without_panel_auth_keeps_own_credentials_strict_and_transactional() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+        }
+        let body = r#"{"torrent_socks":{"enabled":true,"listen":"127.0.0.1","port":10812,"username":"torrent","password":"SECRET_TORRENT_PASSWORD","target":"direct"}}"#;
+        let (status, _, response) = handle_routing_settings(body, &daemon);
+        assert_eq!(status, 200, "{response}");
+        assert!(!response.contains("SECRET_TORRENT_PASSWORD"));
+        {
+            let inner = lock(&daemon.inner);
+            assert!(inner.state.split_routing.torrent_socks.enabled);
+            assert!(!inner.state.web_ui_auth.enabled);
+            assert_eq!(
+                inner.state.split_routing.torrent_socks.password,
+                "SECRET_TORRENT_PASSWORD"
+            );
+        }
+
+        let (status, _, response) = handle_routing_settings(
+            r#"{"torrent_socks":{"port":10808,"password":"replacement"}}"#,
+            &daemon,
+        );
+        assert_eq!(status, 400, "{response}");
+        let inner = lock(&daemon.inner);
+        assert_eq!(inner.state.split_routing.torrent_socks.port, 10812);
+        assert_eq!(
+            inner.state.split_routing.torrent_socks.password,
+            "SECRET_TORRENT_PASSWORD"
+        );
+    }
+
+    #[test]
+    fn torrent_socks_rejects_configured_api_port_collision() {
+        let (_dir, daemon) = test_daemon();
+        let result = {
+            let mut inner = lock(&daemon.inner);
+            inner.state.split_routing.torrent_socks.enabled = true;
+            inner.state.split_routing.torrent_socks.port = 12012;
+            inner.state.split_routing.torrent_socks.username = "torrent".to_owned();
+            inner.state.split_routing.torrent_socks.password = "long-test-password".to_owned();
+            validate_torrent_socks_settings_with_api_port(&inner.state, 12012)
+        };
+        assert!(result.expect_err("collision").contains("conflicts"));
+    }
+
+    #[test]
+    fn restored_enabled_panel_authentication_requires_password_with_torrent_socks() {
+        let (_dir, daemon) = test_daemon();
+        let mut restored = HincyrayState::default();
+        restored.web_ui_auth.enabled = true;
+        restored.split_routing.torrent_socks.enabled = true;
+        restored.split_routing.torrent_socks.username = "torrent".to_owned();
+        restored.split_routing.torrent_socks.password = "long-test-password".to_owned();
+        let error = apply_restored_state(&daemon, restored, "invalid-auth")
+            .expect_err("missing panel password must be rejected");
+        assert!(error.contains("enabled without a password"));
+        assert!(!daemon.state_path.exists());
+    }
+
+    #[test]
+    fn torrent_socks_requires_own_credentials_even_without_panel_auth() {
+        let (_dir, daemon) = test_daemon();
+        let (status, _, response) = handle_routing_settings(
+            r#"{"torrent_socks":{"enabled":true,"username":"torrent","target":"direct"}}"#,
+            &daemon,
+        );
+        assert_eq!(status, 400, "{response}");
+        assert!(
+            !lock(&daemon.inner)
+                .state
+                .split_routing
+                .torrent_socks
+                .enabled
+        );
+
+        let (status, _, response) = handle_routing_settings(
+            r#"{"torrent_socks":{"enabled":true,"username":"torrent","password":"long-test-password","target":"direct"}}"#,
+            &daemon,
+        );
+        assert_eq!(status, 200, "{response}");
+        assert!(
+            lock(&daemon.inner)
+                .state
+                .split_routing
+                .torrent_socks
+                .enabled
+        );
+        assert!(!lock(&daemon.inner).state.web_ui_auth.enabled);
+    }
+
+    #[test]
+    fn panel_auth_can_be_disabled_while_torrent_socks_remains_enabled() {
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.web_ui_auth.enabled = true;
+            inner.state.split_routing.torrent_socks.enabled = true;
+            inner.state.split_routing.torrent_socks.username = "torrent".to_owned();
+            inner.state.split_routing.torrent_socks.password = "long-test-password".to_owned();
+        }
+        let (status, _, response) = handle_auth_settings_set(r#"{"enabled":false}"#, &daemon);
+        assert_eq!(status, 200, "{response}");
+        let inner = lock(&daemon.inner);
+        assert!(!inner.state.web_ui_auth.enabled);
+        assert!(inner.state.split_routing.torrent_socks.enabled);
+        assert_eq!(
+            inner.state.split_routing.torrent_socks.password,
+            "long-test-password"
+        );
+        assert!(validate_torrent_socks_settings(&inner.state).is_ok());
+    }
+
+    #[test]
+    fn rejected_auth_enable_does_not_mutate_username() {
+        let (_dir, daemon) = test_daemon();
+        let original = lock(&daemon.inner).state.web_ui_auth.username.clone();
+        let (status, _, _) =
+            handle_auth_settings_set(r#"{"enabled":true,"username":"rejected-user"}"#, &daemon);
+        assert_eq!(status, 400);
+        assert_eq!(lock(&daemon.inner).state.web_ui_auth.username, original);
+    }
+
+    #[test]
+    fn torrent_socks_config_works_without_transparent_split_routing() {
+        let (_dir, daemon) = test_daemon();
+        handle_import(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active",
+            &daemon,
+        );
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.active_profile_id = Some(0);
+            inner.state.split_routing.enabled = false;
+            inner.state.split_routing.torrent_socks = TorrentSocksSettings {
+                enabled: true,
+                listen: "127.0.0.1".to_owned(),
+                port: 10812,
+                username: "SECRET_TORRENT_USER".to_owned(),
+                password: "SECRET_TORRENT_PASSWORD".to_owned(),
+                target: "direct".to_owned(),
+            };
+        }
+        let raw = build_daemon_config(&lock(&daemon.inner).state, &[]).expect("daemon config");
+        let config: Value = serde_yaml::from_str(&raw).expect("parse config");
+        let listener = config["listeners"]
+            .as_array()
+            .expect("listeners")
+            .iter()
+            .find(|listener| listener["name"] == "torrent-socks-in")
+            .expect("torrent listener");
+        assert_eq!(listener["proxy"], DIRECT_NAME);
+        assert_eq!(listener["users"][0]["password"], "SECRET_TORRENT_PASSWORD");
+        assert!(
+            config["listeners"]
+                .as_array()
+                .expect("listeners")
+                .iter()
+                .all(|listener| listener["name"] != "redir-in")
+        );
+        assert!(config.get("sniffer").is_none());
+        assert!(
+            config["rules"]
+                .as_array()
+                .expect("rules")
+                .iter()
+                .all(|rule| !rule.as_str().unwrap_or_default().contains("DST-PORT,443"))
+        );
+
+        let (status, _, redacted) = handle_get_mihomo_config(&daemon);
+        assert_eq!(status, 200);
+        assert!(!redacted.contains("SECRET_TORRENT_USER"));
+        assert!(!redacted.contains("SECRET_TORRENT_PASSWORD"));
+        assert!(redacted.contains("torrent-socks-in"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn torrent_secret_files_are_private() {
+        let (dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.split_routing.torrent_socks.username = "torrent-user".to_owned();
+            inner.state.split_routing.torrent_socks.password = "torrent-secret-password".to_owned();
+            persist_state(&daemon.state_path, &inner.state).expect("persist state");
+            atomic_write_config(
+                &daemon.mihomo_config_path,
+                b"listeners:\n- users:\n  - password: torrent-secret-password\n",
+            )
+            .expect("write config");
+            let backup = create_state_backup(&daemon.state_path, &inner.state, "private")
+                .expect("create backup");
+            for path in [&daemon.state_path, &daemon.mihomo_config_path, &backup] {
+                assert_eq!(
+                    fs::metadata(path).expect("metadata").permissions().mode() & 0o777,
+                    0o600,
+                    "{} must be private",
+                    path.display()
+                );
+            }
+        }
+        assert!(dir.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn torrent_socks_disabled_settings_remain_bounded() {
+        let (_dir, daemon) = test_daemon();
+        let oversized = "x".repeat(513);
+        let body = json!({"torrent_socks":{"enabled":false,"password":oversized}}).to_string();
+        let (status, _, response) = handle_routing_settings(&body, &daemon);
+        assert_eq!(status, 400, "{response}");
+        assert!(
+            lock(&daemon.inner)
+                .state
+                .split_routing
+                .torrent_socks
+                .password
+                .is_empty()
         );
     }
 
@@ -28474,6 +32399,114 @@ mod tests {
     }
 
     #[test]
+    fn routing_reconnect_scope_keeps_torrent_changes_separate_from_general_policy() {
+        let mut previous = HincyrayState::default();
+        previous.split_routing.torrent_socks.enabled = true;
+        previous.split_routing.torrent_socks.target = "active".to_owned();
+        let mut next = previous.split_routing.clone();
+        next.torrent_socks.target = "server:srv-v1-example".to_owned();
+        let torrent_request =
+            json!({"apply":true, "torrent_socks":{"target":"server:srv-v1-example"}});
+        let object = torrent_request.as_object().expect("torrent request object");
+        assert_eq!(
+            routing_settings_reconnect_scope(&previous, &next, object),
+            RoutingReconnectScope::Torrent
+        );
+        assert_eq!(
+            routing_settings_reconnect_scope(&previous, &previous.split_routing, object),
+            RoutingReconnectScope::None
+        );
+        let unrelated_request = json!({"apply":true,"auto_switch":false});
+        assert_eq!(
+            routing_settings_reconnect_scope(
+                &previous,
+                &previous.split_routing,
+                unrelated_request
+                    .as_object()
+                    .expect("unrelated request object")
+            ),
+            RoutingReconnectScope::None
+        );
+        next.match_target = "direct".to_owned();
+        let mixed_request = json!({"apply":true,"match_target":"direct","torrent_socks":{"target":"server:srv-v1-example"}});
+        assert_eq!(
+            routing_settings_reconnect_scope(
+                &previous,
+                &next,
+                mixed_request.as_object().expect("mixed request object")
+            ),
+            RoutingReconnectScope::All
+        );
+    }
+
+    #[test]
+    fn reconnect_torrent_ids_use_only_mihomo_inbound_not_source_or_chain() {
+        let snapshot = json!({"connections":[
+            {"id":"torrent-one", "metadata":{"inboundName":"torrent-socks-in"},"chains":["proxy-active"]},
+            {"id":"other", "metadata":{"inboundName":"redir-in", "sourceIP":"192.0.2.10"},"chains":["srv-route-example"]},
+            {"id":"torrent-two", "metadata":{"inboundName":"torrent-socks-in", "sourceIP":"192.0.2.10"},"chains":["DIRECT"]},
+            {"metadata":{"inboundName":"torrent-socks-in"}}
+        ]});
+        assert_eq!(
+            torrent_connection_ids(&snapshot),
+            ["torrent-one", "torrent-two"]
+        );
+    }
+
+    #[test]
+    fn reconnect_torrent_closes_only_listener_connections_and_all_uses_global_delete() {
+        let (_dir, daemon) = test_daemon();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("controller");
+        daemon.set_mihomo_controller_override(
+            listener
+                .local_addr()
+                .expect("controller address")
+                .to_string(),
+        );
+        let worker = thread::spawn(move || {
+            let mut paths = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("request");
+                let mut request = [0_u8; 2048];
+                let read = stream.read(&mut request).expect("read request");
+                let line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                paths.push(line.clone());
+                let body = if line.starts_with("GET /connections ") {
+                    json!({"connections":[
+                        {"id":"a", "metadata":{"inboundName":"torrent-socks-in"}},
+                        {"id":"b", "metadata":{"inboundName":"redir-in"}},
+                        {"id":"c", "metadata":{"inboundName":"torrent-socks-in"}}
+                    ]})
+                    .to_string()
+                } else {
+                    "{}".to_owned()
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("response");
+            }
+            paths
+        });
+        let torrent = reconnect_after_routing_change(&daemon, RoutingReconnectScope::Torrent);
+        assert_eq!(torrent["complete"], true);
+        assert_eq!(torrent["closed"], 2);
+        let all = reconnect_after_routing_change(&daemon, RoutingReconnectScope::All);
+        assert_eq!(all["complete"], true);
+        let paths = worker.join().expect("controller worker");
+        assert_eq!(
+            paths,
+            [
+                "GET /connections HTTP/1.1",
+                "DELETE /connections/a HTTP/1.1",
+                "DELETE /connections/c HTTP/1.1",
+                "DELETE /connections HTTP/1.1",
+            ]
+        );
+    }
+
+    #[test]
     fn mihomo_validator_times_out_and_terminates_hung_process() {
         let dir = TempDir::new().expect("temp dir");
         let script_path = dir.path().join("hung-mihomo.sh");
@@ -28648,6 +32681,62 @@ mod tests {
         assert_eq!(state.active_profile_id, Some(0));
         assert_eq!(state.profiles[0].raw, "raw1");
         assert_eq!(state.profiles[0].name, "Sub1-updated");
+    }
+
+    #[test]
+    fn subscription_refresh_cannot_remove_enabled_torrent_fixed_target() {
+        let mut state = HincyrayState::default();
+        let url = "https://provider.example/sub";
+        state.profiles.push(make_profile(
+            0,
+            "Pinned",
+            "vless://11111111-1111-1111-1111-111111111111@one.example:443#Pinned",
+            Some(url),
+        ));
+        sync_server_route_registry(&mut state);
+        let server_ref = server_ref_for_canonical(&canonical_profile_raw(&state.profiles[0]));
+        state.split_routing.torrent_socks.enabled = true;
+        state.split_routing.torrent_socks.target = format!("server:{server_ref}");
+        let before = state
+            .profiles
+            .iter()
+            .map(|profile| (profile.id, profile.raw.clone(), profile.group.clone()))
+            .collect::<Vec<_>>();
+
+        let error = replace_subscription_profiles(
+            &mut state,
+            url,
+            vec![make_profile(
+                0,
+                "Replacement",
+                "vless://22222222-2222-2222-2222-222222222222@two.example:443#Replacement",
+                None,
+            )],
+        )
+        .expect_err("fixed torrent target removal must be rejected");
+
+        assert!(error.contains("enabled fixed-server route"));
+        assert_eq!(
+            state
+                .profiles
+                .iter()
+                .map(|profile| (profile.id, profile.raw.clone(), profile.group.clone()))
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn torrent_update_debug_redacts_credentials() {
+        let update = TorrentSocksSettingsUpdate {
+            username: Some("torrent-user-canary".to_owned()),
+            password: Some("torrent-password-canary".to_owned()),
+            ..Default::default()
+        };
+        let debug = format!("{update:?}");
+        assert!(!debug.contains("torrent-user-canary"));
+        assert!(!debug.contains("torrent-password-canary"));
+        assert_eq!(debug.matches("<redacted>").count(), 2);
     }
 
     #[test]
@@ -29093,6 +33182,9 @@ mod tests {
                     .write_all(response.as_bytes())
                     .expect("controller response");
             }
+            for _ in 0..3 {
+                serve_selector_controller_request(&controller);
+            }
         });
         atomic_write_config(&daemon.mihomo_config_path, b"OLD exact bytes\n").expect("old config");
         {
@@ -29257,6 +33349,44 @@ mod tests {
         assert_eq!(select_profiles_for_deep_bench(&state)[0].id, 20);
         state.deep_bench.profile_filter = ProfileFilter::Explicit(vec![dead_ref]);
         assert_eq!(select_profiles_for_deep_bench(&state)[0].id, 10);
+    }
+
+    #[test]
+    fn trash_list_keeps_first_alias_and_unresolved_legacy_entries() {
+        let (_dir, daemon) = test_daemon();
+        let first = profile_test_fixture_profile(0, "First", "manual");
+        let mut alias = first.clone();
+        alias.id = 1;
+        alias.name = "Alias".to_owned();
+        alias.raw = format!("{}#alias", first.raw.split('#').next().expect("raw prefix"));
+        let server_ref = profile_server_ref(&first);
+        assert_eq!(profile_server_ref(&alias), server_ref);
+        let orphan = "srv-v1-00000000000000000000000000000000".to_owned();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![first, alias];
+            inner.state.dead_server_refs = HashSet::from([server_ref.clone(), orphan.clone()]);
+            inner.state.dead_promoted_at.insert(server_ref.clone(), 123);
+        }
+        let (status, _, body) = handle_trash_list(&daemon);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).expect("trash response");
+        let entries = response["trash"].as_array().expect("entries");
+        assert_eq!(entries.len(), 2);
+        let resolved = entries
+            .iter()
+            .find(|entry| entry["server_ref"] == server_ref)
+            .expect("resolved entry");
+        assert_eq!(resolved["profile_id"], 0);
+        assert_eq!(resolved["name"], "First");
+        assert_eq!(resolved["group"], "manual");
+        assert_eq!(resolved["promoted_at_unix"], 123);
+        let unresolved = entries
+            .iter()
+            .find(|entry| entry["server_ref"] == orphan)
+            .expect("legacy entry");
+        assert_eq!(unresolved["profile_id"], Value::Null);
+        assert_eq!(unresolved["still_in_profiles"], false);
     }
 
     #[test]
@@ -29789,14 +33919,9 @@ mod tests {
                 .to_string(),
         );
         let controller_worker = thread::spawn(move || {
-            let (mut stream, _) = controller.accept().expect("readiness request");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).expect("read readiness request");
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
-                )
-                .expect("readiness response");
+            for _ in 0..2 {
+                serve_selector_controller_request(&controller);
+            }
         });
         daemon.fail_next_active_profile_persist_after_write();
 
@@ -30790,7 +34915,8 @@ mod tests {
         );
         let persisted = fs::read_to_string(&daemon.state_path).expect("persisted state");
         assert!(!persisted.contains("hunter2"));
-        assert!(!persisted.contains("\"password\""));
+        let persisted: Value = serde_json::from_str(&persisted).expect("persisted JSON");
+        assert!(persisted["web_ui_auth"].get("password").is_none());
     }
 
     #[test]
@@ -30849,7 +34975,8 @@ mod tests {
         );
         let serialized = serde_json::to_string(&state).expect("serialize");
         assert!(!serialized.contains("legacy-secret"));
-        assert!(!serialized.contains("\"password\""));
+        let serialized: Value = serde_json::from_str(&serialized).expect("serialized JSON");
+        assert!(serialized["web_ui_auth"].get("password").is_none());
     }
 
     #[test]
@@ -30893,7 +35020,8 @@ mod tests {
 
         let persisted = fs::read_to_string(&state_path).expect("persisted state");
         assert!(!persisted.contains("legacy-secret"));
-        assert!(!persisted.contains("\"password\""));
+        let persisted_value: Value = serde_json::from_str(&persisted).expect("persisted JSON");
+        assert!(persisted_value["web_ui_auth"].get("password").is_none());
         let persisted: HincyrayState = serde_json::from_str(&persisted).expect("valid state");
         assert!(!persisted.web_ui_auth.enabled);
         assert_eq!(persisted.profiles.len(), 1);
@@ -30958,20 +35086,17 @@ mod tests {
     }
 
     #[test]
-    fn fallback_health_requires_the_active_outbound_itself_to_be_alive() {
-        let group = json!({"alive": true, "now": "proxy-active"});
-        assert!(fallback_routes_through_live_active(
-            &group,
-            &json!({"alive": true})
-        ));
-        assert!(!fallback_routes_through_live_active(
-            &group,
-            &json!({"alive": false})
-        ));
-        assert!(!fallback_routes_through_live_active(
-            &json!({"alive": true, "now": "DIRECT"}),
-            &json!({"alive": true})
-        ));
+    fn canonical_selector_accepts_only_fail_closed_targets() {
+        assert_eq!(
+            proxy_selector_target(&json!({"now": "proxy-active"})),
+            Some("proxy-active")
+        );
+        assert_eq!(
+            proxy_selector_target(&json!({"now": "REJECT"})),
+            Some("REJECT")
+        );
+        assert_eq!(proxy_selector_target(&json!({"now": "DIRECT"})), None);
+        assert_eq!(proxy_selector_target(&json!({})), None);
     }
 
     #[test]
@@ -31498,6 +35623,58 @@ ntp:
             connections[0]["metadata"]["hincyrayRecoveredHost"],
             "api.example.ai"
         );
+    }
+
+    #[test]
+    fn connection_filter_matches_sniffed_host_when_host_is_empty() {
+        let connections = json!({"connections":[
+        {
+            "id":"matching",
+            "metadata":{
+                "host":"",
+                "sniffHost":"us.aws.cdn.hf.co",
+                "destinationIP":"198.18.42.7",
+                "sourceIP":"192.0.2.10",
+                "destinationPort":"443",
+                "network":"tcp"
+            }
+        },{
+            "id":"wrong-port",
+            "metadata":{"sniffHost":"us.aws.cdn.hf.co","sourceIP":"192.0.2.10","destinationPort":"80","network":"tcp"}
+        },{
+            "id":"wrong-network",
+            "metadata":{"sniffHost":"us.aws.cdn.hf.co","sourceIP":"192.0.2.10","destinationPort":"443","network":"udp"}
+        }]});
+        assert_eq!(
+            filter_connection_ids_with_route(
+                &connections,
+                Some("us.aws.cdn.hf.co"),
+                None,
+                Some("192.0.2.10"),
+                Some(443),
+                Some("tcp")
+            ),
+            vec!["matching"]
+        );
+    }
+
+    #[test]
+    fn routing_trace_matches_any_network_and_excluded_ports_like_mihomo() {
+        let any = RoutingRule {
+            network: "any".to_owned(),
+            ..Default::default()
+        };
+        assert!(trace_network_matches(&any, "tcp"));
+        assert!(trace_network_matches(&any, "udp"));
+
+        let exclude = RoutingRule {
+            ports: vec!["80".to_owned(), "1000-2000".to_owned()],
+            port_mode: "exclude".to_owned(),
+            ..Default::default()
+        };
+        assert!(!trace_ports_match(&exclude, Some(80)));
+        assert!(!trace_ports_match(&exclude, Some(1500)));
+        assert!(trace_ports_match(&exclude, Some(443)));
     }
 
     #[test]
@@ -32199,7 +36376,24 @@ ntp:
             },
         );
         assert_eq!(trace["decision"], json!("requires_mihomo_geo_eval"));
+        assert!(trace_requires_mihomo_runtime(&trace));
         assert_eq!(trace["candidates"].as_array().expect("candidates").len(), 1);
+    }
+
+    #[test]
+    fn routing_trace_default_does_not_require_runtime_evaluation() {
+        let trace = trace_routing_decision(
+            &HincyrayState::default(),
+            &TraceRequest {
+                host: "unmatched.example".to_owned(),
+                ip: String::new(),
+                source_ip: String::new(),
+                port: Some(443),
+                network: "tcp".to_owned(),
+            },
+        );
+        assert_eq!(trace["decision"], json!("default"));
+        assert!(!trace_requires_mihomo_runtime(&trace));
     }
 
     #[test]
@@ -33022,6 +37216,11 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
                 "auto_vpn metadata should be cleared"
             );
             assert!(!s.auto_vpn_learning_enabled);
+            assert!(!s.torrent_socks.enabled);
+            assert_eq!(s.torrent_socks.listen, "127.0.0.1");
+            assert!(s.torrent_socks.username.is_empty());
+            assert!(s.torrent_socks.password.is_empty());
+            assert_eq!(s.torrent_socks.target, "direct");
             // Routing rules should be just QUIC Block.
             assert_eq!(
                 inner.state.routing_rules.len(),
@@ -33217,7 +37416,7 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         assert_eq!(matching.len(), 1);
         assert_eq!(
             matching[0]["proxies"],
-            json!([format!("srv-out-{suffix}"), PROXY_ACTIVE_NAME])
+            json!(["REJECT", format!("srv-out-{suffix}"), PROXY_ACTIVE_NAME])
         );
         assert!(
             !matching[0]["proxies"]
@@ -33278,6 +37477,22 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         );
         assert!(pinned_route_observer_catalog(&state).is_empty());
 
+        let (_dir, daemon) = test_daemon();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state = state.clone();
+        }
+        let (status, _, body) = handle_routing_connection_context(&daemon);
+        assert_eq!(status, 200);
+        let context: Value = serde_json::from_str(&body).expect("connection context JSON");
+        let pinned = context["servers"]
+            .as_array()
+            .expect("server catalog")
+            .iter()
+            .find(|server| server["id"] == 1)
+            .expect("pinned server");
+        assert_eq!(pinned["dead"], true);
+
         state.dead_server_refs.remove(&pinned_lifecycle_ref);
         let restored_yaml = build_daemon_config(&state, &[]).expect("restored target");
         let restored: Value = serde_yaml::from_str(&restored_yaml).expect("restored yaml");
@@ -33295,7 +37510,7 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
     }
 
     #[test]
-    fn server_routing_active_target_uses_proxy_active_without_extra_group() {
+    fn server_routing_active_target_uses_fail_closed_proxy_without_extra_group() {
         let mut state = HincyrayState {
             profiles: vec![sample_profile(0, "Active", "active.example")],
             active_profile_id: Some(0),
@@ -33318,7 +37533,7 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
                 .as_array()
                 .expect("rules")
                 .iter()
-                .any(|rule| rule == "DOMAIN-SUFFIX,same.example,proxy-active")
+                .any(|rule| rule == "DOMAIN-SUFFIX,same.example,proxy")
         );
         assert!(
             !config["proxy-groups"]
@@ -33365,6 +37580,14 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         );
         assert_eq!(
             detect_pinned_route_transition(Some(PROXY_ACTIVE_NAME), pinned, pinned),
+            Some(PinnedRouteTransition::Recovery)
+        );
+        assert_eq!(
+            detect_pinned_route_transition(Some(pinned), REJECT_NAME, pinned),
+            Some(PinnedRouteTransition::Rejected)
+        );
+        assert_eq!(
+            detect_pinned_route_transition(Some(REJECT_NAME), pinned, pinned),
             Some(PinnedRouteTransition::Recovery)
         );
     }

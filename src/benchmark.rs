@@ -12,7 +12,7 @@
 //! Google region lookup for AI Studio availability through each tested profile.
 
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
@@ -26,13 +26,17 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 use crate::mihomo_config::build_mihomo_bench_config;
 use crate::profiles::Profile;
 #[cfg(test)]
 use crate::profiles::Protocol;
 use crate::telegram_probe::{TelegramProbeConfig, probe_media};
+
+#[path = "youtube_availability.rs"]
+mod youtube_availability;
+pub use youtube_availability::YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
 
 pub const DEFAULT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 pub const DEFAULT_DOWNLOAD_URL: &str = "https://proof.ovh.net/files/100Mb.dat";
@@ -42,19 +46,17 @@ pub const MAX_DEEP_BENCH_STABILITY_MINUTES: u32 = 15;
 
 const PROBE_ATTEMPTS: usize = 3;
 const PROBE_TIMEOUT_SECS: u64 = 6;
+const PREFLIGHT_FAILURE_LIMIT: usize = 20;
+const PREFLIGHT_ERROR_BYTES: usize = 2048;
+const PREFLIGHT_CORE_LOG_BYTES: usize = 64 * 1024;
 const DOWNLOAD_MAX_SECS: u64 = 3;
 const SUSTAINED_DOWNLOAD_MAX_SECS: u64 = 15;
 const XRAY_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-pub const QUICK_RESOURCE_CONTRACT_VERSION: u8 = 6;
+pub const QUICK_RESOURCE_CONTRACT_VERSION: u8 = 7;
 const YOUTUBE_VIDEO_ID: &str = "aqz-KE-bpKQ";
-const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=aqz-KE-bpKQ&hl=en";
 const YOUTUBE_PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
-const YOUTUBE_WEB_USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 Chrome/131 Safari/537.36";
-const YOUTUBE_VR_USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
-const YOUTUBE_SIGNATURE_TIMESTAMP: u64 = 20653;
-const YOUTUBE_PAGE_MAX_BYTES: u64 = 3 * 1024 * 1024;
+const YOUTUBE_PLAYER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15";
 const YOUTUBE_PLAYER_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const YOUTUBE_SEGMENT_BYTES: u64 = 512 * 1024;
 const YOUTUBE_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -77,6 +79,7 @@ const IPREGION_RESPONSE_MAX_BYTES: u64 = 512 * 1024;
 pub struct QuickProbeConfig {
     pub telegram_session_path: String,
     pub telegram: Option<TelegramProbeConfig>,
+    pub service_checks: Option<ServiceCheckOptions>,
 }
 
 /// Benchmark method requested by the API or web UI.
@@ -88,6 +91,10 @@ pub enum BenchMethod {
     Get,
     Quick,
     Full,
+    #[serde(rename = "availability_quick")]
+    AvailabilityQuick,
+    #[serde(rename = "availability_full")]
+    AvailabilityFull,
 }
 
 impl BenchMethod {
@@ -98,6 +105,8 @@ impl BenchMethod {
             "get" => Some(Self::Get),
             "quick" => Some(Self::Quick),
             "full" => Some(Self::Full),
+            "availability_quick" => Some(Self::AvailabilityQuick),
+            "availability_full" => Some(Self::AvailabilityFull),
             _ => None,
         }
     }
@@ -109,16 +118,35 @@ impl BenchMethod {
             Self::Get => "get",
             Self::Quick => "quick",
             Self::Full => "full",
+            Self::AvailabilityQuick => "availability_quick",
+            Self::AvailabilityFull => "availability_full",
         }
+    }
+
+    pub fn is_service(self) -> bool {
+        matches!(
+            self,
+            Self::Quick | Self::Full | Self::AvailabilityQuick | Self::AvailabilityFull
+        )
+    }
+
+    pub fn is_availability(self) -> bool {
+        matches!(self, Self::AvailabilityQuick | Self::AvailabilityFull)
+    }
+
+    pub fn is_fail_fast(self) -> bool {
+        matches!(self, Self::Quick | Self::AvailabilityQuick)
     }
 }
 
 /// One profile's benchmark outcome. Persisted into `HincyrayState::stats`
 /// by the daemon thread callback; also surfaced live in the job state.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BenchResult {
     pub profile_id: usize,
     pub profile_name: String,
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
     pub profile_raw: String,
     pub method: String,
     pub latency_ms: u32,
@@ -135,7 +163,7 @@ pub struct BenchResult {
     pub timestamp: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ResourceTestResult {
     #[serde(default)]
     pub contract_version: u8,
@@ -145,6 +173,8 @@ pub struct ResourceTestResult {
     pub successes: u32,
     pub reachable: bool,
     pub stable: bool,
+    #[serde(default)]
+    pub inconclusive: bool,
     pub avg_ttfb_ms: u32,
     pub max_ttfb_ms: u32,
     pub avg_download_kbps: f32,
@@ -155,6 +185,85 @@ struct QuickResourceAttempt {
     ttfb_ms: u32,
     total_ms: u32,
     bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveSearchOptions {
+    #[schemars(range(min = 1, max = 20))]
+    pub target_good: usize,
+    #[schemars(regex(pattern = "^(all|youtube|telegram|ai)$"))]
+    pub required_services: String,
+    #[serde(default = "default_search_fail_fast")]
+    pub fail_fast: bool,
+}
+
+fn default_search_fail_fast() -> bool {
+    true
+}
+
+impl AdaptiveSearchOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=20).contains(&self.target_good) {
+            return Err("target_good must be between 1 and 20".to_owned());
+        }
+        if !matches!(
+            self.required_services.as_str(),
+            "all" | "youtube" | "telegram" | "ai"
+        ) {
+            return Err("required_services must be all, youtube, telegram, or ai".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Ordinary availability checks use an ordered YT/TG/AI prefix, without search preflight.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceCheckOptions {
+    pub required_services: ServiceCheckPrefix,
+    pub fail_fast: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceCheckPrefix {
+    All,
+    Youtube,
+    Telegram,
+    Ai,
+}
+
+impl ServiceCheckPrefix {
+    fn last_service(self) -> &'static str {
+        match self {
+            Self::Youtube => "youtube",
+            Self::Telegram => "telegram",
+            Self::All | Self::Ai => "ai",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, schemars::JsonSchema)]
+pub struct SearchProgress {
+    pub target_good: usize,
+    pub required_services: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_fast: Option<bool>,
+    pub found_good: usize,
+    pub preflight_completed: usize,
+    pub preflight_rejected: usize,
+    pub quick_completed: usize,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+pub struct PreflightFailure {
+    pub profile_id: usize,
+    #[schemars(regex(pattern = "^(setup|https)$"))]
+    pub phase: String,
+    #[schemars(length(max = 2048))]
+    pub error: String,
 }
 
 /// Live, in-progress job state shared between the worker thread and the
@@ -172,10 +281,15 @@ pub struct BenchJob {
     pub last_updated: u64,
     pub cancel_requested: bool,
     pub results: Vec<BenchResult>,
+    pub search: Option<SearchProgress>,
+    pub service_checks: Option<ServiceCheckOptions>,
+    pub preflight_failures: Vec<PreflightFailure>,
+    pub(crate) requested_concurrency: usize,
+    pub(crate) memory_limited: bool,
     pub(crate) worker_count: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct ActiveBenchProfile {
     pub id: usize,
     pub name: String,
@@ -190,6 +304,8 @@ pub fn new_bench_job(method: BenchMethod, total: usize, concurrency: usize) -> S
         method: Some(method),
         total,
         last_updated: unix_now(),
+        requested_concurrency: concurrency.clamp(1, 6),
+        memory_limited: false,
         worker_count: benchmark_worker_count(concurrency, total),
         ..BenchJob::default()
     }))
@@ -199,7 +315,8 @@ pub fn new_bench_job(method: BenchMethod, total: usize, concurrency: usize) -> S
 /// keeps the `SharedJob` for status reads and the `AtomicBool` to
 /// request cancellation. `on_result` is invoked once per finished
 /// profile (success or failure) so the daemon can persist stats without
-/// the benchmark module depending on `hincyray`.
+/// the benchmark module depending on `hincyray`. With `job.search` set,
+/// rejected preflights emit no result and completion post-actions never run.
 #[allow(clippy::too_many_arguments)]
 pub fn run_bench(
     profiles: Vec<Profile>,
@@ -208,13 +325,103 @@ pub fn run_bench(
     download_url: String,
     upload_url: String,
     core_path: String,
-    quick_probe: Option<QuickProbeConfig>,
+    mut quick_probe: Option<QuickProbeConfig>,
     test_download: bool,
     test_upload: bool,
     job: SharedJob,
     cancel: Arc<AtomicBool>,
     on_result: Box<dyn Fn(BenchResult) + Send + Sync + 'static>,
     on_complete: Option<BenchCompleteCallback>,
+) -> Result<thread::JoinHandle<()>, String> {
+    let policy = job.lock().unwrap_or_else(|poison| poison.into_inner());
+    if policy.service_checks.is_some() && (!method.is_availability() || policy.search.is_some()) {
+        return Err("service_checks requires availability without search".to_owned());
+    }
+    if let Some(options) = &policy.service_checks {
+        quick_probe
+            .get_or_insert_with(|| QuickProbeConfig {
+                telegram_session_path: String::new(),
+                telegram: None,
+                service_checks: None,
+            })
+            .service_checks = Some(options.clone());
+    }
+    let search_fail_fast = policy
+        .search
+        .as_ref()
+        .and_then(|search| search.fail_fast)
+        .unwrap_or(true);
+    if !method.is_availability() && !search_fail_fast {
+        return Err("search.fail_fast=false requires availability_quick".to_owned());
+    }
+    if let Some(search) = &policy.search {
+        if !method.is_fail_fast() {
+            return Err("adaptive search requires quick or availability_quick".to_owned());
+        }
+        AdaptiveSearchOptions {
+            target_good: search.target_good,
+            required_services: search.required_services.clone(),
+            fail_fast: search_fail_fast,
+        }
+        .validate()?;
+    }
+    drop(policy);
+    run_bench_with_probe(
+        profiles,
+        job,
+        cancel,
+        on_result,
+        on_complete,
+        move |profile, required, cancel, on_preflight, on_preflight_failure| {
+            if let Some(required) = required {
+                benchmark_adaptive_profile(
+                    profile,
+                    method,
+                    required,
+                    search_fail_fast,
+                    &probe_url,
+                    &core_path,
+                    quick_probe.as_ref(),
+                    cancel,
+                    on_preflight,
+                    on_preflight_failure,
+                )
+            } else {
+                Some(benchmark_profile(
+                    profile,
+                    method,
+                    &probe_url,
+                    &download_url,
+                    &upload_url,
+                    &core_path,
+                    quick_probe.as_ref(),
+                    test_download,
+                    test_upload,
+                    cancel,
+                ))
+            }
+        },
+        || thread::sleep(Duration::from_millis(50)),
+    )
+}
+
+fn run_bench_with_probe(
+    profiles: Vec<Profile>,
+    job: SharedJob,
+    cancel: Arc<AtomicBool>,
+    on_result: Box<dyn Fn(BenchResult) + Send + Sync + 'static>,
+    on_complete: Option<BenchCompleteCallback>,
+    probe: impl Fn(
+        &Profile,
+        Option<&str>,
+        &AtomicBool,
+        &dyn Fn(bool),
+        &dyn Fn(&str, &str),
+    ) -> Option<BenchResult>
+    + Send
+    + Sync
+    + 'static,
+    idle_wait: impl Fn() + Send + Sync + 'static,
 ) -> Result<thread::JoinHandle<()>, String> {
     thread::Builder::new()
         .name("hincyray-benchmark".to_owned())
@@ -232,24 +439,39 @@ pub fn run_bench(
                     let job = Arc::clone(&job);
                     let cancel = Arc::clone(&cancel);
                     let on_result = Arc::clone(&on_result);
-                    let quick_probe = quick_probe.clone();
-                    let probe_url = &probe_url;
-                    let download_url = &download_url;
-                    let upload_url = &upload_url;
-                    let core_path = &core_path;
+                    let probe = &probe;
+                    let idle_wait = &idle_wait;
                     scope.spawn(move || {
                         loop {
                             if cancel.load(Ordering::Relaxed) {
                                 break;
                             }
-                            let profile = queue
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner())
-                                .pop_front();
-                            let Some(profile) = profile else { break };
-                            {
+                            let (profile, required) = {
                                 let mut state =
                                     job.lock().unwrap_or_else(|poison| poison.into_inner());
+                                if cancel.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                if let Some(search) = &state.search {
+                                    if search.found_good >= search.target_good {
+                                        break;
+                                    }
+                                    if search.found_good + state.active_profiles.len()
+                                        >= search.target_good
+                                    {
+                                        drop(state);
+                                        idle_wait();
+                                        continue;
+                                    }
+                                }
+                                // Admission and reservation are atomic; always lock job before queue.
+                                let Some(profile) = queue
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner())
+                                    .pop_front()
+                                else {
+                                    break;
+                                };
                                 state.current_profile_id = Some(profile.id);
                                 state.current_profile_name = Some(profile.name.clone());
                                 if state.active_profiles.len() < 6 {
@@ -259,19 +481,43 @@ pub fn run_bench(
                                     });
                                 }
                                 state.last_updated = unix_now();
-                            }
+                                let required = state
+                                    .search
+                                    .as_ref()
+                                    .map(|search| search.required_services.clone());
+                                (profile, required)
+                            };
 
-                            let result = benchmark_profile(
+                            let on_preflight = |passed: bool| {
+                                let mut state =
+                                    job.lock().unwrap_or_else(|poison| poison.into_inner());
+                                if let Some(search) = &mut state.search {
+                                    search.preflight_completed += 1;
+                                    search.preflight_rejected += usize::from(!passed);
+                                    state.last_updated = unix_now();
+                                }
+                            };
+                            let on_preflight_failure = |phase: &str, error: &str| {
+                                let mut state =
+                                    job.lock().unwrap_or_else(|poison| poison.into_inner());
+                                if state.search.is_some() {
+                                    if state.preflight_failures.len() == PREFLIGHT_FAILURE_LIMIT {
+                                        state.preflight_failures.remove(0);
+                                    }
+                                    state.preflight_failures.push(PreflightFailure {
+                                        profile_id: profile.id,
+                                        phase: phase.chars().take(32).collect(),
+                                        error: bounded_preflight_error(error),
+                                    });
+                                    state.last_updated = unix_now();
+                                }
+                            };
+                            let result = probe(
                                 &profile,
-                                method,
-                                probe_url,
-                                download_url,
-                                upload_url,
-                                core_path,
-                                quick_probe.as_ref(),
-                                test_download,
-                                test_upload,
+                                required.as_deref(),
                                 &cancel,
+                                &on_preflight,
+                                &on_preflight_failure,
                             );
 
                             if cancel.load(Ordering::Relaxed) {
@@ -283,7 +529,9 @@ pub fn run_bench(
                                 continue;
                             }
 
-                            on_result(result.clone());
+                            if let Some(result) = &result {
+                                on_result(result.clone());
+                            }
                             let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
                             state
                                 .active_profiles
@@ -299,7 +547,24 @@ pub fn run_bench(
                                 state.current_profile_id = None;
                                 state.current_profile_name = None;
                             }
-                            state.results.push(result);
+                            let unique_good = result.as_ref().is_some_and(|result| {
+                                required.as_deref().is_some_and(|required| {
+                                    adaptive_result_is_good(result, required)
+                                        && !state.results.iter().any(|previous| {
+                                            previous.profile_raw == result.profile_raw
+                                                && adaptive_result_is_good(previous, required)
+                                        })
+                                })
+                            });
+                            if let Some(search) = &mut state.search
+                                && result.is_some()
+                            {
+                                search.quick_completed += 1;
+                                search.found_good += usize::from(unique_good);
+                            }
+                            if let Some(result) = result {
+                                state.results.push(result);
+                            }
                             state.completed += 1;
                             state.last_updated = unix_now();
                         }
@@ -309,7 +574,9 @@ pub fn run_bench(
 
             let completed_results = {
                 let state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-                (!cancel.load(Ordering::Relaxed) && state.completed == state.total)
+                (state.search.is_none()
+                    && !cancel.load(Ordering::Relaxed)
+                    && state.completed == state.total)
                     .then(|| state.results.clone())
             };
             if let (Some(on_complete), Some(results)) = (on_complete, completed_results) {
@@ -325,6 +592,18 @@ pub fn run_bench(
                 state.current_profile_id = None;
                 state.current_profile_name = None;
                 state.active_profiles.clear();
+                if let Some(search) = &mut state.search {
+                    search.finish_reason = Some(
+                        if cancel.load(Ordering::Relaxed) {
+                            "cancelled"
+                        } else if search.found_good >= search.target_good {
+                            "target_reached"
+                        } else {
+                            "exhausted"
+                        }
+                        .to_owned(),
+                    );
+                }
                 state.last_updated = unix_now();
             }
         })
@@ -371,7 +650,10 @@ fn benchmark_profile(
     let mut resource_tests = Vec::new();
     let latency_outcome = match method {
         BenchMethod::Tcp => run_tcp(profile),
-        BenchMethod::Quick | BenchMethod::Full => {
+        BenchMethod::Quick
+        | BenchMethod::Full
+        | BenchMethod::AvailabilityQuick
+        | BenchMethod::AvailabilityFull => {
             run_service_resources(profile, method, probe_url, core_path, quick_probe, cancel).map(
                 |(metrics, tests)| {
                     resource_tests = tests;
@@ -387,8 +669,7 @@ fn benchmark_profile(
     // Step 2: Speed metrics are independent of the selected latency method.
     // Always execute every requested speed stage through a temporary Mihomo
     // instance; GET must not silently skip upload or bypass request flags.
-    let need_speed =
-        !matches!(method, BenchMethod::Quick | BenchMethod::Full) && (test_download || test_upload);
+    let need_speed = !method.is_service() && (test_download || test_upload);
 
     let speed_metrics = if need_speed {
         run_speed_via_mihomo(
@@ -417,8 +698,10 @@ fn benchmark_profile(
                 .as_ref()
                 .and_then(|result| result.as_ref().ok())
                 .copied();
-            let resource_error = service_resource_error(&resource_tests);
-            let resources_passed = resource_error.is_empty();
+            let (resources_passed, resource_error) = service_resource_outcome(
+                &resource_tests,
+                quick_probe.and_then(|probe| probe.service_checks.as_ref()),
+            );
             BenchResult {
                 latency_ms: metrics.latency_ms,
                 jitter_ms: metrics.jitter_ms,
@@ -428,15 +711,19 @@ fn benchmark_profile(
                 upload_error: speed_metrics.upload.and_then(Result::err),
                 loss_percent: metrics.loss_percent,
                 success: resources_passed,
-                error: (!resources_passed)
+                error: (!resource_error.is_empty())
                     .then(|| format!("resource checks failed: {resource_error}")),
                 resource_tests,
                 ..base()
             }
         }
         Err(error) => {
-            let resource_tests = if matches!(method, BenchMethod::Quick | BenchMethod::Full) {
-                unavailable_service_resource_results(&error)
+            let resource_tests = if method.is_service() {
+                let mut tests = unavailable_service_resource_results(&error);
+                if method.is_availability() {
+                    tests[3] = youtube_availability::unavailable();
+                }
+                tests
             } else {
                 Vec::new()
             };
@@ -482,6 +769,7 @@ fn unavailable_service_resource_results(error: &str) -> Vec<ResourceTestResult> 
         successes: 0,
         reachable: false,
         stable: false,
+        inconclusive: false,
         avg_ttfb_ms: 0,
         max_ttfb_ms: 0,
         avg_download_kbps: 0.0,
@@ -576,41 +864,300 @@ fn run_service_resources(
         )),
     };
     if let Ok((port, _guard)) = runtime.as_ref() {
-        let youtube = run_youtube_playback_probe(*port, cancel)?;
-        let youtube_passed = youtube.stable;
-        tests.push(youtube);
-        if method == BenchMethod::Quick && !youtube_passed {
-            tests.extend(skipped_service_results_from(
-                "telegram",
-                "skipped after YouTube failed",
-            ));
-        } else {
-            let telegram = run_telegram_media_probe(*port, quick_probe, cancel)?;
-            let telegram_passed = telegram.stable;
-            tests.push(telegram);
-            if method == BenchMethod::Quick && !telegram_passed {
-                tests.extend(skipped_service_results_from(
-                    "ai",
-                    "skipped after Telegram failed",
-                ));
-            } else {
-                tests.push(run_ai_studio_probe(*port, cancel)?);
-            }
-        }
+        tests.extend(run_complete_service_probes(
+            method,
+            quick_probe.and_then(|probe| probe.service_checks.as_ref()),
+            cancel,
+            |id| match id {
+                "youtube" if method.is_availability() => youtube_availability::probe(*port, cancel),
+                "youtube" => run_youtube_playback_probe(*port, cancel),
+                "telegram" => run_telegram_media_probe(*port, quick_probe, cancel),
+                _ => run_ai_studio_probe(*port, cancel),
+            },
+        )?);
     } else {
         let error = runtime.as_ref().err().expect("failed Mihomo runtime");
-        if method == BenchMethod::Quick {
-            tests.push(failed_resource_result("youtube", "YouTube", error));
+        if let Some(options) = quick_probe.and_then(|probe| probe.service_checks.as_ref()) {
+            tests.extend(run_complete_service_probes(
+                method,
+                Some(options),
+                cancel,
+                |id| {
+                    Ok(if id == "youtube" {
+                        youtube_availability::unavailable()
+                    } else {
+                        failed_resource_result(
+                            id,
+                            if id == "telegram" {
+                                "Telegram"
+                            } else {
+                                "AI Studio"
+                            },
+                            error,
+                        )
+                    })
+                },
+            )?);
+        } else if method.is_fail_fast() {
+            tests.push(if method.is_availability() {
+                youtube_availability::unavailable()
+            } else {
+                failed_resource_result("youtube", "YouTube", error)
+            });
             tests.extend(skipped_service_results_from(
                 "telegram",
                 "skipped after YouTube proxy setup failed",
             ));
         } else {
-            tests.extend(unavailable_proxy_service_results(error));
+            let mut unavailable = unavailable_proxy_service_results(error);
+            if method.is_availability() {
+                unavailable[0] = youtube_availability::unavailable();
+            }
+            tests.extend(unavailable);
         }
     }
 
     Ok((ping_metrics(&tests), tests))
+}
+
+fn run_complete_service_probes(
+    method: BenchMethod,
+    options: Option<&ServiceCheckOptions>,
+    cancel: &AtomicBool,
+    mut service: impl FnMut(&str) -> Result<ResourceTestResult, String>,
+) -> Result<Vec<ResourceTestResult>, String> {
+    let mut tests = Vec::new();
+    let required = options.map_or("ai", |options| options.required_services.last_service());
+    let fail_fast = options.map_or(method.is_fail_fast(), |options| options.fail_fast);
+    let mut requested = true;
+    let mut skip_reason: Option<String> = None;
+    for (id, name, next) in [
+        ("youtube", "YouTube", "telegram"),
+        ("telegram", "Telegram", "ai"),
+        ("ai", "AI Studio", ""),
+    ] {
+        ensure_not_cancelled(cancel)?;
+        let test = if !requested {
+            skipped_resource_result(id, name, "not requested by service_checks")
+        } else if let Some(reason) = &skip_reason {
+            skipped_resource_result(id, name, reason)
+        } else {
+            match service(id) {
+                Ok(test) => test,
+                Err(error) if options.is_some() => {
+                    ensure_not_cancelled(cancel)?;
+                    if error == "benchmark cancelled" {
+                        return Err(error);
+                    }
+                    let mut test = failed_resource_result(id, name, &error);
+                    if id == "youtube" && method.is_availability() {
+                        test.id = "youtube_thumbnails".to_owned();
+                        test.contract_version = YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+                    }
+                    test
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if requested && skip_reason.is_none() && fail_fast && !test.stable && !next.is_empty() {
+            skip_reason = Some(format!("skipped after {name} failed"));
+        }
+        if id == required {
+            requested = false;
+        }
+        tests.push(test);
+    }
+    ensure_not_cancelled(cancel)?;
+    Ok(tests)
+}
+
+/// Search requires valid ping evidence and the stable selected service prefix;
+/// unrequested services remain skipped without affecting search success.
+pub fn adaptive_result_is_good(result: &BenchResult, required: &str) -> bool {
+    if !matches!(result.method.as_str(), "search" | "search_availability") {
+        return false;
+    }
+    let count = match required {
+        "youtube" => 1,
+        "telegram" => 2,
+        "all" | "ai" => 3,
+        _ => return false,
+    };
+    result.resource_tests.iter().any(|test| {
+        test.contract_version == QUICK_RESOURCE_CONTRACT_VERSION
+            && matches!(test.id.as_str(), "ping_icmp" | "ping_tcp" | "ping_proxy")
+            && test.attempts > 0
+            && test.successes > 0
+            && test.successes <= test.attempts
+            && test.reachable
+    }) && ["youtube", "telegram", "ai"]
+        .into_iter()
+        .take(count)
+        .all(|id| {
+            let (id, contract_version) =
+                if id == "youtube" && result.method == "search_availability" {
+                    ("youtube_thumbnails", YOUTUBE_AVAILABILITY_CONTRACT_VERSION)
+                } else {
+                    (id, QUICK_RESOURCE_CONTRACT_VERSION)
+                };
+            result.resource_tests.iter().any(|test| {
+                test.contract_version == contract_version
+                    && test.id == id
+                    && test.attempts > 0
+                    && test.successes > 0
+                    && test.successes <= test.attempts
+                    && (id != "youtube_thumbnails" || test.reachable)
+                    && test.stable
+                    && !test.inconclusive
+            })
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_adaptive_profile(
+    profile: &Profile,
+    method: BenchMethod,
+    required: &str,
+    fail_fast: bool,
+    probe_url: &str,
+    mihomo_path: &str,
+    quick_probe: Option<&QuickProbeConfig>,
+    cancel: &AtomicBool,
+    on_preflight: &dyn Fn(bool),
+    on_preflight_failure: &dyn Fn(&str, &str),
+) -> Option<BenchResult> {
+    let tests = run_adaptive_resource_probes(
+        required,
+        fail_fast,
+        cancel,
+        on_preflight,
+        || {
+            let runtime = spawn_bench_mihomo_with_path(profile, mihomo_path, Some(cancel))
+                .inspect_err(|error| {
+                    if !cancel.load(Ordering::Relaxed) {
+                        on_preflight_failure("setup", error);
+                    }
+                })?;
+            let sample = run_adaptive_proxy_preflight(runtime.0, probe_url, cancel)?;
+            if !sample.reachable {
+                let error = preflight_error_with_core_log(
+                    sample.error.as_deref().unwrap_or("no response"),
+                    runtime.1._process_log.path(),
+                );
+                ensure_not_cancelled(cancel)?;
+                on_preflight_failure("https", &error);
+            }
+            Ok((sample, runtime))
+        },
+        || {
+            Ok(vec![
+                skipped_resource_result(
+                    "ping_icmp",
+                    "ICMP ping",
+                    "proxy preflight already proves reachability",
+                ),
+                skipped_resource_result(
+                    "ping_tcp",
+                    "TCP ping",
+                    "proxy preflight already proves reachability",
+                ),
+            ])
+        },
+        |runtime, id| match id {
+            "youtube" if method.is_availability() => youtube_availability::probe(runtime.0, cancel),
+            "youtube" => run_youtube_playback_probe(runtime.0, cancel),
+            "telegram" => run_telegram_media_probe(runtime.0, quick_probe, cancel),
+            _ => run_ai_studio_probe(runtime.0, cancel),
+        },
+    )
+    .ok()??;
+    let metrics = ping_metrics(&tests);
+    let attempted = tests
+        .iter()
+        .filter(|test| test.attempts > 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    let (_, error) = service_resource_outcome(&attempted, None);
+    Some(BenchResult {
+        profile_id: profile.id,
+        profile_name: profile.name.clone(),
+        profile_raw: profile.raw.clone(),
+        method: if method.is_availability() {
+            "search_availability"
+        } else {
+            "search"
+        }
+        .to_owned(),
+        latency_ms: metrics.latency_ms,
+        jitter_ms: metrics.jitter_ms,
+        download_mbps: None,
+        upload_mbps: None,
+        download_error: None,
+        upload_error: None,
+        loss_percent: metrics.loss_percent,
+        success: error.is_empty(),
+        error: (!error.is_empty()).then(|| format!("resource checks failed: {error}")),
+        resource_tests: tests,
+        timestamp: unix_now(),
+    })
+}
+
+fn run_adaptive_resource_probes<T>(
+    required: &str,
+    fail_fast: bool,
+    cancel: &AtomicBool,
+    on_preflight: impl FnOnce(bool),
+    preflight: impl FnOnce() -> Result<(ResourceTestResult, T), String>,
+    direct: impl FnOnce() -> Result<Vec<ResourceTestResult>, String>,
+    mut service: impl FnMut(&T, &str) -> Result<ResourceTestResult, String>,
+) -> Result<Option<Vec<ResourceTestResult>>, String> {
+    ensure_not_cancelled(cancel)?;
+    let preflight = preflight();
+    ensure_not_cancelled(cancel)?;
+    on_preflight(preflight.as_ref().is_ok_and(|(sample, _)| sample.reachable));
+    let Ok((sample, runtime)) = preflight else {
+        return Ok(None);
+    };
+    if !sample.reachable {
+        return Ok(None);
+    }
+    // Keep the runtime alive and reuse the HTTPS sample instead of probing twice.
+    let mut tests = direct()?;
+    tests.push(sample);
+    let mut skip_reason: Option<String> = None;
+    let mut requested = true;
+    for (id, name) in [
+        ("youtube", "YouTube"),
+        ("telegram", "Telegram"),
+        ("ai", "AI Studio"),
+    ] {
+        ensure_not_cancelled(cancel)?;
+        let test = if !requested {
+            skipped_resource_result(id, name, "not requested by adaptive search")
+        } else if let Some(reason) = &skip_reason {
+            skipped_resource_result(id, name, reason)
+        } else {
+            match service(&runtime, id) {
+                Ok(test) => test,
+                Err(error) => {
+                    ensure_not_cancelled(cancel)?;
+                    if error == "benchmark cancelled" {
+                        return Err(error);
+                    }
+                    failed_resource_result(id, name, &error)
+                }
+            }
+        };
+        if fail_fast && requested && skip_reason.is_none() && !test.stable {
+            skip_reason = Some(format!("skipped after {name} failed"));
+        }
+        if id == required {
+            requested = false;
+        }
+        tests.push(test);
+    }
+    ensure_not_cancelled(cancel)?;
+    Ok(Some(tests))
 }
 
 fn ping_metrics(tests: &[ResourceTestResult]) -> Metrics {
@@ -703,6 +1250,159 @@ fn run_proxy_ping_probe(
     )
 }
 
+fn bounded_preflight_error(error: &str) -> String {
+    let mut end = error.len().min(PREFLIGHT_ERROR_BYTES);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    error[..end].to_owned()
+}
+
+fn preflight_error_with_core_log(error: &str, process_log: &Path) -> String {
+    let log = read_tail(process_log, PREFLIGHT_CORE_LOG_BYTES).to_ascii_lowercase();
+    let certificate_error = log.contains("x509:") || log.contains("certificate");
+    // Only fixed categories cross the private-core boundary, never log text or endpoint identity.
+    let categories = [
+        (
+            "deadline_exceeded",
+            &["context deadline exceeded", "i/o timeout"][..],
+        ),
+        (
+            "resolution_failed",
+            &["dns resolve failed", "no such host", "server misbehaving"][..],
+        ),
+        ("connection_refused", &["connection refused"][..]),
+        (
+            "certificate_expired",
+            &["is after", "certificate expired"][..],
+        ),
+        (
+            "certificate_not_yet_valid",
+            &["is before", "certificate not yet valid"][..],
+        ),
+        (
+            "certificate_name_mismatch",
+            &[
+                "certificate is valid for",
+                "cannot validate certificate for",
+                "hostname mismatch",
+            ][..],
+        ),
+        ("certificate_authority", &["unknown authority"][..]),
+        (
+            "ws_handshake",
+            &["websocket: bad handshake", "bad websocket handshake"][..],
+        ),
+        ("configuration_invalid", &["parse config error"][..]),
+    ]
+    .into_iter()
+    .filter(|(category, _)| !category.starts_with("certificate_") || certificate_error)
+    .filter_map(|(category, patterns)| {
+        patterns
+            .iter()
+            .any(|pattern| log.contains(pattern))
+            .then_some(category)
+    })
+    .collect::<Vec<_>>();
+    let mut error = bounded_preflight_error(error);
+    if !categories.is_empty() {
+        let label = if categories.contains(&"deadline_exceeded") {
+            "upstream dial/stream deadline exceeded"
+        } else {
+            "upstream core failure"
+        };
+        let suffix = format!("; {label} [{}]", categories.join(", "));
+        let mut end = error
+            .len()
+            .min(PREFLIGHT_ERROR_BYTES.saturating_sub(suffix.len()));
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        error.truncate(end);
+        error.push_str(&suffix);
+    }
+    error
+}
+
+fn run_adaptive_proxy_preflight(
+    port: u16,
+    probe_url: &str,
+    cancel: &AtomicBool,
+) -> Result<ResourceTestResult, String> {
+    adaptive_preflight_with_probe(probe_url, cancel, |url| {
+        let mut command = Command::new("curl");
+        command
+            .arg("-q")
+            .args(["--noproxy", "", "--socks5-hostname"])
+            .arg(format!("127.0.0.1:{port}"))
+            .args(["--proto", "=https", "--head", "--max-time"])
+            .arg(PROBE_TIMEOUT_SECS.to_string())
+            .args([
+                "--silent",
+                "--show-error",
+                "--output",
+                "/dev/null",
+                "--write-out",
+                "%{http_code}",
+            ])
+            .arg(url);
+        run_cancellable_command(&mut command, cancel)
+    })
+}
+
+fn adaptive_preflight_with_probe(
+    probe_url: &str,
+    cancel: &AtomicBool,
+    mut probe: impl FnMut(&str) -> Result<std::process::Output, String>,
+) -> Result<ResourceTestResult, String> {
+    let fallback = if probe_url == "https://www.youtube.com/" {
+        DEFAULT_PROBE_URL
+    } else {
+        "https://www.youtube.com/"
+    };
+    let mut last_error = String::new();
+    for (index, url) in [probe_url, fallback].into_iter().enumerate() {
+        ensure_not_cancelled(cancel)?;
+        let started = Instant::now();
+        let result = probe(url).and_then(|output| {
+            let status = String::from_utf8_lossy(&output.stdout);
+            // HTTP rejection still proves HTTPS transport; native service tests decide quality.
+            if output.status.success()
+                && status
+                    .trim()
+                    .parse::<u16>()
+                    .is_ok_and(|code| (200..600).contains(&code))
+            {
+                Ok(started.elapsed())
+            } else {
+                Err(format!(
+                    "curl rc={}, http={}, {}",
+                    output
+                        .status
+                        .code()
+                        .map_or_else(|| "?".to_owned(), |code| code.to_string()),
+                    status.trim(),
+                    bounded_process_error(&output.stderr),
+                ))
+            }
+        });
+        ensure_not_cancelled(cancel)?;
+        match result {
+            Ok(latency) => {
+                let mut sample =
+                    successful_resource_result("ping_proxy", "Proxy HTTPS ping", latency);
+                sample.attempts = index as u32 + 1;
+                return Ok(sample);
+            }
+            Err(error) if error == "benchmark cancelled" => return Err(error),
+            Err(error) => last_error = bounded_preflight_error(&error),
+        }
+    }
+    let mut sample = failed_resource_result("ping_proxy", "Proxy HTTPS ping", &last_error);
+    sample.attempts = 2;
+    Ok(sample)
+}
+
 fn successful_resource_result(id: &str, name: &str, latency: Duration) -> ResourceTestResult {
     let latency_ms = latency.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
     ResourceTestResult {
@@ -713,6 +1413,7 @@ fn successful_resource_result(id: &str, name: &str, latency: Duration) -> Resour
         successes: 1,
         reachable: true,
         stable: true,
+        inconclusive: false,
         avg_ttfb_ms: latency_ms,
         max_ttfb_ms: latency_ms,
         avg_download_kbps: 0.0,
@@ -729,6 +1430,7 @@ fn failed_resource_result(id: &str, name: &str, error: &str) -> ResourceTestResu
         successes: 0,
         reachable: false,
         stable: false,
+        inconclusive: false,
         avg_ttfb_ms: 0,
         max_ttfb_ms: 0,
         avg_download_kbps: 0.0,
@@ -777,19 +1479,49 @@ fn unavailable_proxy_service_results(error: &str) -> Vec<ResourceTestResult> {
     .collect()
 }
 
-fn service_resource_error(tests: &[ResourceTestResult]) -> String {
+fn service_resource_outcome(
+    tests: &[ResourceTestResult],
+    policy: Option<&ServiceCheckOptions>,
+) -> (bool, String) {
     if tests.is_empty() {
-        return String::new();
+        return (policy.is_none(), String::new());
     }
+    let count = policy.map_or(3, |options| match options.required_services {
+        ServiceCheckPrefix::Youtube => 1,
+        ServiceCheckPrefix::Telegram => 2,
+        ServiceCheckPrefix::All | ServiceCheckPrefix::Ai => 3,
+    });
+    let requested = &["youtube_thumbnails", "telegram", "ai"][..count];
+    let prefix_complete = policy.is_none()
+        || requested.iter().all(|id| {
+            tests.iter().any(|test| {
+                test.id == *id
+                    && test.contract_version
+                        == if *id == "youtube_thumbnails" {
+                            YOUTUBE_AVAILABILITY_CONTRACT_VERSION
+                        } else {
+                            QUICK_RESOURCE_CONTRACT_VERSION
+                        }
+                    && test.attempts > 0
+                    && test.stable
+                    && !test.inconclusive
+            })
+        });
     let ping_passed = tests
         .iter()
         .filter(|test| test.id.starts_with("ping_"))
         .any(|test| test.reachable);
     let mut failures = Vec::new();
-    if !ping_passed {
+    if !ping_passed
+        && (policy.is_none()
+            || tests
+                .iter()
+                .any(|test| test.id.starts_with("ping_") && test.attempts > 0))
+    {
         let errors = tests
             .iter()
             .filter(|test| test.id.starts_with("ping_"))
+            .filter(|test| policy.is_none() || test.attempts > 0)
             .filter_map(|test| test.error.as_deref())
             .collect::<Vec<_>>()
             .join("; ");
@@ -798,7 +1530,10 @@ fn service_resource_error(tests: &[ResourceTestResult]) -> String {
     failures.extend(
         tests
             .iter()
-            .filter(|test| !test.id.starts_with("ping_") && !test.stable)
+            .filter(|test| !test.id.starts_with("ping_") && (!test.stable || test.inconclusive))
+            .filter(|test| {
+                policy.is_none() || (test.attempts > 0 && requested.contains(&test.id.as_str()))
+            })
             .map(|test| {
                 format!(
                     "{} {}/{}{}",
@@ -811,18 +1546,20 @@ fn service_resource_error(tests: &[ResourceTestResult]) -> String {
                 )
             }),
     );
-    failures.join(", ")
+    (
+        failures.is_empty() && prefix_complete && (policy.is_none() || ping_passed),
+        failures.join(", "),
+    )
 }
 
 fn run_youtube_playback_probe(
     port: u16,
     cancel: &AtomicBool,
 ) -> Result<ResourceTestResult, String> {
-    // Concurrent anonymous Innertube bootstraps from one router IP trigger
+    // Concurrent anonymous Innertube requests from one router IP trigger
     // throttling and TLS resets. Keep the user-selected profile concurrency,
     // but serialize this narrow external-service boundary.
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = lock_cancellable(LOCK.get_or_init(|| Mutex::new(())), cancel)?;
+    let _guard = lock_cancellable(youtube_probe_lock(), cancel)?;
     let mut successes = Vec::new();
     let mut errors = Vec::new();
     for attempt in 0..YOUTUBE_ATTEMPTS {
@@ -840,14 +1577,63 @@ fn run_youtube_playback_probe(
             }
         }
     }
-    Ok(aggregate_quick_resource_probe(
+    Ok(youtube_probe_result(&successes, &errors))
+}
+
+fn youtube_probe_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn youtube_probe_result(
+    successes: &[QuickResourceAttempt],
+    errors: &[String],
+) -> ResourceTestResult {
+    let mut result = aggregate_quick_resource_probe(
         "youtube",
         "YouTube",
         successes.len() as u32 + errors.len() as u32,
-        &successes,
-        &errors,
+        successes,
+        errors,
         true,
-    ))
+    );
+    if successes.is_empty()
+        && errors
+            .iter()
+            .any(|error| youtube_error_is_inconclusive(error))
+    {
+        result.inconclusive = true;
+        // A player response/challenge proves contact, not media playback.
+        result.reachable = errors.iter().any(|error| {
+            error.starts_with("YouTube player ")
+                && !error.contains("rc=")
+                && !error.contains("curl:")
+                || error.contains("http=403")
+                || error.contains("http=429")
+                || error.contains("no direct video format")
+                || error.contains("parse YouTube player response")
+                || error.contains("not video media")
+        });
+    }
+    result
+}
+
+fn youtube_error_is_inconclusive(error: &str) -> bool {
+    (error.starts_with("YouTube player ") && !error.contains("rc=") && !error.contains("curl:"))
+        || error.contains("no direct video format")
+        || error.contains("parse YouTube player response")
+        || error.contains("curl spawn:")
+        || error.contains("command spawn:")
+        || error.contains("command capture:")
+        || error.contains("command output limit")
+        || error.contains("not video media")
+        || error.split("http=").skip(1).any(|status| {
+            status
+                .split(|ch: char| !ch.is_ascii_digit())
+                .next()
+                .and_then(|status| status.parse::<u16>().ok())
+                .is_some_and(|status| (400..600).contains(&status))
+        })
 }
 
 pub(crate) fn probe_youtube_via_socks(port: u16) -> ResourceTestResult {
@@ -1093,6 +1879,7 @@ fn aggregate_quick_resource_probe(
         successes: success_count,
         reachable: success_count > 0,
         stable: success_count > 0 && (any_success_is_stable || success_count == attempts),
+        inconclusive: false,
         avg_ttfb_ms,
         max_ttfb_ms,
         avg_download_kbps,
@@ -1104,86 +1891,14 @@ fn youtube_playback_attempt(
     port: u16,
     cancel: &AtomicBool,
 ) -> Result<QuickResourceAttempt, String> {
-    let cookie_file = NamedTempFile::new().map_err(|error| format!("YouTube cookies: {error}"))?;
-    let watch_file =
-        NamedTempFile::new().map_err(|error| format!("YouTube watch page: {error}"))?;
-    let mut watch_command = Command::new("curl");
-    watch_command
-        .arg("--socks5-hostname")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("-L")
-        .arg("--connect-timeout")
-        .arg(YOUTUBE_CONNECT_TIMEOUT_SECS.to_string())
-        .arg("--max-time")
-        .arg("20")
-        .arg("--max-filesize")
-        .arg(YOUTUBE_PAGE_MAX_BYTES.to_string())
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--user-agent")
-        .arg(YOUTUBE_WEB_USER_AGENT)
-        .arg("--cookie-jar")
-        .arg(cookie_file.path())
-        .arg("--output")
-        .arg(watch_file.path())
-        .arg("--write-out")
-        .arg("%{http_code}")
-        .arg(YOUTUBE_WATCH_URL);
-    let watch = run_cancellable_command(&mut watch_command, cancel).map_err(|error| {
-        if error == "benchmark cancelled" {
-            error
-        } else {
-            format!("YouTube bootstrap curl: {error}")
-        }
-    })?;
-    if !watch.status.success() {
-        return Err(format!(
-            "YouTube bootstrap rc={}: {}",
-            watch
-                .status
-                .code()
-                .map_or_else(|| "?".to_owned(), |code| code.to_string()),
-            bounded_process_error(&watch.stderr)
-        ));
-    }
-    let watch_status = parse_http_status(&watch.stdout, "YouTube bootstrap")?;
-    if !(200..300).contains(&watch_status) {
-        return Err(format!("YouTube bootstrap http={watch_status}"));
-    }
-    let watch_page = std::fs::read_to_string(watch_file.path())
-        .map_err(|error| format!("read YouTube bootstrap: {error}"))?;
-    let visitor_data = embedded_json_string(&watch_page, "visitorData")
-        .ok_or_else(|| "YouTube bootstrap returned no visitor data".to_owned())?;
-    let signature_timestamp =
-        embedded_json_u64(&watch_page, "signatureTimestamp").unwrap_or(YOUTUBE_SIGNATURE_TIMESTAMP);
-    let player_body = serde_json::json!({
-        "context": {"client": {
-            "clientName": "ANDROID_VR",
-            "clientVersion": "1.65.10",
-            "deviceMake": "Oculus",
-            "deviceModel": "Quest 3",
-            "androidSdkVersion": 32,
-            "userAgent": YOUTUBE_VR_USER_AGENT,
-            "osName": "Android",
-            "osVersion": "12L",
-            "hl": "en",
-            "timeZone": "UTC",
-            "utcOffsetMinutes": 0,
-            "visitorData": visitor_data,
-        }},
-        "videoId": YOUTUBE_VIDEO_ID,
-        "playbackContext": {"contentPlaybackContext": {
-            "html5Preference": "HTML5_PREF_WANTS",
-            "signatureTimestamp": signature_timestamp,
-        }},
-        "contentCheckOk": true,
-        "racyCheckOk": true,
-    })
-    .to_string();
+    // This native client does not require the web watch bootstrap or a JS signature.
+    // Anonymous challenges remain inconclusive; only a real media transfer can pass.
+    let player_body = youtube_player_body().to_string();
     let player_file = NamedTempFile::new().map_err(|error| format!("YouTube player: {error}"))?;
     let mut player_command = Command::new("curl");
     player_command
-        .arg("--socks5-hostname")
+        .arg("-q")
+        .args(["--noproxy", "", "--socks5-hostname"])
         .arg(format!("127.0.0.1:{port}"))
         .arg("--connect-timeout")
         .arg(YOUTUBE_CONNECT_TIMEOUT_SECS.to_string())
@@ -1193,20 +1908,16 @@ fn youtube_playback_attempt(
         .arg(YOUTUBE_PLAYER_MAX_BYTES.to_string())
         .arg("--silent")
         .arg("--show-error")
-        .arg("--cookie")
-        .arg(cookie_file.path())
         .arg("--header")
         .arg("Content-Type: application/json")
         .arg("--header")
-        .arg("X-Youtube-Client-Name: 28")
+        .arg("X-Youtube-Client-Name: 101")
         .arg("--header")
-        .arg("X-Youtube-Client-Version: 1.65.10")
-        .arg("--header")
-        .arg(format!("X-Goog-Visitor-Id: {visitor_data}"))
+        .arg("X-Youtube-Client-Version: 1.02")
         .arg("--header")
         .arg("Origin: https://www.youtube.com")
         .arg("--user-agent")
-        .arg(YOUTUBE_VR_USER_AGENT)
+        .arg(YOUTUBE_PLAYER_USER_AGENT)
         .arg("--request")
         .arg("POST")
         .arg("--data")
@@ -1223,20 +1934,7 @@ fn youtube_playback_attempt(
             format!("YouTube player curl: {error}")
         }
     })?;
-    if !player.status.success() {
-        return Err(format!(
-            "YouTube player rc={}: {}",
-            player
-                .status
-                .code()
-                .map_or_else(|| "?".to_owned(), |code| code.to_string()),
-            bounded_process_error(&player.stderr)
-        ));
-    }
-    let player_status = parse_http_status(&player.stdout, "YouTube player")?;
-    if !(200..300).contains(&player_status) {
-        return Err(format!("YouTube player http={player_status}"));
-    }
+    youtube_player_status(&player)?;
     let player: serde_json::Value = serde_json::from_reader(
         std::fs::File::open(player_file.path())
             .map_err(|error| format!("open YouTube player response: {error}"))?,
@@ -1259,12 +1957,52 @@ fn youtube_playback_attempt(
     }
     let mut errors = Vec::new();
     for media_url in media_urls {
-        match curl_youtube_range(port, media_url, cookie_file.path(), cancel) {
+        match curl_youtube_range(port, media_url, cancel) {
             Ok(attempt) => return Ok(attempt),
             Err(error) => errors.push(error),
         }
     }
     Err(errors.join("; "))
+}
+
+fn youtube_player_status(player: &std::process::Output) -> Result<u16, String> {
+    let player_status = parse_http_status(&player.stdout, "YouTube player");
+    if !player.status.success() {
+        return Err(format!(
+            "YouTube player rc={}, http={}: {}",
+            player
+                .status
+                .code()
+                .map_or_else(|| "?".to_owned(), |code| code.to_string()),
+            player_status.unwrap_or(0),
+            bounded_process_error(&player.stderr)
+        ));
+    }
+    let player_status = player_status?;
+    if !(200..300).contains(&player_status) {
+        return Err(format!("YouTube player http={player_status}"));
+    }
+    Ok(player_status)
+}
+
+fn youtube_player_body() -> serde_json::Value {
+    serde_json::json!({
+        "context": {"client": {
+            "clientName": "VISIONOS",
+            "clientVersion": "1.02",
+            "deviceMake": "Apple",
+            "deviceModel": "RealityDevice17,1",
+            "userAgent": YOUTUBE_PLAYER_USER_AGENT,
+            "osName": "visionOS",
+            "osVersion": "26.5.23O471",
+            "hl": "en",
+            "timeZone": "UTC",
+            "utcOffsetMinutes": 0,
+        }},
+        "videoId": YOUTUBE_VIDEO_ID,
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+    })
 }
 
 fn parse_http_status(output: &[u8], stage: &str) -> Result<u16, String> {
@@ -1273,25 +2011,6 @@ fn parse_http_status(output: &[u8], stage: &str) -> Result<u16, String> {
         .map(str::trim)
         .and_then(|status| status.parse().ok())
         .ok_or_else(|| format!("{stage} returned invalid HTTP status"))
-}
-
-fn embedded_json_string(source: &str, key: &str) -> Option<String> {
-    let marker = format!("\"{key}\":");
-    let value = source.get(source.find(&marker)? + marker.len()..)?;
-    serde_json::Deserializer::from_str(value)
-        .into_iter::<String>()
-        .next()?
-        .ok()
-}
-
-fn embedded_json_u64(source: &str, key: &str) -> Option<u64> {
-    let marker = format!("\"{key}\":");
-    let value = source.get(source.find(&marker)? + marker.len()..)?;
-    let digits = value
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    digits.parse().ok()
 }
 
 fn youtube_direct_media_urls(player: &serde_json::Value) -> Vec<&str> {
@@ -1349,14 +2068,14 @@ fn youtube_format_direct_video_url(
 fn curl_youtube_range(
     port: u16,
     media_url: &str,
-    cookie_file: &Path,
     cancel: &AtomicBool,
 ) -> Result<QuickResourceAttempt, String> {
     let output_file =
         NamedTempFile::new().map_err(|error| format!("temp YouTube media: {error}"))?;
     let mut command = Command::new("curl");
     command
-        .arg("--socks5-hostname")
+        .arg("-q")
+        .args(["--noproxy", "", "--socks5-hostname"])
         .arg(format!("127.0.0.1:{port}"))
         .arg("-L")
         .arg("--connect-timeout")
@@ -1370,16 +2089,22 @@ fn curl_youtube_range(
         .arg("--silent")
         .arg("--show-error")
         .arg("--user-agent")
-        .arg(YOUTUBE_VR_USER_AGENT)
-        .arg("--cookie")
-        .arg(cookie_file)
+        .arg(YOUTUBE_PLAYER_USER_AGENT)
         .arg("--output")
         .arg(output_file.path())
         .arg("--write-out")
-        .arg("%{http_code} %{size_download} %{time_starttransfer} %{time_total}")
+        .arg("%{http_code} %{size_download} %{time_starttransfer} %{time_total}|%{content_type}")
         .arg(media_url);
     let output = run_cancellable_command(&mut command, cancel)?;
-    let metrics = parse_curl_metrics(&output.stdout)?;
+    youtube_media_attempt(&output)
+}
+
+fn youtube_media_attempt(output: &std::process::Output) -> Result<QuickResourceAttempt, String> {
+    let text = std::str::from_utf8(&output.stdout).map_err(|_| "invalid YouTube media metrics")?;
+    let (metrics, content_type) = text
+        .split_once('|')
+        .ok_or("missing YouTube media content type")?;
+    let metrics = parse_curl_metrics(metrics.as_bytes())?;
     if !output.status.success() || !(200..300).contains(&metrics.http_status) || metrics.bytes == 0
     {
         return Err(format!(
@@ -1391,6 +2116,13 @@ fn curl_youtube_range(
             metrics.http_status,
             metrics.bytes,
             bounded_process_error(&output.stderr)
+        ));
+    }
+    let content_type = content_type.trim().split(';').next().unwrap_or_default();
+    if !content_type.starts_with("video/") || metrics.bytes < 16 * 1024 {
+        return Err(format!(
+            "YouTube response is not video media: http={}, bytes={}, content_type={}",
+            metrics.http_status, metrics.bytes, content_type
         ));
     }
     Ok(QuickResourceAttempt {
@@ -1592,24 +2324,7 @@ fn run_via_temp_mihomo(
     probe_url: &str,
     mihomo_path: &str,
 ) -> Result<Metrics, String> {
-    let port = reserve_local_port()?;
-    let config = build_mihomo_bench_config(profile, "127.0.0.1", port)?;
-    let mut config_file = NamedTempFile::with_suffix(".yaml")
-        .map_err(|error| format!("temp Mihomo config: {error}"))?;
-    config_file
-        .write_all(config.as_bytes())
-        .map_err(|e| format!("write Mihomo config: {e}"))?;
-    config_file
-        .flush()
-        .map_err(|e| format!("flush Mihomo config: {e}"))?;
-
-    let process_log = NamedTempFile::new().map_err(|e| format!("temp Mihomo log: {e}"))?;
-
-    let child = spawn_mihomo_with_combined_log(mihomo_path, config_file.path(), &process_log)
-        .map_err(|error| format!("Mihomo spawn ({mihomo_path}): {error}"))?;
-    let mut guard = ChildGuard { child: Some(child) };
-
-    wait_until_socks_ready(port, guard.as_mut(), process_log.path(), None)?;
+    let (port, _guard) = spawn_bench_mihomo_with_path(profile, mihomo_path, None)?;
 
     let mut latencies = Vec::new();
     let mut failures = 0usize;
@@ -1665,29 +2380,7 @@ fn run_speed_via_mihomo(
     test_upload: bool,
     mihomo_path: &str,
 ) -> SpeedMetrics {
-    let setup = || -> Result<(u16, NamedTempFile, NamedTempFile, ChildGuard), String> {
-        let port = reserve_local_port()?;
-        let config_yaml = build_mihomo_bench_config(profile, "127.0.0.1", port)?;
-        let mut config_file =
-            NamedTempFile::with_suffix(".yaml").map_err(|e| format!("temp Mihomo config: {e}"))?;
-        config_file
-            .write_all(config_yaml.as_bytes())
-            .map_err(|e| format!("write Mihomo config: {e}"))?;
-        config_file
-            .flush()
-            .map_err(|e| format!("flush Mihomo config: {e}"))?;
-
-        let process_log = NamedTempFile::new().map_err(|e| format!("temp Mihomo log: {e}"))?;
-
-        let child = spawn_mihomo_with_combined_log(mihomo_path, config_file.path(), &process_log)
-            .map_err(|e| format!("spawn Mihomo at {mihomo_path}: {e}"))?;
-        let mut guard = ChildGuard { child: Some(child) };
-
-        wait_until_socks_ready(port, guard.as_mut(), process_log.path(), None)?;
-        Ok((port, config_file, process_log, guard))
-    };
-
-    let (port, _config_file, _stderr_file, _guard) = match setup() {
+    let (port, _guard) = match spawn_bench_mihomo_with_path(profile, mihomo_path, None) {
         Ok(runtime) => runtime,
         Err(error) => {
             return SpeedMetrics {
@@ -1797,14 +2490,9 @@ fn wait_until_socks_ready(
             return Err("benchmark cancelled".to_owned());
         }
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            let process_log_tail = read_tail(process_log_path, 500);
-            return Err(format!(
-                "benchmark core exited early: {status}{tail}",
-                tail = if process_log_tail.is_empty() {
-                    String::new()
-                } else {
-                    format!("; {process_log_tail}")
-                }
+            return Err(preflight_error_with_core_log(
+                &format!("benchmark core exited early: {status}"),
+                process_log_path,
             ));
         }
         if TcpStream::connect(("127.0.0.1", port)).is_err() {
@@ -1832,7 +2520,9 @@ fn curl_probe(
     }
     let started = Instant::now();
     let mut cmd = Command::new("curl");
-    cmd.arg("--socks5-hostname")
+    cmd.arg("-q")
+        .args(["--noproxy", ""])
+        .arg("--socks5-hostname")
         .arg(format!("127.0.0.1:{port}"))
         .arg("-L")
         .arg("--max-time")
@@ -2027,16 +2717,23 @@ fn unix_now() -> u64 {
 }
 
 fn read_tail(path: &Path, limit: usize) -> String {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(mut file) = std::fs::File::open(path) else {
         return String::new();
     };
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return String::new();
+    };
+    if file
+        .seek(SeekFrom::Start(length.saturating_sub(limit as u64)))
+        .is_err()
+    {
         return String::new();
     }
-    let chars: Vec<char> = trimmed.chars().collect();
-    let start = chars.len().saturating_sub(limit);
-    chars[start..].iter().collect()
+    let mut bytes = Vec::new();
+    if file.take(limit as u64).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).trim().to_owned()
 }
 
 fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<(), String> {
@@ -2068,36 +2765,79 @@ fn run_cancellable_command(
     cancel: &AtomicBool,
 ) -> Result<std::process::Output, String> {
     ensure_not_cancelled(cancel)?;
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+    // Pipe capture can deadlock before exit when a child fills either pipe.
+    // Private files let cancellation and bounded-output admission keep progressing.
+    const LIMIT: u64 = 64 * 1024;
+    let stdout = NamedTempFile::new().map_err(|error| format!("command capture: {error}"))?;
+    let stderr = NamedTempFile::new().map_err(|error| format!("command capture: {error}"))?;
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Guard(
+        command
+            .stdout(
+                stdout
+                    .reopen()
+                    .map_err(|error| format!("command capture: {error}"))?,
+            )
+            .stderr(
+                stderr
+                    .reopen()
+                    .map_err(|error| format!("command capture: {error}"))?,
+            )
+            .spawn()
+            .map_err(|error| format!("command spawn: {error}"))?,
+    );
     loop {
         if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
             return Err("benchmark cancelled".to_owned());
         }
-        match child.try_wait().map_err(|error| error.to_string())? {
-            Some(_) => return child.wait_with_output().map_err(|error| error.to_string()),
+        for file in [&stdout, &stderr] {
+            if file
+                .as_file()
+                .metadata()
+                .map_err(|error| format!("command capture: {error}"))?
+                .len()
+                > LIMIT
+            {
+                return Err("command output limit exceeded".to_owned());
+            }
+        }
+        match child.0.try_wait().map_err(|error| error.to_string())? {
+            Some(status) => {
+                let read = |file: &NamedTempFile| -> Result<Vec<u8>, String> {
+                    let mut bytes = Vec::new();
+                    file.reopen()
+                        .map_err(|error| format!("command capture: {error}"))?
+                        .take(LIMIT + 1)
+                        .read_to_end(&mut bytes)
+                        .map_err(|error| format!("command capture: {error}"))?;
+                    if bytes.len() as u64 > LIMIT {
+                        return Err("command output limit exceeded".to_owned());
+                    }
+                    Ok(bytes)
+                };
+                return Ok(std::process::Output {
+                    status,
+                    stdout: read(&stdout)?,
+                    stderr: read(&stderr)?,
+                });
+            }
             None => thread::sleep(Duration::from_millis(40)),
         }
     }
 }
 
-/// RAII guard that kills and reaps the temporary Xray child on drop,
-/// even when the benchmark returns early or is cancelled.
+/// Reap the core before removing its private config, log, and home.
 struct ChildGuard {
     child: Option<Child>,
-}
-
-impl ChildGuard {
-    fn as_mut(&mut self) -> &mut Child {
-        self.child
-            .as_mut()
-            .expect("ChildGuard holds a child until drop")
-    }
+    _config_file: NamedTempFile,
+    _process_log: NamedTempFile,
+    _home: TempDir,
 }
 
 impl Drop for ChildGuard {
@@ -2165,9 +2905,13 @@ fn spawn_bench_mihomo_with_path(
     mihomo_path: &str,
     cancel: Option<&AtomicBool>,
 ) -> Result<(u16, ChildGuard), String> {
+    if let Some(cancel) = cancel {
+        ensure_not_cancelled(cancel)?;
+    }
     let port = reserve_local_port()?;
     let config_yaml = build_mihomo_bench_config(profile, "127.0.0.1", port)?;
-    let mut config_file = NamedTempFile::with_suffix(".yaml")
+    let home = TempDir::new().map_err(|error| format!("temp Mihomo home: {error}"))?;
+    let mut config_file = NamedTempFile::new_in(home.path())
         .map_err(|error| format!("temp Mihomo config: {error}"))?;
     config_file
         .write_all(config_yaml.as_bytes())
@@ -2175,11 +2919,22 @@ fn spawn_bench_mihomo_with_path(
     config_file
         .flush()
         .map_err(|error| format!("flush Mihomo config: {error}"))?;
-    let process_log = NamedTempFile::new().map_err(|error| format!("temp Mihomo log: {error}"))?;
+    let process_log =
+        NamedTempFile::new_in(home.path()).map_err(|error| format!("temp Mihomo log: {error}"))?;
     let child = spawn_mihomo_with_combined_log(mihomo_path, config_file.path(), &process_log)
         .map_err(|error| format!("Mihomo spawn ({mihomo_path}): {error}"))?;
-    let mut guard = ChildGuard { child: Some(child) };
-    wait_until_socks_ready(port, guard.as_mut(), process_log.path(), cancel)?;
+    let mut guard = ChildGuard {
+        child: Some(child),
+        _config_file: config_file,
+        _process_log: process_log,
+        _home: home,
+    };
+    wait_until_socks_ready(
+        port,
+        guard.child.as_mut().expect("temporary core child"),
+        guard._process_log.path(),
+        cancel,
+    )?;
     Ok((port, guard))
 }
 
@@ -2436,6 +3191,396 @@ fn run_unlock_test_cancellable(port: u16, cancel: Option<&AtomicBool>) -> Unlock
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn preflight_output(rc: i32, http: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(rc << 8),
+            stdout: http.as_bytes().to_vec(),
+            stderr: b"fixture transport error".to_vec(),
+        }
+    }
+
+    #[test]
+    fn resource_result_legacy_json_defaults_to_conclusive() {
+        let mut value =
+            serde_json::to_value(failed_resource_result("ping_proxy", "ping", "failed"))
+                .expect("serialize resource");
+        value
+            .as_object_mut()
+            .expect("resource object")
+            .remove("inconclusive");
+        let result: ResourceTestResult = serde_json::from_value(value).expect("legacy resource");
+        assert!(!result.inconclusive);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adaptive_preflight_http_rejection_is_reachability_not_playback() {
+        for status in ["200", "204", "301", "405", "429", "599"] {
+            let sample =
+                adaptive_preflight_with_probe(DEFAULT_PROBE_URL, &AtomicBool::new(false), |_| {
+                    Ok(preflight_output(0, status))
+                })
+                .expect("HTTPS response");
+            assert_eq!(sample.id, "ping_proxy");
+            assert!(sample.reachable);
+            assert_eq!(sample.attempts, 1);
+            assert_eq!(sample.successes, 1);
+            assert!(!sample.inconclusive);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adaptive_preflight_retries_transport_once_on_another_domain() {
+        let mut urls = Vec::new();
+        let sample =
+            adaptive_preflight_with_probe(DEFAULT_PROBE_URL, &AtomicBool::new(false), |url| {
+                urls.push(url.to_owned());
+                Ok(if urls.len() == 1 {
+                    preflight_output(28, "000")
+                } else {
+                    preflight_output(0, "204")
+                })
+            })
+            .expect("retry succeeds");
+        assert_eq!(urls, [DEFAULT_PROBE_URL, "https://www.youtube.com/"]);
+        assert!(sample.reachable);
+        assert_eq!(sample.attempts, 2);
+        assert_eq!(sample.successes, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adaptive_preflight_rejects_invalid_http_and_certificate_failures() {
+        for (rc, http) in [
+            (0, "000"),
+            (0, "199"),
+            (0, "600"),
+            (0, "invalid"),
+            (60, "429"),
+            (28, "200"),
+        ] {
+            let mut calls = 0;
+            let sample = adaptive_preflight_with_probe(
+                "https://www.youtube.com/",
+                &AtomicBool::new(false),
+                |url| {
+                    if calls == 1 {
+                        assert_eq!(url, DEFAULT_PROBE_URL);
+                    }
+                    calls += 1;
+                    Ok(preflight_output(rc, http))
+                },
+            )
+            .expect("failed sample is not cancellation");
+            assert!(!sample.reachable);
+            assert_eq!(sample.successes, 0);
+            assert_eq!(sample.attempts, 2);
+            assert_eq!(calls, 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adaptive_preflight_cancellation_prevents_retry() {
+        let cancel = AtomicBool::new(false);
+        let mut calls = 0;
+        let result = adaptive_preflight_with_probe(DEFAULT_PROBE_URL, &cancel, |_| {
+            calls += 1;
+            cancel.store(true, Ordering::Relaxed);
+            Ok(preflight_output(28, "000"))
+        });
+        assert_eq!(result.expect_err("cancelled"), "benchmark cancelled");
+        assert_eq!(calls, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adaptive_preflight_keeps_only_latest_http_error() {
+        let mut calls = 0;
+        let sample =
+            adaptive_preflight_with_probe(DEFAULT_PROBE_URL, &AtomicBool::new(false), |_| {
+                calls += 1;
+                Ok(preflight_output(if calls == 1 { 28 } else { 35 }, "000"))
+            })
+            .expect("failed preflight sample");
+        let error = sample.error.expect("latest HTTP error");
+        assert!(error.contains("rc=35"));
+        assert!(!error.contains("rc=28"));
+        assert_eq!(sample.attempts, 2);
+    }
+
+    #[test]
+    fn adaptive_preflight_diagnostics_are_job_local_bounded_and_not_persisted() {
+        let job = search_job(25, 1, 1);
+        run_bench_with_probe(
+            search_profiles(25),
+            Arc::clone(&job),
+            Arc::new(AtomicBool::new(false)),
+            Box::new(|_| panic!("rejections must not persist health")),
+            Some(Box::new(|_| panic!("search must not run post-actions"))),
+            |_, _, _, on_preflight, on_failure| {
+                on_failure("setup", &"\u{e9}".repeat(PREFLIGHT_ERROR_BYTES + 1));
+                on_preflight(false);
+                None
+            },
+            || {},
+        )
+        .expect("spawn search")
+        .join()
+        .expect("complete search");
+        let state = job.lock().expect("job snapshot");
+        assert_eq!(state.preflight_failures.len(), PREFLIGHT_FAILURE_LIMIT);
+        assert_eq!(state.preflight_failures[0].profile_id, 5);
+        assert!(state.preflight_failures.iter().all(
+            |failure| failure.phase == "setup" && failure.error.len() <= PREFLIGHT_ERROR_BYTES
+        ));
+        assert!(state.results.is_empty());
+        assert_eq!(
+            state.search.as_ref().expect("search").preflight_rejected,
+            25
+        );
+        assert!(BenchJob::default().preflight_failures.is_empty());
+        assert_eq!(
+            bounded_preflight_error(&format!("{}\u{e9}", "x".repeat(PREFLIGHT_ERROR_BYTES - 1)))
+                .len(),
+            PREFLIGHT_ERROR_BYTES - 1,
+        );
+    }
+
+    #[test]
+    fn adaptive_preflight_records_real_setup_error_without_result() {
+        let failures = std::cell::RefCell::new(Vec::new());
+        let result = benchmark_adaptive_profile(
+            &search_profiles(1)[0],
+            BenchMethod::Quick,
+            "youtube",
+            true,
+            DEFAULT_PROBE_URL,
+            "/definitely/missing/preflight-mihomo",
+            None,
+            &AtomicBool::new(false),
+            &|passed| assert!(!passed),
+            &|phase, error| {
+                failures
+                    .borrow_mut()
+                    .push((phase.to_owned(), error.to_owned()))
+            },
+        );
+        assert!(result.is_none());
+        let failures = failures.borrow();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "setup");
+        assert!(failures[0].1.contains("Mihomo spawn"));
+    }
+
+    #[test]
+    fn preflight_core_categories_are_fixed_bounded_and_secret_free() {
+        let mut log = NamedTempFile::new().expect("private core log");
+        writeln!(log, "connection refused outside the retained tail").expect("old log");
+        log.write_all(&vec![b'x'; PREFLIGHT_CORE_LOG_BYTES])
+            .expect("large log");
+        writeln!(log, "error: context deadline exceeded https://provider.example/sub/<token> password=core-secret-canary").expect("failure log");
+        let error = preflight_error_with_core_log("curl rc=35, http=000, TLS EOF", log.path());
+        assert_eq!(
+            error,
+            "curl rc=35, http=000, TLS EOF; upstream dial/stream deadline exceeded [deadline_exceeded]"
+        );
+        assert!(!error.contains("core-secret-canary"));
+        assert!(!error.contains("provider.example"));
+        assert!(!error.contains("connection_refused"));
+        let bounded =
+            preflight_error_with_core_log(&"\u{e9}".repeat(PREFLIGHT_ERROR_BYTES), log.path());
+        assert!(bounded.len() <= PREFLIGHT_ERROR_BYTES);
+        assert!(bounded.ends_with("[deadline_exceeded]"));
+
+        for (message, category) in [
+            ("dns resolve failed: no such host", "resolution_failed"),
+            ("dial tcp: connection refused", "connection_refused"),
+            (
+                "x509: current time is after certificate validity",
+                "certificate_expired",
+            ),
+            (
+                "x509: current time is before certificate validity",
+                "certificate_not_yet_valid",
+            ),
+            (
+                "x509: certificate is valid for another name",
+                "certificate_name_mismatch",
+            ),
+            (
+                "x509: certificate signed by unknown authority",
+                "certificate_authority",
+            ),
+            ("websocket: bad handshake", "ws_handshake"),
+        ] {
+            log.as_file_mut().set_len(0).expect("reset log");
+            log.as_file_mut()
+                .seek(SeekFrom::Start(0))
+                .expect("rewind log");
+            writeln!(log, "{message}; token=core-secret-canary").expect("category fixture");
+            assert_eq!(
+                preflight_error_with_core_log("curl failed", log.path()),
+                format!("curl failed; upstream core failure [{category}]")
+            );
+        }
+        log.as_file_mut().set_len(0).expect("reset log");
+        log.as_file_mut()
+            .seek(SeekFrom::Start(0))
+            .expect("rewind log");
+        writeln!(log, "unrelated date is before another date").expect("non-certificate log");
+        assert_eq!(
+            preflight_error_with_core_log("curl failed", log.path()),
+            "curl failed"
+        );
+    }
+
+    #[test]
+    fn adaptive_preflight_core_failure_has_no_persistence_or_post_actions() {
+        let mut log = NamedTempFile::new().expect("private core log");
+        writeln!(log, "context deadline exceeded token=core-secret-canary").expect("core failure");
+        let job = search_job(1, 1, 1);
+        run_bench_with_probe(
+            search_profiles(1),
+            Arc::clone(&job),
+            Arc::new(AtomicBool::new(false)),
+            Box::new(|_| panic!("no health persistence for a preflight rejection")),
+            Some(Box::new(|_| {
+                panic!("no search promotion or Dead Servers post-actions")
+            })),
+            move |_, _, cancel, on_preflight, on_failure| {
+                run_adaptive_resource_probes(
+                    "youtube",
+                    true,
+                    cancel,
+                    on_preflight,
+                    || {
+                        let error =
+                            preflight_error_with_core_log("curl rc=35, http=000", log.path());
+                        on_failure("https", &error);
+                        Ok((failed_resource_result("ping_proxy", "ping", &error), ()))
+                    },
+                    || panic!("no direct probes"),
+                    |_, _| panic!("no native or preview probes"),
+                )
+                .expect("rejection is not cancellation")
+                .map(|_| panic!("rejection emits no result"))
+            },
+            || {},
+        )
+        .expect("search worker")
+        .join()
+        .expect("search finishes");
+        let state = job.lock().expect("job snapshot");
+        assert!(state.results.is_empty());
+        assert_eq!(state.preflight_failures.len(), 1);
+        assert_eq!(state.preflight_failures[0].profile_id, 0);
+        assert_eq!(state.preflight_failures[0].phase, "https");
+        assert!(
+            state.preflight_failures[0]
+                .error
+                .ends_with("[deadline_exceeded]")
+        );
+        assert!(
+            !state.preflight_failures[0]
+                .error
+                .contains("core-secret-canary")
+        );
+        assert_eq!(state.search.as_ref().expect("search").preflight_rejected, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn early_core_exit_reports_categories_not_raw_private_log() {
+        let mut log = NamedTempFile::new().expect("private core log");
+        writeln!(
+            log,
+            "Parse config error: password=core-secret-canary https://provider.example/sub/<token>"
+        )
+        .expect("private failure log");
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("exiting child");
+        let error = wait_until_socks_ready(0, &mut child, log.path(), None).expect_err("core exit");
+        assert!(error.contains("benchmark core exited early:"));
+        assert!(error.ends_with("[configuration_invalid]"));
+        assert!(!error.contains("core-secret-canary"));
+        assert!(!error.contains("provider.example"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_core_resources_are_private_retained_and_removed_after_reap() {
+        let make_guard = || {
+            let home = TempDir::new().expect("private home");
+            let config_file = NamedTempFile::new_in(home.path()).expect("private config");
+            let process_log = NamedTempFile::new_in(home.path()).expect("private log");
+            let child = Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("stand-in child");
+            ChildGuard {
+                child: Some(child),
+                _config_file: config_file,
+                _process_log: process_log,
+                _home: home,
+            }
+        };
+        let mut first = make_guard();
+        let second = make_guard();
+        let home = first._home.path().to_owned();
+        let config = first._config_file.path().to_owned();
+        let log = first._process_log.path().to_owned();
+        assert_ne!(home, second._home.path());
+        assert_eq!(benchmark_mihomo_home(&config), home);
+        assert!(config.exists() && log.exists());
+        assert!(
+            first
+                .child
+                .as_mut()
+                .expect("child")
+                .try_wait()
+                .expect("running child")
+                .is_none()
+        );
+        let cancel = AtomicBool::new(true);
+        assert_eq!(
+            wait_until_socks_ready(0, first.child.as_mut().expect("child"), &log, Some(&cancel),)
+                .expect_err("cancel readiness"),
+            "benchmark cancelled",
+        );
+        #[cfg(target_os = "linux")]
+        let pid = first.child.as_ref().expect("child").id() as libc::pid_t;
+        drop(first);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                // SAFETY: waitpid accepts null; this exact child was already reaped by Drop.
+                unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+        assert!(!home.exists() && !config.exists() && !log.exists());
+        assert!(second._config_file.path().exists());
+    }
+
+    #[test]
+    fn process_log_tail_read_is_bounded() {
+        let mut log = NamedTempFile::new().expect("log");
+        log.write_all(&vec![b'x'; 10_000]).expect("log body");
+        log.write_all(b"final diagnostic").expect("log suffix");
+        assert_eq!(read_tail(log.path(), 16), "final diagnostic");
+        assert_eq!(read_tail(log.path(), 0), "");
+    }
+
     #[test]
     fn combined_process_log_preserves_stdout_and_stderr_streams() {
         let process_log = NamedTempFile::new().expect("process log");
@@ -2583,10 +3728,14 @@ mod tests {
                 Duration::from_millis(30),
             ));
         }
-        assert!(service_resource_error(&tests).is_empty());
+        assert!(service_resource_outcome(&tests, None).0);
 
         tests[4] = failed_resource_result("telegram", "Telegram", "timeout");
-        assert!(service_resource_error(&tests).contains("Telegram"));
+        assert!(
+            service_resource_outcome(&tests, None)
+                .1
+                .contains("Telegram")
+        );
     }
 
     #[test]
@@ -2676,7 +3825,7 @@ mod tests {
             false,
         );
 
-        assert_eq!(result.contract_version, 6);
+        assert_eq!(result.contract_version, QUICK_RESOURCE_CONTRACT_VERSION);
         assert!(result.reachable);
         assert!(!result.stable);
         assert_eq!(result.successes, 2);
@@ -2735,13 +3884,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_youtube_bootstrap_and_direct_format() {
-        let page = r#"before "visitorData":"visitor-123","signatureTimestamp":20653 after"#;
-        assert_eq!(
-            embedded_json_string(page, "visitorData").as_deref(),
-            Some("visitor-123")
-        );
-        assert_eq!(embedded_json_u64(page, "signatureTimestamp"), Some(20_653));
+    fn youtube_native_request_does_not_require_web_bootstrap() {
+        let body = youtube_player_body();
+        assert_eq!(body["context"]["client"]["clientName"], "VISIONOS");
+        assert_eq!(body["context"]["client"]["clientVersion"], "1.02");
+        assert!(body["context"]["client"].get("visitorData").is_none());
+        assert!(body.get("playbackContext").is_none());
         let player = serde_json::json!({
             "streamingData": {"adaptiveFormats": [
                 {"itag": 251, "mimeType": "audio/webm", "url": "https://audio.example/"},
@@ -2799,6 +3947,81 @@ mod tests {
                 "https://progressive.example/"
             ]
         );
+    }
+
+    #[test]
+    fn youtube_challenge_is_inconclusive_not_playback_or_transport_failure() {
+        for error in [
+            "YouTube player LOGIN_REQUIRED: Sign in to confirm you’re not a bot",
+            "YouTube player http=429",
+            "YouTube player returned no direct video format",
+        ] {
+            let result = youtube_probe_result(&[], &[error.to_owned()]);
+            assert!(result.inconclusive && result.reachable);
+            assert!(!result.stable);
+            assert_eq!(result.successes, 0);
+        }
+        let transport = youtube_probe_result(
+            &[],
+            &["YouTube player rc=28: Connection timed out".to_owned()],
+        );
+        assert!(!transport.inconclusive && !transport.reachable && !transport.stable);
+    }
+
+    #[test]
+    fn youtube_verified_media_overrides_earlier_transient_challenge() {
+        let result = youtube_probe_result(
+            &[QuickResourceAttempt {
+                ttfb_ms: 50,
+                total_ms: 100,
+                bytes: YOUTUBE_SEGMENT_BYTES,
+            }],
+            &["YouTube player http=429".to_owned()],
+        );
+        assert!(result.stable && result.reachable && !result.inconclusive);
+        assert_eq!(result.successes, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn youtube_requires_video_payload_not_just_http_200() {
+        for metrics in [
+            "200 524288 0.05 0.1|text/html",
+            "200 524288 0.05 0.1|application/octet-stream",
+            "200 128 0.05 0.1|video/mp4",
+            "403 128 0.05 0.1|text/html",
+        ] {
+            assert!(youtube_media_attempt(&preflight_output(0, metrics)).is_err());
+        }
+        let media = youtube_media_attempt(&preflight_output(0, "206 524288 0.05 0.1|video/mp4"))
+            .expect("real video range");
+        assert_eq!(media.bytes, YOUTUBE_SEGMENT_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn youtube_http_refusal_survives_a_failed_body_transfer() {
+        let error = youtube_player_status(&preflight_output(28, "429"))
+            .expect_err("HTTP rejection despite curl timeout");
+        assert!(error.contains("http=429"));
+        let result = youtube_probe_result(&[], &[error]);
+        assert!(result.inconclusive && result.reachable && !result.stable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_command_local_spawn_and_output_limits_do_not_poison_youtube() {
+        let cancel = AtomicBool::new(false);
+        let dir = TempDir::new().expect("test dir");
+        let error =
+            run_cancellable_command(&mut Command::new(dir.path().join("missing-curl")), &cancel)
+                .expect_err("missing command");
+        assert!(error.starts_with("command spawn:") && youtube_error_is_inconclusive(&error));
+        let mut command = Command::new("sh");
+        command.args(["-c", "while :; do printf '%064d\\n' 0; done"]);
+        let error = run_cancellable_command(&mut command, &cancel)
+            .expect_err("oversized output killed and reaped");
+        assert!(error.contains("command output limit") && youtube_error_is_inconclusive(&error));
     }
 
     #[test]
@@ -2954,13 +4177,13 @@ mod tests {
             result
                 .download_error
                 .as_deref()
-                .is_some_and(|e| e.contains("spawn Mihomo"))
+                .is_some_and(|e| e.contains("Mihomo spawn"))
         );
         assert!(
             result
                 .upload_error
                 .as_deref()
-                .is_some_and(|e| e.contains("spawn Mihomo"))
+                .is_some_and(|e| e.contains("Mihomo spawn"))
         );
     }
 
@@ -3013,6 +4236,1308 @@ mod tests {
         );
     }
 
+    fn search_profiles(count: usize) -> Vec<Profile> {
+        (0..count)
+            .map(|id| Profile {
+                id,
+                name: format!("candidate-{id}"),
+                protocol: Protocol::Vless,
+                address: "server.example".to_owned(),
+                port: Some(443),
+                raw: format!(
+                    "vless://11111111-1111-1111-1111-111111111111@server.example:443#{id}"
+                ),
+                selected: false,
+                block_quic: false,
+                group: None,
+            })
+            .collect()
+    }
+
+    fn search_job(total: usize, target: usize, workers: usize) -> SharedJob {
+        let job = new_bench_job(BenchMethod::Quick, total, workers);
+        job.lock().expect("lock new search job").search = Some(SearchProgress {
+            target_good: target,
+            required_services: "youtube".to_owned(),
+            ..SearchProgress::default()
+        });
+        job
+    }
+
+    fn search_result(profile: &Profile, required: &str) -> BenchResult {
+        let cancel = AtomicBool::new(false);
+        let resource_tests = run_adaptive_resource_probes(
+            required,
+            true,
+            &cancel,
+            |_| {},
+            || {
+                Ok((
+                    successful_resource_result(
+                        "ping_proxy",
+                        "Proxy HTTPS ping",
+                        Duration::from_millis(1),
+                    ),
+                    (),
+                ))
+            },
+            || {
+                Ok([("ping_icmp", "ICMP ping"), ("ping_tcp", "TCP ping")]
+                    .into_iter()
+                    .map(|(id, name)| {
+                        skipped_resource_result(
+                            id,
+                            name,
+                            "proxy preflight already proves reachability",
+                        )
+                    })
+                    .collect())
+            },
+            |_, id| Ok(successful_resource_result(id, id, Duration::from_millis(1))),
+        )
+        .expect("run injected search probes")
+        .expect("injected search preflight passes");
+        let attempted = resource_tests
+            .iter()
+            .filter(|test| test.attempts > 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let (_, error) = service_resource_outcome(&attempted, None);
+        BenchResult {
+            profile_id: profile.id,
+            profile_name: profile.name.clone(),
+            profile_raw: profile.raw.clone(),
+            method: "search".to_owned(),
+            latency_ms: 1,
+            jitter_ms: 0,
+            download_mbps: None,
+            upload_mbps: None,
+            download_error: None,
+            upload_error: None,
+            loss_percent: 0.0,
+            success: error.is_empty(),
+            error: (!error.is_empty()).then_some(error),
+            resource_tests,
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn adaptive_options_validate_and_reject_unknown_fields() {
+        for target in [0, 21] {
+            assert!(
+                AdaptiveSearchOptions {
+                    target_good: target,
+                    required_services: "youtube".to_owned(),
+                    fail_fast: true,
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        for required in ["all", "youtube", "telegram", "ai"] {
+            assert!(
+                AdaptiveSearchOptions {
+                    target_good: 20,
+                    required_services: required.to_owned(),
+                    fail_fast: true,
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        assert!(
+            AdaptiveSearchOptions {
+                target_good: 1,
+                required_services: "unknown".to_owned(),
+                fail_fast: true,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<AdaptiveSearchOptions>(
+                r#"{"target_good":1,"required_services":"youtube","extra":true}"#
+            )
+            .is_err()
+        );
+        let options = serde_json::from_str::<AdaptiveSearchOptions>(
+            r#"{"target_good":1,"required_services":"all"}"#,
+        )
+        .expect("omitted adaptive fail-fast defaults to true");
+        assert!(options.fail_fast);
+        assert_eq!(
+            serde_json::to_value(options).expect("serialize default search")["fail_fast"],
+            true
+        );
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!("false"),
+            serde_json::json!(1),
+        ] {
+            assert!(
+                serde_json::from_value::<AdaptiveSearchOptions>(serde_json::json!({
+                    "target_good": 1, "required_services": "all", "fail_fast": invalid,
+                }))
+                .is_err()
+            );
+        }
+        assert!(
+            new_bench_job(BenchMethod::Quick, 1, 1)
+                .lock()
+                .expect("lock default benchmark job")
+                .search
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn adaptive_preflight_rejection_skips_every_other_probe_and_persistence() {
+        for setup_failed in [false, true] {
+            let outcome = run_adaptive_resource_probes(
+                "ai",
+                true,
+                &AtomicBool::new(false),
+                |passed| assert!(!passed),
+                || {
+                    if setup_failed {
+                        Err("setup failed".to_owned())
+                    } else {
+                        Ok((
+                            failed_resource_result("ping_proxy", "Proxy HTTPS ping", "unreachable"),
+                            (),
+                        ))
+                    }
+                },
+                || panic!("direct probes must not run"),
+                |_, _| panic!("services must not run"),
+            )
+            .expect("rejected preflight is not a cancellation");
+            assert!(outcome.is_none());
+        }
+        let job = search_job(3, 1, 3);
+        run_bench_with_probe(
+            search_profiles(3),
+            Arc::clone(&job),
+            Arc::new(AtomicBool::new(false)),
+            Box::new(|_| panic!("preflight rejects must not persist stats")),
+            Some(Box::new(|_| {
+                panic!("search must never invoke completion post-actions")
+            })),
+            |_, _, _, on_preflight, _| {
+                on_preflight(false);
+                None
+            },
+            || thread::sleep(Duration::from_millis(50)),
+        )
+        .expect("spawn rejecting search scheduler")
+        .join()
+        .expect("rejecting search scheduler exits cleanly");
+        let state = job.lock().expect("lock rejected search state");
+        let search = state.search.as_ref().expect("rejected search has progress");
+        assert_eq!(state.completed, 3);
+        assert!(state.results.is_empty());
+        assert_eq!(search.preflight_completed, 3);
+        assert_eq!(search.preflight_rejected, 3);
+        assert_eq!(search.quick_completed, 0);
+        assert_eq!(search.found_good, 0);
+        assert_eq!(search.finish_reason.as_deref(), Some("exhausted"));
+    }
+
+    #[test]
+    fn adaptive_probes_reuse_preflight_and_skip_unrequested_prefix_suffix() {
+        for (required, count) in [("youtube", 1), ("telegram", 2), ("ai", 3)] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let tests = run_adaptive_resource_probes(
+                required,
+                true,
+                &AtomicBool::new(false),
+                |passed| assert!(passed),
+                || {
+                    calls.borrow_mut().push("preflight".to_owned());
+                    Ok((
+                        successful_resource_result(
+                            "ping_proxy",
+                            "Proxy HTTPS ping",
+                            Duration::from_millis(7),
+                        ),
+                        123,
+                    ))
+                },
+                || {
+                    calls.borrow_mut().push("direct_skipped".to_owned());
+                    Ok([("ping_icmp", "ICMP ping"), ("ping_tcp", "TCP ping")]
+                        .into_iter()
+                        .map(|(id, name)| {
+                            skipped_resource_result(
+                                id,
+                                name,
+                                "proxy preflight already proves reachability",
+                            )
+                        })
+                        .collect())
+                },
+                |runtime, id| {
+                    assert_eq!(*runtime, 123);
+                    calls.borrow_mut().push(id.to_owned());
+                    Ok(successful_resource_result(id, id, Duration::from_millis(1)))
+                },
+            )
+            .expect("run injected prefix probes")
+            .expect("prefix preflight passes");
+            assert_eq!(&calls.borrow()[..2], &["preflight", "direct_skipped"]);
+            assert_eq!(calls.borrow().len(), 2 + count);
+            assert_eq!(
+                tests.iter().filter(|test| test.id == "ping_proxy").count(),
+                1
+            );
+            assert_eq!(tests[2].avg_ttfb_ms, 7);
+            for test in tests.iter().take(2) {
+                assert_eq!(test.attempts, 0);
+                assert_eq!(test.successes, 0);
+            }
+            for test in tests.iter().skip(3 + count) {
+                assert_eq!(test.attempts, 0);
+                assert_eq!(test.successes, 0);
+            }
+            let mut result = search_result(&search_profiles(1)[0], required);
+            assert!(adaptive_result_is_good(&result, required));
+            assert_eq!(result.method, "search");
+            assert!(result.success);
+            assert!(result.error.is_none());
+            assert_eq!(
+                service_resource_outcome(&result.resource_tests, None).0,
+                required == "ai"
+            );
+            result.resource_tests[2].reachable = false;
+            assert!(!adaptive_result_is_good(&result, required));
+            result.resource_tests.push(successful_resource_result(
+                "ping_tcp",
+                "TCP ping",
+                Duration::from_millis(1),
+            ));
+            assert!(adaptive_result_is_good(&result, required));
+            result.resource_tests[3].stable = false;
+            assert!(!adaptive_result_is_good(&result, required));
+            assert!(!adaptive_result_is_good(&result, "invalid"));
+        }
+        let tests = run_adaptive_resource_probes(
+            "telegram",
+            true,
+            &AtomicBool::new(false),
+            |passed| assert!(passed),
+            || {
+                Ok((
+                    successful_resource_result(
+                        "ping_proxy",
+                        "Proxy HTTPS ping",
+                        Duration::from_millis(1),
+                    ),
+                    (),
+                ))
+            },
+            || Ok(Vec::new()),
+            |_, id| {
+                assert_eq!(id, "youtube");
+                Ok(failed_resource_result(id, id, "failed"))
+            },
+        )
+        .expect("run failed prefix probes")
+        .expect("failed prefix still retains its successful preflight");
+        assert_eq!(tests[2].attempts, 0);
+        assert_eq!(
+            tests[2].error.as_deref(),
+            Some("skipped after YouTube failed")
+        );
+        assert_eq!(tests[3].attempts, 0);
+    }
+
+    #[test]
+    fn adaptive_preflight_cancellation_does_not_start_quick() {
+        let cancel = AtomicBool::new(false);
+        let error = run_adaptive_resource_probes(
+            "ai",
+            true,
+            &cancel,
+            |_| panic!("cancelled preflight must not be counted"),
+            || {
+                cancel.store(true, Ordering::Relaxed);
+                Ok((
+                    successful_resource_result(
+                        "ping_proxy",
+                        "Proxy HTTPS ping",
+                        Duration::from_millis(1),
+                    ),
+                    (),
+                ))
+            },
+            || panic!("cancelled preflight must not start direct probes"),
+            |_, _| panic!("cancelled preflight must not start services"),
+        )
+        .expect_err("preflight cancellation must propagate");
+        assert_eq!(error, "benchmark cancelled");
+    }
+
+    #[test]
+    fn adaptive_goodness_rejects_stale_contract_and_invalid_sample_counts() {
+        let profile = &search_profiles(1)[0];
+        for required in ["youtube", "telegram", "ai"] {
+            let result = search_result(profile, required);
+            for id in result
+                .resource_tests
+                .iter()
+                .filter(|test| test.attempts > 0)
+                .map(|test| test.id.as_str())
+            {
+                for invalid in 0..5 {
+                    let mut invalid_result = result.clone();
+                    let test = invalid_result
+                        .resource_tests
+                        .iter_mut()
+                        .find(|test| test.id == id)
+                        .expect("selected sample exists in cloned result");
+                    match invalid {
+                        0 => test.contract_version = QUICK_RESOURCE_CONTRACT_VERSION - 1,
+                        1 => test.attempts = 0,
+                        2 => test.successes = 0,
+                        3 => test.successes = test.attempts + 1,
+                        _ => test.id = "ping_invalid".to_owned(),
+                    }
+                    assert!(
+                        !adaptive_result_is_good(&invalid_result, required),
+                        "accepted invalid sample {id}, case {invalid}, prefix {required}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn availability_methods_roundtrip_and_keep_legacy_method_names() {
+        for (method, name, service, availability, fail_fast) in [
+            (BenchMethod::Tcp, "tcp", false, false, false),
+            (BenchMethod::Head, "head", false, false, false),
+            (BenchMethod::Get, "get", false, false, false),
+            (BenchMethod::Quick, "quick", true, false, true),
+            (BenchMethod::Full, "full", true, false, false),
+            (
+                BenchMethod::AvailabilityQuick,
+                "availability_quick",
+                true,
+                true,
+                true,
+            ),
+            (
+                BenchMethod::AvailabilityFull,
+                "availability_full",
+                true,
+                true,
+                false,
+            ),
+        ] {
+            assert_eq!(method.as_str(), name);
+            assert_eq!(
+                BenchMethod::parse_method(&name.to_ascii_uppercase()),
+                Some(method)
+            );
+            assert_eq!(
+                serde_json::to_value(method).expect("serialize method"),
+                name
+            );
+            assert_eq!(
+                serde_json::from_value::<BenchMethod>(serde_json::json!(name))
+                    .expect("deserialize method"),
+                method
+            );
+            assert_eq!(method.is_service(), service);
+            assert_eq!(method.is_availability(), availability);
+            assert_eq!(method.is_fail_fast(), fail_fast);
+        }
+        assert_eq!(BenchMethod::parse_method("search_availability"), None);
+    }
+
+    #[test]
+    fn adaptive_admission_accepts_only_legacy_and_availability_quick() {
+        for method in [
+            BenchMethod::Tcp,
+            BenchMethod::Head,
+            BenchMethod::Get,
+            BenchMethod::Quick,
+            BenchMethod::Full,
+            BenchMethod::AvailabilityQuick,
+            BenchMethod::AvailabilityFull,
+        ] {
+            let job = new_bench_job(method, 0, 1);
+            job.lock().expect("job admission").search = Some(SearchProgress {
+                target_good: 1,
+                required_services: "youtube".to_owned(),
+                ..SearchProgress::default()
+            });
+            let worker = run_bench(
+                Vec::new(),
+                method,
+                DEFAULT_PROBE_URL.to_owned(),
+                DEFAULT_DOWNLOAD_URL.to_owned(),
+                DEFAULT_UPLOAD_URL.to_owned(),
+                "unused-core".to_owned(),
+                None,
+                false,
+                false,
+                job,
+                Arc::new(AtomicBool::new(false)),
+                Box::new(|_| panic!("empty search has no results")),
+                Some(Box::new(|_| panic!("search never runs post-actions"))),
+            );
+            if method.is_fail_fast() {
+                worker
+                    .expect("Quick search admission")
+                    .join()
+                    .expect("empty search finishes");
+            } else {
+                assert_eq!(
+                    worker.err().as_deref(),
+                    Some("adaptive search requires quick or availability_quick")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn availability_complete_scope_short_circuits_quick_but_continues_full() {
+        for method in [
+            BenchMethod::Quick,
+            BenchMethod::Full,
+            BenchMethod::AvailabilityQuick,
+            BenchMethod::AvailabilityFull,
+        ] {
+            let mut calls = Vec::new();
+            let tests = run_complete_service_probes(method, None, &AtomicBool::new(false), |id| {
+                calls.push(id.to_owned());
+                Ok(if id == "youtube" && method.is_availability() {
+                    youtube_availability::unavailable()
+                } else if id == "youtube" {
+                    failed_resource_result(id, id, "failed")
+                } else {
+                    successful_resource_result(id, id, Duration::from_millis(1))
+                })
+            })
+            .expect("complete service scope");
+            assert_eq!(calls.len(), if method.is_fail_fast() { 1 } else { 3 });
+            assert_eq!(tests.len(), 3);
+            assert_eq!(
+                tests[0].id,
+                if method.is_availability() {
+                    "youtube_thumbnails"
+                } else {
+                    "youtube"
+                }
+            );
+            for test in tests.iter().skip(1) {
+                assert_eq!(test.contract_version, QUICK_RESOURCE_CONTRACT_VERSION);
+                assert_eq!(test.attempts, u32::from(!method.is_fail_fast()));
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        let error =
+            run_complete_service_probes(BenchMethod::AvailabilityFull, None, &cancel, |_| {
+                cancel.store(true, Ordering::Relaxed);
+                Ok(youtube_availability::unavailable())
+            })
+            .expect_err("cancel prevents Telegram stage");
+        assert_eq!(error, "benchmark cancelled");
+    }
+
+    #[test]
+    fn service_checks_prefix_and_fail_fast_are_independent_of_availability_method() {
+        for method in [
+            BenchMethod::AvailabilityQuick,
+            BenchMethod::AvailabilityFull,
+        ] {
+            for (required_services, count) in [
+                (ServiceCheckPrefix::Youtube, 1),
+                (ServiceCheckPrefix::Telegram, 2),
+                (ServiceCheckPrefix::Ai, 3),
+                (ServiceCheckPrefix::All, 3),
+            ] {
+                for fail_fast in [false, true] {
+                    for failure in [None, Some("youtube"), Some("telegram"), Some("ai")] {
+                        let options = ServiceCheckOptions {
+                            required_services,
+                            fail_fast,
+                        };
+                        let mut calls = Vec::new();
+                        let tests = run_complete_service_probes(
+                            method,
+                            Some(&options),
+                            &AtomicBool::new(false),
+                            |id| {
+                                calls.push(id.to_owned());
+                                let mut test = if Some(id) == failure {
+                                    failed_resource_result(id, id, "failed")
+                                } else {
+                                    successful_resource_result(id, id, Duration::from_millis(1))
+                                };
+                                if id == "youtube" {
+                                    test.id = "youtube_thumbnails".to_owned();
+                                    test.contract_version = YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+                                }
+                                Ok(test)
+                            },
+                        )
+                        .expect("explicit ordinary service policy");
+                        let expected = if fail_fast {
+                            ["youtube", "telegram", "ai"]
+                                .iter()
+                                .position(|id| Some(*id) == failure)
+                                .map_or(count, |index| count.min(index + 1))
+                        } else {
+                            count
+                        };
+                        assert_eq!(calls, ["youtube", "telegram", "ai"][..expected]);
+                        assert_eq!(tests.len(), 3);
+                        assert_eq!(tests[0].id, "youtube_thumbnails");
+                        assert_eq!(
+                            tests[0].contract_version,
+                            YOUTUBE_AVAILABILITY_CONTRACT_VERSION
+                        );
+                        for test in tests.iter().skip(expected) {
+                            assert_eq!(test.attempts, 0);
+                            assert_eq!(test.successes, 0);
+                        }
+                        let mut resources = ["ping_icmp", "ping_tcp", "ping_proxy"]
+                            .into_iter()
+                            .map(|id| successful_resource_result(id, id, Duration::from_millis(1)))
+                            .collect::<Vec<_>>();
+                        resources.extend(tests);
+                        let (success, selected_error) =
+                            service_resource_outcome(&resources, Some(&options));
+                        let selected_failed = ["youtube", "telegram", "ai"][..count]
+                            .iter()
+                            .any(|id| Some(*id) == failure);
+                        assert_eq!(
+                            success, !selected_failed,
+                            "unrequested skipped services must not contaminate selected-prefix success"
+                        );
+                        assert!(!selected_error.contains("0/0"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn service_checks_fail_fast_summary_excludes_skips_without_granting_incomplete_success() {
+        let options = ServiceCheckOptions {
+            required_services: ServiceCheckPrefix::All,
+            fail_fast: true,
+        };
+        let mut tests = vec![successful_resource_result(
+            "ping_proxy",
+            "Proxy HTTPS ping",
+            Duration::from_millis(1),
+        )];
+        tests.extend(
+            run_complete_service_probes(
+                BenchMethod::AvailabilityFull,
+                Some(&options),
+                &AtomicBool::new(false),
+                |id| {
+                    assert_eq!(id, "youtube", "fail-fast must not attempt TG/AI");
+                    let mut test =
+                        failed_resource_result("youtube_thumbnails", "YouTube", "preview failed");
+                    test.contract_version = YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+                    Ok(test)
+                },
+            )
+            .expect("failed preview is per-service evidence"),
+        );
+        let (success, error) = service_resource_outcome(&tests, Some(&options));
+        assert!(!success);
+        assert!(error.contains("YouTube"));
+        assert!(!error.contains("Telegram"));
+        assert!(!error.contains("AI Studio"));
+        assert!(!error.contains("0/0"));
+        let (_, legacy_error) = service_resource_outcome(&tests, None);
+        assert!(legacy_error.contains("Telegram 0/0"));
+        assert!(legacy_error.contains("AI Studio 0/0"));
+
+        tests[1] =
+            successful_resource_result("youtube_thumbnails", "YouTube", Duration::from_millis(1));
+        tests[1].contract_version = YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+        assert_eq!(
+            service_resource_outcome(&tests, Some(&options)),
+            (false, String::new()),
+            "passing YT plus skipped TG/AI is not an all-services pass"
+        );
+        let youtube_only = ServiceCheckOptions {
+            required_services: ServiceCheckPrefix::Youtube,
+            fail_fast: true,
+        };
+        assert_eq!(
+            service_resource_outcome(&tests, Some(&youtube_only)),
+            (true, String::new())
+        );
+        for invalid in 0..4 {
+            let mut incomplete = tests.clone();
+            match invalid {
+                0 => {
+                    incomplete.remove(1);
+                }
+                1 => incomplete[1].attempts = 0,
+                2 => incomplete[1].contract_version = QUICK_RESOURCE_CONTRACT_VERSION,
+                _ => incomplete[1].inconclusive = true,
+            }
+            assert!(!service_resource_outcome(&incomplete, Some(&youtube_only)).0);
+        }
+        tests.remove(0);
+        assert!(
+            !service_resource_outcome(&tests, Some(&youtube_only)).0,
+            "existing ping evidence is still required"
+        );
+        assert!(!service_resource_outcome(&[], Some(&options)).0);
+        assert!(
+            service_resource_outcome(&[], None).0,
+            "legacy empty aggregation is unchanged"
+        );
+    }
+
+    #[test]
+    fn service_checks_worker_captures_job_policy_without_adaptive_preflight() {
+        let method = BenchMethod::AvailabilityFull;
+        let mut profile = search_profiles(1).remove(0);
+        profile.address.clear();
+        let job = new_bench_job(method, 1, 1);
+        job.lock().expect("job policy").service_checks = Some(ServiceCheckOptions {
+            required_services: ServiceCheckPrefix::Youtube,
+            fail_fast: false,
+        });
+        run_bench(
+            vec![profile],
+            method,
+            DEFAULT_PROBE_URL.to_owned(),
+            DEFAULT_DOWNLOAD_URL.to_owned(),
+            DEFAULT_UPLOAD_URL.to_owned(),
+            "/definitely/missing/service-checks-mihomo".to_owned(),
+            None,
+            false,
+            false,
+            Arc::clone(&job),
+            Arc::new(AtomicBool::new(false)),
+            Box::new(|_| {}),
+            None,
+        )
+        .expect("ordinary worker starts")
+        .join()
+        .expect("ordinary worker finishes");
+        let state = job.lock().expect("completed ordinary job");
+        assert!(state.search.is_none());
+        assert!(state.preflight_failures.is_empty());
+        assert_eq!(state.completed, 1);
+        assert_eq!(
+            state.results.len(),
+            1,
+            "setup failure is an ordinary result, not preflight rejection"
+        );
+        let result = &state.results[0];
+        assert_eq!(result.method, "availability_full");
+        assert!(!result.success);
+        assert_eq!(result.resource_tests[3].id, "youtube_thumbnails");
+        assert_eq!(
+            result.resource_tests[3].contract_version,
+            YOUTUBE_AVAILABILITY_CONTRACT_VERSION
+        );
+        assert_eq!(result.resource_tests[4].attempts, 0);
+        assert_eq!(result.resource_tests[5].attempts, 0);
+    }
+
+    #[test]
+    fn service_checks_errors_continue_unless_fail_fast_and_cancellation_always_interrupts() {
+        for fail_fast in [false, true] {
+            let options = ServiceCheckOptions {
+                required_services: ServiceCheckPrefix::All,
+                fail_fast,
+            };
+            let mut calls = Vec::new();
+            let tests = run_complete_service_probes(
+                BenchMethod::AvailabilityFull,
+                Some(&options),
+                &AtomicBool::new(false),
+                |id| {
+                    calls.push(id.to_owned());
+                    Err("service unavailable".to_owned())
+                },
+            )
+            .expect("ordinary errors remain per-service evidence");
+            assert_eq!(calls.len(), if fail_fast { 1 } else { 3 });
+            assert_eq!(tests[0].id, "youtube_thumbnails");
+            assert_eq!(
+                tests[0].contract_version,
+                YOUTUBE_AVAILABILITY_CONTRACT_VERSION
+            );
+            assert_eq!(tests[0].error.as_deref(), Some("service unavailable"));
+            for cancelled in [false, true] {
+                let cancel = AtomicBool::new(false);
+                let error = run_complete_service_probes(
+                    BenchMethod::AvailabilityFull,
+                    Some(&options),
+                    &cancel,
+                    |_| {
+                        cancel.store(cancelled, Ordering::Relaxed);
+                        Err(if cancelled {
+                            "interrupted"
+                        } else {
+                            "benchmark cancelled"
+                        }
+                        .to_owned())
+                    },
+                )
+                .expect_err("cancellation is not a per-service failure");
+                assert_eq!(error, "benchmark cancelled");
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_availability_fail_fast_false_continues_selected_prefix_after_failure() {
+        for (required, count) in [("youtube", 1), ("telegram", 2), ("ai", 3), ("all", 3)] {
+            for fail_fast in [false, true] {
+                let mut calls = Vec::new();
+                let tests = run_adaptive_resource_probes(
+                    required,
+                    fail_fast,
+                    &AtomicBool::new(false),
+                    |passed| assert!(passed),
+                    || {
+                        Ok((
+                            successful_resource_result(
+                                "ping_proxy",
+                                "Proxy HTTPS ping",
+                                Duration::from_millis(1),
+                            ),
+                            (),
+                        ))
+                    },
+                    || Ok(Vec::new()),
+                    |_, id| {
+                        calls.push(id.to_owned());
+                        Ok(if id == "youtube" {
+                            youtube_availability::unavailable()
+                        } else {
+                            successful_resource_result(id, id, Duration::from_millis(1))
+                        })
+                    },
+                )
+                .expect("adaptive policy")
+                .expect("passing preflight retains failed service evidence");
+                let attempted = if fail_fast { 1 } else { count };
+                assert_eq!(calls.len(), attempted);
+                assert_eq!(tests[1].id, "youtube_thumbnails");
+                for test in tests.iter().skip(1 + attempted) {
+                    assert_eq!(test.attempts, 0);
+                }
+            }
+            let mut result = search_result(&search_profiles(1)[0], required);
+            result.method = "search_availability".to_owned();
+            result.resource_tests[3].id = "youtube_thumbnails".to_owned();
+            result.resource_tests[3].contract_version = YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+            assert!(adaptive_result_is_good(&result, required));
+            assert_eq!(
+                adaptive_result_is_good(&result, "all"),
+                adaptive_result_is_good(&result, "ai")
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_goodness_accepts_only_search_producers_even_with_valid_evidence() {
+        for required in ["youtube", "telegram", "ai", "all"] {
+            for producer in ["search", "search_availability"] {
+                let mut result = search_result(&search_profiles(1)[0], required);
+                result.method = producer.to_owned();
+                if producer == "search_availability" {
+                    result.resource_tests[3].id = "youtube_thumbnails".to_owned();
+                    result.resource_tests[3].contract_version =
+                        YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+                }
+                assert!(adaptive_result_is_good(&result, required));
+                for unsupported in [
+                    "",
+                    "tcp",
+                    "head",
+                    "get",
+                    "quick",
+                    "full",
+                    "availability_quick",
+                    "availability_full",
+                    "Search",
+                    "search_unknown",
+                    "search_availability_extra",
+                ] {
+                    result.method = unsupported.to_owned();
+                    assert!(
+                        !adaptive_result_is_good(&result, required),
+                        "{unsupported} must fail closed for {producer} evidence"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn availability_search_goodness_never_confuses_thumbnail_and_native_evidence() {
+        for required in ["youtube", "telegram", "ai"] {
+            let mut result = search_result(&search_profiles(1)[0], required);
+            assert!(adaptive_result_is_good(&result, required));
+            result.method = "search_availability".to_owned();
+            assert!(!adaptive_result_is_good(&result, required));
+            let test = &mut result.resource_tests[3];
+            test.id = "youtube_thumbnails".to_owned();
+            test.contract_version = YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+            assert!(adaptive_result_is_good(&result, required));
+            for wrong_method in [
+                "search",
+                "quick",
+                "full",
+                "availability_quick",
+                "search_availability_extra",
+            ] {
+                result.method = wrong_method.to_owned();
+                assert!(!adaptive_result_is_good(&result, required));
+            }
+            result.method = "search_availability".to_owned();
+            for invalid in 0..7 {
+                let mut invalid_result = result.clone();
+                let thumbnail = &mut invalid_result.resource_tests[3];
+                match invalid {
+                    0 => thumbnail.contract_version = QUICK_RESOURCE_CONTRACT_VERSION,
+                    1 => thumbnail.inconclusive = true,
+                    2 => thumbnail.stable = false,
+                    3 => thumbnail.attempts = 0,
+                    4 => thumbnail.successes = 0,
+                    5 => thumbnail.successes = thumbnail.attempts + 1,
+                    _ => thumbnail.reachable = false,
+                }
+                assert!(!adaptive_result_is_good(&invalid_result, required));
+            }
+            if required != "youtube" {
+                result.resource_tests[4].contract_version = YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+                assert!(!adaptive_result_is_good(&result, required));
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_service_errors_retain_failed_results_but_cancel_propagates() {
+        for failed_id in ["youtube", "telegram", "ai"] {
+            let tests = run_adaptive_resource_probes(
+                "ai",
+                true,
+                &AtomicBool::new(false),
+                |passed| assert!(passed),
+                || {
+                    Ok((
+                        successful_resource_result(
+                            "ping_proxy",
+                            "Proxy HTTPS ping",
+                            Duration::from_millis(1),
+                        ),
+                        (),
+                    ))
+                },
+                || Ok(Vec::new()),
+                |_, id| {
+                    if id == failed_id {
+                        Err("service unavailable".to_owned())
+                    } else {
+                        Ok(successful_resource_result(id, id, Duration::from_millis(1)))
+                    }
+                },
+            )
+            .expect("ordinary service errors are represented in resource results")
+            .expect("successful preflight retains the Quick outcome");
+            let failed = tests
+                .iter()
+                .find(|test| test.id == failed_id)
+                .expect("failed service is present");
+            assert_eq!(failed.attempts, 1);
+            assert_eq!(failed.successes, 0);
+            assert!(!failed.stable);
+            assert_eq!(failed.error.as_deref(), Some("service unavailable"));
+            assert!(!service_resource_outcome(&tests, None).0);
+        }
+        for cancellation_flag in [false, true] {
+            let cancel = AtomicBool::new(false);
+            let error = run_adaptive_resource_probes(
+                "ai",
+                true,
+                &cancel,
+                |passed| assert!(passed),
+                || {
+                    Ok((
+                        successful_resource_result(
+                            "ping_proxy",
+                            "Proxy HTTPS ping",
+                            Duration::from_millis(1),
+                        ),
+                        (),
+                    ))
+                },
+                || Ok(Vec::new()),
+                |_, _| {
+                    cancel.store(cancellation_flag, Ordering::Relaxed);
+                    Err(if cancellation_flag {
+                        "interrupted"
+                    } else {
+                        "benchmark cancelled"
+                    }
+                    .to_owned())
+                },
+            )
+            .expect_err("service cancellation must not become a resource failure");
+            assert_eq!(error, "benchmark cancelled");
+        }
+
+        let job = search_job(1, 1, 1);
+        let persisted = Arc::new(Mutex::new(Vec::new()));
+        let collected = Arc::clone(&persisted);
+        run_bench_with_probe(
+            search_profiles(1),
+            Arc::clone(&job),
+            Arc::new(AtomicBool::new(false)),
+            Box::new(move |result| {
+                collected
+                    .lock()
+                    .expect("lock failed-service collection")
+                    .push(result)
+            }),
+            Some(Box::new(|_| {
+                panic!("failed search must not invoke post-actions")
+            })),
+            |profile, required, cancel, on_preflight, _| {
+                let required = required.expect("search admission supplies service prefix");
+                let tests = run_adaptive_resource_probes(
+                    required,
+                    true,
+                    cancel,
+                    on_preflight,
+                    || {
+                        Ok((
+                            successful_resource_result(
+                                "ping_proxy",
+                                "Proxy HTTPS ping",
+                                Duration::from_millis(1),
+                            ),
+                            (),
+                        ))
+                    },
+                    || Ok(Vec::new()),
+                    |_, _| Err("service unavailable".to_owned()),
+                )
+                .expect("ordinary service error keeps probe outcome")
+                .expect("ordinary service error keeps successful preflight");
+                let attempted = tests
+                    .iter()
+                    .filter(|test| test.attempts > 0)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let (_, error) = service_resource_outcome(&attempted, None);
+                let mut result = search_result(profile, required);
+                result.success = error.is_empty();
+                result.error = (!error.is_empty()).then_some(error);
+                result.resource_tests = tests;
+                Some(result)
+            },
+            || thread::sleep(Duration::from_millis(50)),
+        )
+        .expect("spawn search with ordinary service error")
+        .join()
+        .expect("failed-service search scheduler exits cleanly");
+        let state = job.lock().expect("lock failed-service search state");
+        let search = state
+            .search
+            .as_ref()
+            .expect("failed-service search has progress");
+        assert_eq!(state.completed, 1);
+        assert_eq!(state.results.len(), 1);
+        assert!(!state.results[0].success);
+        assert_eq!(
+            persisted
+                .lock()
+                .expect("lock collected service failure")
+                .len(),
+            1
+        );
+        assert_eq!(search.preflight_completed, 1);
+        assert_eq!(search.preflight_rejected, 0);
+        assert_eq!(search.quick_completed, 1);
+        assert_eq!(search.found_good, 0);
+        assert_eq!(search.finish_reason.as_deref(), Some("exhausted"));
+    }
+
+    #[test]
+    fn adaptive_scheduler_limits_in_flight_and_stops_without_cancel() {
+        for target in [1, 2] {
+            let job = search_job(12, target, 6);
+            let observed_job = Arc::clone(&job);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let persisted = Arc::new(Mutex::new(Vec::new()));
+            let observed_persisted = Arc::clone(&persisted);
+            run_bench_with_probe(
+                search_profiles(12),
+                Arc::clone(&job),
+                Arc::clone(&cancel),
+                Box::new(move |result| {
+                    observed_persisted
+                        .lock()
+                        .expect("lock persisted search results")
+                        .push(result)
+                }),
+                Some(Box::new(|_| panic!("target stop is intentionally partial"))),
+                move |profile, required, _, on_preflight, _| {
+                    let state = observed_job.lock().expect("lock admitted search candidate");
+                    assert!(
+                        state.active_profiles.len()
+                            + state
+                                .search
+                                .as_ref()
+                                .expect("admitted search has progress")
+                                .found_good
+                            <= target
+                    );
+                    drop(state);
+                    on_preflight(true);
+                    assert!(
+                        observed_job
+                            .lock()
+                            .expect("lock preflight search progress")
+                            .search
+                            .as_ref()
+                            .expect("preflight search has progress")
+                            .preflight_completed
+                            > 0
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                    Some(search_result(
+                        profile,
+                        required.expect("search admission supplies a service prefix"),
+                    ))
+                },
+                || thread::sleep(Duration::from_millis(50)),
+            )
+            .expect("spawn target-limited search scheduler")
+            .join()
+            .expect("target-limited search scheduler exits cleanly");
+            let state = job.lock().expect("lock completed target search");
+            assert_eq!(state.completed, target);
+            assert_eq!(state.total, 12);
+            assert_eq!(state.results.len(), target);
+            assert_eq!(
+                persisted
+                    .lock()
+                    .expect("lock collected target results")
+                    .len(),
+                target
+            );
+            assert!(!cancel.load(Ordering::Relaxed));
+            let search = state.search.as_ref().expect("target search has progress");
+            assert_eq!(search.found_good, target);
+            assert_eq!(search.quick_completed, target);
+            assert_eq!(search.finish_reason.as_deref(), Some("target_reached"));
+        }
+    }
+
+    #[test]
+    fn adaptive_scheduler_reuses_waiting_workers_after_failed_reservation() {
+        fn wait_until(cancel: &AtomicBool, ready: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cancel.load(Ordering::Relaxed) && !ready() {
+                if Instant::now() >= deadline {
+                    cancel.store(true, Ordering::Relaxed);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let job = search_job(4, 2, 4);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let probe_events = events_tx.clone();
+        let probe_phase = Arc::clone(&phase);
+        let probe_job = Arc::clone(&job);
+        let wait_phase = Arc::clone(&phase);
+        let wait_job = Arc::clone(&job);
+        let wait_cancel = Arc::clone(&cancel);
+        let handle = run_bench_with_probe(
+            search_profiles(4),
+            Arc::clone(&job),
+            Arc::clone(&cancel),
+            Box::new(|_| {}),
+            Some(Box::new(|_| {
+                panic!("search never invokes completion post-actions")
+            })),
+            move |profile, required, cancel, on_preflight, _| {
+                assert!(
+                    probe_job
+                        .lock()
+                        .expect("lock reserved test candidate")
+                        .active_profiles
+                        .len()
+                        <= 2
+                );
+                probe_events
+                    .send((thread::current().id(), Some(profile.id)))
+                    .expect("report reserved test candidate");
+                wait_until(cancel, || {
+                    probe_phase.load(Ordering::Relaxed) >= if profile.id == 0 { 1 } else { 2 }
+                });
+                if profile.id == 0 {
+                    on_preflight(false);
+                    None
+                } else {
+                    on_preflight(true);
+                    Some(search_result(
+                        profile,
+                        required.expect("reserved search has a service prefix"),
+                    ))
+                }
+            },
+            move || {
+                if wait_phase.load(Ordering::Relaxed) == 0 {
+                    events_tx
+                        .send((thread::current().id(), None))
+                        .expect("report initially saturated worker");
+                    wait_until(&wait_cancel, || wait_phase.load(Ordering::Relaxed) >= 1);
+                } else {
+                    wait_until(&wait_cancel, || {
+                        if wait_phase.load(Ordering::Relaxed) >= 2 {
+                            return true;
+                        }
+                        let state = wait_job.lock().expect("inspect released test reservation");
+                        state.completed == 1 && state.active_profiles.len() == 2
+                    });
+                    if wait_phase.load(Ordering::Relaxed) < 2
+                        && !wait_cancel.load(Ordering::Relaxed)
+                    {
+                        events_tx
+                            .send((thread::current().id(), None))
+                            .expect("report worker retry after failed reservation");
+                        wait_until(&wait_cancel, || wait_phase.load(Ordering::Relaxed) >= 2);
+                    }
+                }
+            },
+        )
+        .expect("spawn deterministic saturated-worker regression");
+
+        // Hold both reservations until every excess worker has entered the wait
+        // path. After failure, hold the replacement and observe the entire pool.
+        let mut initially_waiting = Vec::new();
+        let mut surviving_probe = None;
+        for _ in 0..4 {
+            let (worker, profile) = events_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("all four workers reach reserved or waiting state");
+            match profile {
+                None => initially_waiting.push(worker),
+                Some(1) => surviving_probe = Some(worker),
+                Some(0) => {}
+                _ => panic!("no replacement is admitted before a reservation fails"),
+            }
+        }
+        assert_eq!(initially_waiting.len(), 2);
+        phase.store(1, Ordering::Relaxed);
+        let mut resumed = std::collections::HashSet::new();
+        let mut replacement_seen = false;
+        while resumed.len() < 3 {
+            let (worker, profile) = events_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("idle workers return to scheduling after the failed reservation");
+            assert!(profile.is_none() || profile == Some(2));
+            replacement_seen |= profile == Some(2);
+            resumed.insert(worker);
+        }
+        assert!(replacement_seen);
+        assert!(
+            initially_waiting
+                .iter()
+                .all(|worker| resumed.contains(worker))
+        );
+        assert!(
+            !resumed.contains(&surviving_probe.expect("one original reservation remains active"))
+        );
+        {
+            let state = job.lock().expect("inspect restored parallel reservations");
+            assert_eq!(state.completed, 1);
+            assert_eq!(state.active_profiles.len(), 2);
+        }
+        phase.store(2, Ordering::Relaxed);
+        handle
+            .join()
+            .expect("retained worker pool reaches its target");
+        let state = job.lock().expect("inspect retained-worker search outcome");
+        assert_eq!(state.completed, 3);
+        assert_eq!(state.results.len(), 2);
+        assert_eq!(
+            state
+                .search
+                .as_ref()
+                .expect("retained-worker search has progress")
+                .found_good,
+            2
+        );
+        assert!(!cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn adaptive_scheduler_counts_raw_uniquely_and_preserves_results_on_cancel() {
+        for cancelled in [false, true] {
+            let job = search_job(3, 2, 1);
+            let mut profiles = search_profiles(3);
+            profiles[1].raw = profiles[0].raw.clone();
+            run_bench_with_probe(
+                profiles,
+                Arc::clone(&job),
+                Arc::new(AtomicBool::new(false)),
+                Box::new(|_| {}),
+                Some(Box::new(|_| panic!("no search post-actions"))),
+                move |profile, required, cancel, on_preflight, _| {
+                    if cancelled && profile.id == 1 {
+                        cancel.store(true, Ordering::Relaxed);
+                        return None;
+                    }
+                    on_preflight(true);
+                    Some(search_result(
+                        profile,
+                        required.expect("search admission supplies a service prefix"),
+                    ))
+                },
+                || thread::sleep(Duration::from_millis(50)),
+            )
+            .expect("spawn deduplicating search scheduler")
+            .join()
+            .expect("deduplicating search scheduler exits cleanly");
+            let state = job.lock().expect("lock deduplicated search state");
+            let search = state
+                .search
+                .as_ref()
+                .expect("deduplicated search has progress");
+            assert_eq!(state.completed, if cancelled { 1 } else { 3 });
+            assert_eq!(state.results.len(), state.completed);
+            assert_eq!(search.found_good, if cancelled { 1 } else { 2 });
+            assert_eq!(
+                search.finish_reason.as_deref(),
+                Some(if cancelled {
+                    "cancelled"
+                } else {
+                    "target_reached"
+                })
+            );
+            assert!(!state.running);
+            assert!(state.active_profiles.is_empty());
+        }
+    }
+
     #[test]
     fn run_bench_skips_completion_callback_after_cancellation() {
         let job = new_bench_job(BenchMethod::Quick, 0, 1);
@@ -3047,6 +5572,17 @@ mod tests {
         assert_eq!(benchmark_worker_count(4, 8), 4);
         assert_eq!(benchmark_worker_count(4, 2), 2);
         assert_eq!(benchmark_worker_count(9, 8), 6);
+        for (requested, total, expected_requested, expected_workers) in
+            [(0, 8, 1, 1), (4, 2, 4, 2), (9, 8, 6, 6)]
+        {
+            let job = new_bench_job(BenchMethod::Quick, total, requested);
+            let state = job
+                .lock()
+                .expect("inspect requested and effective worker counts");
+            assert_eq!(state.requested_concurrency, expected_requested);
+            assert_eq!(state.worker_count, expected_workers);
+            assert!(!state.memory_limited);
+        }
     }
 
     #[test]

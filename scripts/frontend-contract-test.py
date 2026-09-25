@@ -51,11 +51,12 @@ REQUIRED_MARKERS = [
     "/api/mihomo-config/validate",
     "/api/diagnostics/dns",
     "/api/diagnostics/udp-quic",
+    "/api/diagnostics/direct-availability",
     "/api/telegram-probe/status",
     "/api/telegram-probe/request-code",
     "/api/telegram-probe/confirm",
     "/api/telegram-probe/delete",
-    "v1.3.6",
+    "v1.3.28",
     "/api/memory-guard",
     "/api/subscriptions/refresh-report",
     "/api/undo",
@@ -72,12 +73,72 @@ REQUIRED_MARKERS = [
     'id="benchConcurrency"',
     'id="benchConcurrency" data-native-select="1"',
     'label for="benchConcurrency"',
-    'id="benchFullAll"',
-    "function fullBenchAll()",
+    'id="benchSearchTarget" type="number" min="1" max="20" step="1" value="5"',
+    'id="benchSearchServices" data-native-select="1"',
+    '<option value="youtube">YT</option><option value="telegram">YT+TG</option><option value="ai">YT+TG+AI</option>',
+    'id="benchSearchAll"',
+    'id="benchDetails"',
+    'id="benchAdvancedParameters"',
+    'id="benchAdvancedSearch" onclick="startServerSearch({advanced:true})"',
+    'id="benchNativeCompatibility"',
+    'id="benchResultStatus"',
+    'id="benchSearchSelected"',
+    'id="benchSearchStopMode" data-native-select="1"',
+    'id="benchSearchFailFast"',
+    'Стоп после сбоя YT/TG',
+    'Stop after YT/TG failure',
+    'Services and stop after failure are shared by all checks',
+    "required_services:'all',fail_fast:false",
+    'body.service_checks = {required_services,fail_fast}',
+    'Even if all ping checks fail, YouTube is still tested',
+    'Ping failure alone does not prove unreachability',
+    'id="benchSelectionSearchHelp"',
+    'id="benchConcurrencyStatus"',
+    'id="benchConcurrencyHelp"',
+    'YouTube channel and thumbnails (contract 1) run in parallel across admitted workers',
+    'Each candidate has its own private temporary core and files; decoder limits are unchanged',
+    'Native YouTube (contract 7) and the shared Telegram session remain serialized',
+    'Ordinary explicit-policy checks require min(requested, candidates) workers or HTTP 503',
+    '4 workers need an estimated 272 MiB available memory',
+    'id="benchSearchPartialHelp"',
+    'id="benchSearchHelp"',
+    'id="benchYouTubeHelp"',
+    'only the @MrBeast channel page and 3 thumbnails',
+    'not video playback',
+    'id="benchSearchStatus"',
+    'id="benchInconclusiveStatus"',
+    'id="benchInconclusive"',
+    'id="benchPreflightDiagnostics"',
+    'id="benchPreflightFailures"',
+    'function hasInconclusiveTests(resourceTests)',
+    'function renderBenchDiagnostics(data)',
+    'function boundedDiagnosticText(value, maxBytes = 2048)',
+    'data?.summary?.inconclusive',
+    'data.preflight_failures.slice(-20)',
+    '.profile-service-test.unknown{color:var(--warning)',
+    'function startServerSearch(scope)',
+    'function syncServerSearchParameters(changed)',
+    'function renderBenchConcurrencyStatus(data)',
+    'data?.concurrency_status',
+    'data?.requested_concurrency',
+    "limit_reasons.slice(0,3)",
+    "hr_search_",
+    'function renderBenchSearchStatus(data)',
+    'search.preflight_completed',
+    'search.preflight_rejected',
+    'search.quick_completed',
+    'search.found_good',
+    'search.finish_reason',
     "concurrency: benchConcurrency()",
     "function normalizeBenchConcurrency(value)",
     "localStorage.getItem('hr_bench_concurrency')",
     'id="benchPromoteSuccessful"',
+    'id="benchNativePostActionsLabel"',
+    'Нативные пост-действия (совместимость)',
+    'Native post-actions (compatibility)',
+    'settings apply to legacy native tests; thumbnail checks do not trigger them',
+    'both complete scope and N servers, never triggers server promotion, movement to Dead Servers, or AutoSelect',
+    'YouTube @MrBeast channel page and 3 thumbnails, Telegram media, and the AI Studio region',
     'id="benchAutoMoveNoPing"',
     "function loadProfileTestSettings()",
     "function saveProfileTestSettings()",
@@ -87,8 +148,7 @@ REQUIRED_MARKERS = [
     "apiAction('POST','/api/bench/settings'",
     "active_profiles",
     'data-bench-scope="single"',
-    'data-bench-scope="group"',
-    "method: 'quick'",
+    'function benchGroup(ids)',
     "https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/whitelist.txt",
     "reader.readAsText(file, 'UTF-8');",
     "function handleGeoBaseFile(event)",
@@ -124,18 +184,19 @@ REQUIRED_MARKERS = [
     "Math.min(15000, 2000 * (2 ** geobasePollFailures))",
     "runtime.running === true",
     "sr.auto_vpn_learning_enabled === true",
-    "function quickBenchSelected()",
-    "method:'quick', test_download:false, test_upload:false",
-    "function profileServiceTestsHtml(resourceTests)",
-    "resourceTests.filter(test => test.contract_version === 6)",
-    "profile-service-test ${skipped?'skipped':ok?'ok':'bad'}",
-    "[['youtube','YT'],['telegram','TG'],['ai','AI']]",
+    "function profileServiceTestsHtml(resourceTests, serviceTimestamp, now = Math.floor(Date.now()/1000))",
+    "profileServiceTestsHtml(p.resource_tests,p.last_service_test_unix)",
+    "function isCurrentSearchResourceTest(test)",
+    "function hasCurrentThumbnailTest(resourceTests)",
+    "resourceTests.filter(isCurrentSearchResourceTest)",
+    "profile-service-test ${inconclusive?'unknown':skipped?'skipped':ok?'ok':'bad'}",
+    "[['youtube_thumbnails','YT'],['telegram','TG'],['ai','AI']]",
     "startsWith('ping_')",
-    "last_service_test_success: st.last_service_test_success ?? null",
+    "last_service_test_success: !hasCurrentThumbnailTest(resource_tests) || hasInconclusiveTests(resource_tests) ? null : st.last_service_test_success ?? null",
     "function toggleProfileMetricSettings(event)",
     "hr_profile_metrics",
     "data-profile-metric=\"latency\"",
-    "resource_tests: Array.isArray(st.resource_tests) ? st.resource_tests : []",
+    "const resource_tests = Array.isArray(st.resource_tests)",
     "Домены из списка всегда идут через VPN",
     "🚂 Паровозик",
     "id=\"rParovozikEnabled\"",
@@ -145,6 +206,7 @@ REQUIRED_MARKERS = [
     "function renderParovozikServers(selectedRefs)",
     "function toggleParovozikWagon(serverRef)",
     "function saveParovozikConsist()",
+    'id="rParovozikConsist"',
     "Сохранить состав вагонов",
     "const subscription = subscriptionForGroup(group);",
     "subscription?.title || shortGroupName(group || t('Без группы'))",
@@ -153,6 +215,25 @@ REQUIRED_MARKERS = [
     "if (!parovozikConsistDirty) renderParovozikServers(sr.parovozik_server_refs);",
     "Паровозик Direct",
     "Паровозик VPN",
+    "id=\"torrentSocksCard\"",
+    "id=\"rTorrentSocksEnabled\"",
+    "id=\"rTorrentSocksListen\"",
+    "id=\"rTorrentSocksPassword\" type=\"password\"",
+    "id=\"rTorrentSocksPasswordLength\"",
+    "function updateTorrentSocksPasswordHint()",
+    "new TextEncoder().encode(password).length",
+    "id=\"rTorrentSocksTarget\" data-routing-target-select=\"1\"",
+    "const torrentSettings = {",
+    "if (torrentPassword) torrentSettings.password = torrentPassword;",
+    "body.torrent_socks = torrentSettings;",
+    "const torrent = sr.torrent_socks || {};",
+    "safeValue('rTorrentSocksPassword', '');",
+    "torrent.password_set ? t('Пароль настроен') : t('Пароль не настроен')",
+    "id=\"rTorrentSocksClear\"",
+    "авторизация панели не требуется",
+    "function clearTorrentSocksCredentials()",
+    "torrent_socks:{enabled:false,clear_credentials:true}",
+    "function refreshTorrentSocksTargetSelect(selectedTarget)",
     "safeChecked('autoSwitchEnabled', sr.auto_switch);",
     "safeChecked('rAutoSwitch', d.auto_switch);",
     "managed_routing_rules: []",
@@ -169,6 +250,7 @@ REQUIRED_MARKERS = [
     "result.activation_error || t('требуется повторное применение')",
     "Array.isArray(result.errors) && result.errors.length",
     "/api/routing/resource-route",
+    "/api/routing/resource-reload",
     "/api/routing/explain",
     "/api/routing/preview",
     "/api/routing/connection-context",
@@ -181,15 +263,25 @@ REQUIRED_MARKERS = [
     "api('POST','/api/mihomo-api/connections/page',{query,offset,limit:CONNECTIONS_TABLE_PAGE_SIZE},true)",
     "function changeConnectionsTablePage(direction)",
     "api('POST','/api/mihomo-api/connections/device-traffic',{source_ips},true)",
-    "data-testid=\"connections-action\" data-native-select=\"1\" data-resource=\"${resource}\" onchange=\"routeConnectionResource(this)\"",
+    "data-testid=\"connections-action\" data-routing-target-select=\"1\" data-searchable-select=\"1\"",
     "select:not([data-native-select]):not([data-custom-select-enhanced])",
     "select.dataset.nativeSelect",
     "function routeConnectionResource(select)",
     "const resource = String(select?.dataset?.resource || '').trim();",
-    "data-resource=\"${resource}\" onclick=\"reloadConnectionResource(this)\"",
+    "onclick=\"reloadConnectionResource(this)\"",
     "function reloadConnectionResource(button)",
     "const resource = String(button?.dataset?.resource || '').trim();",
-    "api('POST','/api/mihomo-api/connections/close',{resource})",
+    "api('POST','/api/routing/resource-reload',request)",
+    "function connectionRoutingSelectOpen()",
+    "if (connectionRoutingEditorActive()) {",
+    "function populateCustomSelectMenu(select, shell, menu)",
+    "routing-target-dialog",
+    "function routingEditActive()",
+    "function flushDeferredRoutingReload()",
+    "if (!options.force && routingEditActive())",
+    "function deleteRoutingRule(idx)",
+    "onclick=\"deleteRoutingRule(${i})\"",
+    "data-searchable-select=\"1\"",
     "Маршрутизация по серверам",
     "MOCK.routing_servers = Array.isArray(d.servers) ? d.servers : [];",
     "`server:${String(server.ref)}`",
@@ -246,7 +338,7 @@ REQUIRED_MARKERS = [
     "api('POST','/api/trash/move',{server_refs})",
     "api('POST','/api/trash/restore',{server_refs})",
     "function benchSubscription(subscriptionUrl)",
-    "{subscription_url:subscriptionUrl, method:'quick'}",
+    "{subscription_url:subscriptionUrl}",
     "server_ref: p.server_ref || st.server_ref",
     "dead: p.dead ?? st.dead ?? false",
     "const byServerRef = new Map();",
@@ -285,6 +377,21 @@ REQUIRED_MARKERS = [
 ]
 
 FORBIDDEN_MARKERS = [
+    'These actions apply only after a complete, non-cancelled complete-scope check',
+    'Вся область: все текущие проверки Ping+YT+TG+AI',
+    'Остановить проверки сервера при первом сбое',
+    'First failure stops checks for that server',
+    'id="benchFullAll"',
+    'id="benchQuickSelected"',
+    'id="benchFindAll"',
+    'id="benchFindSelected"',
+    'function quickBenchSelected(',
+    'function fullBenchAll(',
+    'function findBenchServers(',
+    'function startBenchWithIds(',
+    'function startBenchScope(',
+    'function quickTestTrash(',
+    'function quickTestAllTrash(',
     'data-profile-metric="download"',
     'data-profile-metric="upload"',
     'data-profile-metric="ewma"',
@@ -625,6 +732,281 @@ def verify_reduced_mihomo_features(html_text: str) -> str | None:
     return None
 
 
+def verify_discovery(html_text: str) -> str | None:
+    try:
+        start = "\n".join(js_function(html_text, name) for name in ("startServerSearch", "benchOne", "benchGroup", "benchSubscription"))
+        poll = js_function(html_text, "pollBenchStatus")
+        update = js_function(html_text, "updateBenchStatus")
+    except ValueError as error:
+        return str(error)
+    if "if (benchPollInFlight)" not in poll or "setInterval" in poll:
+        return "discovery must reuse single-flight benchmark polling"
+    if "!data?.search && !running && results.length && isGroup" not in update:
+        return "discovery must not show the generic passed/failed summary"
+    sidebar_progress = html_text.split('id="benchProgress"', 1)[1].split('id="longOperationProgress"', 1)[0]
+    details = html_text.split('id="benchDetails"', 1)[1].split('<h3', 1)[0]
+    for dom_id in ("benchSearchStatus", "benchConcurrencyStatus", "benchConcurrencyHelp", "benchSearchPartialHelp", "benchInconclusiveStatus", "benchSummary", "benchPreflightDiagnostics"):
+        if f'id="{dom_id}"' in sidebar_progress or f'id="{dom_id}"' not in details:
+            return "technical service diagnostics must live in collapsed Profiles details, not the sidebar"
+    concurrency_help = details.split('id="benchConcurrencyHelp"', 1)[1].split('</p>', 1)[0]
+    for marker in ("Канал и превью YouTube (контракт 1) проверяются параллельно", "общая сессия Telegram", "контракт 7", "лимиты декодера прежние", "min(запрошено, кандидаты)", "HTTP 503", "272 МиБ доступной памяти"):
+        if marker not in concurrency_help:
+            return "collapsed concurrency help must distinguish parallel thumbnails, serialized native/session probes, and exact memory admission"
+    if "YouTube и Telegram выполняются последовательно" in html_text or "YouTube and Telegram are serialized:" in html_text:
+        return "concurrency help must not describe thumbnail checks as serialized"
+    program = f"""
+const controls = {{benchSearchStopMode:{{value:'complete_scope'}},benchSearchFailFast:{{checked:false}},benchSearchTarget:{{value:'5'}},benchSearchServices:{{value:'all'}}}};
+const document = {{getElementById:id => controls[id]}};
+let posted = [], errors = [], selected = [];
+let benchResultFingerprint, benchWasRunning;
+const window = {{benchIsGroup:true}};
+const MOCK = {{profiles:[{{id:42,dead:false}},{{id:43,dead:true}}]}};
+const t = text => text;
+const showToast = (kind, text) => errors.push(text);
+const selectedProfiles = () => selected;
+const benchConcurrency = () => 4;
+const renderBenchConcurrencyStatus = () => {{}};
+const pollBenchStatus = () => {{}};
+const api = (method, path, body) => {{
+  if (method !== 'POST' || path !== '/api/bench/start') throw new Error('unexpected API');
+  posted.push(body);
+  return Promise.resolve({{}});
+}};
+// Primary scopes retain full availability intent, with explicit shared policy and no discovery.
+const assertPolicy = (body, services, failFast) => {{
+  if (body.method !== 'availability_full' || 'search' in body || JSON.stringify(body.service_checks) !== JSON.stringify({{required_services:services,fail_fast:failFast}})) throw new Error('explicit full-scope service policy');
+}};
+{start}
+startServerSearch();
+if (JSON.stringify(posted[0]) !== JSON.stringify({{method:'availability_full',concurrency:4,test_download:false,test_upload:false,service_checks:{{required_services:'all',fail_fast:false}}}})) throw new Error('default complete-scope body');
+controls.benchSearchFailFast.checked = true;
+startServerSearch();
+assertPolicy(posted.at(-1),'all',true);
+startServerSearch({{advanced:true}});
+assertPolicy(posted.at(-1),'all',true);
+selected = [{{id:42,dead:false}},{{id:43,dead:true}}];
+startServerSearch({{selected:true}});
+if (posted.at(-1).method !== 'availability_full' || posted.at(-1).profile_ids.join(',') !== '42,43') throw new Error('explicit selection full-scope intent');
+controls.benchSearchStopMode.value = 'find_n';
+controls.benchSearchServices.value = 'youtube';
+startServerSearch();
+assertPolicy(posted.at(-1),'youtube',true);
+startServerSearch({{advanced:true}});
+if (posted.at(-1).method !== 'availability_quick' || posted.at(-1).search.required_services !== 'youtube' || posted.at(-1).search.fail_fast !== true || 'service_checks' in posted.at(-1)) throw new Error('explicit discovery policy');
+for (const service of ['all','youtube','telegram','ai']) {{
+  controls.benchSearchServices.value = service;
+  for (const failFast of [false,true]) {{
+    controls.benchSearchFailFast.checked = failFast;
+    for (const scope of [{{}},{{selected:true}},{{profile_ids:[42]}},{{profile_ids:[42,43]}},{{profile_ids:[43],diagnostic:true}},{{subscription_url:'https://provider.example/sub/<token>'}}]) {{
+      startServerSearch(scope);
+      assertPolicy(posted.at(-1),service,failFast);
+      if (posted.at(-1).concurrency !== 4) throw new Error('requested concurrency changed');
+    }}
+    startServerSearch({{advanced:true}});
+    if (JSON.stringify(posted.at(-1).search) !== JSON.stringify({{target_good:5,required_services:service,fail_fast:failFast}}) || 'service_checks' in posted.at(-1)) throw new Error('advanced prefix/fail-fast policy');
+  }}
+}}
+let count = posted.length;
+for (const value of ['', '0', '21', '1.5', '-1']) {{
+  controls.benchSearchTarget.value = value;
+  startServerSearch({{advanced:true}});
+}}
+if (posted.length !== count || errors.length !== 5) throw new Error('target bounds');
+controls.benchSearchTarget.value = '20';
+controls.benchSearchServices.value = 'invalid';
+startServerSearch({{advanced:true}});
+if (posted.length !== count) throw new Error('service validation');
+controls.benchSearchServices.value = 'ai';
+selected = [];
+startServerSearch({{selected:true}});
+selected = [{{id:43,dead:true}}];
+startServerSearch({{selected:true}});
+if (posted.at(-1).profile_ids.join(',') !== '43' || posted.at(-1).method !== 'availability_full' || 'search' in posted.at(-1)) throw new Error('explicit dead selection became discovery');
+count = posted.length;
+for (const ids of [[], undefined, null, ['42'], [-1]]) benchGroup(ids);
+benchSubscription(undefined);
+startServerSearch({{subscription_url:''}});
+startServerSearch({{selected:true,profile_ids:[42]}});
+startServerSearch({{subscription_url:'https://provider.example/sub/<token>',profile_ids:[42]}});
+if (posted.length !== count) throw new Error('scope/count guards');
+benchOne(42);
+if (posted.at(-1).profile_ids.join(',') !== '42' || posted.at(-1).method !== 'availability_full' || 'search' in posted.at(-1)) throw new Error('single scope');
+benchGroup([42,43]);
+if (posted.at(-1).profile_ids.join(',') !== '42,43' || posted.at(-1).method !== 'availability_full' || 'search' in posted.at(-1)) throw new Error('complete explicit group');
+benchSubscription('https://provider.example/sub/<token>');
+if (posted.at(-1).subscription_url !== 'https://provider.example/sub/<token>' || posted.at(-1).method !== 'availability_full' || 'search' in posted.at(-1) || 'profile_ids' in posted.at(-1)) throw new Error('subscription scope');
+controls.benchSearchTarget.value = '';
+controls.benchSearchServices.value = 'ai';
+controls.benchSearchFailFast.checked = false;
+benchOne(43);
+startServerSearch({{profile_ids:[43],diagnostic:true}});
+if (posted.slice(-2).some(body => body.method !== 'availability_full' || 'search' in body || body.profile_ids.join(',') !== '43')) throw new Error('dead diagnostics retain full-scope intent');
+posted.slice(-2).forEach(body => assertPolicy(body,'ai',false));
+controls.benchSearchFailFast.checked = true;
+startServerSearch({{profile_ids:[43],diagnostic:true}});
+assertPolicy(posted.at(-1),'ai',true);
+for (const mode of ['find_n','unsupported']) {{
+  controls.benchSearchStopMode.value = mode;
+  controls.benchSearchTarget.value = '0';
+  controls.benchSearchServices.value = 'youtube';
+  startServerSearch();
+  assertPolicy(posted.at(-1),'youtube',true);
+}}
+count = posted.length;
+controls.benchSearchServices.value = 'invalid';
+startServerSearch();
+benchOne(43);
+if (posted.length !== count) throw new Error('primary service policy validation missing');
+controls.benchSearchStopMode.value = 'find_n';
+controls.benchSearchTarget.value = '5';
+controls.benchSearchServices.value = 'all';
+count = posted.length;
+for (const scope of [{{profile_ids:[42]}},{{subscription_url:'https://provider.example/sub/<token>'}},{{selected:true}},{{selected:false}},{{diagnostic:true}},{{diagnostic:false}}]) {{
+  startServerSearch({{...scope,advanced:true}});
+}}
+for (const advanced of [false,'true',1,null]) startServerSearch({{advanced}});
+if (posted.length !== count) throw new Error('ambiguous advanced/scoped request accepted');
+if (window.benchIsGroup !== true) throw new Error('presentation changed before start acceptance');
+"""
+    result = subprocess.run(["node", "-e", program], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return (result.stderr or result.stdout).strip()
+    return None
+
+
+def verify_inconclusive_diagnostics(html_text: str) -> str | None:
+    try:
+        functions = "\n".join(js_function(html_text, name) for name in (
+            "isCurrentSearchResourceTest", "hasCurrentThumbnailTest", "hasInconclusiveTests", "searchResourceEvidence", "isFreshServiceTest", "profileServiceTestsHtml", "profileResultRank", "profileSuccessfulChecks", "profilePingMs", "getSortValue", "applyProfileSort",
+            "boundedDiagnosticText", "renderBenchDiagnostics",
+            "mergeBenchResultsIntoProfiles", "overlayAvailabilityEvidence", "normalizeProfiles",
+        ))
+        for name in ("attrEscape", "htmlEscape"):
+            match = re.search(rf"function {name}\([^\n]*\) \{{\n.*?\n\}}", html_text, re.S)
+            if not match:
+                raise ValueError(f"missing escaping helper {name}")
+            functions += "\n" + match.group(0)
+        update = js_function(html_text, "updateBenchStatus")
+    except ValueError as error:
+        return str(error)
+    if "results.filter(r => !hasInconclusiveTests(r.resource_tests))" not in update:
+        return "inconclusive jobs must be excluded from passed and failed counts"
+    for name in ("mergeBenchResultsIntoProfiles", "overlayAvailabilityEvidence"):
+        if "last_checked" in js_function(html_text, name):
+            return "resource freshness must never use the generic health timestamp"
+    program = f"""
+const t = text => text;
+const PREVIEW_MODE = false;
+let profileSortState = {{key:'results',dir:'desc'}};
+const elements = Object.fromEntries(['benchInconclusive','benchInconclusiveStatus','benchPreflightDiagnostics','benchPreflightFailures'].map(id => [id,{{style:{{}},textContent:'',innerHTML:''}}]));
+const document = {{getElementById:id => elements[id]}};
+const safeSet = (id,text) => {{ if (elements[id]) elements[id].textContent = text; }};
+const MOCK = {{profiles:[{{id:42,server_ref:'srv-v2-fixture',last_service_test_success:true}}]}};
+let benchResultFingerprint = '', renders = 0;
+const benchAvailabilityEvidence = new Map();
+const renderProfiles = () => renders++;
+{functions}
+const resource = {{contract_version:1,id:'youtube_thumbnails',name:'YouTube channel/thumbnails',attempts:1,successes:1,stable:true,inconclusive:false}};
+const result = {{profile_id:42,server_ref:'srv-v2-fixture',method:'availability_quick',timestamp:1,success:true,latency_ms:100,resource_tests:[resource]}};
+mergeBenchResultsIntoProfiles([result]);
+resource.inconclusive = true;
+resource.error = 'HTTP 200: LOGIN_REQUIRED <img src=x>';
+mergeBenchResultsIntoProfiles([result]);
+if (renders !== 2 || MOCK.profiles[0].last_service_test_success !== null) throw new Error('unknown transition/legacy success');
+result.success = false;
+mergeBenchResultsIntoProfiles([result]);
+if (MOCK.profiles[0].last_service_test_success !== null) throw new Error('legacy false is not an inconclusive failure');
+for (const attempts of [0,1]) {{
+  resource.attempts = attempts;
+  const badge = profileServiceTestsHtml([resource],1,1);
+  if (!badge.includes('profile-service-test unknown') || badge.includes('profile-service-test ok') || badge.includes('profile-service-test bad') || badge.includes('<img')) throw new Error('unknown badge priority/escaping');
+}}
+if (profileSuccessfulChecks({{resource_tests:[resource],last_service_test_unix:Math.floor(Date.now()/1000)}}) !== 0) throw new Error('unknown ranked as a successful check');
+if (!profileServiceTestsHtml([{{...resource,contract_version:6}}]).includes('Устаревший результат; требуется новая проверка')) throw new Error('obsolete v6 outcome not neutral');
+for (const native of [{{...resource,id:'youtube',contract_version:7}},{{...resource,contract_version:7}},{{...resource,contract_version:2}}]) {{
+  const badges = profileServiceTestsHtml([native],Math.floor(Date.now()/1000));
+  if (isCurrentSearchResourceTest(native) || hasCurrentThumbnailTest([native]) || (badges.match(/profile-service-test (?:skipped|stale)/g) || []).length !== 3 || badges.includes('profile-service-test ok') || profileSuccessfulChecks({{resource_tests:[native],last_service_test_unix:Math.floor(Date.now()/1000)}}) !== 0) throw new Error('native video or obsolete thumbnails used as availability evidence');
+}}
+if (!isCurrentSearchResourceTest({{id:'telegram',contract_version:7}}) || !isCurrentSearchResourceTest({{id:'ai',contract_version:7}})) throw new Error('native Telegram/AI contract lost');
+mergeBenchResultsIntoProfiles([{{...result,method:'quick',resource_tests:[{{id:'youtube',contract_version:7,stable:true}}]}}]);
+if (MOCK.profiles[0].resource_tests[0].id !== 'youtube_thumbnails') throw new Error('native cache overwrote thumbnail evidence');
+const olderProfile = {{id:42,server_ref:'srv-v2-fixture',last_checked:300,last_service_test_unix:0,resource_tests:[]}};
+overlayAvailabilityEvidence([olderProfile]);
+if (olderProfile.resource_tests[0]?.id !== 'youtube_thumbnails' || olderProfile.last_service_test_success !== null) throw new Error('older refresh erased current availability evidence');
+const reusedProfile = {{id:42,server_ref:'srv-v2-replacement',resource_tests:[]}};
+overlayAvailabilityEvidence([reusedProfile]);
+if (reusedProfile.resource_tests.length || benchAvailabilityEvidence.size) throw new Error('overlay rebound evidence to a reused ID');
+MOCK.profiles = [reusedProfile];
+mergeBenchResultsIntoProfiles([{{...result,timestamp:2}}]);
+if (reusedProfile.resource_tests.length) throw new Error('retained result rebound to a reused ID');
+const {{server_ref:ignored,...missingRef}} = result;
+mergeBenchResultsIntoProfiles([{{...missingRef,timestamp:3,profile_name:'Same Name'}}]);
+if (reusedProfile.resource_tests.length || benchAvailabilityEvidence.size) throw new Error('missing result ref attributed by ID/name');
+const remapped = {{id:43,server_ref:result.server_ref,name:'Same Name',last_checked:300,last_service_test_unix:0,resource_tests:[]}};
+const alias = {{id:44,server_ref:result.server_ref,name:'Same Name',resource_tests:[]}};
+MOCK.profiles = [reusedProfile,remapped,alias];
+mergeBenchResultsIntoProfiles([{{...result,profile_id:43,timestamp:3}}]);
+if (remapped.resource_tests[0]?.id !== 'youtube_thumbnails' || alias.resource_tests.length || reusedProfile.resource_tests.length) throw new Error('public mapped ID/ref alias attribution');
+mergeBenchResultsIntoProfiles([{{...result,profile_id:43,timestamp:2,resource_tests:[]}}]);
+if (remapped.resource_tests[0]?.id !== 'youtube_thumbnails' || benchAvailabilityEvidence.get(43).timestamp !== 3) throw new Error('older result erased newer evidence');
+const changedRef = {{...result,profile_id:42,server_ref:'srv-v2-unknown',timestamp:4}};
+mergeBenchResultsIntoProfiles([changedRef]);
+changedRef.server_ref = reusedProfile.server_ref;
+mergeBenchResultsIntoProfiles([changedRef]);
+if (reusedProfile.resource_tests[0]?.id !== 'youtube_thumbnails') throw new Error('result-ref fingerprint ignored');
+const publicRef = 'srv-v2-00000000000000000000000000000050';
+const metadata = {{profiles:[{{id:50,server_ref:publicRef}}]}};
+const preview = {{id:'youtube_thumbnails',contract_version:1,attempts:1,successes:1,stable:true}};
+const now = Math.floor(Date.now()/1000);
+for (const timestamp of [undefined,null,0,-1,now-21601,now+61,Infinity,NaN]) {{
+  if (isFreshServiceTest(timestamp,now)) throw new Error('invalid/stale clock accepted');
+  const badges = profileServiceTestsHtml([preview],timestamp,now);
+  if (!badges.includes('data-state="stale"') || badges.includes('profile-service-test ok') || badges.includes('profile-service-test bad')) throw new Error('stale thumbnail evidence rendered as current/failed');
+}}
+for (const timestamp of [now-21600,now,now+1,now+60]) {{
+  if (!isFreshServiceTest(timestamp,now) || !profileServiceTestsHtml([preview],timestamp,now).includes('profile-service-test ok')) throw new Error('fresh clock boundary rejected');
+}}
+const stale = {{id:'stale',last_service_test_unix:now-7*86400,last_checked:now+86400,last_service_test_success:true,resource_tests:[preview]}};
+const fresh = {{id:'fresh',last_service_test_unix:now,last_service_test_success:true,resource_tests:[preview]}};
+if (profileSuccessfulChecks(stale) !== 0 || profileSuccessfulChecks(fresh) !== 1 || applyProfileSort([stale,fresh])[0].id !== 'fresh') throw new Error('stale service evidence counted/ranked as current');
+if (!profileServiceTestsHtml([{{...preview,attempts:0}}],now,now).includes('data-state="skipped"') || !profileServiceTestsHtml([],0,now).includes('data-state="not-tested"')) throw new Error('skipped/not-tested distinction lost');
+const stored = {{profile_id:50,server_ref:publicRef,last_checked:300,last_service_test_unix:100,resource_tests:[{{...preview,stable:false,successes:0}}]}};
+for (const method of ['availability_quick','availability_full','search_availability']) {{
+  benchAvailabilityEvidence.clear();
+  MOCK.profiles = normalizeProfiles({{stats:[stored]}}, metadata);
+  if (MOCK.profiles[0].last_service_test_unix !== 100) throw new Error('public service timestamp not normalized');
+  mergeBenchResultsIntoProfiles([{{profile_id:50,server_ref:publicRef,timestamp:200,method,success:true,resource_tests:[preview]}}]);
+  if (MOCK.profiles[0].resource_tests[0].stable !== true || MOCK.profiles[0].last_service_test_unix !== 200 || benchAvailabilityEvidence.get(50)?.timestamp !== 200) throw new Error('generic health timestamp suppressed service pass');
+  const refreshed = normalizeProfiles({{stats:[{{...stored,last_checked:400}}]}}, metadata);
+  overlayAvailabilityEvidence(refreshed);
+  if (refreshed[0].resource_tests[0].stable !== true || refreshed[0].last_service_test_unix !== 200 || refreshed[0].last_checked !== 400 || benchAvailabilityEvidence.get(50).timestamp !== 200) throw new Error('generic health refresh replaced service evidence/time');
+}}
+for (const timestamp of [undefined,0]) {{
+  benchAvailabilityEvidence.clear();
+  MOCK.profiles = normalizeProfiles({{stats:[{{...stored,last_service_test_unix:timestamp}}]}}, metadata);
+  overlayAvailabilityEvidence(MOCK.profiles);
+  if (MOCK.profiles[0].last_service_test_unix !== 0 || benchAvailabilityEvidence.size) throw new Error('unknown source clock invented from health');
+  for (const test of [{{id:'telegram',contract_version:7,attempts:1,stable:true}},{{id:'youtube',contract_version:7,attempts:1,stable:true}}]) {{
+    mergeBenchResultsIntoProfiles([{{profile_id:50,server_ref:publicRef,timestamp:500,method:'availability_quick',success:true,resource_tests:[test]}}]);
+    if (MOCK.profiles[0].last_service_test_unix !== 0 || benchAvailabilityEvidence.size) throw new Error('non-thumbnail result advanced service overlay clock');
+  }}
+}}
+const longError = '<img src=x> https://provider.example/sub/<token> '+ '\u0416'.repeat(2200);
+const bounded = boundedDiagnosticText(longError);
+if (new TextEncoder().encode(bounded).length > 2048 || bounded.includes('\uFFFD')) throw new Error('UTF-8 diagnostic bound');
+renderBenchDiagnostics({{results:[result],summary:{{inconclusive:1}},preflight_failures:Array.from({{length:25}},(_,i) => ({{profile_id:i,phase:'transport',error:longError,raw:'CANARY',username:'CANARY'}})),raw:'CANARY'}});
+if (elements.benchInconclusive.textContent !== '1') throw new Error('unknown jobs double counted');
+const diagnostics = elements.benchPreflightFailures.innerHTML;
+if ((diagnostics.match(/<li>/g) || []).length !== 20 || diagnostics.includes('CANARY') || diagnostics.includes('<img') || !diagnostics.includes('#5 ')) throw new Error('diagnostic whitelist/bound/escaping');
+renderBenchDiagnostics({{results:[],preflight_failures:[]}});
+if (elements.benchPreflightDiagnostics.style.display !== 'none' || elements.benchPreflightFailures.innerHTML !== '') throw new Error('stale diagnostics');
+"""
+    result = subprocess.run(["node", "-e", program], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return (result.stderr or result.stdout).strip()
+    return None
+
+
 def main() -> int:
     html_text = HTML.read_text(encoding="utf-8")
     missing_markers = [marker for marker in REQUIRED_MARKERS if marker not in html_text]
@@ -650,9 +1032,11 @@ def main() -> int:
     geobase_parser_error = verify_geobase_network_parser(html_text)
     dead_server_projection_error = verify_dead_server_projection(html_text)
     mihomo_features_error = verify_reduced_mihomo_features(html_text)
+    discovery_error = verify_discovery(html_text)
+    inconclusive_error = verify_inconclusive_diagnostics(html_text)
     rule_target_markup = re.search(r'<select id="ruleTarget">(?P<body>.*?)</select>', html_text, re.S)
     numeric_profile_targets = re.findall(r"profile:\d+", rule_target_markup.group("body") if rule_target_markup else "")
-    if missing_markers or forbidden_markers or numeric_profile_targets or missing_system_ids or missing_dead_server_ids or missing_profile_logger_ids or missing_geobase_ids or duplicate_geobase_ids or missing_geobase_routes or missing_profile_logger_routes or nav_without_panel or nav_without_map or map_without_panel or missing_routes or sort_error or geobase_parser_error or dead_server_projection_error or mihomo_features_error:
+    if missing_markers or forbidden_markers or numeric_profile_targets or missing_system_ids or missing_dead_server_ids or missing_profile_logger_ids or missing_geobase_ids or duplicate_geobase_ids or missing_geobase_routes or missing_profile_logger_routes or nav_without_panel or nav_without_map or map_without_panel or missing_routes or sort_error or geobase_parser_error or dead_server_projection_error or mihomo_features_error or discovery_error or inconclusive_error:
         if missing_markers:
             print("Missing required UI markers:")
             for marker in missing_markers:
@@ -717,6 +1101,10 @@ def main() -> int:
             print(f"Dead Servers virtual projection contract failed: {dead_server_projection_error}")
         if mihomo_features_error:
             print(f"Reduced Mihomo features contract failed: {mihomo_features_error}")
+        if discovery_error:
+            print(f"Adaptive discovery contract failed: {discovery_error}")
+        if inconclusive_error:
+            print(f"Inconclusive outcome/diagnostics contract failed: {inconclusive_error}")
         return 1
     print(f"frontend contract ok: {len(used)} UI routes checked")
     return 0

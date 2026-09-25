@@ -215,17 +215,28 @@ fn default_ip_version() -> String {
 /// Tag/name constants used in generated Mihomo configs.
 pub const PROXY_NAME: &str = "proxy";
 pub const PROXY_ACTIVE_NAME: &str = "proxy-active";
+pub const PROXY_HEALTH_NAME: &str = "proxy-health";
 pub const DIRECT_NAME: &str = "DIRECT";
 pub const REJECT_NAME: &str = "REJECT";
 pub const PAROVOZIK_PROXY_GROUP: &str = "parovozik-vpn";
 pub const REDIR_LISTENER: &str = "redir-in";
 pub const TPROXY_LISTENER: &str = "tproxy-in";
+pub const TORRENT_SOCKS_LISTENER: &str = "torrent-socks-in";
 
-/// Health-check URL for the direct-fallback proxy group. Mihomo probes
-/// this URL **through the proxy** to determine availability. When the
-/// probe fails, mihomo automatically falls back to DIRECT — preventing
-/// connection storms when the upstream proxy is unreachable.
+/// Base URL for isolated VPN health sensors. The query scope is part of
+/// Mihomo's health-state key, so unrelated groups must never reuse it verbatim.
 pub const FALLBACK_HEALTH_URL: &str = "https://www.gstatic.com/generate_204";
+const FALLBACK_HEALTH_INTERVAL_SECS: u32 = 10;
+const FALLBACK_HEALTH_TIMEOUT_MS: u32 = 8_000;
+const AUXILIARY_HEALTH_INTERVAL_SECS: u32 = 60;
+
+fn fallback_health_url(scope: &str) -> String {
+    format!("{FALLBACK_HEALTH_URL}?hincyray={scope}")
+}
+
+pub fn main_fallback_health_url() -> String {
+    fallback_health_url("main")
+}
 
 /// A server-specific outbound and its routing target group.
 ///
@@ -485,7 +496,7 @@ fn insert_effective_provider_path(
 // Config builders
 // ---------------------------------------------------------------------------
 
-/// Build a simple Mihomo config with just a SOCKS5 listener.
+/// Build a simple fail-closed Mihomo config with just a SOCKS5 listener.
 /// Used when split routing is disabled.
 pub fn build_mihomo_config(
     profile: &Profile,
@@ -493,7 +504,7 @@ pub fn build_mihomo_config(
     socks_port: u16,
     features: &MihomoFeatures,
 ) -> Result<String, String> {
-    let mut proxy = build_proxy(profile, PROXY_NAME)?;
+    let mut proxy = build_proxy(profile, PROXY_ACTIVE_NAME)?;
     apply_per_proxy_fields(&mut proxy, features);
     let rules = vec![format!("MATCH,{}", PROXY_NAME)];
     let mut config = json!({
@@ -505,6 +516,25 @@ pub fn build_mihomo_config(
         "ipv6": false,
         "socks-port": socks_port,
         "proxies": [proxy],
+        "proxy-groups": [
+            {
+                "name": PROXY_NAME,
+                "type": "select",
+                "proxies": [PROXY_ACTIVE_NAME, REJECT_NAME],
+                "default-selected": PROXY_ACTIVE_NAME,
+                "empty-fallback": REJECT_NAME,
+            },
+            {
+                "name": PROXY_HEALTH_NAME,
+                "type": "fallback",
+                "proxies": [REJECT_NAME, PROXY_ACTIVE_NAME],
+                "url": main_fallback_health_url(),
+                "interval": FALLBACK_HEALTH_INTERVAL_SECS,
+                "timeout": FALLBACK_HEALTH_TIMEOUT_MS,
+                "empty-fallback": REJECT_NAME,
+                "hidden": true,
+            }
+        ],
         "rules": rules,
     });
     apply_global_features(&mut config, features);
@@ -523,7 +553,7 @@ pub fn build_mihomo_bench_config(
     let proxy = build_proxy(profile, PROXY_NAME)?;
     let config = json!({
         "mode": "rule",
-        "log-level": "silent",
+        "log-level": "warning",
         "allow-lan": false,
         "bind-address": bind_address(listen_host),
         "find-process-mode": "off",
@@ -597,18 +627,22 @@ pub fn build_mihomo_router_config(
     features: &MihomoFeatures,
 ) -> Result<String, String> {
     // The active profile outbound is always named "proxy-active".
-    // A fallback proxy group named "proxy" wraps it with DIRECT as a
-    // last-resort destination — so when the upstream proxy is
-    // unreachable, mihomo automatically routes traffic direct instead
-    // of timing out every connection (which causes a storm that can
-    // OOM the router). When the proxy recovers, mihomo switches back.
+    // The canonical "proxy" selector never contains DIRECT and is controlled
+    // by the daemon's multi-sample watchdog. A separate fallback group owns the
+    // active VPN health probe; one delayed probe must not directly change the
+    // dataplane. Explicit DIRECT routing rules remain direct.
     //
     let active_proxy_name = PROXY_ACTIVE_NAME.to_owned();
 
-    let mut internal_names: HashSet<&str> =
-        [PROXY_ACTIVE_NAME, PROXY_NAME, DIRECT_NAME, REJECT_NAME]
-            .into_iter()
-            .collect();
+    let mut internal_names: HashSet<&str> = [
+        PROXY_ACTIVE_NAME,
+        PROXY_NAME,
+        PROXY_HEALTH_NAME,
+        DIRECT_NAME,
+        REJECT_NAME,
+    ]
+    .into_iter()
+    .collect();
     for (_, name) in extra_profiles {
         if name.trim().is_empty() || !internal_names.insert(name) {
             return Err(format!("duplicate or empty proxy/group name {name:?}"));
@@ -642,7 +676,8 @@ pub fn build_mihomo_router_config(
     // can't be transparent-proxied) or when the active profile doesn't
     // support QUIC. User-level QUIC blocking (quic_mode, block_quic_global)
     // is handled by a regular routing rule migrated in load_state().
-    let system_quic_block = active_block_quic || !tproxy_available;
+    let transparent_mode = redirect_port.is_some();
+    let system_quic_block = transparent_mode && (active_block_quic || !tproxy_available);
     if system_quic_block {
         rules.push(format!(
             "AND,((NETWORK,udp),(DST-PORT,443)),{}",
@@ -674,10 +709,10 @@ pub fn build_mihomo_router_config(
         {
             let target_name = match target {
                 // GeoBase Active is a broad routing intent, not a raw outbound
-                // identity.  It must therefore use the same direct-fallback
+                // identity. It must therefore use the same fail-closed
                 // group as regular `active` routing rules.  Sending a large
                 // generated RULE-SET directly to `proxy-active` bypasses the
-                // `[proxy-active, DIRECT]` safety group and can make all
+                // `[REJECT, proxy-active]` group and can make all
                 // policy-marked clients lose internet when the upstream server
                 // flaps or dies.
                 GeoBaseRuleTarget::Active => PROXY_NAME,
@@ -737,23 +772,41 @@ pub fn build_mihomo_router_config(
         }
     }
 
-    let redirect_port = redirect_port.unwrap_or(10810);
-    // TPROXY listener uses a separate port (redirect_port + 1) to
-    // avoid a TCP bind conflict with the redir listener.
-    let tproxy_port = redirect_port + 1;
-    let mut listeners = vec![json!({
-        "name": REDIR_LISTENER,
-        "type": "redir",
-        "port": redirect_port,
-        "listen": "0.0.0.0",
-    })];
-    if tproxy_available {
+    let mut listeners = Vec::new();
+    if let Some(redirect_port) = redirect_port {
+        // TPROXY listener uses a separate port (redirect_port + 1) to
+        // avoid a TCP bind conflict with the redir listener.
+        let tproxy_port = redirect_port
+            .checked_add(1)
+            .ok_or_else(|| "Mihomo TPROXY port overflows u16".to_owned())?;
         listeners.push(json!({
-            "name": TPROXY_LISTENER,
-            "type": "tproxy",
-            "port": tproxy_port,
+            "name": REDIR_LISTENER,
+            "type": "redir",
+            "port": redirect_port,
             "listen": "0.0.0.0",
+        }));
+        if tproxy_available {
+            listeners.push(json!({
+                "name": TPROXY_LISTENER,
+                "type": "tproxy",
+                "port": tproxy_port,
+                "listen": "0.0.0.0",
+                "udp": true,
+            }));
+        }
+    }
+    if let Some(torrent) = &extra.torrent_socks {
+        listeners.push(json!({
+            "name": TORRENT_SOCKS_LISTENER,
+            "type": "socks",
+            "port": torrent.port,
+            "listen": &torrent.listen,
             "udp": true,
+            "users": [{
+                "username": &torrent.username,
+                "password": &torrent.password,
+            }],
+            "proxy": &torrent.proxy,
         }));
     }
 
@@ -769,43 +822,60 @@ pub fn build_mihomo_router_config(
         "listeners": listeners,
         "proxies": proxies,
         "rules": rules,
-        "sniffer": build_sniffer_json(features),
     });
+    if transparent_mode {
+        config["sniffer"] = build_sniffer_json(features);
+    }
 
-    config["proxy-groups"] = json!([{
-        "name": PROXY_NAME,
-        "type": "fallback",
-        "proxies": [active_proxy_name, DIRECT_NAME],
-        "url": FALLBACK_HEALTH_URL,
-        "interval": 10,
-        "timeout": 3000,
-    }]);
+    config["proxy-groups"] = json!([
+        {
+            "name": PROXY_NAME,
+            "type": "select",
+            "proxies": [active_proxy_name, REJECT_NAME],
+            "default-selected": PROXY_ACTIVE_NAME,
+            "empty-fallback": REJECT_NAME,
+        },
+        {
+            "name": PROXY_HEALTH_NAME,
+            "type": "fallback",
+            "proxies": [REJECT_NAME, PROXY_ACTIVE_NAME],
+            "url": main_fallback_health_url(),
+            "interval": FALLBACK_HEALTH_INTERVAL_SECS,
+            "timeout": FALLBACK_HEALTH_TIMEOUT_MS,
+            "empty-fallback": REJECT_NAME,
+            "hidden": true,
+        }
+    ]);
 
     let groups = config
         .get_mut("proxy-groups")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| "internal error: router proxy groups are missing".to_owned())?;
     groups.extend(pinned_server_routes.iter().map(|route| {
+        let health_url = fallback_health_url(&route.group_name);
         json!({
             "name": &route.group_name,
             "type": "fallback",
-            "proxies": [&route.outbound_name, PROXY_ACTIVE_NAME],
-            "url": FALLBACK_HEALTH_URL,
-            "interval": 10,
-            "timeout": 3000,
+            "proxies": [REJECT_NAME, &route.outbound_name, PROXY_ACTIVE_NAME],
+            "url": health_url,
+            "interval": AUXILIARY_HEALTH_INTERVAL_SECS,
+            "timeout": FALLBACK_HEALTH_TIMEOUT_MS,
+            "empty-fallback": REJECT_NAME,
         })
     }));
     if !extra.parovozik_vpn_target.is_empty() {
-        let proxies: Vec<String> = std::iter::once(PROXY_ACTIVE_NAME.to_owned())
+        let proxies: Vec<String> = [REJECT_NAME.to_owned(), PROXY_ACTIVE_NAME.to_owned()]
+            .into_iter()
             .chain(extra.parovozik_vpn_outbounds.iter().cloned())
             .collect();
         groups.push(json!({
             "name": PAROVOZIK_PROXY_GROUP,
             "type": "fallback",
             "proxies": proxies,
-            "url": FALLBACK_HEALTH_URL,
-            "interval": 10,
-            "timeout": 3000,
+            "url": fallback_health_url("parovozik"),
+            "interval": AUXILIARY_HEALTH_INTERVAL_SECS,
+            "timeout": FALLBACK_HEALTH_TIMEOUT_MS,
+            "empty-fallback": REJECT_NAME,
         }));
     }
 
@@ -998,6 +1068,16 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
         );
     }
 
+    if let Some(fingerprint) = query_value(&url, "pcs").filter(|value| !value.is_empty()) {
+        proxy["fingerprint"] = json!(normalize_sha256_fingerprint(&fingerprint)?);
+    }
+    if let Some(name) = query_value(&url, "vcn").filter(|value| !value.trim().is_empty()) {
+        if name.contains(',') {
+            return Err("VLESS vcn must contain one certificate verification name".to_owned());
+        }
+        proxy["name-cert-verify"] = json!(name.trim());
+    }
+
     // mTLS (mutual TLS) — certificate + private-key, both required.
     apply_mtls_cert_key(&mut proxy, &url);
 
@@ -1052,6 +1132,27 @@ fn build_vless_proxy(profile: &Profile, name: &str) -> Result<Value, String> {
     }
 
     Ok(proxy)
+}
+
+fn normalize_sha256_fingerprint(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(value.to_ascii_lowercase());
+    }
+    if value.len() != 95
+        || value.bytes().enumerate().any(|(index, byte)| {
+            if index % 3 == 2 {
+                byte != b':'
+            } else {
+                !byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err("VLESS pcs must contain one SHA-256 certificate fingerprint".to_owned());
+    }
+    let mut normalized = String::with_capacity(64);
+    normalized.extend(value.bytes().filter(|byte| *byte != b':').map(char::from));
+    Ok(normalized.to_ascii_lowercase())
 }
 
 const MAX_XHTTP_EXTRA_BYTES: usize = 16 * 1024;
@@ -3252,14 +3353,16 @@ fn apply_grpc_advanced(grpc_opts: &mut Value, url: &Url) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalControllerConfig, FALLBACK_HEALTH_URL, MihomoFeatures, PAROVOZIK_PROXY_GROUP,
-        PROXY_ACTIVE_NAME, PROXY_NAME, PerProxyDefaults, PinnedServerRoute, REDIR_LISTENER,
-        TPROXY_LISTENER, TunnelConfig, build_anytls_proxy, build_http_proxy, build_hysteria_proxy,
-        build_hysteria2_proxy, build_masque_proxy, build_mihomo_bench_config, build_mihomo_config,
-        build_mihomo_router_config, build_openvpn_proxy, build_shadowsocks_proxy,
-        build_shadowsocksr_proxy, build_snell_proxy, build_socks_proxy, build_ssh_proxy,
-        build_tailscale_proxy, build_trojan_proxy, build_tuic_proxy, build_vless_proxy,
-        build_vmess_proxy, build_wireguard_proxy, domain_rule_body, ip_rule_body,
+        AUXILIARY_HEALTH_INTERVAL_SECS, DIRECT_NAME, ExternalControllerConfig,
+        FALLBACK_HEALTH_TIMEOUT_MS, MihomoFeatures, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME,
+        PROXY_HEALTH_NAME, PROXY_NAME, PerProxyDefaults, PinnedServerRoute, REDIR_LISTENER,
+        REJECT_NAME, TORRENT_SOCKS_LISTENER, TPROXY_LISTENER, TunnelConfig, build_anytls_proxy,
+        build_http_proxy, build_hysteria_proxy, build_hysteria2_proxy, build_masque_proxy,
+        build_mihomo_bench_config, build_mihomo_config, build_mihomo_router_config,
+        build_openvpn_proxy, build_shadowsocks_proxy, build_shadowsocksr_proxy, build_snell_proxy,
+        build_socks_proxy, build_ssh_proxy, build_tailscale_proxy, build_trojan_proxy,
+        build_tuic_proxy, build_vless_proxy, build_vmess_proxy, build_wireguard_proxy,
+        domain_rule_body, fallback_health_url, ip_rule_body, main_fallback_health_url,
         parse_xhttp_extra, read_xhttp_tuning, update_xhttp_tuning,
     };
     use crate::profiles::parse_profiles;
@@ -3307,6 +3410,63 @@ mod tests {
         assert_eq!(
             reality_opts.get("short-id").and_then(Value::as_str),
             Some("shortid")
+        );
+    }
+
+    #[test]
+    fn build_vless_maps_xray_certificate_pin_without_disabling_verification() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=grpc&security=tls&sni=example.com&pcs=00%3A11%3A22%3A33%3A44%3A55%3A66%3A77%3A88%3A99%3AAA%3ABB%3ACC%3ADD%3AEE%3AFF%3A00%3A11%3A22%3A33%3A44%3A55%3A66%3A77%3A88%3A99%3AAA%3ABB%3ACC%3ADD%3AEE%3AFF&vcn=verify.example.com#Pinned",
+        );
+        let proxy = build_vless_proxy(&profiles[0], PROXY_NAME).expect("vless proxy");
+
+        assert_eq!(
+            proxy.get("fingerprint").and_then(Value::as_str),
+            Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(
+            proxy.get("name-cert-verify").and_then(Value::as_str),
+            Some("verify.example.com")
+        );
+        assert!(proxy.get("skip-cert-verify").is_none());
+    }
+
+    #[test]
+    fn build_vless_rejects_malformed_xray_certificate_pin() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&pcs=not-a-sha256-pin#Pinned",
+        );
+        let error = build_vless_proxy(&profiles[0], PROXY_NAME).expect_err("invalid pcs");
+
+        assert_eq!(
+            error,
+            "VLESS pcs must contain one SHA-256 certificate fingerprint"
+        );
+    }
+
+    #[test]
+    fn build_vless_accepts_unseparated_xray_certificate_pin() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&pcs=00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF#Pinned",
+        );
+        let proxy = build_vless_proxy(&profiles[0], PROXY_NAME).expect("vless proxy");
+
+        assert_eq!(
+            proxy.get("fingerprint").and_then(Value::as_str),
+            Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+        );
+    }
+
+    #[test]
+    fn build_vless_rejects_multiple_certificate_verification_names() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&vcn=one.example.com%2Ctwo.example.com#Pinned",
+        );
+        let error = build_vless_proxy(&profiles[0], PROXY_NAME).expect_err("multiple vcn names");
+
+        assert_eq!(
+            error,
+            "VLESS vcn must contain one certificate verification name"
         );
     }
 
@@ -3516,6 +3676,16 @@ mod tests {
             config.get("socks-port").and_then(Value::as_u64),
             Some(10808)
         );
+        assert_eq!(config["proxies"][0]["name"], PROXY_ACTIVE_NAME);
+        assert_eq!(config["proxy-groups"][0]["name"], PROXY_NAME);
+        assert_eq!(config["proxy-groups"][0]["type"], "select");
+        assert_eq!(
+            config["proxy-groups"][0]["proxies"],
+            json!([PROXY_ACTIVE_NAME, REJECT_NAME])
+        );
+        assert_eq!(config["proxy-groups"][1]["name"], PROXY_HEALTH_NAME);
+        assert_eq!(config["proxy-groups"][1]["type"], "fallback");
+        assert_eq!(config["proxy-groups"][1]["url"], main_fallback_health_url());
         let rules = config
             .get("rules")
             .and_then(Value::as_array)
@@ -3563,6 +3733,60 @@ mod tests {
         assert!(names.contains(&TPROXY_LISTENER));
     }
 
+    #[test]
+    fn dedicated_torrent_socks_listener_is_authenticated_and_targeted() {
+        let profiles = parse_profiles(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Test",
+        );
+        let extra = RouterExtra {
+            torrent_socks: Some(crate::xray_config::TorrentSocksInbound {
+                listen: "192.168.1.1".to_owned(),
+                port: 10812,
+                username: "torrent-user".to_owned(),
+                password: "torrent-password".to_owned(),
+                proxy: DIRECT_NAME.to_owned(),
+            }),
+            ..RouterExtra::default()
+        };
+        let yaml = build_mihomo_router_config(
+            &profiles[0],
+            &[],
+            &[],
+            &[],
+            "127.0.0.1",
+            10808,
+            None,
+            false,
+            QuicMode::Block,
+            false,
+            &extra,
+            &MihomoFeatures::default(),
+        )
+        .expect("torrent SOCKS config");
+        let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
+        let listeners = config["listeners"].as_array().expect("listeners");
+        assert_eq!(listeners.len(), 1);
+        let listener = &listeners[0];
+        assert_eq!(listener["name"], TORRENT_SOCKS_LISTENER);
+        assert_eq!(listener["type"], "socks");
+        assert_eq!(listener["listen"], "192.168.1.1");
+        assert_eq!(listener["port"], 10812);
+        assert_eq!(listener["udp"], true);
+        assert_eq!(listener["proxy"], DIRECT_NAME);
+        assert_eq!(listener["users"][0]["username"], "torrent-user");
+        assert_eq!(listener["users"][0]["password"], "torrent-password");
+        assert!(
+            listeners
+                .iter()
+                .all(|listener| listener["name"] != REDIR_LISTENER)
+        );
+        assert!(
+            listeners
+                .iter()
+                .all(|listener| listener["name"] != TPROXY_LISTENER)
+        );
+    }
+
     fn pinned_route_rule(target: &str) -> XrayRouteRule {
         XrayRouteRule {
             domains: vec!["pinned.example".to_owned()],
@@ -3605,19 +3829,20 @@ mod tests {
         .expect("router config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
         let groups = config["proxy-groups"].as_array().expect("groups");
-        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.len(), 3);
         assert_eq!(
-            groups[1],
+            groups[2],
             json!({
                 "name": "pinned-route-opaque-7",
                 "type": "fallback",
-                "proxies": ["pinned-out-opaque-7", PROXY_ACTIVE_NAME],
-                "url": FALLBACK_HEALTH_URL,
-                "interval": 10,
-                "timeout": 3000,
+                "proxies": [REJECT_NAME, "pinned-out-opaque-7", PROXY_ACTIVE_NAME],
+                "url": fallback_health_url("pinned-route-opaque-7"),
+                "interval": AUXILIARY_HEALTH_INTERVAL_SECS,
+                "timeout": FALLBACK_HEALTH_TIMEOUT_MS,
+                "empty-fallback": REJECT_NAME,
             })
         );
-        let members = groups[1]["proxies"].as_array().expect("members");
+        let members = groups[2]["proxies"].as_array().expect("members");
         assert!(
             !members
                 .iter()
@@ -3658,12 +3883,14 @@ mod tests {
         .expect("router config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
         let groups = config["proxy-groups"].as_array().expect("groups");
-        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.len(), 3);
         assert_eq!(groups[0]["name"], PROXY_NAME);
-        assert_eq!(groups[0]["proxies"], json!([PROXY_ACTIVE_NAME, "DIRECT"]));
+        assert_eq!(groups[0]["type"], "select");
+        assert_eq!(groups[0]["proxies"], json!([PROXY_ACTIVE_NAME, "REJECT"]));
+        assert_eq!(groups[1]["name"], PROXY_HEALTH_NAME);
         assert_eq!(
-            groups[1]["proxies"],
-            json!(["pinned-out", PROXY_ACTIVE_NAME])
+            groups[2]["proxies"],
+            json!(["REJECT", "pinned-out", PROXY_ACTIVE_NAME])
         );
     }
 
@@ -4367,9 +4594,8 @@ mod tests {
     #[test]
     fn proxy_group_disabled_uses_single_proxy_name() {
         let config = build_test_router_config(&default_features());
-        // When proxy groups disabled, active proxy outbound is named
-        // "proxy-active" and a direct-fallback group named "proxy" wraps
-        // it with DIRECT as last resort.
+        // The dataplane selector and health sensor remain separate even when
+        // optional candidate groups are disabled.
         let proxies = config
             .get("proxies")
             .and_then(Value::as_array)
@@ -4378,16 +4604,15 @@ mod tests {
             proxies[0].get("name").and_then(Value::as_str),
             Some("proxy-active")
         );
-        // Direct-fallback proxy group is always present
         let groups = config
             .get("proxy-groups")
             .and_then(Value::as_array)
             .expect("proxy-groups");
-        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].get("name").and_then(Value::as_str), Some("proxy"));
         assert_eq!(
             groups[0].get("type").and_then(Value::as_str),
-            Some("fallback")
+            Some("select")
         );
         let group_proxies = groups[0]
             .get("proxies")
@@ -4395,7 +4620,9 @@ mod tests {
             .expect("group proxies");
         assert_eq!(group_proxies.len(), 2);
         assert_eq!(group_proxies[0].as_str(), Some("proxy-active"));
-        assert_eq!(group_proxies[1].as_str(), Some("DIRECT"));
+        assert_eq!(group_proxies[1].as_str(), Some("REJECT"));
+        assert_eq!(groups[1]["name"], PROXY_HEALTH_NAME);
+        assert_eq!(groups[1]["type"], "fallback");
     }
 
     // --- Domain rule prefix tests ---
@@ -6075,7 +6302,7 @@ mod tests {
             build_mihomo_bench_config(&profiles[0], "127.0.0.1", 20808).expect("bench config");
         let config: Value = serde_yaml::from_str(&yaml).expect("parse yaml");
         assert_eq!(config["socks-port"], json!(20808));
-        assert_eq!(config["log-level"], json!("silent"));
+        assert_eq!(config["log-level"], json!("warning"));
         assert_eq!(config["allow-lan"], json!(false));
         assert_eq!(config["geo-auto-update"], json!(false));
         let rules = config["rules"].as_array().expect("rules array");
@@ -6355,7 +6582,7 @@ mod tests {
         assert_eq!(group["type"], "fallback");
         assert_eq!(
             group["proxies"],
-            json!([PROXY_ACTIVE_NAME, "srv-route-test"])
+            json!(["REJECT", PROXY_ACTIVE_NAME, "srv-route-test"])
         );
     }
 
