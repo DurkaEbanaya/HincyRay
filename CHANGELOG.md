@@ -1,5 +1,17 @@
 # Changelog
 
+Publication update (2026-09-26): v1.3.30 is the release selected after reverting the unpublished Jitsi integration. Historical publication notes below retain their original context.
+
+## v1.3.30 - 2026-09-26
+
+- Expanded best-of-best membership to 16 under the existing shared pinned-route limit. Added the full searchable profile catalog, manual-profile admission without previous Check Services evidence, membership counts, and removal by unchecking; profiles themselves remain intact. Every selected outbound still requires a fresh HTTPS pass before routing.
+
+## v1.3.29 - 2026-09-26
+
+- Added opt-in “Лучшие из лучших” routing target with up to six tested subscription servers. A single raw outbound is HTTPS-probed before selection; persistent failures place it in cooldown and select REJECT until another candidate passes its own fresh HTTPS check. Proxy-ping alone cannot establish service availability.
+- Both routing-target pickers now sort current-service passes before fresh proxy ping, with unavailable/dead targets last. Existing routing-v1 server refs and lifecycle-v2 evidence remain separate.
+- Verified and deployed on the router with the pool disabled by default and existing settings preserved; no GitHub publication.
+
 ## v1.3.28 - 2026-09-25
 
 - Show Keenetic's `active` status as green/red connection indicators in the policy automation device list. Keep online devices visible and offline registered devices in a collapsed-by-default section, including previously selected MACs.

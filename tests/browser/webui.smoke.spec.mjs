@@ -43,7 +43,7 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.28');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.30');
 });
 
 test('Direct availability card checks each site and shows independent colors', async ({ page }) => {
@@ -77,6 +77,56 @@ test('Direct policy automation stays opt-in and selects devices by MAC', async (
   const request = page.waitForRequest(r => r.method() === 'POST' && new URL(r.url()).pathname === '/api/automation/direct-policy');
   await page.locator('#directPolicySave').click();
   expect((await request).postDataJSON()).toEqual({enabled:true,devices:['02:00:00:00:00:33','02:00:00:00:00:44']});
+});
+
+test('best-of-best stays opt-in, uses routing refs, and ranks both target pickers by checked services then ping', async ({ page }) => {
+  await page.route('**/api/stats', async route => {
+    const response = await route.fetch();
+    const data = await response.json();
+    const now = Math.floor(Date.now() / 1000);
+    data.stats.push({profile_id:102,server_ref:'srv-v2-fixture-manual',last_service_test_unix:now,
+      resource_tests:[{id:'youtube_thumbnails',contract_version:1,attempts:1,successes:1,stable:true},
+        {id:'telegram',contract_version:7,attempts:1,successes:1,stable:true},
+        {id:'ai',contract_version:7,attempts:1,successes:1,stable:true},
+        {id:'ping_proxy',contract_version:7,attempts:1,successes:1,reachable:true,avg_ttfb_ms:300}]});
+    await route.fulfill({response,json:data});
+  });
+  await openFixture(page);
+  await page.evaluate(() => navTo('best-of-best'));
+  await expect(page.locator('#bestOfBestEnabled')).not.toBeChecked();
+  await expect(page.locator('#bestOfBestCandidates')).toContainText('Fixture Profile');
+  const checkbox = page.locator('#bestOfBestCandidates input[data-best-ref="srv-v1-fixture"]');
+  await checkbox.check();
+  await page.locator('#bestOfBestSearch').fill('#102');
+  const manual = page.locator('#bestOfBestCandidates input[data-best-ref="srv-v1-wagon"]');
+  await manual.check();
+  await expect(page.locator('#bestOfBestCount')).toHaveText('В пуле: 2 / 16');
+  await manual.uncheck();
+  await expect(page.locator('#bestOfBestCount')).toHaveText('В пуле: 1 / 16');
+  const posted = page.waitForRequest(r => r.method() === 'POST' && new URL(r.url()).pathname === '/api/automation/best-of-best');
+  await page.locator('#bestOfBestSave').click();
+  expect((await posted).postDataJSON()).toEqual({enabled:false,server_refs:['srv-v1-fixture']});
+
+  const order = await page.evaluate(() => {
+    const values = html => Array.from(new DOMParser().parseFromString(`<select>${html}</select>`,'text/html').querySelectorAll('option[value^="server:"]')).map(option => option.value);
+    return {rules:values(routingTargetOptions('active')),connections:values(routingTargetServerOptions(''))};
+  });
+  expect(order.rules.slice(0,2)).toEqual(['server:srv-v1-wagon','server:srv-v1-fixture']);
+  expect(order.connections.slice(0,2)).toEqual(order.rules.slice(0,2));
+  expect(order.rules.at(-1)).toBe('server:srv-v1-dead-route');
+  const byPing = await page.evaluate(() => {
+    const originalServers = MOCK.routing_servers;
+    const originalProfiles = MOCK.profiles;
+    const source = originalProfiles.find(profile => profile.id === 102);
+    MOCK.profiles = [...originalProfiles, {...source,id:200,server_ref:'srv-v2-fixture-fast',resource_tests:source.resource_tests.map(test => test.id === 'ping_proxy' ? {...test,avg_ttfb_ms:20} : test)}];
+    MOCK.routing_servers = [...originalServers,{id:200,ref:'srv-v1-fixture-fast',lifecycle_ref:'srv-v2-fixture-fast',name:'Fast fixture',group:'https://provider.example/sub/fixture-token',dead:false}];
+    const result = new DOMParser().parseFromString(`<select>${routingTargetServerOptions('')}</select>`,'text/html');
+    const values = [...result.querySelectorAll('option[value^="server:"]')].map(option => option.value);
+    MOCK.profiles = originalProfiles;
+    MOCK.routing_servers = originalServers;
+    return values;
+  });
+  expect(byPing.slice(0,2)).toEqual(['server:srv-v1-fixture-fast','server:srv-v1-wagon']);
 });
 
 test('Direct bot settings accept a private token and prompt /start pairing', async ({ page }) => {

@@ -328,13 +328,56 @@ pub fn mihomo_api_delay(
     test_url: &str,
     timeout_ms: u32,
 ) -> Result<u32, String> {
+    mihomo_api_delay_expected(addr, secret, proxy_name, test_url, timeout_ms, None)
+}
+
+/// Require a completed HTTPS response with an expected status for a raw leaf.
+/// Mihomo otherwise accepts every HTTP status (including 403/500) as delay.
+pub fn mihomo_api_delay_expected(
+    addr: &str,
+    secret: Option<&str>,
+    proxy_name: &str,
+    test_url: &str,
+    timeout_ms: u32,
+    expected: Option<&str>,
+) -> Result<u32, String> {
     let path = format!(
-        "/proxies/{}/delay?url={}&timeout={}",
+        "/proxies/{}/delay?url={}&timeout={}{}",
         utf8_percent_encode(proxy_name, NON_ALPHANUMERIC),
         utf8_percent_encode(test_url, NON_ALPHANUMERIC),
-        timeout_ms
+        timeout_ms,
+        expected
+            .map(|status| format!(
+                "&expected={}",
+                utf8_percent_encode(status, NON_ALPHANUMERIC)
+            ))
+            .unwrap_or_default()
     );
-    let json = mihomo_api_get_json(addr, secret, &path)?;
+    // This endpoint holds the controller request open while Mihomo performs
+    // the HTTPS probe. Its HTTP deadline must exceed the requested probe
+    // deadline, unlike the ordinary short controller reads (3 seconds).
+    let json = if expected.is_some() {
+        let url = format!("http://{addr}{path}");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(
+                u64::from(timeout_ms).min(8_000) + 1_000,
+            ))
+            .no_proxy()
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mut req = client.get(url);
+        if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
+            req = req.header("Authorization", format!("Bearer {secret}"));
+        }
+        let mut response = req.send().map_err(|error| error.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("Mihomo API delay: HTTP {}", response.status()));
+        }
+        let bytes = read_response_text_bounded(&mut response, "/proxies/delay")?;
+        serde_json::from_str(&bytes).map_err(|_| "Mihomo API delay: invalid JSON".to_owned())?
+    } else {
+        mihomo_api_get_json(addr, secret, &path)?
+    };
     json.get("delay")
         .and_then(Value::as_u64)
         .map(|d| d as u32)
@@ -389,6 +432,52 @@ mod tests {
         let ec = mihomo_controller(&features).expect("controller");
         assert_eq!(ec.0, "127.0.0.1:9090");
         assert_eq!(ec.1.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn raw_leaf_https_probe_requests_success_status_and_rejects_failed_response() {
+        for (status, body, should_pass) in [
+            ("200 OK", r#"{"delay":42}"#, true),
+            (
+                "503 Service Unavailable",
+                r#"{"message":"status rejected"}"#,
+                false,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("controller");
+            let addr = listener.local_addr().expect("address").to_string();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let worker = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("request");
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).expect("read request");
+                let line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                stream.write_all(response.as_bytes()).expect("response");
+                line
+            });
+            let result = mihomo_api_delay_expected(
+                &addr,
+                None,
+                "srv-out-fixture",
+                "https://www.gstatic.com/generate_204",
+                4000,
+                Some("200-399"),
+            );
+            assert_eq!(result.is_ok(), should_pass);
+            let line = worker.join().expect("controller worker");
+            assert!(
+                line.starts_with("GET /proxies/srv%2Dout%2Dfixture/delay?"),
+                "{line}"
+            );
+            assert!(line.contains("expected=200%2D399"), "{line}");
+        }
     }
 
     #[test]

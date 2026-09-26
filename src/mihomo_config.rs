@@ -219,6 +219,7 @@ pub const PROXY_HEALTH_NAME: &str = "proxy-health";
 pub const DIRECT_NAME: &str = "DIRECT";
 pub const REJECT_NAME: &str = "REJECT";
 pub const PAROVOZIK_PROXY_GROUP: &str = "parovozik-vpn";
+pub const BEST_OF_BEST_GROUP: &str = "best-of-best";
 pub const REDIR_LISTENER: &str = "redir-in";
 pub const TPROXY_LISTENER: &str = "tproxy-in";
 pub const TORRENT_SOCKS_LISTENER: &str = "torrent-socks-in";
@@ -638,6 +639,7 @@ pub fn build_mihomo_router_config(
         PROXY_ACTIVE_NAME,
         PROXY_NAME,
         PROXY_HEALTH_NAME,
+        BEST_OF_BEST_GROUP,
         DIRECT_NAME,
         REJECT_NAME,
     ]
@@ -863,6 +865,24 @@ pub fn build_mihomo_router_config(
             "empty-fallback": REJECT_NAME,
         })
     }));
+    if !extra.best_of_best_outbounds.is_empty() {
+        groups.push(json!({
+            "name": BEST_OF_BEST_GROUP,
+            "type": "select",
+            "proxies": std::iter::once(REJECT_NAME.to_owned()).chain(extra.best_of_best_outbounds.iter().cloned()).collect::<Vec<_>>(),
+            "default-selected": REJECT_NAME,
+            "empty-fallback": REJECT_NAME,
+        }));
+    } else if route_rules
+        .iter()
+        .any(|rule| rule.outbound_tag == BEST_OF_BEST_GROUP)
+        || extra
+            .torrent_socks
+            .as_ref()
+            .is_some_and(|socks| socks.proxy == BEST_OF_BEST_GROUP)
+    {
+        groups.push(json!({"name":BEST_OF_BEST_GROUP,"type":"select","proxies":[REJECT_NAME],"default-selected":REJECT_NAME}));
+    }
     if !extra.parovozik_vpn_target.is_empty() {
         let proxies: Vec<String> = [REJECT_NAME.to_owned(), PROXY_ACTIVE_NAME.to_owned()]
             .into_iter()

@@ -71,10 +71,11 @@ use crate::hincyray_api::{
     TorrentSocksSettingsUpdate, XhttpTuning, api_endpoint_contracts, openapi_document,
 };
 use crate::hincyray_mihomo_api::{
-    MAX_DIAGNOSTIC_CONNECTIONS_JSON_BYTES, mihomo_api_delay, mihomo_api_delete, mihomo_api_get,
-    mihomo_api_get_connections_json, mihomo_api_get_connections_json_bounded, mihomo_api_get_json,
-    mihomo_api_get_response, mihomo_api_post, mihomo_api_post_response, mihomo_api_put,
-    mihomo_api_stream_get, mihomo_api_stream_get_json, mihomo_controller,
+    MAX_DIAGNOSTIC_CONNECTIONS_JSON_BYTES, mihomo_api_delay, mihomo_api_delay_expected,
+    mihomo_api_delete, mihomo_api_get, mihomo_api_get_connections_json,
+    mihomo_api_get_connections_json_bounded, mihomo_api_get_json, mihomo_api_get_response,
+    mihomo_api_post, mihomo_api_post_response, mihomo_api_put, mihomo_api_stream_get,
+    mihomo_api_stream_get_json, mihomo_controller,
 };
 #[cfg(test)]
 use crate::hincyray_mihomo_api::{controller_dial_address, first_stream_json};
@@ -90,9 +91,10 @@ use crate::hincyray_security::{
 };
 use crate::hincyray_webui::index_html;
 use crate::mihomo_config::{
-    DIRECT_NAME, MihomoFeatures, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME, PROXY_HEALTH_NAME,
-    PROXY_NAME, PinnedServerRoute, REJECT_NAME, TORRENT_SOCKS_LISTENER, build_mihomo_config,
-    build_mihomo_router_config, main_fallback_health_url, read_xhttp_tuning, update_xhttp_tuning,
+    BEST_OF_BEST_GROUP, DIRECT_NAME, MihomoFeatures, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME,
+    PROXY_HEALTH_NAME, PROXY_NAME, PinnedServerRoute, REJECT_NAME, TORRENT_SOCKS_LISTENER,
+    build_mihomo_config, build_mihomo_router_config, main_fallback_health_url, read_xhttp_tuning,
+    update_xhttp_tuning,
 };
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionMetadata, SubscriptionSource,
@@ -626,6 +628,8 @@ struct DaemonInner {
     deep_bench_status: DeepBenchStatus,
     geobase: GeoBaseRuntime,
     pinned_route_now: HashMap<String, String>,
+    best_of_best_failures: u8,
+    best_of_best_cooldown: HashMap<String, u64>,
     profile_diagnostics: ProfileDiagnosticRuntime,
     core_generation: u64,
 }
@@ -1004,6 +1008,8 @@ fn default_auth_username() -> String {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HincyrayState {
     #[serde(default)]
+    pub best_of_best: BestOfBestSettings,
+    #[serde(default)]
     pub profiles: Vec<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<usize>,
@@ -1158,6 +1164,7 @@ impl Default for HincyrayState {
     fn default() -> Self {
         Self {
             profiles: Vec::new(),
+            best_of_best: BestOfBestSettings::default(),
             active_profile_id: None,
             auto_select: false,
             listen_host: default_listen_host(),
@@ -2094,6 +2101,20 @@ fn default_routing_target() -> String {
 }
 
 const MAX_PINNED_SERVERS: usize = 16;
+const MAX_BEST_OF_BEST_SERVERS: usize = 16;
+const BEST_OF_BEST_PROBE_URL: &str = "https://www.gstatic.com/generate_204?hincyray=best-of-best";
+const BEST_OF_BEST_PROBE_INTERVAL_TICKS: u64 = 6;
+const BEST_OF_BEST_PROBE_FAILURES: u8 = 2;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BestOfBestSettings {
+    pub enabled: bool,
+    /// Canonical routing (v1) refs, never lifecycle v2 refs.
+    pub server_refs: Vec<String>,
+    #[serde(default)]
+    pub selected_ref: Option<String>,
+}
 const MAX_RESOURCE_CONNECTION_CLOSES: usize = 20;
 const MAX_TORRENT_CONNECTION_CLOSES: usize = 128;
 
@@ -2109,6 +2130,7 @@ enum RoutingTarget {
     Active,
     Reject,
     Parovozik,
+    BestOfBest,
     Server(String),
     LegacyProfile(usize),
 }
@@ -2121,6 +2143,7 @@ impl RoutingTarget {
             "direct" => Ok(Self::Direct),
             "reject" => Ok(Self::Reject),
             "parovozik" => Ok(Self::Parovozik),
+            "best-of-best" => Ok(Self::BestOfBest),
             _ if value.starts_with("server:") => {
                 let server_ref = &value[7..];
                 if valid_routing_server_ref(server_ref) {
@@ -2356,6 +2379,7 @@ fn sync_server_route_registry(state: &mut HincyrayState) {
             _ => None,
         })
         .chain(state.split_routing.parovozik_server_refs.iter().cloned())
+        .chain(state.best_of_best.server_refs.iter().cloned())
         .collect();
     state.server_route_registry.retain(|entry| {
         current.contains(&entry.canonical_raw) || referenced.contains(&entry.server_ref)
@@ -2527,6 +2551,8 @@ impl Daemon {
                 deep_bench_status: DeepBenchStatus::default(),
                 geobase: GeoBaseRuntime::default(),
                 pinned_route_now: HashMap::new(),
+                best_of_best_failures: 0,
+                best_of_best_cooldown: HashMap::new(),
                 profile_diagnostics: ProfileDiagnosticRuntime::default(),
                 core_generation: 0,
             })),
@@ -4584,7 +4610,10 @@ fn build_daemon_config(
             &mut pinned_routes,
         )?;
         let parovozik_target = proxy == PAROVOZIK_PROXY_GROUP;
+        let best_of_best_outbounds =
+            best_of_best_routes(state, active_profile, &mut pinned_routes)?;
         let extra = RouterExtra {
+            best_of_best_outbounds,
             torrent_socks: Some(TorrentSocksInbound {
                 listen: state.split_routing.torrent_socks.listen.clone(),
                 port: state.split_routing.torrent_socks.port,
@@ -4668,6 +4697,7 @@ fn build_daemon_config(
         });
     }
 
+    extra.best_of_best_outbounds = best_of_best_routes(state, active_profile, &mut pinned_routes)?;
     build_mihomo_router_config(
         active_profile,
         &extra_profiles,
@@ -4689,7 +4719,587 @@ fn effective_mihomo_features(state: &HincyrayState) -> MihomoFeatures {
     if state.safe_mode_enabled {
         features.tunnels.clear();
     }
+    // Mihomo restores cached group selections AFTER listeners are opened.
+    // A previously selected raw leaf could otherwise carry traffic before the
+    // daemon can reset best-of-best to REJECT and re-test the actual HTTPS path.
+    // The daemon itself restores the canonical proxy selector after reload.
+    if best_of_best_group_required(state) {
+        features.store_selected = false;
+    }
     features
+}
+
+fn best_of_best_group_required(state: &HincyrayState) -> bool {
+    state.best_of_best.enabled
+        || state
+            .routing_rules
+            .iter()
+            .any(|rule| rule.enabled && rule.target == BEST_OF_BEST_GROUP)
+        || state
+            .device_routes
+            .iter()
+            .any(|route| route.enabled && route.target == BEST_OF_BEST_GROUP)
+        || (state.split_routing.torrent_socks.enabled
+            && state.split_routing.torrent_socks.target == BEST_OF_BEST_GROUP)
+}
+
+fn best_of_best_routes<'a>(
+    state: &'a HincyrayState,
+    active: &'a Profile,
+    pinned: &mut Vec<PinnedServerRoute<'a>>,
+) -> Result<Vec<String>, String> {
+    if !state.best_of_best.enabled {
+        return Ok(Vec::new());
+    }
+    let mut outbounds = Vec::new();
+    for server_ref in &state.best_of_best.server_refs {
+        if !valid_routing_server_ref(server_ref) {
+            continue;
+        }
+        let Some(entry) = state
+            .server_route_registry
+            .iter()
+            .find(|entry| entry.server_ref == *server_ref)
+        else {
+            continue;
+        };
+        let Some(profile) = state.profiles.iter().find(|profile| {
+            canonical_profile_raw(profile) == entry.canonical_raw
+                && !profile_is_dead(state, profile)
+        }) else {
+            continue;
+        };
+        let (group, _) = resolve_target(state, active, &format!("server:{server_ref}"), pinned)?;
+        let outbound = if canonical_profile_raw(profile) == canonical_profile_raw(active) {
+            PROXY_ACTIVE_NAME.to_owned()
+        } else {
+            format!("srv-out-{}", &server_ref[7..])
+        };
+        if group == PROXY_NAME && outbound != PROXY_ACTIVE_NAME {
+            continue;
+        }
+        if !outbounds.contains(&outbound) {
+            outbounds.push(outbound);
+        }
+    }
+    Ok(outbounds)
+}
+
+fn best_of_best_evidence(state: &HincyrayState, profile: &Profile, now: u64) -> (u8, u32) {
+    let Some(stat) = state.stats.iter().find(|stat| {
+        stat.profile_raw == profile.raw
+            && stat.last_service_test_unix > 0
+            && stat.last_service_test_unix <= now.saturating_add(60)
+            && now.saturating_sub(stat.last_service_test_unix) <= 6 * 3600
+    }) else {
+        return (0, u32::MAX);
+    };
+    let passed = ["youtube_thumbnails", "telegram", "ai"]
+        .into_iter()
+        .filter(|id| {
+            stat.resource_tests.iter().any(|test| {
+                test.id == *id
+                    && test.contract_version == if *id == "youtube_thumbnails" { 1 } else { 7 }
+                    && test.attempts > 0
+                    && test.stable
+                    && test.successes > 0
+                    && !test.inconclusive
+            })
+        })
+        .count() as u8;
+    let latency = stat
+        .resource_tests
+        .iter()
+        .filter(|test| {
+            test.id == "ping_proxy"
+                && test.contract_version == 7
+                && test.attempts > 0
+                && test.reachable
+                && !test.inconclusive
+                && test.avg_ttfb_ms > 0
+        })
+        .map(|test| test.avg_ttfb_ms)
+        .min()
+        .unwrap_or(u32::MAX);
+    (passed, latency)
+}
+
+fn best_of_best_candidates(state: &HincyrayState, now: u64) -> Vec<String> {
+    let mut candidates: Vec<_> = state
+        .profiles
+        .iter()
+        .filter(|profile| {
+            best_of_best_subscription(state, profile) && !profile_is_dead(state, profile)
+        })
+        .filter_map(|profile| {
+            let (passed, ping) = best_of_best_evidence(state, profile, now);
+            (passed > 0).then(|| {
+                (
+                    server_ref_for_canonical(&canonical_profile_raw(profile)),
+                    passed,
+                    ping,
+                    profile.id,
+                )
+            })
+        })
+        .collect();
+    candidates.sort_by_key(|entry| (std::cmp::Reverse(entry.1), entry.2, entry.3));
+    let mut unique = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|entry| unique.insert(entry.0.clone()))
+        .take(MAX_BEST_OF_BEST_SERVERS)
+        .map(|entry| entry.0)
+        .collect()
+}
+
+fn best_of_best_subscription(state: &HincyrayState, profile: &Profile) -> bool {
+    profile
+        .group
+        .as_deref()
+        .and_then(normalized_subscription_url)
+        .is_some_and(|url| {
+            state.subscriptions.iter().any(|subscription| {
+                normalized_subscription_url(&subscription.url).as_deref() == Some(url.as_str())
+            })
+        })
+}
+
+/// Keep configured identities usable when their historical service evidence
+/// ages out. That evidence ranks admission; a fresh direct HTTPS probe, not
+/// history or ICMP, decides whether the actual outbound may carry traffic.
+fn best_of_best_available(state: &HincyrayState) -> Vec<String> {
+    state
+        .best_of_best
+        .server_refs
+        .iter()
+        .filter(|reference| {
+            state.server_route_registry.iter().any(|entry| {
+                entry.server_ref == ***reference
+                    && state.profiles.iter().any(|profile| {
+                        canonical_profile_raw(profile) == entry.canonical_raw
+                            && !profile_is_dead(state, profile)
+                    })
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn best_of_best_snapshot(daemon: &Daemon) -> Value {
+    let inner = lock(&daemon.inner);
+    let state = &inner.state;
+    let mut candidates = best_of_best_available(state);
+    // Admission suggestions are ranked, but manual membership is chosen from
+    // the current profile catalog, not just its highest-ranked prefix.
+    for reference in best_of_best_candidates(state, unix_now())
+        .into_iter()
+        .chain(
+            state
+                .profiles
+                .iter()
+                .map(|profile| server_ref_for_canonical(&canonical_profile_raw(profile))),
+        )
+        .chain(state.best_of_best.server_refs.iter().cloned())
+    {
+        if !candidates.contains(&reference) {
+            candidates.push(reference);
+        }
+    }
+    let entries: Vec<_> = candidates
+        .iter()
+        .filter_map(|server_ref| {
+            let profile = state.profiles.iter().find(|profile| {
+                server_ref_for_canonical(&canonical_profile_raw(profile)) == *server_ref
+            })?;
+            let (passed, ping_ms) = best_of_best_evidence(state, profile, unix_now());
+            Some(json!({"ref":server_ref,"id":profile.id,"name":profile.name,
+            "dead":profile_is_dead(state, profile),"manual":!best_of_best_subscription(state, profile),
+            "passed":passed,"ping_ms":(ping_ms != u32::MAX).then_some(ping_ms),
+            "cooldown_until":inner.best_of_best_cooldown.get(server_ref).copied()}))
+        })
+        .collect();
+    json!({"settings":state.best_of_best,"candidates":entries,"max_candidates":MAX_BEST_OF_BEST_SERVERS})
+}
+
+fn handle_best_of_best_get(daemon: &Daemon) -> (u16, &'static str, String) {
+    json_response(&best_of_best_snapshot(daemon))
+}
+
+fn handle_best_of_best_set(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
+    let Ok(request) = serde_json::from_str::<BestOfBestSettings>(body) else {
+        return json_error(400, "invalid best-of-best settings");
+    };
+    if request.server_refs.len() > MAX_BEST_OF_BEST_SERVERS
+        || request
+            .server_refs
+            .iter()
+            .any(|reference| !valid_routing_server_ref(reference))
+        || request.server_refs.iter().collect::<HashSet<_>>().len() != request.server_refs.len()
+        || request.selected_ref.is_some()
+    {
+        return json_error(400, "invalid best-of-best server refs");
+    }
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
+    let previous_runtime_evidence = {
+        let inner = lock(&daemon.inner);
+        (
+            inner.best_of_best_failures,
+            inner.best_of_best_cooldown.clone(),
+        )
+    };
+    let previous = {
+        let mut inner = lock(&daemon.inner);
+        let previous = inner.state.clone();
+        if request.enabled
+            && !inner.state.split_routing.enabled
+            && !inner.state.split_routing.torrent_socks.enabled
+        {
+            return json_error(
+                400,
+                "enable split routing or Torrent SOCKS before enabling the pool",
+            );
+        }
+        sync_server_route_registry(&mut inner.state);
+        let mut eligible: Vec<_> = inner
+            .state
+            .profiles
+            .iter()
+            .filter(|profile| !profile_is_dead(&inner.state, profile))
+            .map(|profile| server_ref_for_canonical(&canonical_profile_raw(profile)))
+            .collect();
+        // Keep previously configured dead/missing entries removable without
+        // blocking a save of the remaining pool.
+        eligible.extend(inner.state.best_of_best.server_refs.iter().cloned());
+        if request
+            .server_refs
+            .iter()
+            .any(|reference| !eligible.contains(reference))
+        {
+            inner.state = previous;
+            return json_error(400, "select existing server profiles");
+        }
+        inner.state.best_of_best = request;
+        // Previous selected server remains sticky if it is still present.
+        if inner.state.best_of_best.enabled {
+            inner.state.best_of_best.selected_ref = previous
+                .best_of_best
+                .selected_ref
+                .clone()
+                .filter(|reference| inner.state.best_of_best.server_refs.contains(reference));
+        }
+        if let Err(error) = validate_routing_targets(
+            &inner.state,
+            &inner.state.routing_rules,
+            &inner.state.device_routes,
+        ) {
+            inner.state = previous;
+            return json_error(400, &error);
+        }
+        if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+            inner.state = previous;
+            return json_error(500, &format!("persist state: {error}"));
+        }
+        previous
+    };
+    if let Err(error) = activate_current_config_locked_with_rollback(
+        daemon,
+        false,
+        true,
+        GeoBaseProjection::Desired,
+        Some(previous.clone()),
+    ) {
+        let mut inner = lock(&daemon.inner);
+        inner.state = previous;
+        inner.best_of_best_failures = previous_runtime_evidence.0;
+        inner.best_of_best_cooldown = previous_runtime_evidence.1;
+        let _ = persist_state(&daemon.state_path, &inner.state);
+        return json_error(500, &error);
+    }
+    {
+        let mut inner = lock(&daemon.inner);
+        inner.best_of_best_failures = 0;
+        inner.best_of_best_cooldown.clear();
+    }
+    update_best_of_best_selector_locked(daemon);
+    json_response(&best_of_best_snapshot(daemon))
+}
+
+fn best_of_best_next(
+    settings: &BestOfBestSettings,
+    available: &[String],
+    cooldown: &HashMap<String, u64>,
+    now: u64,
+) -> Option<String> {
+    settings
+        .selected_ref
+        .as_ref()
+        .filter(|reference| {
+            settings.server_refs.contains(reference)
+                && available.contains(reference)
+                && cooldown.get(*reference).is_none_or(|until| *until <= now)
+        })
+        .cloned()
+        .or_else(|| {
+            settings
+                .server_refs
+                .iter()
+                .find(|reference| {
+                    available.contains(*reference)
+                        && cooldown.get(*reference).is_none_or(|until| *until <= now)
+                })
+                .cloned()
+        })
+}
+
+fn set_best_of_best_group(addr: &str, secret: Option<&str>, target: &str) -> Result<(), String> {
+    let path = format!("/proxies/{BEST_OF_BEST_GROUP}");
+    mihomo_api_put(
+        addr,
+        secret,
+        &path,
+        Some(&json!({"name":target}).to_string()),
+    )?;
+    let group = mihomo_api_get_json(addr, secret, &path)?;
+    if group.get("now").and_then(Value::as_str) != Some(target) {
+        return Err("best-of-best selector did not retain target".to_owned());
+    }
+    Ok(())
+}
+
+fn reject_best_of_best_after_reload(
+    controller: Option<&(String, Option<String>)>,
+    state: &HincyrayState,
+) -> Result<(), String> {
+    if !best_of_best_group_required(state) {
+        return Ok(());
+    }
+    let (addr, secret) = controller.ok_or("Mihomo controller is unavailable")?;
+    set_best_of_best_group(addr, secret.as_deref(), REJECT_NAME)
+}
+
+fn best_of_best_probe_result(result: Result<u32, String>) -> bool {
+    matches!(result, Ok(delay) if delay > 0)
+}
+
+fn update_best_of_best_selector(daemon: &Daemon) {
+    if let Ok(_apply) = daemon.apply.try_lock() {
+        update_best_of_best_selector_locked(daemon);
+    }
+}
+
+/// Call with `daemon.apply` held. Keep the state mutex free during the bounded
+/// HTTPS probe and Mihomo controller operations so HTTP/status remains usable.
+fn update_best_of_best_selector_locked(daemon: &Daemon) {
+    let (controller, expected, generation, selection) = {
+        let mut inner = lock(&daemon.inner);
+        if !inner.state.best_of_best.enabled || !inner.core.is_running() {
+            return;
+        }
+        let controller = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
+        let expected = inner
+            .state
+            .best_of_best
+            .selected_ref
+            .as_ref()
+            .and_then(|reference| {
+                best_of_best_available(&inner.state)
+                    .contains(reference)
+                    .then_some(reference)
+                    .and_then(|reference| {
+                        inner
+                            .state
+                            .profiles
+                            .iter()
+                            .find(|profile| {
+                                server_ref_for_canonical(&canonical_profile_raw(profile))
+                                    == *reference
+                                    && !profile_is_dead(&inner.state, profile)
+                            })
+                            .map(|profile| {
+                                if Some(profile.id) == inner.state.active_profile_id {
+                                    PROXY_ACTIVE_NAME.to_owned()
+                                } else {
+                                    format!("srv-out-{}", &reference[7..])
+                                }
+                            })
+                    })
+            })
+            .unwrap_or_else(|| REJECT_NAME.to_owned());
+        (
+            controller,
+            expected,
+            inner.core_generation,
+            inner.state.best_of_best.selected_ref.clone(),
+        )
+    };
+    let Some((addr, secret)) = controller else {
+        let _ = lock(&daemon.inner).core.stop();
+        return;
+    };
+    let current_group = mihomo_api_get_json(
+        &addr,
+        secret.as_deref(),
+        &format!("/proxies/{BEST_OF_BEST_GROUP}"),
+    );
+    // Without an observable selector we cannot establish which outbound is
+    // carrying traffic or safely reroute it to REJECT. Stop the core instead
+    // of leaving a stale raw selection active indefinitely.
+    if current_group.is_err() {
+        let _ = lock(&daemon.inner).core.stop();
+        return;
+    }
+    let actual = current_group
+        .as_ref()
+        .ok()
+        .and_then(|group| group.get("now"))
+        .and_then(Value::as_str);
+    {
+        let mut inner = lock(&daemon.inner);
+        if inner.core_generation != generation
+            || inner.state.best_of_best.selected_ref != selection
+            || !inner.core.is_running()
+        {
+            return;
+        }
+    }
+    if actual != Some(expected.as_str()) {
+        if set_best_of_best_group(&addr, secret.as_deref(), REJECT_NAME).is_err() {
+            let _ = lock(&daemon.inner).core.stop();
+            return;
+        }
+        let mut inner = lock(&daemon.inner);
+        // A reload deliberately resets the selector to REJECT. Retain the
+        // sticky identity until its raw outbound passes a fresh HTTPS probe;
+        // an unexpected third-party selection instead invalidates it.
+        if actual != Some(REJECT_NAME) && inner.state.best_of_best.selected_ref.take().is_some() {
+            inner.dirty = true;
+        }
+        inner.best_of_best_failures = 0;
+    }
+    let (selected, outbound, controller, generation, previous_selection) = {
+        let mut inner = lock(&daemon.inner);
+        if !inner.state.best_of_best.enabled || !inner.core.is_running() {
+            return;
+        }
+        let candidates = best_of_best_available(&inner.state);
+        let previous_selection = inner.state.best_of_best.selected_ref.clone();
+        let selected = best_of_best_next(
+            &inner.state.best_of_best,
+            &candidates,
+            &inner.best_of_best_cooldown,
+            unix_now(),
+        );
+        let Some(ref selected_ref) = selected else {
+            let controller = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
+            drop(inner);
+            if let Some((addr, secret)) = controller {
+                if set_best_of_best_group(&addr, secret.as_deref(), REJECT_NAME).is_err() {
+                    let _ = lock(&daemon.inner).core.stop();
+                    return;
+                }
+                let mut inner = lock(&daemon.inner);
+                if inner.state.best_of_best.selected_ref.take().is_some() {
+                    inner.dirty = true;
+                }
+            }
+            return;
+        };
+        if !inner.state.best_of_best.server_refs.contains(selected_ref) {
+            return;
+        }
+        let Some(profile) = inner.state.profiles.iter().find(|profile| {
+            server_ref_for_canonical(&canonical_profile_raw(profile)) == *selected_ref
+                && !profile_is_dead(&inner.state, profile)
+        }) else {
+            return;
+        };
+        let outbound = if Some(profile.id) == inner.state.active_profile_id {
+            PROXY_ACTIVE_NAME.to_owned()
+        } else {
+            format!("srv-out-{}", &selected_ref[7..])
+        };
+        let generation = inner.core_generation;
+        let controller = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
+        (
+            selected,
+            outbound,
+            controller,
+            generation,
+            previous_selection,
+        )
+    };
+    let Some((addr, secret)) = controller else {
+        let _ = lock(&daemon.inner).core.stop();
+        return;
+    };
+    // Keep the group on REJECT whenever the direct leaf has not proved HTTPS reachability.
+    let probe = mihomo_api_delay_expected(
+        &addr,
+        secret.as_deref(),
+        &outbound,
+        BEST_OF_BEST_PROBE_URL,
+        4000,
+        Some("200-399"),
+    );
+    let mut inner = lock(&daemon.inner);
+    if inner.core_generation != generation
+        || !inner.core.is_running()
+        || !inner.state.best_of_best.enabled
+        || inner.state.best_of_best.selected_ref != previous_selection
+        || selected
+            .as_ref()
+            .is_none_or(|reference| !best_of_best_available(&inner.state).contains(reference))
+    {
+        return;
+    }
+    if !best_of_best_probe_result(probe) {
+        inner.best_of_best_failures = inner.best_of_best_failures.saturating_add(1);
+        if previous_selection.is_none()
+            || inner.best_of_best_failures >= BEST_OF_BEST_PROBE_FAILURES
+        {
+            if let Some(ref selected) = selected {
+                inner
+                    .best_of_best_cooldown
+                    .insert(selected.clone(), unix_now() + 15 * 60);
+            }
+            inner.best_of_best_failures = 0;
+            // Do not route through the next server until its own HTTPS probe succeeds.
+            drop(inner);
+            if set_best_of_best_group(&addr, secret.as_deref(), REJECT_NAME).is_err() {
+                let _ = lock(&daemon.inner).core.stop();
+                return;
+            }
+            let mut inner = lock(&daemon.inner);
+            if inner.state.best_of_best.selected_ref.take().is_some() {
+                inner.dirty = true;
+            }
+        }
+        return;
+    }
+    inner.best_of_best_failures = 0;
+    drop(inner);
+    if set_best_of_best_group(&addr, secret.as_deref(), &outbound).is_ok() {
+        let mut inner = lock(&daemon.inner);
+        if inner.state.best_of_best.selected_ref != selected {
+            inner.state.best_of_best.selected_ref = selected;
+            inner.dirty = true;
+        }
+    } else {
+        // A failed PUT or verification leaves the selected leaf unknown.
+        // Reset even if the previous raw outbound had been healthy.
+        if set_best_of_best_group(&addr, secret.as_deref(), REJECT_NAME).is_err() {
+            let _ = lock(&daemon.inner).core.stop();
+        } else {
+            let mut inner = lock(&daemon.inner);
+            if inner.state.best_of_best.selected_ref.take().is_some() {
+                inner.dirty = true;
+            }
+        }
+    }
 }
 
 /// Build the routing context shared by the daemon's config generator.
@@ -4791,6 +5401,7 @@ fn build_routing_context<'a>(
         }
     }
     let extra = RouterExtra {
+        best_of_best_outbounds: Vec::new(),
         dns: Some(state.dns_settings.clone()),
         port_mode: state.split_routing.port_mode.clone(),
         proxy_ports: normalize_route_items(&state.split_routing.proxy_ports),
@@ -4843,6 +5454,7 @@ fn resolve_target<'a>(
         RoutingTarget::Direct => Ok((DIRECT_NAME.to_owned(), None)),
         RoutingTarget::Reject => Ok((REJECT_NAME.to_owned(), None)),
         RoutingTarget::Parovozik => Ok((PAROVOZIK_PROXY_GROUP.to_owned(), Some(active))),
+        RoutingTarget::BestOfBest => Ok((BEST_OF_BEST_GROUP.to_owned(), None)),
         RoutingTarget::Active => Ok((PROXY_NAME.to_owned(), Some(active))),
         RoutingTarget::LegacyProfile(_) => Err(format!("unmigrated legacy target {value:?}")),
         RoutingTarget::Server(server_ref) => {
@@ -4950,6 +5562,20 @@ fn validate_routing_targets(
             continue;
         }
         refs.insert(server_ref.clone());
+    }
+    if state.best_of_best.enabled {
+        if state.best_of_best.server_refs.len() > MAX_BEST_OF_BEST_SERVERS {
+            return Err(format!(
+                "at most {MAX_BEST_OF_BEST_SERVERS} best-of-best servers may be enabled"
+            ));
+        }
+        for server_ref in &state.best_of_best.server_refs {
+            if valid_routing_server_ref(server_ref)
+                && best_of_best_available(state).contains(server_ref)
+            {
+                refs.insert(server_ref.clone());
+            }
+        }
     }
     if state.split_routing.parovozik_server_refs.len() > MAX_PAROVOZIK_SERVERS {
         return Err(format!(
@@ -6159,6 +6785,8 @@ fn dispatch_from(
         ("GET", "/api/logs") => handle_logs(daemon),
         ("GET", "/api/system") => handle_system(daemon),
         ("GET", "/api/auto-settings") => handle_auto_settings_get(daemon),
+        ("GET", "/api/automation/best-of-best") => handle_best_of_best_get(daemon),
+        ("POST", "/api/automation/best-of-best") => handle_best_of_best_set(body, daemon),
         ("POST", "/api/auto-settings") => handle_auto_settings_set(body, daemon),
         ("GET", "/api/hwid") => handle_hwid_get(daemon),
         ("POST", "/api/hwid") => handle_hwid_set(body, daemon),
@@ -7601,10 +8229,18 @@ fn hot_reload_or_restart_core_locked(
             let result = inner.core.restart(&state.mihomo_path, config_path, geo_dir);
             if result.is_ok() {
                 inner.core_generation = inner.core_generation.saturating_add(1);
+                if best_of_best_group_required(state) {
+                    wait_for_core_readiness_locked(inner, daemon, controller, state)?;
+                }
+                if let Err(error) = reject_best_of_best_after_reload(controller, state) {
+                    let _ = inner.core.stop();
+                    return Err(format!("best-of-best fail-closed reset: {error}"));
+                }
             }
             return result;
         }
     };
+    let reload = running && owned && controller.is_some();
     let result = if running
         && owned
         && let Some(controller) = controller
@@ -7615,6 +8251,13 @@ fn hot_reload_or_restart_core_locked(
     };
     if result.is_ok() {
         inner.core_generation = inner.core_generation.saturating_add(1);
+        if !reload && best_of_best_group_required(state) {
+            wait_for_core_readiness_locked(inner, daemon, controller, state)?;
+        }
+        if let Err(error) = reject_best_of_best_after_reload(controller, state) {
+            let _ = inner.core.stop();
+            return Err(format!("best-of-best fail-closed reset: {error}"));
+        }
     }
     result
 }
@@ -7633,6 +8276,7 @@ fn restart_core_with_selector_locked(
     let state = inner.state.clone();
     let result = wait_for_core_readiness_locked(inner, daemon, controller.as_ref(), &state)
         .and_then(|()| validate_proxy_selector(controller.as_ref()).map(|_| ()))
+        .and_then(|()| reject_best_of_best_after_reload(controller.as_ref(), &state))
         .and_then(|()| {
             let (addr, secret) = controller
                 .as_ref()
@@ -9921,6 +10565,12 @@ fn profile_has_enabled_pinned_route(state: &HincyrayState, profile: &Profile) ->
             _ => None,
         })
         .any(|server_ref| pinned_refs.contains(server_ref.as_str()))
+        || (state.best_of_best.enabled
+            && state
+                .best_of_best
+                .server_refs
+                .iter()
+                .any(|server_ref| pinned_refs.contains(server_ref.as_str())))
         || (state.split_routing.parovozik_enabled
             && state
                 .split_routing
@@ -10011,6 +10661,14 @@ fn migrate_profile_identity(state: &mut HincyrayState, old: &Profile, replacemen
                 &old_ref,
                 &new_routing_ref,
             );
+            replace_string_value(
+                &mut state.best_of_best.server_refs,
+                &old_ref,
+                &new_routing_ref,
+            );
+            if state.best_of_best.selected_ref.as_deref() == Some(old_ref.as_str()) {
+                state.best_of_best.selected_ref = Some(new_routing_ref.clone());
+            }
         }
         state
             .server_route_registry
@@ -12325,6 +12983,7 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
                     .find(|entry| entry.canonical_raw == canonical)?;
                 Some(json!({
                     "ref": entry.server_ref,
+                    "lifecycle_ref": profile_server_ref(profile),
                     "id": profile.id,
                     "name": profile.name,
                     "protocol": profile.protocol.to_string(),
@@ -23539,6 +24198,9 @@ fn start_watchdog(
                 thread::sleep(Duration::from_millis(200));
             }
             watchdog_tick += 1;
+            if watchdog_tick.is_multiple_of(BEST_OF_BEST_PROBE_INTERVAL_TICKS) {
+                update_best_of_best_selector(&daemon);
+            }
 
             // --- Read state snapshot (short lock) ---
             let (
@@ -25413,6 +26075,173 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    #[test]
+    fn best_of_best_uses_fresh_service_evidence_and_routing_refs_only() {
+        let (dir, daemon) = test_daemon();
+        let first =
+            profile_test_fixture_profile(159, "First", "https://provider.example/sub/<token>");
+        let second =
+            profile_test_fixture_profile(123, "Second", "https://provider.example/sub/<token>");
+        let manual = profile_test_fixture_profile(160, "Manual", "manual");
+        let reference = server_ref_for_canonical(&canonical_profile_raw(&first));
+        let now = unix_now();
+        {
+            let mut inner = lock(&daemon.inner);
+            let state = &mut inner.state;
+            state.subscriptions.push(StoredSubscription {
+                url: "https://provider.example/sub/<token>".to_owned(),
+                ..StoredSubscription::default()
+            });
+            state.profiles = vec![second.clone(), first.clone(), manual.clone()];
+            state.active_profile_id = Some(first.id);
+            for (profile, passes, ping) in [(&first, 2, 38), (&second, 1, 12), (&manual, 3, 3)] {
+                let mut tests = vec![profile_test_fixture_resource("ping_proxy", true)];
+                tests[0].avg_ttfb_ms = ping;
+                for (id, passed) in [
+                    ("youtube_thumbnails", passes >= 1),
+                    ("telegram", passes >= 2),
+                    ("ai", passes >= 3),
+                ] {
+                    let mut resource = profile_test_fixture_resource(id, passed);
+                    if id == "youtube_thumbnails" {
+                        resource.contract_version = 1;
+                    }
+                    tests.push(resource);
+                }
+                state.stats.push(ProfileStats {
+                    profile_raw: profile.raw.clone(),
+                    last_service_test_unix: now,
+                    resource_tests: tests,
+                    ..ProfileStats::default()
+                });
+            }
+            sync_server_route_registry(state);
+            assert_eq!(
+                best_of_best_candidates(state, now).first(),
+                Some(&reference)
+            );
+            assert_eq!(best_of_best_candidates(state, now).len(), 2);
+            state.best_of_best = BestOfBestSettings {
+                enabled: true,
+                server_refs: vec![reference.clone()],
+                selected_ref: None,
+            };
+            state.split_routing.enabled = true;
+            assert_eq!(best_of_best_available(state), vec![reference.clone()]);
+            assert!(best_of_best_candidates(state, now + 6 * 3600 + 1).is_empty());
+            let mut pinned = Vec::new();
+            assert_eq!(
+                best_of_best_routes(state, &first, &mut pinned).expect("routes"),
+                vec![PROXY_ACTIVE_NAME]
+            );
+            let config = build_daemon_config(state, &[]).expect("config");
+            let yaml: serde_yaml::Value = serde_yaml::from_str(&config).expect("yaml");
+            let group = yaml["proxy-groups"]
+                .as_sequence()
+                .expect("groups")
+                .iter()
+                .find(|group| group["name"] == BEST_OF_BEST_GROUP)
+                .expect("best selector");
+            assert_eq!(group["proxies"][0], REJECT_NAME);
+            assert_eq!(group["proxies"][1], PROXY_ACTIVE_NAME);
+            assert_ne!(yaml["profile"]["store-selected"], true);
+            let manual_ref = server_ref_for_canonical(&canonical_profile_raw(&manual));
+            state.best_of_best.server_refs.push(manual_ref.clone());
+            assert!(best_of_best_available(state).contains(&manual_ref));
+            let manual_routes =
+                best_of_best_routes(state, &first, &mut Vec::new()).expect("manual routes");
+            assert!(manual_routes.contains(&format!("srv-out-{}", &manual_ref[7..])));
+            state
+                .best_of_best
+                .server_refs
+                .retain(|candidate| candidate != &manual_ref);
+            assert!(!best_of_best_available(state).contains(&manual_ref));
+            state.best_of_best.enabled = false;
+            assert_eq!(
+                effective_mihomo_features(state).store_selected,
+                state.mihomo_features.store_selected
+            );
+        }
+        assert_eq!(
+            best_of_best_snapshot(&daemon)["candidates"][0]["ref"],
+            reference
+        );
+        assert!(best_of_best_probe_result(Ok(42)));
+        assert!(!best_of_best_probe_result(Ok(0)));
+        assert!(!best_of_best_probe_result(Err("TLS EOF".to_owned())));
+        drop(dir);
+    }
+
+    #[test]
+    fn best_of_best_sticky_order_and_reference_validation() {
+        let a = "srv-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        let b = "srv-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+        let settings = BestOfBestSettings {
+            enabled: true,
+            server_refs: vec![a.clone(), b.clone()],
+            selected_ref: Some(b.clone()),
+        };
+        let available = vec![a.clone(), b.clone()];
+        assert_eq!(
+            best_of_best_next(&settings, &available, &HashMap::new(), 100),
+            Some(b.clone())
+        );
+        assert_eq!(
+            best_of_best_next(
+                &settings,
+                &available,
+                &HashMap::from([(b.clone(), 200)]),
+                100
+            ),
+            Some(a.clone())
+        );
+        assert_eq!(
+            best_of_best_next(
+                &settings,
+                &available,
+                &HashMap::from([(a.clone(), 200), (b.clone(), 200)]),
+                100
+            ),
+            None
+        );
+        assert_eq!(
+            RoutingTarget::parse("best-of-best"),
+            Ok(RoutingTarget::BestOfBest)
+        );
+        assert!(!valid_routing_server_ref(
+            "srv-v2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+    }
+
+    #[test]
+    fn best_of_best_selector_verifies_reject_and_selected_leaf() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock controller");
+        let address = listener.local_addr().expect("address").to_string();
+        let worker = thread::spawn(move || {
+            for expected in [REJECT_NAME, "srv-out-fixture"] {
+                let (mut socket, _) = listener.accept().expect("PUT selector");
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(3)));
+                let mut request = [0_u8; 2048];
+                let size = socket.read(&mut request).expect("PUT request");
+                let text = String::from_utf8_lossy(&request[..size]);
+                assert!(text.starts_with("PUT /proxies/best-of-best HTTP/1.1"));
+                assert!(text.contains(&format!("\"name\":\"{expected}\"")));
+                socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").expect("PUT response");
+                let (mut socket, _) = listener.accept().expect("GET selector");
+                let size = socket.read(&mut request).expect("GET request");
+                assert!(
+                    String::from_utf8_lossy(&request[..size])
+                        .starts_with("GET /proxies/best-of-best HTTP/1.1")
+                );
+                let body = json!({"now":expected}).to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).expect("GET response");
+            }
+        });
+        set_best_of_best_group(&address, None, REJECT_NAME).expect("verified reject");
+        set_best_of_best_group(&address, None, "srv-out-fixture").expect("verified raw leaf");
+        worker.join().expect("mock worker");
+    }
 
     fn test_daemon() -> (TempDir, Daemon) {
         let dir = TempDir::new().expect("temp dir");

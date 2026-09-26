@@ -1,6 +1,8 @@
-# HincyRay v1.3.28
+# HincyRay v1.3.30
 
-Local v1.3.28, dated 2026-09-25, shows green/red connection indicators for Keenetic devices in “Zигануть Vсеми руками” and keeps disconnected devices in a collapsed list while preserving MAC selection. Details: [v1.3.28](docs/releases/v1.3.28.md). The versioned GitHub Release artifact has not been published.
+v1.3.30 expands “Best of the best” to a searchable pool of up to 16 servers, including manual profiles, with explicit addition/removal and sticky fail-closed routing. Both routing target pickers rank fresh service checks and proxy ping. See [release evidence](docs/releases/v1.3.30.md). This version does not include Jitsi integration.
+
+Download the Keenetic/Entware aarch64 binary from [GitHub Release v1.3.30](https://github.com/DurkaEbanaya/HincyRay/releases/tag/v1.3.30). SHA256: `5fd5a6989fb9339414394dddcfdf27ed93e9d5337bf16e6d4d53ad534d4b9bec`. Publication restrictions and pending-release notes below describe historical versions, not this release.
 
 [English](README.md) | [Русский](README.ru.md)
 

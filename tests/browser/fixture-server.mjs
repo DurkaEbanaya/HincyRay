@@ -255,6 +255,7 @@ const routing = {
   servers: [
     {
       ref: 'srv-v1-fixture',
+      lifecycle_ref: profile.server_ref,
       id: 101,
       name: 'Fixture Profile',
       protocol: 'VLESS',
@@ -264,6 +265,7 @@ const routing = {
     },
     {
       ref: 'srv-v1-wagon',
+      lifecycle_ref: manualProfile.server_ref,
       id: 102,
       name: 'Fixture Wagon',
       protocol: 'VLESS',
@@ -274,6 +276,7 @@ const routing = {
     },
     {
       ref: 'srv-v1-dead-route',
+      lifecycle_ref: deadProfile.server_ref,
       id: 404,
       name: 'Very long unavailable route target that must remain readable',
       protocol: 'VLESS',
@@ -340,6 +343,7 @@ const responses = new Map([
   ] }] }],
   ['/api/profiles', { profiles: [profile, manualProfile, secondSubscriptionProfile, deadProfile] }],
   ['/api/routing', routing],
+  ['/api/automation/best-of-best', {settings:{enabled:false,server_refs:[],selected_ref:null},candidates:[{ref:'srv-v1-fixture',id:101,name:'Fixture Profile',passed:2,ping_ms:28},{ref:'srv-v1-wagon',id:102,name:'Fixture Manual',passed:0,ping_ms:null,manual:true}],max_candidates:16}],
   ['/api/routing/connection-context', { servers: routing.servers }],
   ['/api/routing/preview', { requires_apply: true, core_restart: true, firewall_reload: true, desired_config_sha256: 'desired', applied_config_sha256: 'applied', changes: ['fixture change'], warnings: [] }],
   ['/api/onboarding/status', { ready: true, checks: [] }],
@@ -552,6 +556,10 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === 'POST' && url.pathname === '/api/automation/direct-policy') {
       sendJson(response, 200, { enabled: body?.enabled, selected: body?.devices?.length });
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/automation/best-of-best') {
+      sendJson(response, 200, { settings: { ...body, selected_ref: null }, candidates: responses.get('/api/automation/best-of-best').candidates });
       return;
     }
 

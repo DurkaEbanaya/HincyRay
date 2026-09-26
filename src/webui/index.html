@@ -1012,7 +1012,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   <nav class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="sidebar-brand" style="border-radius: 0px;">
       <svg class="brand-icon" viewBox="0 0 1024 1024" role="img" aria-label="HincyRay"><defs><radialGradient id="brand-bg" cx="50%" cy="46%" r="62%"><stop stop-color="#172b3d"/><stop offset=".55" stop-color="#0b1018"/><stop offset="1" stop-color="#05070b"/></radialGradient><linearGradient id="brand-phone" x1="250" y1="100" x2="760" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#3b424d"/><stop offset=".45" stop-color="#151a21"/><stop offset="1" stop-color="#050608"/></linearGradient><linearGradient id="brand-screen" x1="310" y1="150" x2="690" y2="850" gradientUnits="userSpaceOnUse"><stop stop-color="#1f3146"/><stop offset="1" stop-color="#070a0f"/></linearGradient></defs><rect width="1024" height="1024" rx="220" fill="url(#brand-bg)"/><path d="M130 740 40 820M190 820 95 930M845 170l115-92M820 790l130 92M93 276l112 52" stroke="#0078d7" stroke-width="18" stroke-linecap="round" opacity=".65"/><g transform="rotate(-8 512 512)"><rect x="290" y="92" width="444" height="840" rx="78" fill="url(#brand-phone)" stroke="#737b87" stroke-width="14"/><rect x="328" y="138" width="368" height="748" rx="48" fill="url(#brand-screen)" stroke="#0e1620" stroke-width="10"/><circle cx="512" cy="176" r="16" fill="#080b10" stroke="#4d5663" stroke-width="5"/><path d="M510 132 455 292l68-30-42 172 106-238-72 34z" fill="#f4d03f" stroke="#fff2a4" stroke-width="8"/><path d="M496 432 365 536l112 8-74 204 214-260-102 14 75-134z" fill="#ff453a" stroke="#ffb2ab" stroke-width="9"/><path d="M520 398 660 496l-92 22 70 188-198-238 92 18z" fill="#60cdff" stroke="#b8efff" stroke-width="8"/><path d="M445 308 340 248M444 309l-96 102M521 264l118-98M514 436l-160 44M514 437l120 152M477 546l-112 188M566 515l104 166" stroke="#d8e6f3" stroke-width="10" stroke-linecap="round" opacity=".8"/><path d="M336 610 238 660l87 36-142 98 238-62-62-42 98-38zM664 300l150-50-72 102 160 10-228 68 38-78z" fill="#1f8fff" opacity=".88"/><text x="512" y="760" text-anchor="middle" font-family="Arial Black,Arial,sans-serif" font-size="76" fill="#f2f6fb" stroke="#05070b" stroke-width="7" paint-order="stroke">POCO</text></g></svg>
-      <div><div class="logo">HincyRay</div><div class="version">v1.3.28</div></div>
+      <div><div class="logo">HincyRay</div><div class="version">v1.3.30</div></div>
     </div>
     <div class="brightness-row">
       <svg class="brightness-icon" onclick="toggleTheme()" title="Переключить тему" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9L14 6M5.9 14l-1.1 1.1"></path></svg>
@@ -1084,6 +1084,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
         <div class="nav-sub-list">
           <div class="nav-sub-item" data-section="auto-select" onclick="navTo('auto-select')"><span class="nav-label">Auto-Select</span></div>
           <div class="nav-sub-item" data-section="direct-policy" onclick="navTo('direct-policy')"><span class="nav-label">Zигануть Vсеми руками</span></div>
+          <div class="nav-sub-item" data-section="best-of-best" onclick="navTo('best-of-best')"><span class="nav-label">Лучшие из лучших</span></div>
           <div class="nav-sub-item" data-section="maintenance" onclick="navTo('maintenance')"><span class="nav-label">Обслуживание</span></div>
         </div>
       </div>
@@ -1962,6 +1963,18 @@ https://sub.example.com/…"></textarea>
         </div>
       </section>
 
+      <section class="section-panel" data-section="best-of-best" data-od-id="sec-best-of-best">
+        <div class="section-header" onclick="toggleSection(this)"><h2>Лучшие из лучших</h2><svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg></div>
+        <div class="section-body">
+          <p>До 16 серверов, включая свои ручные профили для теста. Число загруженных серверов также ограничено общим лимитом маршрутов. Добавьте серверы галочками, удалите из пула снятием галочки и сохраните. Перед использованием каждого выхода обязательна HTTPS-проверка; при отказе нет перехода на DIRECT.</p>
+          <label class="toggle"><input type="checkbox" id="bestOfBestEnabled"><span class="slider"></span></label> Включить пул
+          <div id="bestOfBestSelected" style="margin:12px 0">—</div>
+          <input id="bestOfBestSearch" type="search" placeholder="Поиск сервера по имени или #ID" oninput="filterBestOfBestCatalog()" style="width:100%;margin-bottom:10px">
+          <div id="bestOfBestCount" style="margin-bottom:8px">В пуле: 0</div>
+          <div id="bestOfBestCandidates" style="max-height:380px;overflow:auto"></div>
+          <button class="btn btn-accent btn-sm" id="bestOfBestSave" onclick="saveBestOfBest()">Сохранить и применить</button>
+        </div>
+      </section>
       <section class="section-panel" data-section="maintenance" data-od-id="sec-maintenance">
         <div class="section-header" onclick="toggleSection(this)">
           <h2>Обслуживание</h2>
@@ -2476,6 +2489,7 @@ function previewApi(method, path, body) {
     '/api/diagnostics/udp-quic': {ok:true,udp_tproxy:true,quic_mode:'proxy'},
     '/api/diagnostics/direct-availability': {ok:true,results:[{id:'google',name:'Google',ok:true,status:204,elapsed_ms:42},{id:'vk',name:'Vk.ru',ok:true,status:200,elapsed_ms:55},{id:'ya',name:'ya.ru',ok:true,status:200,elapsed_ms:49},{id:'youtube',name:'YouTube',ok:false,status:403,elapsed_ms:70,error:'HTTP 403'}]},
     '/api/automation/direct-policy': {enabled:false,devices:[{mac:'02:00:00:00:00:33',ip:'192.168.2.33',name:'PC',policy:'Policy0',selected:false,active:true},{mac:'02:00:00:00:00:44',ip:'0.0.0.0',name:'Offline PC',policy:'Policy0',selected:false,active:false}],last_check_unix:null,last_action_unix:null,last_action:null,error:null},
+    '/api/automation/best-of-best': {settings:{enabled:false,server_refs:[],selected_ref:null},candidates:[],max_candidates:6},
     '/api/diagnostics/direct-monitor': {bot_configured:false,bot_paired:false,results:[]},
     '/api/hwid': {hwid:'a1b2c3d4e5f60708',os_version:'Android 14',device_model:'Reference Device',device_os:'android',app_version:'2.18.0',bundle_id:'app.hincyray',api_version:'5'},
     '/api/auth-settings': {enabled:false,username:'admin'},
@@ -3169,6 +3183,7 @@ const NAV_MAP = {
   'update':      {group:'mihomo',label:'Обновление'},
   'auto-select': {group:'automation',label:'Auto-Select'},
   'direct-policy': {group:'automation',label:'Zигануть Vсеми руками'},
+  'best-of-best': {group:'automation',label:'Лучшие из лучших'},
   'maintenance': {group:'automation',label:'Обслуживание'},
   'trace':       {group:'diagnostics',label:'Трассировка'},
   'unlock':      {group:'diagnostics',label:'Разблокировка'},
@@ -3188,7 +3203,7 @@ const GROUP_SUBS = {
   profiles:    ['profiles','import','sub-store'],
   routing:     ['routing','connections-table','devices','dns'],
   mihomo:      ['features','config','logs','update'],
-  automation:  ['auto-select','direct-policy','maintenance'],
+  automation:  ['auto-select','direct-policy','best-of-best','maintenance'],
   diagnostics: ['trace','unlock','diag-network','profile-logger','deep-bench','trash'],
   admin:       ['backups','auth','hwid','acrylic','tooltips'],
 };
@@ -3236,6 +3251,7 @@ function navTo(section) {
   else stopProfileLoggerPolling();
   if (section === 'features') loadFeatures();
   if (section === 'direct-policy') loadDirectPolicy();
+  if (section === 'best-of-best') loadBestOfBest();
 }
 
 function arrangeRoutingSecondarySections() {
@@ -4335,13 +4351,24 @@ function getSortValue(p, key) {
 function profileResultRank(profile) {
   if (!isFreshServiceTest(profile.last_service_test_unix)) return {services:0,pingRank:1,pingMs:Infinity};
   const tests = Array.isArray(profile.resource_tests) ? profile.resource_tests.filter(isCurrentSearchResourceTest) : [];
-  const services = ['youtube_thumbnails','telegram','ai'].filter(id => tests.some(test => test.id === id && test.inconclusive !== true && test.stable === true && Number(test.attempts) > 0)).length;
+  const services = ['youtube_thumbnails','telegram','ai'].filter(id => tests.some(test => test.id === id && test.inconclusive !== true && test.stable === true && Number(test.attempts) > 0 && Number(test.successes) > 0)).length;
   const pings = tests.filter(test => String(test.id || '').startsWith('ping_'));
   const successful = pings.filter(test => test.inconclusive !== true && test.reachable === true && Number(test.attempts) > 0 && Number.isFinite(Number(test.avg_ttfb_ms)) && Number(test.avg_ttfb_ms) > 0);
   if (successful.length) return {services,pingRank:0,pingMs:Math.round(successful.reduce((sum,test) => sum + Number(test.avg_ttfb_ms),0)/successful.length)};
   if (pings.some(test => test.inconclusive !== true && test.reachable === true && Number(test.attempts) > 0)) return {services,pingRank:0,pingMs:Infinity};
   const pingRank = pings.some(test => test.inconclusive !== true && Number(test.attempts) > 0 && test.reachable === false) ? 2 : 1;
   return {services,pingRank,pingMs:Infinity};
+}
+
+function routingTargetResultRank(profile) {
+  const rank = profileResultRank(profile);
+  if (!isFreshServiceTest(profile.last_service_test_unix)) return rank;
+  const proxyPing = (Array.isArray(profile.resource_tests) ? profile.resource_tests : [])
+    .find(test => test.id === 'ping_proxy' && isCurrentSearchResourceTest(test) && test.inconclusive !== true && Number(test.attempts) > 0);
+  if (proxyPing?.reachable === true && Number.isFinite(Number(proxyPing.avg_ttfb_ms)) && Number(proxyPing.avg_ttfb_ms) > 0) {
+    return {services:rank.services,pingRank:0,pingMs:Number(proxyPing.avg_ttfb_ms)};
+  }
+  return {services:rank.services,pingRank:proxyPing?.reachable === false ? 2 : 1,pingMs:Infinity};
 }
 
 function profileSuccessfulChecks(profile) {
@@ -5028,7 +5055,7 @@ function routingServerLabel(server) {
 
 function routingTargetOptions(selectedTarget) {
   const selected = String(selectedTarget || 'active');
-  const base = [['active',t('Текущий активный VPN')],['direct','DIRECT'],['reject','REJECT']];
+  const base = [['active',t('Текущий активный VPN')],['best-of-best','Лучшие из лучших'],['direct','DIRECT'],['reject','REJECT']];
   let html = base.map(([value,label]) => `<option value="${attrEscape(value)}" ${selected===value?'selected':''}>${htmlEscape(label)}</option>`).join('');
   html += routingTargetServerOptions(selected);
   return html;
@@ -5036,21 +5063,30 @@ function routingTargetOptions(selectedTarget) {
 
 function routingTargetServerOptions(selectedTarget) {
   const selected = String(selectedTarget || '');
+  // The shared builder serves both rule and connection-table dialogs.
+  const ranked = (Array.isArray(MOCK.routing_servers) ? MOCK.routing_servers : [])
+    .filter(server => server?.ref != null)
+    .map((server, index) => {
+      const profile = (MOCK.profiles || []).find(profile => profile.id === server.id);
+      const matches = profile && profile.server_ref === server.lifecycle_ref;
+      return {server, index, rank:matches ? routingTargetResultRank(profile) : {services:0,pingRank:1,pingMs:Infinity}};
+    }).sort((a,b) => a.server.dead - b.server.dead || b.rank.services - a.rank.services
+      || a.rank.pingRank - b.rank.pingRank || a.rank.pingMs - b.rank.pingMs || a.index - b.index);
   let html = '';
-  const groups = new Map();
-  (Array.isArray(MOCK.routing_servers) ? MOCK.routing_servers : []).forEach(server => {
-    if (server == null || server.ref == null) return;
+  // Each contiguous provenance segment retains its label without hiding the
+  // global best-first order behind subscription grouping.
+  let currentGroup = null, options = [];
+  const flush = () => {
+    if (options.length) html += `<optgroup label="${attrEscape(currentGroup)}">${options.join('')}</optgroup>`;
+    options = [];
+  };
+  ranked.forEach(({server}) => {
     const group = shortGroupName(server.group || t('Без группы'));
-    if (!groups.has(group)) groups.set(group, []);
-    groups.get(group).push(server);
-  });
-  groups.forEach((items, group) => {
-    const options = items.map(server => {
+    if (group !== currentGroup) { flush(); currentGroup = group; }
       const value = `server:${String(server.ref)}`;
-      return `<option value="${attrEscape(value)}" ${selected===value?'selected':''}>${htmlEscape(routingServerLabel(server))}</option>`;
-    }).join('');
-    html += `<optgroup label="${attrEscape(group)}">${options}</optgroup>`;
+      options.push(`<option value="${attrEscape(value)}" ${selected===value?'selected':''}>${htmlEscape(routingServerLabel(server))}</option>`);
   });
+  flush();
   if (selected.startsWith('server:') && !routingServerByTarget(selected)) {
     html += `<optgroup label="${attrEscape(t('нет в каталоге'))}"><option value="${attrEscape(selected)}" selected>${htmlEscape(t('Сервер удалён или недоступен'))}</option></optgroup>`;
   }
@@ -5081,7 +5117,7 @@ function refreshTorrentSocksTargetSelect(selectedTarget) {
 function routingTargetPresentation(target) {
   const value = String(target || 'active');
   if (!value.startsWith('server:')) {
-    const labels = {active:t('Текущий активный VPN'),direct:'DIRECT',reject:'REJECT'};
+    const labels = {active:t('Текущий активный VPN'),'best-of-best':'Лучшие из лучших',direct:'DIRECT',reject:'REJECT'};
     return {label:labels[value] || value, detail:'', stale:false};
   }
   const server = routingServerByTarget(value);
@@ -6168,6 +6204,7 @@ function renderConnectionsTableRows() {
     const actionSelect = `<select class="form-control" data-testid="connections-action" data-routing-target-select="1" data-searchable-select="1" data-custom-select-align="end" data-resource="${resource}" onchange="routeConnectionResource(this)" ${actionable?'':'disabled title="'+attrEscape(t('Fake-IP: ожидается восстановление домена'))+'"'}>
       <option value="">${htmlEscape(t('Следовать правилу…'))}</option>
       <option value="active">${htmlEscape(t('Текущий активный VPN'))}</option>
+      <option value="best-of-best">Лучшие из лучших</option>
       <option value="direct">DIRECT</option>
       <option value="reject">REJECT</option>
       ${routingTargetServerOptions('')}
@@ -6219,6 +6256,7 @@ function openConnectionRuleEditor(button) {
       <label>${htmlEscape(t('Цель'))}</label>
       <select id="connectionRuleTarget" class="form-control" data-routing-target-select="1" data-searchable-select="1">
         <option value="active">${htmlEscape(t('Текущий активный VPN'))}</option>
+        <option value="best-of-best">Лучшие из лучших</option>
         <option value="direct">DIRECT</option>
         <option value="reject">REJECT</option>
         ${routingTargetServerOptions('')}
@@ -7029,6 +7067,49 @@ async function saveDirectPolicy() {
 document.getElementById('directPolicyEnabled')?.addEventListener('change', () => { directPolicyEditing = true; });
 document.getElementById('directPolicyDevices')?.addEventListener('change', () => { directPolicyEditing = true; });
 document.getElementById('directPolicyOfflineDevices')?.addEventListener('change', () => { directPolicyEditing = true; });
+
+async function loadBestOfBest() {
+  try {
+    const data = await api('GET','/api/automation/best-of-best',undefined,true);
+    if (bestOfBestDraftDirty) return;
+    bestOfBestLimit = Number(data.max_candidates) || 16;
+    document.getElementById('bestOfBestEnabled').checked = data.settings?.enabled === true;
+    const selected = new Set(data.settings?.server_refs || []);
+    const selectedName = (data.candidates || []).find(server => server.ref === data.settings?.selected_ref);
+    document.getElementById('bestOfBestSelected').textContent = selectedName ? `Текущий выход: #${selectedName.id} · ${selectedName.name}` : 'Текущий выход: REJECT до успешной HTTPS-проверки';
+    document.getElementById('bestOfBestCandidates').innerHTML = (data.candidates || []).map(server =>
+      `<label data-best-search="${attrEscape(`#${server.id} ${server.name}`.toLowerCase())}" style="display:block;padding:6px"><input type="checkbox" data-best-ref="${attrEscape(server.ref)}" ${selected.has(server.ref)?'checked':''} ${server.dead && !selected.has(server.ref)?'disabled':''}> #${server.id} · ${htmlEscape(server.name)} · ${server.manual?'Ручной · ':''}${server.dead?'Dead · ':''}${server.passed}/3 · ${server.ping_ms == null ? '—' : `${server.ping_ms} ms`}</label>`
+    ).join('') || 'Проверенных серверов подписок пока нет';
+    filterBestOfBestCatalog();
+    updateBestOfBestCount();
+  } catch (_) { document.getElementById('bestOfBestSelected').textContent = 'Не удалось загрузить пул'; }
+}
+async function saveBestOfBest() {
+  const server_refs = [...document.querySelectorAll('#bestOfBestCandidates input[data-best-ref]:checked')].map(input => input.dataset.bestRef);
+  if (server_refs.length > bestOfBestLimit) return showToast('error',`Не более ${bestOfBestLimit} серверов; общий лимит маршрутов также учитывается`);
+  const button = document.getElementById('bestOfBestSave');
+  button.disabled = true;
+  try {
+    await api('POST','/api/automation/best-of-best',{enabled:document.getElementById('bestOfBestEnabled').checked,server_refs});
+    bestOfBestDraftDirty = false;
+    await loadBestOfBest();
+    showToast('success','Пул сохранён');
+  } catch (_) { /* api reports failure */ }
+  finally { button.disabled = false; }
+}
+let bestOfBestDraftDirty = false;
+let bestOfBestLimit = 16;
+function filterBestOfBestCatalog() {
+  const query = (document.getElementById('bestOfBestSearch')?.value || '').trim().toLowerCase();
+  document.querySelectorAll('#bestOfBestCandidates label[data-best-search]').forEach(row => {
+    row.style.display = row.dataset.bestSearch.includes(query) ? 'block' : 'none';
+  });
+}
+function updateBestOfBestCount() {
+  document.getElementById('bestOfBestCount').textContent = `В пуле: ${document.querySelectorAll('#bestOfBestCandidates input:checked').length} / ${bestOfBestLimit}`;
+}
+document.getElementById('bestOfBestEnabled')?.addEventListener('change', () => { bestOfBestDraftDirty = true; });
+document.getElementById('bestOfBestCandidates')?.addEventListener('change', () => { bestOfBestDraftDirty = true; updateBestOfBestCount(); });
 
 // ─── AUTO SETTINGS ───────────────────────────────────────────────────
 function saveAutoSettings() {

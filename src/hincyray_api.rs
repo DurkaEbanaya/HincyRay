@@ -16,6 +16,7 @@ use crate::benchmark::{
 use crate::direct_monitor::{
     DirectMonitorSettingsRequest, DirectMonitorSettingsResponse, DirectMonitorStatusResponse,
 };
+use crate::hincyray::BestOfBestSettings;
 use crate::mihomo_config::TunnelConfig;
 use crate::policy_automation::{PolicyAutomationRequest, PolicyAutomationStatus};
 use crate::telegram_probe::TelegramProbeConfig;
@@ -979,6 +980,22 @@ pub fn api_endpoint_contracts() -> Vec<ApiEndpointContract> {
             mutates_state: false,
         },
         ApiEndpointContract {
+            method: "GET",
+            path: "/api/automation/best-of-best",
+            request_schema: None,
+            response_schema: "BestOfBestStatus",
+            bounded: true,
+            mutates_state: false,
+        },
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/automation/best-of-best",
+            request_schema: Some("BestOfBestSettings"),
+            response_schema: "BestOfBestStatus",
+            bounded: true,
+            mutates_state: true,
+        },
+        ApiEndpointContract {
             method: "POST",
             path: "/api/automation/direct-policy",
             request_schema: Some("PolicyAutomationRequest"),
@@ -1210,6 +1227,8 @@ pub fn openapi_document() -> Value {
         "ProfileTestSettingsResponse": schema_value::<ProfileTestSettingsResponse>(),
     });
     let routing_settings_schemas = json!({
+        "BestOfBestSettings": schema_value::<BestOfBestSettings>(),
+        "BestOfBestStatus": json!({"type":"object","description":"Bounded best-of-best settings and ranked candidates"}),
         "TorrentSocksSettingsUpdate": schema_value::<TorrentSocksSettingsUpdate>(),
         "TorrentSocksSettingsResponse": schema_value::<TorrentSocksSettingsResponse>(),
         "RoutingSettingsUpdateRequest": schema_value::<RoutingSettingsUpdateRequest>(),

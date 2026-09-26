@@ -168,6 +168,8 @@ impl std::fmt::Debug for TorrentSocksInbound {
 
 #[derive(Clone, Debug, Default)]
 pub struct RouterExtra {
+    /// Fail-closed, explicitly selected service-ranked upstreams.
+    pub best_of_best_outbounds: Vec<String>,
     pub dns: Option<DnsSettings>,
     pub port_mode: PortMode,
     pub proxy_ports: Vec<String>,
