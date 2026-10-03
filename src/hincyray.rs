@@ -51,8 +51,8 @@ use crate::geobase::{
 };
 use crate::hincyray_api::{
     ActiveProfileApplyStatusResponse, ApiContractDescriptor, BenchStatusResult,
-    ConnectionPageResponse, ConnectionQueryRequest, DeviceTrafficRequest, DeviceTrafficResponse,
-    DeviceTrafficSummary, MemoryEstimateResponse, MihomoDnsParameters,
+    ConnectionPageResponse, ConnectionQueryRequest, CoreRestartResponse, DeviceTrafficRequest,
+    DeviceTrafficResponse, DeviceTrafficSummary, MemoryEstimateResponse, MihomoDnsParameters,
     MihomoExperimentalParameters, MihomoExternalControllerRuntime, MihomoParameters,
     MihomoParametersResponse, MihomoParametersRuntime, MihomoParametersUpdateRequest,
     MihomoPerProxyParameters, MihomoSnifferParameters, OnboardingStatusResponse, ProfileDetail,
@@ -81,7 +81,7 @@ use crate::hincyray_mihomo_api::{
 use crate::hincyray_mihomo_api::{controller_dial_address, first_stream_json};
 use crate::hincyray_routing::{
     RoutingResource, RoutingResourceKind, is_mihomo_fake_ip, normalize_domain_rule,
-    normalize_routing_resource,
+    normalize_port_items, normalize_routing_resource,
 };
 #[cfg(test)]
 use crate::hincyray_security::verify_password;
@@ -91,10 +91,9 @@ use crate::hincyray_security::{
 };
 use crate::hincyray_webui::index_html;
 use crate::mihomo_config::{
-    BEST_OF_BEST_GROUP, DIRECT_NAME, MihomoFeatures, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME,
-    PROXY_HEALTH_NAME, PROXY_NAME, PinnedServerRoute, REJECT_NAME, TORRENT_SOCKS_LISTENER,
-    build_mihomo_config, build_mihomo_router_config, main_fallback_health_url, read_xhttp_tuning,
-    update_xhttp_tuning,
+    BEST_OF_BEST_GROUP, DIRECT_NAME, MihomoFeatures, PROXY_ACTIVE_NAME, PROXY_HEALTH_NAME,
+    PROXY_NAME, PinnedServerRoute, REJECT_NAME, TORRENT_SOCKS_LISTENER, build_mihomo_config,
+    build_mihomo_router_config, main_fallback_health_url, read_xhttp_tuning, update_xhttp_tuning,
 };
 use crate::profiles::{
     HwidConfig, Profile, SubscriptionMetadata, SubscriptionSource,
@@ -128,8 +127,6 @@ const MAX_CONNECTION_LOG: usize = 500;
 const MAX_STALE_PROFILE_STATS: usize = 256;
 const MAX_AUTO_VPN_EXCEPTIONS: usize = 200;
 const MAX_AUTO_VPN_PENDING_DOMAINS: usize = 200;
-const MAX_PAROVOZIK_DOMAINS: usize = 500;
-const MAX_PAROVOZIK_SERVERS: usize = 5;
 const AUTO_VPN_PROBE_INTERVAL_TICKS: u64 = 3; // 30 seconds
 const AUTO_VPN_RECHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const AUTO_VPN_PROBE_CONTRACT_VERSION: u8 = 1;
@@ -157,6 +154,10 @@ const MAX_PROFILE_NAME_CHARS: usize = 256;
 const MAX_PROFILE_RAW_BYTES: usize = 64 * 1024;
 const BENCH_MEMORY_RESERVE_KB: u64 = 80 * 1024;
 const BENCH_WORKER_MEMORY_BUDGET_KB: u64 = 48 * 1024;
+// Availability workers use aggressively collected private cores, release HTML
+// before decoding and trim between candidates. This is an incremental estimate
+// (executable pages are shared), backed by a continuous reserve guard.
+const AVAILABILITY_WORKER_MEMORY_BUDGET_KB: u64 = 16 * 1024;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 const GLIBC_MALLOC_ARENA_LIMIT: i32 = 2;
 const MAX_PROFILE_REVALIDATION_ERRORS: usize = 100;
@@ -172,10 +173,6 @@ const PROFILE_DIAGNOSTIC_MAX_STRING_CHARS: usize = 512;
 const GEOBASE_JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const GEOBASE_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const GEOBASE_DNS_TIMEOUT: Duration = Duration::from_secs(3);
-const PAROVOZIK_DIRECT_PROVIDER: &str = "parovozik-direct";
-const PAROVOZIK_VPN_PROVIDER: &str = "parovozik-vpn-rules";
-const PAROVOZIK_DIRECT_FILE: &str = "parovozik-direct.txt";
-const PAROVOZIK_VPN_FILE: &str = "parovozik-vpn.txt";
 
 /// Global shutdown flag set by the SIGTERM/SIGINT handler.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -294,9 +291,6 @@ pub fn run() -> Result<(), String> {
     // inbounds are included when split routing is enabled.
     {
         let mut inner = lock(&daemon.inner);
-        if let Err(error) = write_parovozik_provider_files(&inner.state) {
-            eprintln!("hincyray: startup Parovozik providers failed: {error}");
-        }
         if let Err(error) = regenerate_config(&inner.state, &daemon) {
             eprintln!("hincyray: startup config regeneration failed: {error}");
         }
@@ -431,7 +425,7 @@ fn configure_router_allocator() {
     }
 }
 
-fn trim_process_allocator() {
+pub(crate) fn trim_process_allocator() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         // SAFETY: glibc documents malloc_trim as process-wide and thread-safe.
@@ -630,6 +624,7 @@ struct DaemonInner {
     pinned_route_now: HashMap<String, String>,
     best_of_best_failures: u8,
     best_of_best_cooldown: HashMap<String, u64>,
+    best_of_best_runtime: crate::hincyray_pool::PoolRuntime,
     profile_diagnostics: ProfileDiagnosticRuntime,
     core_generation: u64,
 }
@@ -1929,19 +1924,6 @@ pub struct SplitRoutingSettings {
     /// Persisted migration marker for auto-VPN probe semantics.
     #[serde(default)]
     pub auto_vpn_probe_contract_version: u8,
-    /// Experimental direct-first classifier for hosts absent from enabled
-    /// managed GeoBases. Disabled by default.
-    #[serde(default)]
-    pub parovozik_enabled: bool,
-    #[serde(default)]
-    pub parovozik_direct_domains: Vec<String>,
-    #[serde(default)]
-    pub parovozik_vpn_domains: Vec<String>,
-    /// Stable routing refs tried after the current active VPN, max five.
-    #[serde(default)]
-    pub parovozik_server_refs: Vec<String>,
-    #[serde(default)]
-    pub parovozik_last_checked_unix: HashMap<String, u64>,
     /// v0.16: Controls the final MATCH rule target.
     /// `"proxy"` = everything through VPN, `"direct"` = everything direct.
     /// Empty string (old state) is migrated in `load_state()`.
@@ -1975,11 +1957,6 @@ impl Default for SplitRoutingSettings {
             auto_vpn_last_checked_unix: HashMap::new(),
             auto_vpn_learning_enabled: false,
             auto_vpn_probe_contract_version: AUTO_VPN_PROBE_CONTRACT_VERSION,
-            parovozik_enabled: false,
-            parovozik_direct_domains: Vec::new(),
-            parovozik_vpn_domains: Vec::new(),
-            parovozik_server_refs: Vec::new(),
-            parovozik_last_checked_unix: HashMap::new(),
             match_target: String::new(),
             torrent_socks: TorrentSocksSettings::default(),
         }
@@ -2006,10 +1983,6 @@ fn split_routing_settings_response(settings: &SplitRoutingSettings) -> Value {
         "ru_direct_exceptions": settings.ru_direct_exceptions,
         "auto_vpn_exceptions": settings.auto_vpn_exceptions,
         "auto_vpn_learning_enabled": settings.auto_vpn_learning_enabled,
-        "parovozik_enabled": settings.parovozik_enabled,
-        "parovozik_direct_domains": settings.parovozik_direct_domains,
-        "parovozik_vpn_domains": settings.parovozik_vpn_domains,
-        "parovozik_server_refs": settings.parovozik_server_refs,
         "match_target": settings.match_target,
         "torrent_socks": {
             "enabled": settings.torrent_socks.enabled,
@@ -2103,7 +2076,6 @@ fn default_routing_target() -> String {
 const MAX_PINNED_SERVERS: usize = 16;
 const MAX_BEST_OF_BEST_SERVERS: usize = 16;
 const BEST_OF_BEST_PROBE_URL: &str = "https://www.gstatic.com/generate_204?hincyray=best-of-best";
-const BEST_OF_BEST_PROBE_INTERVAL_TICKS: u64 = 6;
 const BEST_OF_BEST_PROBE_FAILURES: u8 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2129,7 +2101,6 @@ enum RoutingTarget {
     Direct,
     Active,
     Reject,
-    Parovozik,
     BestOfBest,
     Server(String),
     LegacyProfile(usize),
@@ -2142,7 +2113,6 @@ impl RoutingTarget {
             "" | "active" | "best" => Ok(Self::Active),
             "direct" => Ok(Self::Direct),
             "reject" => Ok(Self::Reject),
-            "parovozik" => Ok(Self::Parovozik),
             "best-of-best" => Ok(Self::BestOfBest),
             _ if value.starts_with("server:") => {
                 let server_ref = &value[7..];
@@ -2378,7 +2348,6 @@ fn sync_server_route_registry(state: &mut HincyrayState) {
             RoutingTarget::Server(server_ref) => Some(server_ref),
             _ => None,
         })
-        .chain(state.split_routing.parovozik_server_refs.iter().cloned())
         .chain(state.best_of_best.server_refs.iter().cloned())
         .collect();
     state.server_route_registry.retain(|entry| {
@@ -2479,7 +2448,30 @@ fn unsafe_router_geosite_ref(value: &str) -> Option<&'static str> {
 }
 
 fn validate_router_routing_rules(rules: &[RoutingRule]) -> Result<(), String> {
-    for rule in rules.iter().filter(|rule| rule.enabled) {
+    for rule in rules {
+        normalize_port_items(&rule.ports)
+            .map_err(|error| format!("routing rule '{}': {error}", rule.name))?;
+        if !matches!(
+            rule.network.trim().to_ascii_lowercase().as_str(),
+            "" | "any" | "tcp" | "udp"
+        ) {
+            return Err(format!(
+                "routing rule '{}': network must be any, tcp or udp",
+                rule.name
+            ));
+        }
+        if !matches!(
+            rule.port_mode.trim().to_ascii_lowercase().as_str(),
+            "" | "include" | "exclude"
+        ) {
+            return Err(format!(
+                "routing rule '{}': port mode must be include or exclude",
+                rule.name
+            ));
+        }
+        if !rule.enabled {
+            continue;
+        }
         for item in rule.domains.iter().chain(rule.services.iter()) {
             if let Some(reason) = unsafe_router_geosite_ref(item) {
                 return Err(format!("routing rule '{}' is unsafe: {reason}", rule.name));
@@ -2553,6 +2545,7 @@ impl Daemon {
                 pinned_route_now: HashMap::new(),
                 best_of_best_failures: 0,
                 best_of_best_cooldown: HashMap::new(),
+                best_of_best_runtime: crate::hincyray_pool::PoolRuntime::default(),
                 profile_diagnostics: ProfileDiagnosticRuntime::default(),
                 core_generation: 0,
             })),
@@ -2617,7 +2610,7 @@ struct CoreManager {
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_core_on_persistent_thread(command: Command) -> std::io::Result<Child> {
+pub(crate) fn spawn_core_on_persistent_thread(command: Command) -> std::io::Result<Child> {
     struct SpawnRequest {
         command: Command,
         reply: mpsc::SyncSender<std::io::Result<Child>>,
@@ -4190,6 +4183,7 @@ fn load_state_with_hasher(
     let mut migration_changed = routing_identity_changed
         || auth_migration.changed()
         || legacy_mihomo_migration.removed_surface
+        || legacy_mihomo_migration.removed_routing_feature
         || dead_servers_changed
         || deep_bench_filter_changed
         || deep_bench_duration_changed
@@ -4247,6 +4241,7 @@ fn deserialize_persisted_state(text: &str) -> Result<HincyrayState, String> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct LegacyMihomoMigration {
     removed_surface: bool,
+    removed_routing_feature: bool,
     unsafe_listener_auth: bool,
     removed_tunnels: usize,
 }
@@ -4327,6 +4322,7 @@ fn sanitize_legacy_mihomo_features(value: &mut Value) -> LegacyMihomoMigration {
     }
     LegacyMihomoMigration {
         removed_surface,
+        removed_routing_feature: false,
         unsafe_listener_auth: listen_exposed && (legacy_auth || legacy_skip_auth),
         removed_tunnels,
     }
@@ -4345,7 +4341,10 @@ fn deserialize_persisted_state_with_hasher(
     hash: impl FnOnce(&str) -> Result<String, String>,
 ) -> Result<(HincyrayState, AuthMigration, LegacyMihomoMigration), String> {
     let mut value: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
-    let legacy_mihomo_migration = sanitize_legacy_mihomo_features(&mut value);
+    let mut legacy_mihomo_migration = sanitize_legacy_mihomo_features(&mut value);
+    let before = value.clone();
+    migrate_removed_routing_feature(&mut value);
+    legacy_mihomo_migration.removed_routing_feature = value != before;
     if let Some(split) = value
         .get_mut("split_routing")
         .and_then(Value::as_object_mut)
@@ -4364,6 +4363,35 @@ fn deserialize_persisted_state_with_hasher(
     }
     let auth_migration = state.web_ui_auth.migrate_legacy_password_with(hash);
     Ok((state, auth_migration, legacy_mihomo_migration))
+}
+
+/// Apply to both startup and restored backups before typed deserialization.
+/// Preserve explicit routes, replacing the removed VPN target with active VPN.
+fn migrate_removed_routing_feature(value: &mut Value) {
+    for field in ["routing_rules", "device_routes"] {
+        if let Some(routes) = value.get_mut(field).and_then(Value::as_array_mut) {
+            routes.retain(|route| route["kind"] != "managed-parovozik");
+            for route in routes {
+                if route["target"]
+                    .as_str()
+                    .is_some_and(|target| target.trim() == "parovozik")
+                {
+                    route["target"] = json!("active");
+                }
+            }
+        }
+    }
+    if let Some(split) = value
+        .get_mut("split_routing")
+        .and_then(Value::as_object_mut)
+    {
+        split.retain(|key, _| !key.starts_with("parovozik_"));
+        if let Some(torrent) = split.get_mut("torrent_socks")
+            && torrent["target"] == "parovozik"
+        {
+            torrent["target"] = json!("active");
+        }
+    }
 }
 
 fn compact_state_for_persist(state: &mut HincyrayState) {
@@ -4390,33 +4418,6 @@ fn compact_state_for_persist(state: &mut HincyrayState) {
     {
         report.entries.truncate(MAX_REFRESH_REPORT_ENTRIES);
     }
-    state.split_routing.parovozik_direct_domains =
-        normalize_parovozik_domains(&state.split_routing.parovozik_direct_domains);
-    state.split_routing.parovozik_vpn_domains =
-        normalize_parovozik_domains(&state.split_routing.parovozik_vpn_domains);
-    state
-        .split_routing
-        .parovozik_server_refs
-        .truncate(MAX_PAROVOZIK_SERVERS);
-    prune_parovozik_metadata(&mut state.split_routing);
-}
-
-fn prune_parovozik_metadata(settings: &mut SplitRoutingSettings) -> bool {
-    let limit = MAX_PAROVOZIK_DOMAINS * 2;
-    if settings.parovozik_last_checked_unix.len() <= limit {
-        return false;
-    }
-    let mut checked: Vec<(String, u64)> = settings
-        .parovozik_last_checked_unix
-        .iter()
-        .map(|(domain, timestamp)| (domain.clone(), *timestamp))
-        .collect();
-    checked.sort_unstable_by_key(|(_, timestamp)| *timestamp);
-    let remove_count = checked.len() - limit;
-    for (domain, _) in checked.into_iter().take(remove_count) {
-        settings.parovozik_last_checked_unix.remove(&domain);
-    }
-    true
 }
 
 fn prune_stale_profile_stats(state: &mut HincyrayState) -> bool {
@@ -4460,10 +4461,7 @@ fn persist_state(state_path: &Path, state: &HincyrayState) -> Result<(), String>
     compacted.metrics_history.clear();
     compacted.web_ui_auth.password.clear();
     let text = serde_json::to_string_pretty(&compacted).map_err(|error| error.to_string())?;
-    let tmp = state_path.with_extension("tmp");
-    write_private_file(&tmp, text.as_bytes())?;
-    fs::rename(&tmp, state_path).map_err(|error| error.to_string())?;
-    set_private_file_permissions(state_path)
+    atomic_write_config(state_path, text.as_bytes())
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -4476,6 +4474,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
     let mut file = options.open(path).map_err(|error| error.to_string())?;
     file.write_all(bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
     set_private_file_permissions(path)
 }
 
@@ -4495,10 +4494,10 @@ fn set_private_file_permissions(path: &Path) -> Result<(), String> {
 /// `mark_dirty()` calls within a tick collapse into a single disk write.
 fn flush_if_dirty(inner: &mut DaemonInner, state_path: &Path) {
     if inner.dirty {
-        if let Err(error) = persist_state(state_path, &inner.state) {
-            eprintln!("hincyray: watchdog persist failed: {error}");
+        match persist_state(state_path, &inner.state) {
+            Ok(()) => inner.dirty = false,
+            Err(error) => eprintln!("hincyray: watchdog persist failed: {error}"),
         }
-        inner.dirty = false;
     }
 }
 
@@ -4584,32 +4583,12 @@ fn build_daemon_config(
     validate_torrent_socks_settings(state)?;
     if !state.split_routing.enabled {
         let mut pinned_routes = Vec::new();
-        let mut parovozik_vpn_outbounds = Vec::new();
-        if state.split_routing.torrent_socks.target.trim() == "parovozik" {
-            for server_ref in state
-                .split_routing
-                .parovozik_server_refs
-                .iter()
-                .take(MAX_PAROVOZIK_SERVERS)
-            {
-                let (group, _) = resolve_target(
-                    state,
-                    active_profile,
-                    &format!("server:{server_ref}"),
-                    &mut pinned_routes,
-                )?;
-                if group != PROXY_NAME && !parovozik_vpn_outbounds.contains(&group) {
-                    parovozik_vpn_outbounds.push(group);
-                }
-            }
-        }
         let (proxy, _) = resolve_target(
             state,
             active_profile,
             &state.split_routing.torrent_socks.target,
             &mut pinned_routes,
         )?;
-        let parovozik_target = proxy == PAROVOZIK_PROXY_GROUP;
         let best_of_best_outbounds =
             best_of_best_routes(state, active_profile, &mut pinned_routes)?;
         let extra = RouterExtra {
@@ -4621,12 +4600,6 @@ fn build_daemon_config(
                 password: state.split_routing.torrent_socks.password.clone(),
                 proxy: proxy.clone(),
             }),
-            parovozik_vpn_target: if parovozik_target {
-                PAROVOZIK_PROXY_GROUP.to_owned()
-            } else {
-                String::new()
-            },
-            parovozik_vpn_outbounds,
             match_target: "proxy".to_owned(),
             ..RouterExtra::default()
         };
@@ -4647,8 +4620,7 @@ fn build_daemon_config(
     }
 
     // Split routing: build the full router config.
-    let mut managed_providers = geobase_rule_providers.to_vec();
-    managed_providers.extend(parovozik_rule_providers(state)?);
+    let managed_providers = geobase_rule_providers.to_vec();
     let (extra_profiles, mut pinned_routes, mut routes, active_block_quic, mut extra) =
         build_routing_context(
             state,
@@ -4886,13 +4858,68 @@ fn best_of_best_available(state: &HincyrayState) -> Vec<String> {
         .collect()
 }
 
+/// Public, categorical evidence for catalog display. Historical or incompatible
+/// checks remain distinguishable from missing checks, but cannot rank as passes.
+fn best_of_best_catalog_checks(state: &HincyrayState, profile: &Profile, now: u64) -> Value {
+    let stats = state
+        .stats
+        .iter()
+        .find(|stat| stat.profile_raw == profile.raw);
+    let fresh = stats.is_some_and(|stat| {
+        stat.last_service_test_unix > 0
+            && stat.last_service_test_unix <= now.saturating_add(60)
+            && now.saturating_sub(stat.last_service_test_unix) <= 6 * 3600
+    });
+    let checks = ["youtube_thumbnails", "telegram", "ai", "ping_proxy"]
+        .into_iter()
+        .map(|id| {
+            let expected_contract = if id == "youtube_thumbnails" { 1 } else { 7 };
+            let test = stats.and_then(|stat| {
+                stat.resource_tests
+                    .iter()
+                    .find(|test| test.id == id && test.contract_version == expected_contract)
+                    .or_else(|| stat.resource_tests.iter().find(|test| test.id == id))
+                    .or_else(|| {
+                        (id == "youtube_thumbnails")
+                            .then(|| stat.resource_tests.iter().find(|test| test.id == "youtube"))
+                            .flatten()
+                    })
+            });
+            let tested = test.is_some_and(|test| test.attempts > 0);
+            let status = match test {
+                None => "not-tested",
+                Some(test)
+                    if !fresh || test.id != id || test.contract_version != expected_contract =>
+                {
+                    "stale"
+                }
+                Some(test) if test.inconclusive => "unknown",
+                Some(test) if test.attempts == 0 => "skipped",
+                Some(test)
+                    if if id == "ping_proxy" {
+                        test.reachable
+                    } else {
+                        test.stable && test.successes > 0
+                    } =>
+                {
+                    "passed"
+                }
+                Some(_) => "failed",
+            };
+            (id.to_owned(), json!({"state":status,"tested":tested}))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Value::Object(checks)
+}
+
 fn best_of_best_snapshot(daemon: &Daemon) -> Value {
     let inner = lock(&daemon.inner);
     let state = &inner.state;
+    let now = unix_now();
     let mut candidates = best_of_best_available(state);
     // Admission suggestions are ranked, but manual membership is chosen from
     // the current profile catalog, not just its highest-ranked prefix.
-    for reference in best_of_best_candidates(state, unix_now())
+    for reference in best_of_best_candidates(state, now)
         .into_iter()
         .chain(
             state
@@ -4911,15 +4938,21 @@ fn best_of_best_snapshot(daemon: &Daemon) -> Value {
         .filter_map(|server_ref| {
             let profile = state.profiles.iter().find(|profile| {
                 server_ref_for_canonical(&canonical_profile_raw(profile)) == *server_ref
+                    && !profile_is_dead(state, profile)
             })?;
-            let (passed, ping_ms) = best_of_best_evidence(state, profile, unix_now());
+            let (passed, ping_ms) = best_of_best_evidence(state, profile, now);
+            let checks = best_of_best_catalog_checks(state, profile, now);
+            let tested = checks
+                .as_object()
+                .is_some_and(|checks| checks.values().any(|check| check["tested"] == true));
             Some(json!({"ref":server_ref,"id":profile.id,"name":profile.name,
-            "dead":profile_is_dead(state, profile),"manual":!best_of_best_subscription(state, profile),
+            "dead":false,"manual":!best_of_best_subscription(state, profile),
             "passed":passed,"ping_ms":(ping_ms != u32::MAX).then_some(ping_ms),
+            "checks":checks,"tested":tested,
             "cooldown_until":inner.best_of_best_cooldown.get(server_ref).copied()}))
         })
         .collect();
-    json!({"settings":state.best_of_best,"candidates":entries,"max_candidates":MAX_BEST_OF_BEST_SERVERS})
+    json!({"settings":state.best_of_best,"candidates":entries,"max_candidates":MAX_BEST_OF_BEST_SERVERS,"runtime":inner.best_of_best_runtime})
 }
 
 fn handle_best_of_best_get(daemon: &Daemon) -> (u16, &'static str, String) {
@@ -4949,6 +4982,7 @@ fn handle_best_of_best_set(body: &str, daemon: &Daemon) -> (u16, &'static str, S
         (
             inner.best_of_best_failures,
             inner.best_of_best_cooldown.clone(),
+            inner.best_of_best_runtime.clone(),
         )
     };
     let previous = {
@@ -5013,16 +5047,19 @@ fn handle_best_of_best_set(body: &str, daemon: &Daemon) -> (u16, &'static str, S
         Some(previous.clone()),
     ) {
         let mut inner = lock(&daemon.inner);
-        inner.state = previous;
+        restore_policy_fields(&mut inner.state, &previous);
         inner.best_of_best_failures = previous_runtime_evidence.0;
         inner.best_of_best_cooldown = previous_runtime_evidence.1;
-        let _ = persist_state(&daemon.state_path, &inner.state);
+        inner.best_of_best_runtime = previous_runtime_evidence.2;
+        inner.dirty = true;
+        flush_if_dirty(&mut inner, &daemon.state_path);
         return json_error(500, &error);
     }
     {
         let mut inner = lock(&daemon.inner);
         inner.best_of_best_failures = 0;
         inner.best_of_best_cooldown.clear();
+        inner.best_of_best_runtime = crate::hincyray_pool::PoolRuntime::default();
     }
     update_best_of_best_selector_locked(daemon);
     json_response(&best_of_best_snapshot(daemon))
@@ -5085,7 +5122,20 @@ fn best_of_best_probe_result(result: Result<u32, String>) -> bool {
     matches!(result, Ok(delay) if delay > 0)
 }
 
+fn best_of_best_controller_failed(daemon: &Daemon) {
+    let mut inner = lock(&daemon.inner);
+    let refs = inner.state.best_of_best.server_refs.clone();
+    let selected = inner.state.best_of_best.selected_ref.clone();
+    inner
+        .best_of_best_runtime
+        .record(&refs, selected, "selector_unavailable", unix_now(), false);
+    let _ = inner.core.stop();
+}
+
 fn update_best_of_best_selector(daemon: &Daemon) {
+    if unix_now() < lock(&daemon.inner).best_of_best_runtime.next_attempt_unix {
+        return;
+    }
     if let Ok(_apply) = daemon.apply.try_lock() {
         update_best_of_best_selector_locked(daemon);
     }
@@ -5137,7 +5187,7 @@ fn update_best_of_best_selector_locked(daemon: &Daemon) {
         )
     };
     let Some((addr, secret)) = controller else {
-        let _ = lock(&daemon.inner).core.stop();
+        best_of_best_controller_failed(daemon);
         return;
     };
     let current_group = mihomo_api_get_json(
@@ -5149,7 +5199,7 @@ fn update_best_of_best_selector_locked(daemon: &Daemon) {
     // carrying traffic or safely reroute it to REJECT. Stop the core instead
     // of leaving a stale raw selection active indefinitely.
     if current_group.is_err() {
-        let _ = lock(&daemon.inner).core.stop();
+        best_of_best_controller_failed(daemon);
         return;
     }
     let actual = current_group
@@ -5168,7 +5218,7 @@ fn update_best_of_best_selector_locked(daemon: &Daemon) {
     }
     if actual != Some(expected.as_str()) {
         if set_best_of_best_group(&addr, secret.as_deref(), REJECT_NAME).is_err() {
-            let _ = lock(&daemon.inner).core.stop();
+            best_of_best_controller_failed(daemon);
             return;
         }
         let mut inner = lock(&daemon.inner);
@@ -5192,8 +5242,21 @@ fn update_best_of_best_selector_locked(daemon: &Daemon) {
             &candidates,
             &inner.best_of_best_cooldown,
             unix_now(),
-        );
+        )
+        .filter(|reference| previous_selection.as_ref() == Some(reference))
+        .or_else(|| {
+            inner.best_of_best_runtime.next(
+                &inner.state.best_of_best.server_refs,
+                &candidates,
+                &inner.best_of_best_cooldown,
+                unix_now(),
+            )
+        });
         let Some(ref selected_ref) = selected else {
+            let refs = inner.state.best_of_best.server_refs.clone();
+            inner
+                .best_of_best_runtime
+                .record(&refs, None, "no_eligible_member", unix_now(), false);
             let controller = daemon_mihomo_controller(daemon, &inner.state.mihomo_features);
             drop(inner);
             if let Some((addr, secret)) = controller {
@@ -5257,8 +5320,16 @@ fn update_best_of_best_selector_locked(daemon: &Daemon) {
         return;
     }
     if !best_of_best_probe_result(probe) {
+        let refs = inner.state.best_of_best.server_refs.clone();
+        inner.best_of_best_runtime.record(
+            &refs,
+            selected.clone(),
+            "upstream_unreachable",
+            unix_now(),
+            previous_selection == selected,
+        );
         inner.best_of_best_failures = inner.best_of_best_failures.saturating_add(1);
-        if previous_selection.is_none()
+        if previous_selection != selected
             || inner.best_of_best_failures >= BEST_OF_BEST_PROBE_FAILURES
         {
             if let Some(ref selected) = selected {
@@ -5274,6 +5345,7 @@ fn update_best_of_best_selector_locked(daemon: &Daemon) {
                 return;
             }
             let mut inner = lock(&daemon.inner);
+            inner.best_of_best_runtime.next_attempt_unix = unix_now() + 10;
             if inner.state.best_of_best.selected_ref.take().is_some() {
                 inner.dirty = true;
             }
@@ -5284,11 +5356,30 @@ fn update_best_of_best_selector_locked(daemon: &Daemon) {
     drop(inner);
     if set_best_of_best_group(&addr, secret.as_deref(), &outbound).is_ok() {
         let mut inner = lock(&daemon.inner);
+        let refs = inner.state.best_of_best.server_refs.clone();
+        inner.best_of_best_runtime.record(
+            &refs,
+            selected.clone(),
+            "https_passed",
+            unix_now(),
+            true,
+        );
         if inner.state.best_of_best.selected_ref != selected {
             inner.state.best_of_best.selected_ref = selected;
             inner.dirty = true;
         }
     } else {
+        {
+            let mut inner = lock(&daemon.inner);
+            let refs = inner.state.best_of_best.server_refs.clone();
+            inner.best_of_best_runtime.record(
+                &refs,
+                selected.clone(),
+                "selector_error",
+                unix_now(),
+                false,
+            );
+        }
         // A failed PUT or verification leaves the selected leaf unknown.
         // Reset even if the previous raw outbound had been healthy.
         if set_best_of_best_group(&addr, secret.as_deref(), REJECT_NAME).is_err() {
@@ -5341,7 +5432,8 @@ fn build_routing_context<'a>(
                 }
             }
         }
-        let ports = normalize_route_items(&rule.ports);
+        let ports = normalize_port_items(&rule.ports)
+            .map_err(|error| format!("routing rule '{}': {error}", rule.name))?;
         let network = normalize_route_network(&rule.network);
         if domains.is_empty() && ips.is_empty() && ports.is_empty() && network.is_none() {
             continue;
@@ -5368,44 +5460,12 @@ fn build_routing_context<'a>(
     // ("QUIC Block"). active_block_quic only reflects per-profile QUIC
     // capability, which is a system-level automatic rule.
     let active_block_quic = active_profile.block_quic;
-    let mut parovozik_vpn_outbounds = Vec::new();
-    if state.split_routing.parovozik_enabled {
-        let active_canonical = canonical_profile_raw(active_profile);
-        for server_ref in state
-            .split_routing
-            .parovozik_server_refs
-            .iter()
-            .take(MAX_PAROVOZIK_SERVERS)
-        {
-            let is_active = state.server_route_registry.iter().any(|entry| {
-                entry.server_ref == *server_ref && entry.canonical_raw == active_canonical
-            });
-            if is_active {
-                continue;
-            }
-            let usable = state.server_route_registry.iter().any(|entry| {
-                entry.server_ref == *server_ref
-                    && state.profiles.iter().any(|profile| {
-                        canonical_profile_raw(profile) == entry.canonical_raw
-                            && !profile_is_dead(state, profile)
-                    })
-            });
-            if !usable {
-                continue;
-            }
-            let target = format!("server:{server_ref}");
-            let (group, _) = resolve_target(state, active_profile, &target, &mut pinned_routes)?;
-            if group != PROXY_ACTIVE_NAME && !parovozik_vpn_outbounds.contains(&group) {
-                parovozik_vpn_outbounds.push(group);
-            }
-        }
-    }
     let extra = RouterExtra {
         best_of_best_outbounds: Vec::new(),
         dns: Some(state.dns_settings.clone()),
         port_mode: state.split_routing.port_mode.clone(),
-        proxy_ports: normalize_route_items(&state.split_routing.proxy_ports),
-        bypass_ports: normalize_route_items(&state.split_routing.bypass_ports),
+        proxy_ports: normalize_port_items(&state.split_routing.proxy_ports)?,
+        bypass_ports: normalize_port_items(&state.split_routing.bypass_ports)?,
         geo_asset_path: if state.split_routing.geo_asset_path.is_empty() {
             None
         } else {
@@ -5414,22 +5474,6 @@ fn build_routing_context<'a>(
         ru_direct_mode: state.split_routing.ru_direct_mode.clone(),
         ru_direct_exceptions: normalize_route_items(&state.split_routing.ru_direct_exceptions),
         auto_vpn_exceptions: normalize_route_items(&state.split_routing.auto_vpn_exceptions),
-        parovozik_direct_domains: if state.split_routing.parovozik_enabled {
-            normalize_route_items(&state.split_routing.parovozik_direct_domains)
-        } else {
-            Vec::new()
-        },
-        parovozik_vpn_domains: if state.split_routing.parovozik_enabled {
-            normalize_route_items(&state.split_routing.parovozik_vpn_domains)
-        } else {
-            Vec::new()
-        },
-        parovozik_vpn_target: if state.split_routing.parovozik_enabled {
-            PAROVOZIK_PROXY_GROUP.to_owned()
-        } else {
-            String::new()
-        },
-        parovozik_vpn_outbounds,
         match_target: state.split_routing.match_target.clone(),
         mihomo_home: geo_dir_from_state(state),
         geobase_rule_providers: geobase_rule_providers.to_vec(),
@@ -5453,7 +5497,6 @@ fn resolve_target<'a>(
     match RoutingTarget::parse(value)? {
         RoutingTarget::Direct => Ok((DIRECT_NAME.to_owned(), None)),
         RoutingTarget::Reject => Ok((REJECT_NAME.to_owned(), None)),
-        RoutingTarget::Parovozik => Ok((PAROVOZIK_PROXY_GROUP.to_owned(), Some(active))),
         RoutingTarget::BestOfBest => Ok((BEST_OF_BEST_GROUP.to_owned(), None)),
         RoutingTarget::Active => Ok((PROXY_NAME.to_owned(), Some(active))),
         RoutingTarget::LegacyProfile(_) => Err(format!("unmigrated legacy target {value:?}")),
@@ -5538,48 +5581,14 @@ fn validate_routing_targets(
             _ => {}
         }
     }
-    for server_ref in state
-        .split_routing
-        .parovozik_server_refs
-        .iter()
-        .take(MAX_PAROVOZIK_SERVERS)
+    // Fixed routes (including device and Torrent targets) and the
+    // best-of-best pool have independent bounded budgets. A full pool must not
+    // consume the slots promised to existing fixed routes. Config generation
+    // still deduplicates any outbounds shared by the two sets.
+    if state.best_of_best.enabled && state.best_of_best.server_refs.len() > MAX_BEST_OF_BEST_SERVERS
     {
-        let Some(entry) = state
-            .server_route_registry
-            .iter()
-            .find(|entry| entry.server_ref == *server_ref)
-        else {
-            continue;
-        };
-        let Some(profile) = state
-            .profiles
-            .iter()
-            .find(|profile| canonical_profile_raw(profile) == entry.canonical_raw)
-        else {
-            continue;
-        };
-        if profile_is_dead(state, profile) {
-            continue;
-        }
-        refs.insert(server_ref.clone());
-    }
-    if state.best_of_best.enabled {
-        if state.best_of_best.server_refs.len() > MAX_BEST_OF_BEST_SERVERS {
-            return Err(format!(
-                "at most {MAX_BEST_OF_BEST_SERVERS} best-of-best servers may be enabled"
-            ));
-        }
-        for server_ref in &state.best_of_best.server_refs {
-            if valid_routing_server_ref(server_ref)
-                && best_of_best_available(state).contains(server_ref)
-            {
-                refs.insert(server_ref.clone());
-            }
-        }
-    }
-    if state.split_routing.parovozik_server_refs.len() > MAX_PAROVOZIK_SERVERS {
         return Err(format!(
-            "Паровозик поддерживает не более {MAX_PAROVOZIK_SERVERS} дополнительных серверов"
+            "at most {MAX_BEST_OF_BEST_SERVERS} best-of-best servers may be enabled"
         ));
     }
     if refs.len() > MAX_PINNED_SERVERS {
@@ -5670,9 +5679,6 @@ fn validate_torrent_socks_settings_with_api_port(
                 "torrent SOCKS {name} must contain {min}-{max} bytes without control characters"
             ));
         }
-    }
-    if matches!(target, RoutingTarget::Parovozik) && !state.split_routing.parovozik_enabled {
-        return Err("torrent SOCKS cannot target disabled Parovozik".to_owned());
     }
     Ok(())
 }
@@ -5881,88 +5887,6 @@ fn geo_dir_from_state(state: &HincyrayState) -> Option<String> {
     }
 }
 
-fn parovozik_provider_paths(state: &HincyrayState) -> Result<(PathBuf, PathBuf), String> {
-    let home = geo_dir_from_state(state)
-        .map(PathBuf::from)
-        .ok_or_else(|| "Mihomo home is required for Parovozik providers".to_owned())?;
-    Ok((
-        home.join(PAROVOZIK_DIRECT_FILE),
-        home.join(PAROVOZIK_VPN_FILE),
-    ))
-}
-
-fn parovozik_rule_providers(state: &HincyrayState) -> Result<Vec<GeoBaseRuleProvider>, String> {
-    if !state.split_routing.parovozik_enabled {
-        return Ok(Vec::new());
-    }
-    let (direct, vpn) = parovozik_provider_paths(state)?;
-    Ok(vec![
-        GeoBaseRuleProvider {
-            enabled: true,
-            name: PAROVOZIK_DIRECT_PROVIDER.to_owned(),
-            path: direct.to_string_lossy().into_owned(),
-            behavior: GeoBaseRuleBehavior::Domain,
-            target: GeoBaseRuleTarget::ParovozikDirect,
-        },
-        GeoBaseRuleProvider {
-            enabled: true,
-            name: PAROVOZIK_VPN_PROVIDER.to_owned(),
-            path: vpn.to_string_lossy().into_owned(),
-            behavior: GeoBaseRuleBehavior::Domain,
-            target: GeoBaseRuleTarget::ParovozikVpn,
-        },
-    ])
-}
-
-fn parovozik_provider_bytes(domains: &[String]) -> Vec<u8> {
-    let domains = normalize_parovozik_domains(domains);
-    if domains.is_empty() {
-        b"# empty\n".to_vec()
-    } else {
-        format!("{}\n", domains.join("\n")).into_bytes()
-    }
-}
-
-fn write_parovozik_provider_files(state: &HincyrayState) -> Result<(), String> {
-    if !state.split_routing.parovozik_enabled {
-        return Ok(());
-    }
-    let (direct_path, vpn_path) = parovozik_provider_paths(state)?;
-    atomic_write_config(
-        &direct_path,
-        &parovozik_provider_bytes(&state.split_routing.parovozik_direct_domains),
-    )?;
-    atomic_write_config(
-        &vpn_path,
-        &parovozik_provider_bytes(&state.split_routing.parovozik_vpn_domains),
-    )
-}
-
-fn hot_update_parovozik_providers(
-    state: &HincyrayState,
-    direct_changed: bool,
-    vpn_changed: bool,
-) -> Result<(), String> {
-    write_parovozik_provider_files(state)?;
-    let (addr, secret) = mihomo_controller(&state.mihomo_features).ok_or_else(|| {
-        "Mihomo External Controller is required for Parovozik hot update".to_owned()
-    })?;
-    for provider in [
-        direct_changed.then_some(PAROVOZIK_DIRECT_PROVIDER),
-        vpn_changed.then_some(PAROVOZIK_VPN_PROVIDER),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let path = format!(
-            "/providers/rules/{}",
-            utf8_percent_encode(provider, NON_ALPHANUMERIC)
-        );
-        mihomo_api_put(&addr, secret.as_deref(), &path, None)?;
-    }
-    Ok(())
-}
-
 fn normalize_route_items(items: &[String]) -> Vec<String> {
     items
         .iter()
@@ -6093,55 +6017,6 @@ fn prune_auto_vpn_metadata(split: &mut SplitRoutingSettings) {
     for (domain, _) in candidates.into_iter().take(remove_count) {
         split.auto_vpn_last_checked_unix.remove(&domain);
     }
-}
-
-fn normalize_parovozik_domains(items: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    items
-        .iter()
-        .filter_map(|item| normalize_auto_vpn_domain(item))
-        .filter(|domain| seen.insert(domain.clone()))
-        .take(MAX_PAROVOZIK_DOMAINS)
-        .collect()
-}
-
-fn normalize_parovozik_server_refs(
-    state: &HincyrayState,
-    values: &[String],
-) -> Result<Vec<String>, String> {
-    if values.len() > MAX_PAROVOZIK_SERVERS {
-        return Err(format!(
-            "Паровозик поддерживает не более {MAX_PAROVOZIK_SERVERS} дополнительных серверов"
-        ));
-    }
-    let mut refs = Vec::new();
-    for value in values
-        .iter()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    {
-        let server_ref = value.strip_prefix("server:").unwrap_or(value);
-        if !state
-            .server_route_registry
-            .iter()
-            .any(|entry| entry.server_ref == server_ref)
-        {
-            return Err(format!("unknown Parovozik server ref {server_ref}"));
-        }
-        if state.profiles.iter().any(|profile| {
-            state.server_route_registry.iter().any(|entry| {
-                entry.server_ref == server_ref
-                    && entry.canonical_raw == canonical_profile_raw(profile)
-                    && profile_is_dead(state, profile)
-            })
-        }) {
-            return Err(format!("Parovozik server ref {server_ref} is dead"));
-        }
-        if !refs.iter().any(|existing| existing == server_ref) {
-            refs.push(server_ref.to_owned());
-        }
-    }
-    Ok(refs)
 }
 
 fn normalize_route_network(network: &str) -> Option<String> {
@@ -6672,6 +6547,7 @@ fn dispatch_from(
         ("POST", "/api/core/start") => handle_core_start(daemon),
         ("POST", "/api/core/stop") => handle_core_stop(daemon),
         ("POST", "/api/core/restart") => handle_core_restart(daemon),
+        ("POST", "/api/core/cleanup") => handle_core_cleanup(daemon),
         ("GET", "/api/bench/status") => handle_bench_status(daemon),
         ("GET", "/api/bench/settings") => handle_profile_test_settings_get(daemon),
         ("POST", "/api/bench/settings") => handle_profile_test_settings_set(body, daemon),
@@ -8542,6 +8418,24 @@ fn activate_current_config_locked_with_rollback(
     projection: GeoBaseProjection,
     rollback_state: Option<HincyrayState>,
 ) -> Result<ActivationResult, String> {
+    activate_current_config_locked_with_mode(
+        daemon,
+        start_if_stopped,
+        configure_firewall,
+        projection,
+        rollback_state,
+        false,
+    )
+}
+
+fn activate_current_config_locked_with_mode(
+    daemon: &Daemon,
+    start_if_stopped: bool,
+    configure_firewall: bool,
+    projection: GeoBaseProjection,
+    rollback_state: Option<HincyrayState>,
+    force_restart: bool,
+) -> Result<ActivationResult, String> {
     let (state, previous_runtime) = {
         let mut inner = lock(&daemon.inner);
         let state = inner.state.clone();
@@ -8550,7 +8444,6 @@ fn activate_current_config_locked_with_rollback(
     };
     let rollback_state = rollback_state.unwrap_or_else(|| state.clone());
     let (mut config_yaml, generation, activated_bases) = config_plan(&state, daemon, projection)?;
-    write_parovozik_provider_files(&state)?;
     let geo_dir = geo_dir_from_state(&state);
     let validation =
         validate_mihomo_config_yaml(&state.mihomo_path, &config_yaml, geo_dir.as_deref());
@@ -8577,21 +8470,32 @@ fn activate_current_config_locked_with_rollback(
     let activation = (|| -> Result<(String, String), String> {
         if should_run {
             let mut inner = lock(&daemon.inner);
-            hot_reload_or_restart_core_locked(
-                &mut inner,
-                daemon,
-                &state,
-                controller.as_ref(),
-                &daemon.mihomo_config_path,
-                geo_dir.as_deref(),
-            )?;
-            drop(inner);
-            wait_for_core_readiness(daemon, controller.as_ref(), &state)?;
-            validate_proxy_selector(controller.as_ref())?;
-            if let Some((addr, secret)) = controller.as_ref() {
-                set_proxy_selector(addr, secret.as_deref(), desired_target)?;
+            if force_restart {
+                restart_core_with_selector_locked(
+                    &mut inner,
+                    daemon,
+                    &state.mihomo_path,
+                    &daemon.mihomo_config_path,
+                    geo_dir.as_deref(),
+                    desired_target,
+                )?;
+            } else {
+                hot_reload_or_restart_core_locked(
+                    &mut inner,
+                    daemon,
+                    &state,
+                    controller.as_ref(),
+                    &daemon.mihomo_config_path,
+                    geo_dir.as_deref(),
+                )?;
+                drop(inner);
+                wait_for_core_readiness(daemon, controller.as_ref(), &state)?;
+                validate_proxy_selector(controller.as_ref())?;
+                if let Some((addr, secret)) = controller.as_ref() {
+                    set_proxy_selector(addr, secret.as_deref(), desired_target)?;
+                }
+                lock(&daemon.inner).proxy_rejected = desired_target == REJECT_NAME;
             }
-            lock(&daemon.inner).proxy_rejected = desired_target == REJECT_NAME;
         }
 
         let firewall_status = if configure_firewall {
@@ -8751,13 +8655,62 @@ fn handle_core_stop(daemon: &Daemon) -> (u16, &'static str, String) {
 }
 
 fn handle_core_restart(daemon: &Daemon) -> (u16, &'static str, String) {
-    match activate_current_config(daemon, true, false, GeoBaseProjection::Applied) {
-        Ok(result) => (
-            200,
-            "application/json",
-            json!({"core_status": result.core_status, "generation": result.generation}).to_string(),
-        ),
-        Err(error) => (500, "application/json", json!({"error": error}).to_string()),
+    handle_core_process_reset(daemon, false)
+}
+
+fn handle_core_cleanup(daemon: &Daemon) -> (u16, &'static str, String) {
+    handle_core_process_reset(daemon, true)
+}
+
+fn handle_core_process_reset(daemon: &Daemon, cleanup: bool) -> (u16, &'static str, String) {
+    // Reject overlapping lifecycle/apply operations rather than queueing another
+    // disruptive restart behind the one already in progress.
+    let _apply = match daemon.apply.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return json_error(409, "another core/config operation is in progress");
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return json_error(500, "config apply lock is poisoned");
+        }
+    };
+    let previous_pid = {
+        let mut inner = lock(&daemon.inner);
+        match inner.core.running_pid() {
+            Ok(pid) => pid,
+            Err(error) => return json_error(500, &error),
+        }
+    };
+    if cleanup && previous_pid.is_none() {
+        return json_error(
+            400,
+            "Mihomo is stopped; there is no process memory to clean",
+        );
+    }
+    let rss_before_kb = previous_pid.and_then(read_process_rss_kb);
+    match activate_current_config_locked_with_mode(
+        daemon,
+        true,
+        false,
+        GeoBaseProjection::Applied,
+        None,
+        true,
+    ) {
+        Ok(result) => {
+            let pid = lock(&daemon.inner).core.pid();
+            json_response(&CoreRestartResponse {
+                core_status: result.core_status,
+                generation: result.generation,
+                operation: if cleanup { "cleanup" } else { "restart" }.to_owned(),
+                process_restarted: true,
+                connections_reset: true,
+                previous_pid,
+                pid,
+                rss_before_kb,
+                rss_after_kb: pid.and_then(read_process_rss_kb),
+            })
+        }
+        Err(error) => json_error(500, &error),
     }
 }
 
@@ -8854,6 +8807,7 @@ fn handle_bench_status(daemon: &Daemon) -> (u16, &'static str, String) {
         "concurrency_status": concurrency_status,
         "last_updated": job.last_updated,
         "cancel_requested": job.cancel_requested,
+        "memory_pressure": job.memory_pressure,
         "search": job.search,
         "preflight_failures": job.preflight_failures,
         "results": results,
@@ -9404,7 +9358,11 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
                 return json_error(503, "not enough memory to start benchmark safely");
             }
             let (_, available_kb, _) = memory_summary_from_proc();
-            memory_bounded_bench_concurrency(requested_concurrency, available_kb)
+            if method.is_availability() {
+                memory_bounded_availability_concurrency(requested_concurrency, available_kb)
+            } else {
+                memory_bounded_bench_concurrency(requested_concurrency, available_kb)
+            }
         } else {
             requested_concurrency
         };
@@ -9428,6 +9386,7 @@ fn handle_bench_start(body: &str, daemon: &Daemon) -> (u16, &'static str, String
             job.requested_concurrency = requested_concurrency;
             job.memory_limited = concurrency < requested_concurrency;
             job.service_checks = service_checks;
+            job.memory_reserve_kb = method.is_availability().then_some(BENCH_MEMORY_RESERVE_KB);
         }
         if let Some(options) = &search {
             lock(&job).search = Some(SearchProgress {
@@ -9657,12 +9616,27 @@ fn benchmark_uses_temporary_core(
 }
 
 fn memory_bounded_bench_concurrency(requested: usize, available_kb: u64) -> usize {
+    memory_bounded_worker_concurrency(requested, available_kb, BENCH_WORKER_MEMORY_BUDGET_KB)
+}
+
+fn memory_bounded_availability_concurrency(requested: usize, available_kb: u64) -> usize {
+    if requested > 3 {
+        return memory_bounded_bench_concurrency(requested, available_kb);
+    }
+    memory_bounded_worker_concurrency(
+        requested,
+        available_kb,
+        AVAILABILITY_WORKER_MEMORY_BUDGET_KB,
+    )
+}
+
+fn memory_bounded_worker_concurrency(requested: usize, available_kb: u64, worker_kb: u64) -> usize {
     if available_kb == 0 {
         return 0;
     }
     let workers = available_kb
         .saturating_sub(BENCH_MEMORY_RESERVE_KB)
-        .checked_div(BENCH_WORKER_MEMORY_BUDGET_KB)
+        .checked_div(worker_kb)
         .unwrap_or(0) as usize;
     requested.min(workers)
 }
@@ -9957,7 +9931,8 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
                 .then_some(result.success);
             stats_entry.last_checked_unix = now;
             stats_entry.last_service_test_unix = now;
-            let _ = persist_state(&daemon.state_path, &inner.state);
+            inner.dirty = true;
+            flush_if_dirty(&mut inner, &daemon.state_path);
             return;
         }
         if result.success {
@@ -10005,7 +9980,8 @@ fn apply_bench_result(daemon: &Daemon, result: BenchResult) {
     }
     prune_stale_profile_stats(&mut inner.state);
 
-    let _ = persist_state(&daemon.state_path, &inner.state);
+    inner.dirty = true;
+    flush_if_dirty(&mut inner, &daemon.state_path);
 }
 
 fn handle_stats(daemon: &Daemon) -> (u16, &'static str, String) {
@@ -10571,12 +10547,6 @@ fn profile_has_enabled_pinned_route(state: &HincyrayState, profile: &Profile) ->
                 .server_refs
                 .iter()
                 .any(|server_ref| pinned_refs.contains(server_ref.as_str())))
-        || (state.split_routing.parovozik_enabled
-            && state
-                .split_routing
-                .parovozik_server_refs
-                .iter()
-                .any(|server_ref| pinned_refs.contains(server_ref.as_str())))
 }
 
 fn replace_string_value(values: &mut Vec<String>, old: &str, new: &str) {
@@ -10656,11 +10626,6 @@ fn migrate_profile_identity(state: &mut HincyrayState, old: &Profile, replacemen
             }
         }
         for old_ref in old_routing_refs {
-            replace_string_value(
-                &mut state.split_routing.parovozik_server_refs,
-                &old_ref,
-                &new_routing_ref,
-            );
             replace_string_value(
                 &mut state.best_of_best.server_refs,
                 &old_ref,
@@ -10796,7 +10761,6 @@ fn apply_profile_dataplane_locked(
     previous_runtime: &ActivationRuntimeIdentity,
 ) -> Result<(), String> {
     let (config_yaml, _, _) = config_plan(&inner.state, daemon, GeoBaseProjection::Applied)?;
-    write_parovozik_provider_files(&inner.state)?;
     let geo_dir = geo_dir_from_state(&inner.state);
     let validation =
         validate_mihomo_config_yaml(&inner.state.mihomo_path, &config_yaml, geo_dir.as_deref());
@@ -11525,6 +11489,7 @@ fn handle_favorites_toggle(body: &str, daemon: &Daemon) -> (u16, &'static str, S
         );
     };
 
+    let previous_favorites = inner.state.favorites.clone();
     let raw = profile.raw.clone();
     let already = inner
         .state
@@ -11540,6 +11505,7 @@ fn handle_favorites_toggle(body: &str, daemon: &Daemon) -> (u16, &'static str, S
     };
 
     if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        inner.state.favorites = previous_favorites;
         return (
             500,
             "application/json",
@@ -12953,16 +12919,7 @@ fn managed_geobase_routing_rules(
 }
 
 fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
-    let (
-        settings_response,
-        parovozik_enabled,
-        parovozik_direct_domains,
-        parovozik_vpn_domains,
-        match_target,
-        rules,
-        conflicts,
-        servers,
-    ) = {
+    let (settings_response, match_target, rules, conflicts, servers) = {
         let mut inner = lock(&daemon.inner);
         sync_server_route_registry(&mut inner.state);
         let active_canonical = inner
@@ -12996,34 +12953,12 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
             .collect();
         (
             split_routing_settings_response(&inner.state.split_routing),
-            inner.state.split_routing.parovozik_enabled,
-            inner.state.split_routing.parovozik_direct_domains.clone(),
-            inner.state.split_routing.parovozik_vpn_domains.clone(),
             inner.state.split_routing.match_target.clone(),
             inner.state.routing_rules.clone(),
             detect_routing_conflicts(&inner.state),
             servers,
         )
     };
-    let mut rules = rules;
-    if parovozik_enabled {
-        rules.push(RoutingRule {
-            enabled: true,
-            name: "Паровозик Direct".to_owned(),
-            target: "direct".to_owned(),
-            domains: parovozik_direct_domains,
-            kind: "managed-parovozik".to_owned(),
-            ..RoutingRule::default()
-        });
-        rules.push(RoutingRule {
-            enabled: true,
-            name: "Паровозик VPN".to_owned(),
-            target: "parovozik".to_owned(),
-            domains: parovozik_vpn_domains,
-            kind: "managed-parovozik".to_owned(),
-            ..RoutingRule::default()
-        });
-    }
     let manifest = match daemon.geobase_store().load_manifest() {
         Ok(manifest) => manifest,
         Err(error) => {
@@ -13036,6 +12971,7 @@ fn handle_routing_get(daemon: &Daemon) -> (u16, &'static str, String) {
     };
     let response = json!({
         "settings": settings_response,
+        "rules_revision": routing_rules_revision(&rules),
         "rules": rules,
         "catalog": popular_service_catalog(),
         "sources": rule_sources(),
@@ -13519,6 +13455,9 @@ fn handle_routing_explain(body: &str, daemon: &Daemon) -> (u16, &'static str, St
     let Ok(value) = serde_json::from_str::<Value>(body) else {
         return json_error(400, "invalid JSON body");
     };
+    if let Err(error) = validate_trace_metadata(&value) {
+        return json_error(400, &error);
+    }
     let raw = value
         .get("resource")
         .or_else(|| value.get("host"))
@@ -13552,7 +13491,7 @@ fn handle_routing_explain(body: &str, daemon: &Daemon) -> (u16, &'static str, St
             .to_ascii_lowercase(),
     };
     let inner = lock(&daemon.inner);
-    let mut trace = trace_routing_decision(&inner.state, &request);
+    let mut trace = trace_with_runtime_assets(daemon, &inner.state, &request);
     trace["resource"] = json!(resource.value);
     trace["resource_kind"] = json!(resource.kind.as_str());
     trace["safe_mode_enabled"] = json!(inner.state.safe_mode_enabled);
@@ -13597,10 +13536,10 @@ fn detect_routing_conflicts(state: &HincyrayState) -> Vec<String> {
                     .map(|p| p.trim())
                     .filter(|p| !p.is_empty())
                 {
-                    if !allowed.contains(&port) {
+                    if rule.port_mode != "exclude" && !port_set_covers(&split.proxy_ports, port) {
                         warnings.push(format!(
                             "правило «{}»: порт {} не входит в AllowList ({}) — \
-                             глобальный PortMode может перехватить трафик раньше",
+                              пользовательское правило имеет приоритет над PortMode",
                             rule.name,
                             port,
                             allowed.join(",")
@@ -13623,10 +13562,10 @@ fn detect_routing_conflicts(state: &HincyrayState) -> Vec<String> {
                     .map(|p| p.trim())
                     .filter(|p| !p.is_empty())
                 {
-                    if bypassed.contains(&port) {
+                    if rule.port_mode != "exclude" && port_sets_overlap(&split.bypass_ports, port) {
                         warnings.push(format!(
                             "правило «{}»: порт {} входит в DenyList bypass ({}) — \
-                             глобальный PortMode направит его напрямую",
+                              пользовательское правило имеет приоритет над bypass",
                             rule.name,
                             port,
                             bypassed.join(",")
@@ -13639,6 +13578,51 @@ fn detect_routing_conflicts(state: &HincyrayState) -> Vec<String> {
     }
 
     warnings
+}
+
+fn port_intervals(items: &[String]) -> Vec<(u16, u16)> {
+    normalize_port_items(items)
+        .unwrap_or_default()
+        .iter()
+        .filter(|item| !item.contains(':'))
+        .filter_map(|item| {
+            if let Some((first, last)) = item.split_once('-') {
+                Some((first.parse().ok()?, last.parse().ok()?))
+            } else {
+                let port = item.parse().ok()?;
+                Some((port, port))
+            }
+        })
+        .collect()
+}
+
+fn port_sets_overlap(items: &[String], port: &str) -> bool {
+    let rule = port_intervals(&[port.to_owned()]);
+    port_intervals(items)
+        .iter()
+        .any(|(first, last)| rule.iter().any(|(a, b)| first <= b && a <= last))
+}
+
+fn port_set_covers(items: &[String], port: &str) -> bool {
+    let mut intervals = port_intervals(items);
+    intervals.sort_unstable();
+    let rule = port_intervals(&[port.to_owned()]);
+    !rule.is_empty()
+        && rule.iter().all(|(start, end)| {
+            let mut next = u32::from(*start);
+            for &(first, last) in &intervals {
+                if u32::from(first) > next {
+                    break;
+                }
+                if u32::from(last) >= next {
+                    next = u32::from(last) + 1;
+                }
+                if next > u32::from(*end) {
+                    return true;
+                }
+            }
+            false
+        })
 }
 
 fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
@@ -13670,10 +13654,6 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
         "ru_direct_exceptions",
         "auto_vpn_learning_enabled",
         "auto_vpn_exceptions",
-        "parovozik_enabled",
-        "parovozik_direct_domains",
-        "parovozik_vpn_domains",
-        "parovozik_server_refs",
         "match_target",
         "torrent_socks",
     ];
@@ -13752,19 +13732,26 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
                 _ => PortMode::All,
             };
         }
-        if let Some(v) = value.get("proxy_ports").and_then(Value::as_array) {
-            candidate.split_routing.proxy_ports = v
-                .iter()
-                .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
-                .filter(|s| !s.is_empty())
-                .collect();
+        for (key, ports) in [
+            ("proxy_ports", &mut candidate.split_routing.proxy_ports),
+            ("bypass_ports", &mut candidate.split_routing.bypass_ports),
+        ] {
+            if let Some(value) = value.get(key) {
+                let Ok(items) = serde_json::from_value::<Vec<String>>(value.clone()) else {
+                    return json_error(400, "port lists must be arrays of strings");
+                };
+                *ports = items;
+            }
         }
-        if let Some(v) = value.get("bypass_ports").and_then(Value::as_array) {
-            candidate.split_routing.bypass_ports = v
-                .iter()
-                .filter_map(|item| item.as_str().map(|s| s.trim().to_owned()))
-                .filter(|s| !s.is_empty())
-                .collect();
+        for ports in [
+            &mut candidate.split_routing.proxy_ports,
+            &mut candidate.split_routing.bypass_ports,
+        ] {
+            *ports = match normalize_port_items(ports) {
+                Ok(ports) if ports.iter().all(|port| !port.contains(':')) => ports,
+                Ok(_) => return json_error(400, "global port lists accept destination ports only"),
+                Err(error) => return json_error(400, &error),
+            };
         }
         if let Some(v) = value.get("geo_asset_path").and_then(Value::as_str) {
             candidate.split_routing.geo_asset_path = v.trim().to_owned();
@@ -13792,38 +13779,6 @@ fn handle_routing_settings(body: &str, daemon: &Daemon) -> (u16, &'static str, S
                 .collect();
             candidate.split_routing.auto_vpn_exceptions = dedup_limited_domains(items);
             prune_auto_vpn_metadata(&mut candidate.split_routing);
-        }
-        if let Some(v) = value.get("parovozik_enabled").and_then(Value::as_bool) {
-            candidate.split_routing.parovozik_enabled = v;
-        }
-        if let Some(v) = value
-            .get("parovozik_direct_domains")
-            .and_then(Value::as_array)
-        {
-            let items: Vec<String> = v
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect();
-            candidate.split_routing.parovozik_direct_domains = normalize_parovozik_domains(&items);
-        }
-        if let Some(v) = value.get("parovozik_vpn_domains").and_then(Value::as_array) {
-            let items: Vec<String> = v
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect();
-            candidate.split_routing.parovozik_vpn_domains = normalize_parovozik_domains(&items);
-        }
-        if let Some(v) = value.get("parovozik_server_refs").and_then(Value::as_array) {
-            let items: Vec<String> = v
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect();
-            sync_server_route_registry(&mut candidate);
-            let refs = match normalize_parovozik_server_refs(&candidate, &items) {
-                Ok(refs) => refs,
-                Err(error) => return json_error(400, &error),
-            };
-            candidate.split_routing.parovozik_server_refs = refs;
         }
         if let Some(v) = value.get("match_target").and_then(Value::as_str) {
             let target = v.trim().to_ascii_lowercase();
@@ -13996,10 +13951,6 @@ fn routing_setting_affects_dataplane(key: &str) -> bool {
             | "ru_direct_mode"
             | "ru_direct_exceptions"
             | "auto_vpn_exceptions"
-            | "parovozik_enabled"
-            | "parovozik_direct_domains"
-            | "parovozik_vpn_domains"
-            | "parovozik_server_refs"
             | "match_target"
     )
 }
@@ -14089,6 +14040,16 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
             json!({"error": "invalid JSON body"}).to_string(),
         );
     };
+    if value
+        .get("expected_revision")
+        .is_some_and(|revision| !revision.is_null() && !revision.is_string())
+    {
+        return json_error(400, "expected_revision must be a string");
+    }
+    let expected_revision = value
+        .get("expected_revision")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let apply_requested = value.get("apply").and_then(Value::as_bool).unwrap_or(false);
     let rules_value = value.get("rules").cloned().unwrap_or(value);
     let Ok(mut rules) = serde_json::from_value::<Vec<RoutingRule>>(rules_value) else {
@@ -14098,7 +14059,6 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
             json!({"error": "expected rules array"}).to_string(),
         );
     };
-    rules.retain(|rule| rule.kind != "managed-parovozik");
     for rule in &mut rules {
         rule.name = rule.name.trim().to_owned();
         rule.kind = rule.kind.trim().to_owned();
@@ -14116,8 +14076,17 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         }
         rule.ips = normalize_route_items(&rule.ips);
         rule.services = normalize_route_items(&rule.services);
-        rule.ports = normalize_route_items(&rule.ports);
-        rule.network = rule.network.trim().to_owned();
+        rule.ports = match normalize_port_items(&rule.ports) {
+            Ok(ports) => ports,
+            Err(error) => {
+                return json_error(400, &format!("routing rule '{}': {error}", rule.name));
+            }
+        };
+        rule.network = rule.network.trim().to_ascii_lowercase();
+        rule.port_mode = rule.port_mode.trim().to_ascii_lowercase();
+        if rule.port_mode.is_empty() {
+            rule.port_mode = default_rule_port_mode();
+        }
     }
     if let Err(error) = validate_router_routing_rules(&rules) {
         return (400, "application/json", json!({"error": error}).to_string());
@@ -14128,6 +14097,12 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
     };
     let (previous_state, saved_rules, removes_rules) = {
         let mut inner = lock(&daemon.inner);
+        if expected_revision
+            .as_ref()
+            .is_some_and(|revision| *revision != routing_rules_revision(&inner.state.routing_rules))
+        {
+            return json_error(409, "routing rules changed; reload before saving");
+        }
         let mut candidate = inner.state.clone();
         sync_server_route_registry(&mut candidate);
         if let Err(error) = validate_routing_targets(&candidate, &rules, &candidate.device_routes) {
@@ -14175,6 +14150,7 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
                     "application/json",
                     json!({
                         "rules": saved_rules,
+                        "rules_revision": routing_rules_revision(&saved_rules),
                         "applied": true,
                         "core_status": result.core_status,
                         "firewall_status": result.firewall_status,
@@ -14190,6 +14166,7 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
                 "application/json",
                 json!({
                     "rules": saved_rules,
+                    "rules_revision": routing_rules_revision(&saved_rules),
                     "applied": false,
                     "requires_apply": true,
                     "activation_error": error,
@@ -14206,8 +14183,12 @@ fn handle_routing_rules(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
     (
         200,
         "application/json",
-        json!({"rules": saved_rules, "applied": false, "requires_apply": true}).to_string(),
+        json!({"rules": saved_rules, "rules_revision":routing_rules_revision(&saved_rules), "applied": false, "requires_apply": true}).to_string(),
     )
+}
+
+fn routing_rules_revision(rules: &[RoutingRule]) -> String {
+    sha256_hex(&serde_json::to_vec(rules).expect("routing rules are serializable"))
 }
 
 fn routing_rules_are_strict_deletion(previous: &[RoutingRule], next: &[RoutingRule]) -> bool {
@@ -14229,11 +14210,32 @@ fn restore_state_after_failed_policy_change(
     previous_state: HincyrayState,
 ) -> String {
     let mut inner = lock(&daemon.inner);
-    inner.state = previous_state;
+    restore_policy_fields(&mut inner.state, &previous_state);
     match persist_state(&daemon.state_path, &inner.state) {
         Ok(()) => "restored".to_owned(),
-        Err(error) => format!("failed ({error})"),
+        Err(error) => {
+            inner.dirty = true;
+            format!("failed ({error})")
+        }
     }
+}
+
+/// Policy activation releases the state mutex for core/controller I/O.
+/// Restore only fields owned by the serialized policy operation, retaining
+/// concurrent benchmark evidence, favorites, traffic and background history.
+fn restore_policy_fields(current: &mut HincyrayState, previous: &HincyrayState) {
+    let learned = current.split_routing.auto_vpn_last_checked_unix.clone();
+    current.split_routing = previous.split_routing.clone();
+    current
+        .split_routing
+        .auto_vpn_last_checked_unix
+        .extend(learned);
+    current.dns_settings = previous.dns_settings.clone();
+    current.routing_rules = previous.routing_rules.clone();
+    current.device_routes = previous.device_routes.clone();
+    current.server_route_registry = previous.server_route_registry.clone();
+    current.best_of_best = previous.best_of_best.clone();
+    current.undo_stack = previous.undo_stack.clone();
 }
 
 fn handle_routing_resource_route(body: &str, daemon: &Daemon) -> (u16, &'static str, String) {
@@ -14401,7 +14403,7 @@ fn handle_routing_resource_reload(body: &str, daemon: &Daemon) -> (u16, &'static
             port: request.port,
             network: network.clone(),
         };
-        let trace = trace_routing_decision(&inner.state, &request);
+        let trace = trace_with_runtime_assets(daemon, &inner.state, &request);
         let runtime_evaluation = trace_requires_mihomo_runtime(&trace);
         let target = trace
             .get("target")
@@ -14603,11 +14605,6 @@ fn handle_routing_reset(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
         s.auto_vpn_exceptions = Vec::new();
         s.auto_vpn_last_checked_unix.clear();
         s.auto_vpn_learning_enabled = false;
-        s.parovozik_enabled = false;
-        s.parovozik_direct_domains.clear();
-        s.parovozik_vpn_domains.clear();
-        s.parovozik_server_refs.clear();
-        s.parovozik_last_checked_unix.clear();
         s.match_target = "proxy".to_owned();
         s.port_mode = PortMode::AllowList;
         s.proxy_ports = vec!["80".to_owned(), "443".to_owned()];
@@ -15133,6 +15130,9 @@ fn handle_routing_trace(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
             json!({"error": "invalid JSON body"}).to_string(),
         );
     };
+    if let Err(error) = validate_trace_metadata(&value) {
+        return json_error(400, &error);
+    }
     let request = TraceRequest {
         host: value
             .get("host")
@@ -15162,7 +15162,7 @@ fn handle_routing_trace(body: &str, daemon: &Daemon) -> (u16, &'static str, Stri
             .to_ascii_lowercase(),
     };
     let inner = lock(&daemon.inner);
-    let trace = trace_routing_decision(&inner.state, &request);
+    let trace = trace_with_runtime_assets(daemon, &inner.state, &request);
     (200, "application/json", trace.to_string())
 }
 
@@ -15613,6 +15613,25 @@ struct TraceRequest {
     network: String,
 }
 
+fn validate_trace_metadata(value: &Value) -> Result<(), String> {
+    if let Some(port) = value.get("port")
+        && !port.is_null()
+        && !port
+            .as_u64()
+            .is_some_and(|port| (1..=65535).contains(&port))
+    {
+        return Err("port must be between 1 and 65535".to_owned());
+    }
+    if let Some(network) = value.get("network")
+        && !network.as_str().is_some_and(|network| {
+            matches!(network.to_ascii_lowercase().as_str(), "" | "tcp" | "udp")
+        })
+    {
+        return Err("network must be tcp or udp".to_owned());
+    }
+    Ok(())
+}
+
 fn trace_routing_decision(state: &HincyrayState, request: &TraceRequest) -> Value {
     let mut candidates: Vec<Value> = Vec::new();
 
@@ -15635,15 +15654,28 @@ fn trace_routing_decision(state: &HincyrayState, request: &TraceRequest) -> Valu
         .enumerate()
         .filter(|(_, rule)| rule.enabled)
     {
-        let port_ok = trace_ports_match(rule, request.port);
-        let network_ok = trace_network_matches(rule, &request.network);
+        let ports_unknown = !rule.ports.is_empty()
+            && (request.port.is_none() || rule.ports.iter().any(|port| port.contains(':')));
+        let network_unknown =
+            normalize_route_network(&rule.network).is_some() && request.network.is_empty();
+        let port_ok = ports_unknown || trace_ports_match(rule, request.port);
+        let network_ok = network_unknown || trace_network_matches(rule, &request.network);
         if !port_ok || !network_ok {
             continue;
         }
 
         let domain_match = trace_domain_match(rule, &request.host);
         let ip_match = trace_ip_match(rule, &request.ip, &request.source_ip);
-        if domain_match.exact || ip_match.exact {
+        let port_only = rule.domains.is_empty()
+            && rule.ips.is_empty()
+            && rule.services.is_empty()
+            && rule.pattern.trim().is_empty()
+            && (!rule.ports.is_empty() || normalize_route_network(&rule.network).is_some());
+        if domain_match.exact || ip_match.exact || port_only {
+            if ports_unknown || network_unknown || !candidates.is_empty() {
+                candidates.push(json!({"rule_index":idx,"name":rule.name,"target":rule.target,"reason":"earlier runtime rule or missing transport metadata"}));
+                return json!({"decision":"requires_mihomo_geo_eval","target":Value::Null,"candidates":candidates,"reason":"cannot establish first matching rule locally"});
+            }
             return json!({
                 "decision": "matched",
                 "source": "routing_rule",
@@ -15664,9 +15696,25 @@ fn trace_routing_decision(state: &HincyrayState, request: &TraceRequest) -> Valu
         }
     }
 
+    let system_unknown = state.split_routing.enabled
+        && !state.safe_mode_enabled
+        && (!matches!(state.split_routing.ru_direct_mode.as_str(), "" | "off")
+            || !state.split_routing.auto_vpn_exceptions.is_empty()
+            || !state.split_routing.ru_direct_exceptions.is_empty()
+            || state.split_routing.port_mode != PortMode::All
+            || !state.split_routing.tproxy_available
+            || state
+                .profiles
+                .iter()
+                .any(|profile| Some(profile.id) == state.active_profile_id && profile.block_quic));
+    let default_target = if state.split_routing.match_target == "direct" {
+        "direct"
+    } else {
+        "active"
+    };
     json!({
-        "decision": if candidates.is_empty() { "default" } else { "requires_mihomo_geo_eval" },
-        "target": "active",
+        "decision": if candidates.is_empty() && !system_unknown { "default" } else { "requires_mihomo_geo_eval" },
+        "target": if candidates.is_empty() && !system_unknown { json!(default_target) } else { Value::Null },
         "reason": if candidates.is_empty() {
             "no exact local rule matched"
         } else {
@@ -15678,6 +15726,25 @@ fn trace_routing_decision(state: &HincyrayState, request: &TraceRequest) -> Valu
 
 fn trace_requires_mihomo_runtime(trace: &Value) -> bool {
     trace.get("decision").and_then(Value::as_str) == Some("requires_mihomo_geo_eval")
+}
+
+fn trace_with_runtime_assets(
+    daemon: &Daemon,
+    state: &HincyrayState,
+    request: &TraceRequest,
+) -> Value {
+    let mut trace = trace_routing_decision(state, request);
+    if trace["decision"] == "default" && !state.safe_mode_enabled && state.split_routing.enabled {
+        match project_geobase_rule_providers(daemon, GeoBaseProjection::Applied, true) {
+            Ok(providers) if providers.is_empty() => {}
+            _ => {
+                trace["decision"] = json!("requires_mihomo_geo_eval");
+                trace["target"] = Value::Null;
+                trace["reason"] = json!("managed runtime rules require Mihomo evaluation");
+            }
+        }
+    }
+    trace
 }
 
 #[derive(Default)]
@@ -15694,7 +15761,14 @@ fn trace_ports_match(rule: &RoutingRule, port: Option<u16>) -> bool {
     let Some(port) = port else {
         return false;
     };
-    let listed = rule.ports.iter().any(|spec| port_matches_spec(port, spec));
+    let Ok(ports) = normalize_port_items(&rule.ports) else {
+        return false;
+    };
+    // TraceRequest has no source/listener port: do not assert a match for them.
+    if ports.iter().any(|spec| spec.contains(':')) {
+        return false;
+    }
+    let listed = ports.iter().any(|spec| port_matches_spec(port, spec));
     if rule.port_mode == "exclude" {
         !listed
     } else {
@@ -15722,6 +15796,8 @@ fn trace_network_matches(rule: &RoutingRule, network: &str) -> bool {
 }
 
 fn trace_domain_match(rule: &RoutingRule, host: &str) -> TraceMatch {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let mut uncertain = TraceMatch::default();
     let mut items = normalize_route_items(&rule.domains);
     for service in &rule.services {
         let service = service.trim().trim_start_matches("geosite:");
@@ -15735,21 +15811,31 @@ fn trace_domain_match(rule: &RoutingRule, host: &str) -> TraceMatch {
     for item in items {
         let low = item.to_ascii_lowercase();
         if low.starts_with("geosite:") || low.starts_with("rule-set:") {
-            return TraceMatch {
+            uncertain = TraceMatch {
                 possible: true,
                 reason: Some(format!("{item} requires Mihomo runtime rule assets")),
                 ..Default::default()
             };
+            continue;
         }
-        let needle = low
-            .trim_start_matches("domain:")
-            .trim_start_matches("suffix:")
-            .trim_start_matches("keyword:")
-            .trim_start_matches("wildcard:")
-            .trim_start_matches("regex:")
-            .trim_start_matches('.')
-            .to_owned();
-        if host == needle || host.ends_with(&format!(".{needle}")) || host.contains(&needle) {
+        if host.is_empty() {
+            uncertain.possible = true;
+            uncertain.reason = Some("hostname is missing".to_owned());
+            continue;
+        }
+        let matched = if let Some(exact) = low.strip_prefix('=') {
+            host == exact
+        } else if let Some(keyword) = low.strip_prefix("keyword:") {
+            host.contains(keyword)
+        } else if low.starts_with("regex:") || low.starts_with("wildcard:") {
+            uncertain.possible = true;
+            uncertain.reason = Some("pattern requires Mihomo matching semantics".to_owned());
+            continue;
+        } else {
+            let suffix = low.trim_start_matches('.');
+            host == suffix || host.ends_with(&format!(".{suffix}"))
+        };
+        if matched {
             return TraceMatch {
                 exact: true,
                 reason: Some(format!("host {host} matches {item}")),
@@ -15757,10 +15843,11 @@ fn trace_domain_match(rule: &RoutingRule, host: &str) -> TraceMatch {
             };
         }
     }
-    TraceMatch::default()
+    uncertain
 }
 
 fn trace_ip_match(rule: &RoutingRule, ip: &str, source_ip: &str) -> TraceMatch {
+    let mut uncertain = TraceMatch::default();
     let mut items = normalize_route_items(&rule.ips);
     if items.is_empty()
         && !rule.pattern.trim().is_empty()
@@ -15770,16 +15857,33 @@ fn trace_ip_match(rule: &RoutingRule, ip: &str, source_ip: &str) -> TraceMatch {
     }
     for item in items {
         let low = item.to_ascii_lowercase();
-        if low.starts_with("geoip:") || low.starts_with("ip-asn:") || low.starts_with("src-geoip:")
+        if [
+            "geoip:",
+            "ip-asn:",
+            "src-geoip:",
+            "geoip-asn:",
+            "src-ip-asn:",
+            "ip-suffix:",
+            "src-ip-suffix:",
+            "rule-set:",
+        ]
+        .iter()
+        .any(|prefix| low.starts_with(prefix))
         {
-            return TraceMatch {
+            uncertain = TraceMatch {
                 possible: true,
                 reason: Some(format!("{item} requires Mihomo geo database")),
                 ..Default::default()
             };
+            continue;
         }
         let is_src = low.starts_with("src-ip-cidr:");
         let target_ip = if is_src { source_ip } else { ip };
+        if target_ip.is_empty() {
+            uncertain.possible = true;
+            uncertain.reason = Some("IP metadata is missing".to_owned());
+            continue;
+        }
         let cidr = low
             .trim_start_matches("src-ip-cidr:")
             .trim_start_matches("ip-cidr:")
@@ -15792,7 +15896,7 @@ fn trace_ip_match(rule: &RoutingRule, ip: &str, source_ip: &str) -> TraceMatch {
             };
         }
     }
-    TraceMatch::default()
+    uncertain
 }
 
 fn ip_matches_cidr_text(ip: &str, cidr: &str) -> bool {
@@ -15800,6 +15904,19 @@ fn ip_matches_cidr_text(ip: &str, cidr: &str) -> bool {
         let Ok(prefix) = prefix.parse::<u8>() else {
             return false;
         };
+        if let (Ok(std::net::IpAddr::V6(ip)), Ok(std::net::IpAddr::V6(base))) =
+            (ip.parse(), base.parse())
+        {
+            if prefix > 128 {
+                return false;
+            }
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            return u128::from(ip) & mask == u128::from(base) & mask;
+        }
         return ipv4_in_cidr(ip, base, prefix);
     }
     ip == cidr
@@ -16197,7 +16314,22 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
             json!({"error": "invalid JSON body"}).to_string(),
         );
     };
+    for name in ["auto_bench_interval_hours", "auto_refresh_interval_hours"] {
+        if let Some(interval) = value.get(name)
+            && interval
+                .as_u64()
+                .and_then(|hours| u32::try_from(hours).ok())
+                .is_none()
+        {
+            return json_error(400, "interval must be an unsigned 32-bit integer");
+        }
+    }
+    let _apply = match daemon.apply.lock() {
+        Ok(guard) => guard,
+        Err(_) => return json_error(500, "config apply lock is poisoned"),
+    };
     let mut inner = lock(&daemon.inner);
+    let previous = inner.state.clone();
     if let Some(v) = value.get("auto_select").and_then(Value::as_bool) {
         inner.state.auto_select = v;
     }
@@ -16205,7 +16337,10 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
         .get("auto_bench_interval_hours")
         .and_then(Value::as_u64)
     {
-        inner.state.auto_bench_interval_hours = v as u32;
+        let Ok(hours) = u32::try_from(v) else {
+            return json_error(400, "interval is too large");
+        };
+        inner.state.auto_bench_interval_hours = hours;
     }
     if let Some(v) = value.get("auto_switch").and_then(Value::as_bool) {
         inner.state.split_routing.auto_switch = v;
@@ -16217,12 +16352,18 @@ fn handle_auto_settings_set(body: &str, daemon: &Daemon) -> (u16, &'static str, 
         .get("auto_refresh_interval_hours")
         .and_then(Value::as_u64)
     {
-        inner.state.auto_refresh_interval_hours = v as u32;
+        let Ok(hours) = u32::try_from(v) else {
+            return json_error(400, "interval is too large");
+        };
+        inner.state.auto_refresh_interval_hours = hours;
     }
     if let Some(maintenance) = value.get("maintenance") {
         apply_maintenance_settings(&mut inner.state.maintenance, maintenance);
     }
-    let _ = persist_state(&daemon.state_path, &inner.state);
+    if let Err(error) = persist_state(&daemon.state_path, &inner.state) {
+        inner.state = previous;
+        return json_error(500, &format!("persist state: {error}"));
+    }
     (
         200,
         "application/json",
@@ -19186,7 +19327,11 @@ fn handle_mihomo_api_memory(daemon: &Daemon) -> (u16, &'static str, String) {
                     json!({"inuse": kb, "oslimit": 0, "source": "procfs"}).to_string(),
                 );
             }
-            (200, "application/json", body)
+            (
+                200,
+                "application/json",
+                normalize_mihomo_memory(&body).to_string(),
+            )
         }
         Err(e) => (
             502,
@@ -19194,6 +19339,12 @@ fn handle_mihomo_api_memory(daemon: &Daemon) -> (u16, &'static str, String) {
             json!({"error": format!("Mihomo API: {e}")}).to_string(),
         ),
     }
+}
+
+fn normalize_mihomo_memory(body: &str) -> Value {
+    let value = serde_json::from_str::<Value>(body).unwrap_or_else(|_| json!({}));
+    json!({"inuse":value["inuse"].as_u64().unwrap_or(0)/1024,
+        "oslimit":value["oslimit"].as_u64().unwrap_or(0)/1024,"unit":"KiB","source":"mihomo"})
 }
 
 fn read_process_rss_kb(pid: u32) -> Option<u64> {
@@ -19962,22 +20113,6 @@ fn auto_vpn_candidate_from_mihomo_log_payload(payload: &str) -> Option<AutoVpnCa
     })
 }
 
-fn parovozik_candidate_from_mihomo_log_payload(payload: &str) -> Option<AutoVpnCandidate> {
-    let (target, error) = payload.split_once(" error:")?;
-    let direct_attempt = payload.contains("dial DIRECT")
-        || payload.contains("dial tcp")
-        || payload.contains("connect error");
-    if !direct_attempt || error.trim().is_empty() {
-        return None;
-    }
-    let target = target.rsplit(" --> ").next()?.trim();
-    let domain = normalize_auto_vpn_domain(target)?;
-    let port = target
-        .rsplit_once(':')
-        .and_then(|(_, port)| port.parse::<u16>().ok());
-    Some(AutoVpnCandidate { domain, port })
-}
-
 #[derive(Debug, Default)]
 struct MihomoLogCursor {
     identity: Option<(u64, u64)>,
@@ -19997,13 +20132,9 @@ impl MihomoLogCursor {
         }
     }
 
-    fn read_new_domains(
-        &mut self,
-        path: &Path,
-        parovozik_enabled: bool,
-    ) -> Result<Vec<AutoVpnCandidate>, String> {
+    fn read_new_domains(&mut self, path: &Path) -> Result<Vec<AutoVpnCandidate>, String> {
         let text = self.read_new_text(path)?;
-        Ok(log_candidate_domains_from_text(&text, parovozik_enabled))
+        Ok(log_candidate_domains_from_text(&text))
     }
 
     fn read_new_text(&mut self, path: &Path) -> Result<String, String> {
@@ -20060,18 +20191,14 @@ fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
 
 #[cfg(test)]
 fn auto_vpn_log_candidate_domains_from_text(text: &str) -> Vec<AutoVpnCandidate> {
-    log_candidate_domains_from_text(text, false)
+    log_candidate_domains_from_text(text)
 }
 
-fn log_candidate_domains_from_text(text: &str, parovozik_enabled: bool) -> Vec<AutoVpnCandidate> {
+fn log_candidate_domains_from_text(text: &str) -> Vec<AutoVpnCandidate> {
     let mut seen = HashSet::new();
     let mut domains = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let candidate = if parovozik_enabled {
-            parovozik_candidate_from_mihomo_log_payload(line)
-        } else {
-            auto_vpn_candidate_from_mihomo_log_payload(line)
-        };
+        let candidate = auto_vpn_candidate_from_mihomo_log_payload(line);
         let Some(candidate) = candidate else {
             continue;
         };
@@ -20171,216 +20298,6 @@ fn auto_vpn_candidate_domains(
     candidates
 }
 
-fn domain_matches_geobase_artifact(domain: &str, bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).is_ok_and(|text| {
-        text.lines().any(|line| {
-            let entry = line.trim().trim_start_matches("+.");
-            !entry.is_empty() && (domain == entry || domain.ends_with(&format!(".{entry}")))
-        })
-    })
-}
-
-fn domain_is_in_applied_geobase(daemon: &Daemon, domain: &str) -> Result<bool, String> {
-    let manifest = daemon
-        .geobase_store()
-        .load_manifest()
-        .map_err(|error| format!("GeoBase manifest: {error}"))?;
-    for base in manifest
-        .applied_bases
-        .iter()
-        .filter(|base| base.enabled && base.status == GeoBaseStatus::Ready)
-    {
-        for metadata in [
-            &base.lists.active,
-            &base.lists.direct,
-            &base.lists.unresolved,
-        ] {
-            let bytes = fs::read(daemon.geobase_store_root.join(&metadata.file))
-                .map_err(|error| format!("GeoBase artifact {}: {error}", metadata.file))?;
-            if domain_matches_geobase_artifact(domain, &bytes) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-fn parovozik_candidate_domains(
-    state: &HincyrayState,
-    now: u64,
-    observed_direct_failures: &[AutoVpnCandidate],
-) -> Vec<AutoVpnCandidate> {
-    let known: HashSet<&str> = state
-        .split_routing
-        .parovozik_direct_domains
-        .iter()
-        .chain(state.split_routing.parovozik_vpn_domains.iter())
-        .map(String::as_str)
-        .collect();
-    let manual_rule_match = |domain: &str| {
-        state
-            .routing_rules
-            .iter()
-            .filter(|rule| rule.enabled)
-            .any(|rule| trace_domain_match(rule, domain).exact)
-    };
-    observed_direct_failures
-        .iter()
-        .filter(|candidate| !known.contains(candidate.domain.as_str()))
-        .filter(|candidate| !manual_rule_match(&candidate.domain))
-        .filter(|candidate| {
-            now.saturating_sub(
-                state
-                    .split_routing
-                    .parovozik_last_checked_unix
-                    .get(&candidate.domain)
-                    .copied()
-                    .unwrap_or(0),
-            ) >= AUTO_VPN_RECHECK_INTERVAL_SECS
-        })
-        .take(3)
-        .cloned()
-        .collect()
-}
-
-fn parovozik_probe_targets(state: &HincyrayState) -> Vec<String> {
-    let mut targets = vec![PROXY_ACTIVE_NAME.to_owned()];
-    for server_ref in state
-        .split_routing
-        .parovozik_server_refs
-        .iter()
-        .take(MAX_PAROVOZIK_SERVERS)
-    {
-        let usable = state.server_route_registry.iter().any(|entry| {
-            entry.server_ref == *server_ref
-                && state.profiles.iter().any(|profile| {
-                    canonical_profile_raw(profile) == entry.canonical_raw
-                        && !profile_is_dead(state, profile)
-                })
-        });
-        if usable && server_ref.len() > 7 {
-            targets.push(format!("srv-route-{}", &server_ref[7..]));
-        }
-    }
-    targets
-}
-
-fn run_parovozik(
-    daemon: &Daemon,
-    ec_addr: Option<&str>,
-    ec_secret: Option<&str>,
-    observed_direct_failures: &[AutoVpnCandidate],
-) -> bool {
-    let Some(ec_addr) = ec_addr else {
-        return false;
-    };
-    let now = unix_now();
-    let (candidates, targets) = {
-        let inner = lock(&daemon.inner);
-        if !inner.state.split_routing.parovozik_enabled {
-            return true;
-        }
-        (
-            parovozik_candidate_domains(&inner.state, now, observed_direct_failures),
-            parovozik_probe_targets(&inner.state),
-        )
-    };
-    if candidates.is_empty() {
-        return true;
-    }
-    let Ok(direct_client) = direct_http_client(Duration::from_secs(5)) else {
-        return false;
-    };
-    let mut classified = Vec::new();
-    for candidate in candidates {
-        match domain_is_in_applied_geobase(daemon, &candidate.domain) {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(error) => {
-                eprintln!("hincyray: Паровозик GeoBase lookup failed: {error}");
-                return false;
-            }
-        }
-        let target = if probe_domain_reachable(&direct_client, &candidate) {
-            Some("direct")
-        } else if targets.iter().any(|target| {
-            auto_vpn_probe_urls(&candidate)
-                .iter()
-                .any(|url| mihomo_api_delay(ec_addr, ec_secret, target, url, 8000).is_ok())
-        }) {
-            Some("vpn")
-        } else {
-            None
-        };
-        classified.push((candidate.domain, target));
-    }
-    if classified.is_empty() {
-        return true;
-    }
-
-    let previous_state = lock(&daemon.inner).state.clone();
-    let (changed, direct_changed, vpn_changed, updated_state) = {
-        let mut inner = lock(&daemon.inner);
-        if !inner.state.split_routing.parovozik_enabled {
-            return true;
-        }
-        let mut changed = false;
-        let mut direct_changed = false;
-        let mut vpn_changed = false;
-        for (domain, target) in classified {
-            inner
-                .state
-                .split_routing
-                .parovozik_last_checked_unix
-                .insert(domain.clone(), now);
-            let list = match target {
-                Some("direct") => Some(&mut inner.state.split_routing.parovozik_direct_domains),
-                Some("vpn") => Some(&mut inner.state.split_routing.parovozik_vpn_domains),
-                _ => None,
-            };
-            if let Some(list) = list
-                && !list.contains(&domain)
-            {
-                eprintln!("hincyray: Паровозик classified {domain} as {target:?}");
-                list.push(domain);
-                changed = true;
-                direct_changed |= target == Some("direct");
-                vpn_changed |= target == Some("vpn");
-            }
-        }
-        changed |= prune_parovozik_metadata(&mut inner.state.split_routing);
-        inner.state.split_routing.parovozik_direct_domains =
-            normalize_parovozik_domains(&inner.state.split_routing.parovozik_direct_domains);
-        inner.state.split_routing.parovozik_vpn_domains =
-            normalize_parovozik_domains(&inner.state.split_routing.parovozik_vpn_domains);
-        if changed && let Err(error) = persist_state(&daemon.state_path, &inner.state) {
-            inner.state = previous_state.clone();
-            eprintln!("hincyray: Паровозик persist failed: {error}");
-            return false;
-        }
-        (changed, direct_changed, vpn_changed, inner.state.clone())
-    };
-    if changed {
-        if let Err(error) =
-            hot_update_parovozik_providers(&updated_state, direct_changed, vpn_changed)
-        {
-            let rollback = restore_state_after_failed_policy_change(daemon, previous_state.clone());
-            let provider_rollback =
-                hot_update_parovozik_providers(&previous_state, direct_changed, vpn_changed)
-                    .map_or_else(
-                        |error| format!("failed ({error})"),
-                        |()| "restored".to_owned(),
-                    );
-            eprintln!(
-                "hincyray: Паровозик hot update failed: {error}; state rollback: {rollback}; provider rollback: {provider_rollback}"
-            );
-            return false;
-        }
-        eprintln!("hincyray: Паровозик providers updated without core/firewall restart");
-    }
-    true
-}
-
 fn run_auto_vpn_learning(
     daemon: &Daemon,
     ec_addr: Option<&str>,
@@ -20424,7 +20341,13 @@ fn run_auto_vpn_learning(
         return true;
     }
 
+    let Ok(_apply) = daemon.apply.try_lock() else {
+        return false;
+    };
     let mut inner = lock(&daemon.inner);
+    if !inner.state.split_routing.auto_vpn_learning_enabled {
+        return true;
+    }
     let mut changed = false;
     for (domain, timestamp) in checked {
         inner
@@ -22043,6 +21966,7 @@ fn apply_restored_state(
         .apply
         .lock()
         .map_err(|_| "config apply lock is poisoned".to_owned())?;
+    let restored_snapshot = restored.clone();
     let (previous_state, was_running) = {
         let mut inner = lock(&daemon.inner);
         let previous_state = inner.state.clone();
@@ -22068,7 +21992,28 @@ fn apply_restored_state(
             Ok(result.core_status)
         }
         Err(error) => {
-            let state_rollback = restore_state_after_failed_policy_change(daemon, previous_state);
+            // A full backup restore owns all saved fields, but changes made
+            // during activation belong to the concurrent caller, not restore.
+            let mut inner = lock(&daemon.inner);
+            let current = serde_json::to_value(&inner.state).map_err(|e| e.to_string())?;
+            let baseline = serde_json::to_value(&restored_snapshot).map_err(|e| e.to_string())?;
+            let previous = serde_json::to_value(&previous_state).map_err(|e| e.to_string())?;
+            let rollback =
+                crate::hincyray_state_transaction::rollback(&previous, &baseline, &current);
+            let transient_undo = previous_state.undo_stack;
+            let connection_log = inner.state.connection_log.clone();
+            let metrics_history = inner.state.metrics_history.clone();
+            inner.state = serde_json::from_value(rollback).map_err(|e| e.to_string())?;
+            inner.state.undo_stack = transient_undo;
+            inner.state.connection_log = connection_log;
+            inner.state.metrics_history = metrics_history;
+            let state_rollback = match persist_state(&daemon.state_path, &inner.state) {
+                Ok(()) => "restored".to_owned(),
+                Err(error) => {
+                    inner.dirty = true;
+                    format!("failed ({error})")
+                }
+            };
             Err(format!(
                 "apply restored state: {error}; state rollback: {state_rollback}"
             ))
@@ -24198,9 +24143,7 @@ fn start_watchdog(
                 thread::sleep(Duration::from_millis(200));
             }
             watchdog_tick += 1;
-            if watchdog_tick.is_multiple_of(BEST_OF_BEST_PROBE_INTERVAL_TICKS) {
-                update_best_of_best_selector(&daemon);
-            }
+            update_best_of_best_selector(&daemon);
 
             // --- Read state snapshot (short lock) ---
             let (
@@ -24229,7 +24172,6 @@ fn start_watchdog(
                 last_auto_refresh,
                 maintenance,
                 auto_vpn_learning_enabled,
-                parovozik_enabled,
                 deep_bench_running,
                 deep_bench_due_now,
             ) = {
@@ -24265,7 +24207,6 @@ fn start_watchdog(
                     inner.state.last_auto_refresh_unix,
                     inner.state.maintenance.clone(),
                     inner.state.split_routing.auto_vpn_learning_enabled,
-                    inner.state.split_routing.parovozik_enabled,
                     inner.deep_bench_active,
                     deep_bench_due(&inner.state.deep_bench, unix_now()),
                 )
@@ -25029,8 +24970,8 @@ fn start_watchdog(
             // to Mihomo's local log instead; the cursor handles rotation and
             // truncation, while the bounded queue bridges 10s reads to 30s
             // probe cycles.
-            if core_running && split_enabled && (auto_vpn_learning_enabled || parovozik_enabled) {
-                match mihomo_log_cursor.read_new_domains(&mihomo_log_path, parovozik_enabled) {
+            if core_running && split_enabled && auto_vpn_learning_enabled {
+                match mihomo_log_cursor.read_new_domains(&mihomo_log_path) {
                     Ok(domains) => {
                         for candidate in domains {
                             if !pending_auto_vpn_domains
@@ -25053,13 +24994,11 @@ fn start_watchdog(
 
             if core_running
                 && split_enabled
-                && (auto_vpn_learning_enabled || parovozik_enabled)
+                && auto_vpn_learning_enabled
                 && watchdog_tick.is_multiple_of(AUTO_VPN_PROBE_INTERVAL_TICKS)
             {
                 let batch: Vec<AutoVpnCandidate> =
                     pending_auto_vpn_domains.iter().take(3).cloned().collect();
-                let parovozik_ok = !parovozik_enabled
-                    || run_parovozik(&daemon, ec_addr.as_deref(), ec_secret.as_deref(), &batch);
                 let auto_vpn_ok = !auto_vpn_learning_enabled
                     || run_auto_vpn_learning(
                         &daemon,
@@ -25067,7 +25006,7 @@ fn start_watchdog(
                         ec_secret.as_deref(),
                         &batch,
                     );
-                if parovozik_ok && auto_vpn_ok {
+                if auto_vpn_ok {
                     pending_auto_vpn_domains.drain(..batch.len());
                 }
             }
@@ -25539,6 +25478,8 @@ fn run_deep_bench(
         worker_count: 1,
         requested_concurrency: 1,
         memory_limited: false,
+        memory_reserve_kb: None,
+        memory_pressure: false,
     }));
     let on_result: Box<dyn Fn(crate::benchmark::BenchResult) + Send + Sync> = Box::new(|_| {});
     // Update status to Phase A.
@@ -26171,6 +26112,98 @@ mod tests {
         assert!(!best_of_best_probe_result(Ok(0)));
         assert!(!best_of_best_probe_result(Err("TLS EOF".to_owned())));
         drop(dir);
+    }
+
+    #[test]
+    fn best_of_best_catalog_distinguishes_test_states_without_exposing_private_evidence() {
+        let (_dir, daemon) = test_daemon();
+        let profile = profile_test_fixture_profile(159, "Catalog", "manual");
+        let now = unix_now();
+        let mut inner = lock(&daemon.inner);
+        let state = &mut inner.state;
+        state.profiles.push(profile.clone());
+        let empty = best_of_best_catalog_checks(state, &profile, now);
+        assert_eq!(empty["youtube_thumbnails"]["state"], "not-tested");
+        assert_eq!(empty["ping_proxy"]["tested"], false);
+        let mut youtube = profile_test_fixture_resource("youtube_thumbnails", true);
+        youtube.contract_version = 1;
+        youtube.error = Some("private-canary-do-not-expose".to_owned());
+        let mut ai = profile_test_fixture_resource("ai", false);
+        ai.inconclusive = true;
+        let mut ping = profile_test_fixture_resource("ping_proxy", false);
+        ping.attempts = 0;
+        state.stats.push(ProfileStats {
+            profile_raw: profile.raw.clone(),
+            last_service_test_unix: now,
+            resource_tests: vec![
+                youtube,
+                profile_test_fixture_resource("telegram", false),
+                ai,
+                ping,
+            ],
+            ..ProfileStats::default()
+        });
+        let checks = best_of_best_catalog_checks(state, &profile, now);
+        assert_eq!(checks["youtube_thumbnails"]["state"], "passed");
+        assert_eq!(checks["telegram"]["state"], "failed");
+        assert_eq!(checks["ai"]["state"], "unknown");
+        assert_eq!(checks["ai"]["tested"], true);
+        assert_eq!(checks["ping_proxy"]["state"], "skipped");
+        assert_eq!(checks["ping_proxy"]["tested"], false);
+        assert!(!checks.to_string().contains("private-canary"));
+        let stale = best_of_best_catalog_checks(state, &profile, now + 6 * 3600 + 1);
+        assert_eq!(stale["youtube_thumbnails"]["state"], "stale");
+        assert_eq!(stale["youtube_thumbnails"]["tested"], true);
+        assert_eq!(stale["telegram"]["state"], "stale");
+        state.stats[0].resource_tests[0].contract_version = 7;
+        assert_eq!(
+            best_of_best_catalog_checks(state, &profile, now)["youtube_thumbnails"]["state"],
+            "stale"
+        );
+        state.stats[0].resource_tests[0].id = "youtube".to_owned();
+        let native = best_of_best_catalog_checks(state, &profile, now);
+        assert_eq!(native["youtube_thumbnails"]["state"], "stale");
+        assert_eq!(native["youtube_thumbnails"]["tested"], true);
+        state.stats[0].last_service_test_unix = now + 61;
+        assert_eq!(
+            best_of_best_catalog_checks(state, &profile, now)["telegram"]["state"],
+            "stale"
+        );
+        state.stats[0].profile_raw = "unrelated-profile".to_owned();
+        assert_eq!(
+            best_of_best_catalog_checks(state, &profile, now)["telegram"]["state"],
+            "not-tested"
+        );
+        drop(inner);
+        let snapshot = best_of_best_snapshot(&daemon);
+        assert_eq!(snapshot["candidates"][0]["tested"], false);
+        assert!(!snapshot.to_string().contains("profile_raw"));
+        assert!(!snapshot.to_string().contains("private-canary"));
+    }
+
+    #[test]
+    fn best_of_best_catalog_excludes_dead_even_when_saved_in_membership() {
+        let (_dir, daemon) = test_daemon();
+        let live = profile_test_fixture_profile(159, "Live", "manual");
+        let dead = profile_test_fixture_profile(160, "Dead", "manual");
+        let dead_ref = server_ref_for_canonical(&canonical_profile_raw(&dead));
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.profiles = vec![live.clone(), dead.clone()];
+            inner
+                .state
+                .dead_server_refs
+                .insert(profile_server_ref(&dead));
+            inner.state.best_of_best.server_refs = vec![dead_ref.clone()];
+            sync_server_route_registry(&mut inner.state);
+        }
+        let snapshot = best_of_best_snapshot(&daemon);
+        let candidates = snapshot["candidates"].as_array().expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["id"], live.id);
+        assert_eq!(candidates[0]["dead"], false);
+        assert_eq!(snapshot["settings"]["server_refs"][0], dead_ref);
+        assert!(best_of_best_available(&lock(&daemon.inner).state).is_empty());
     }
 
     #[test]
@@ -28963,102 +28996,33 @@ mod tests {
     }
 
     #[test]
-    fn parovozik_managed_rules_are_visible_only_when_enabled() {
+    fn removed_routing_feature_migrates_backups_without_losing_explicit_routes() {
         let (_dir, daemon) = test_daemon();
-        assert!(!lock(&daemon.inner).state.split_routing.parovozik_enabled);
-        let (status, _, body) = handle_routing_get(&daemon);
-        assert_eq!(status, 200);
-        let response: Value = serde_json::from_str(&body).expect("routing response");
-        let rules = response["rules"].as_array().expect("rules");
-        assert!(rules.iter().all(|rule| rule["kind"] != "managed-parovozik"));
-        lock(&daemon.inner).state.split_routing.parovozik_enabled = true;
-        let (status, _, body) = handle_routing_get(&daemon);
-        assert_eq!(status, 200);
-        let response: Value = serde_json::from_str(&body).expect("routing response");
-        let parovozik: Vec<&Value> = response["rules"]
-            .as_array()
-            .expect("rules")
-            .iter()
-            .filter(|rule| rule["kind"] == "managed-parovozik")
-            .collect();
-        assert_eq!(parovozik.len(), 2);
-        assert!(parovozik.iter().all(|rule| rule["enabled"] == true));
+        let mut legacy = serde_json::to_value(&lock(&daemon.inner).state).expect("state");
+        legacy["split_routing"]["parovozik_enabled"] = json!(true);
+        legacy["split_routing"]["torrent_socks"]["target"] = json!("parovozik");
+        legacy["routing_rules"] = json!([
+            {"name":"explicit","target":"parovozik","enabled":true},
+            {"name":"generated","kind":"managed-parovozik","target":"direct"},
+            {"name":"ordinary","target":"direct","enabled":false}
+        ]);
+        legacy["device_routes"] =
+            json!([{ "enabled":true, "name":"device", "ip":"192.168.1.10", "target":"parovozik" }]);
+        let migrated = deserialize_persisted_state(&legacy.to_string()).expect("old backup");
+        assert_eq!(migrated.routing_rules.len(), 2);
+        assert_eq!(migrated.routing_rules[0].target, "active");
+        assert_eq!(migrated.routing_rules[1].target, "direct");
+        assert!(!migrated.routing_rules[1].enabled);
+        assert_eq!(migrated.device_routes[0].target, "active");
+        assert_eq!(migrated.split_routing.torrent_socks.target, "active");
         assert!(
-            parovozik
-                .iter()
-                .any(|rule| rule["name"] == "Паровозик Direct")
+            !serde_json::to_string(&migrated)
+                .expect("serialize")
+                .contains("parovozik")
         );
-        assert!(parovozik.iter().any(|rule| rule["name"] == "Паровозик VPN"));
-    }
-
-    #[test]
-    fn parovozik_provider_files_are_bounded_normalized_and_atomic() {
-        let (dir, daemon) = test_daemon();
-        let mut state = lock(&daemon.inner).state.clone();
-        state.split_routing.geo_asset_path = dir.path().to_string_lossy().into_owned();
-        state.split_routing.parovozik_enabled = true;
-        state.split_routing.parovozik_direct_domains =
-            vec![" Example.COM ".to_owned(), "example.com".to_owned()];
-        state.split_routing.parovozik_vpn_domains = vec!["vpn.example".to_owned()];
-
-        write_parovozik_provider_files(&state).expect("provider files");
-        let (direct, vpn) = parovozik_provider_paths(&state).expect("paths");
-        assert_eq!(fs::read_to_string(direct).expect("direct"), "example.com\n");
-        assert_eq!(fs::read_to_string(vpn).expect("vpn"), "vpn.example\n");
-
-        state.split_routing.parovozik_direct_domains.clear();
-        write_parovozik_provider_files(&state).expect("empty provider");
-        let (direct, _) = parovozik_provider_paths(&state).expect("paths");
-        assert_eq!(fs::read_to_string(direct).expect("direct"), "# empty\n");
-    }
-
-    #[test]
-    fn parovozik_config_uses_hot_update_rule_providers() {
-        let (dir, daemon) = test_daemon();
-        handle_import(
-            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls#Active",
-            &daemon,
-        );
-        let state = {
-            let mut inner = lock(&daemon.inner);
-            inner.state.active_profile_id = Some(0);
-            inner.state.split_routing.enabled = true;
-            inner.state.split_routing.parovozik_enabled = true;
-            inner.state.split_routing.geo_asset_path = dir.path().to_string_lossy().into_owned();
-            inner.state.clone()
-        };
-        write_parovozik_provider_files(&state).expect("provider files");
-        let yaml = build_daemon_config(&state, &[]).expect("config");
-        assert!(yaml.contains("RULE-SET,parovozik-direct,DIRECT"));
-        assert!(yaml.contains("RULE-SET,parovozik-vpn-rules,parovozik-vpn"));
-        assert!(!yaml.contains("DOMAIN-SUFFIX,example.com,parovozik-vpn"));
-    }
-
-    #[test]
-    fn stale_parovozik_refs_do_not_block_profile_switch_config() {
-        let (dir, daemon) = test_daemon();
-        handle_import(
-            "vless://11111111-1111-1111-1111-111111111111@one.example:443?security=tls#One\n\
-             vless://22222222-2222-2222-2222-222222222222@two.example:443?security=tls#Two",
-            &daemon,
-        );
-        let mut state = lock(&daemon.inner).state.clone();
-        state.active_profile_id = Some(1);
-        state.split_routing.enabled = true;
-        state.split_routing.parovozik_enabled = true;
-        state.split_routing.geo_asset_path = dir.path().to_string_lossy().into_owned();
-        sync_server_route_registry(&mut state);
-        let stale_ref = "srv-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        state
-            .split_routing
-            .parovozik_server_refs
-            .push(stale_ref.to_owned());
-        state.server_route_registry.push(ServerRouteRegistryEntry {
-            server_ref: stale_ref.to_owned(),
-            canonical_raw: "missing-profile".to_owned(),
-        });
-
-        build_daemon_config(&state, &[]).expect("stale Parovozik ref must be ignored");
+        let (status, _, body) = handle_routing_get(&daemon);
+        assert_eq!(status, 200);
+        assert!(!body.contains("parovozik"));
     }
 
     #[test]
@@ -30259,7 +30223,7 @@ mod tests {
         let mut state = HincyrayState::default();
         state
             .split_routing
-            .parovozik_last_checked_unix
+            .auto_vpn_last_checked_unix
             .insert("internal.example".to_owned(), 1);
         let daemon = Daemon::new(state, state_path, mihomo_config_path);
         let (status, _, body) = dispatch("GET", "/api/status", "", &daemon);
@@ -30282,14 +30246,10 @@ mod tests {
         settings
             .auto_vpn_last_checked_unix
             .insert("auto.internal".to_owned(), 1);
-        settings
-            .parovozik_last_checked_unix
-            .insert("parovozik.internal".to_owned(), 2);
 
         let response = split_routing_settings_response(&settings);
         assert_eq!(response["enabled"], false);
         assert!(response.get("auto_vpn_last_checked_unix").is_none());
-        assert!(response.get("parovozik_last_checked_unix").is_none());
         assert_eq!(response["torrent_socks"]["password_set"], true);
         assert!(response["torrent_socks"].get("password").is_none());
         assert!(!response.to_string().contains("SECRET_TORRENT_PASSWORD"));
@@ -30516,6 +30476,162 @@ mod tests {
         let (status, _, body) = dispatch("POST", "/api/core/stop", "", &daemon);
         assert_eq!(status, 200);
         assert!(body.contains("\"core_status\":\"stopped\""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_core_reset_reaps_process_and_preserves_selector_and_state() {
+        for cleanup in [false, true] {
+            let dir = TempDir::new().expect("temp dir");
+            let script = dir.path().join("fake-mihomo.sh");
+            fs::write(
+                &script,
+                "#!/bin/sh\nif [ \"$1\" = \"-t\" ]; then exit 0; fi\nexec sleep 30\n",
+            )
+            .expect("fake core");
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+            let daemon = Daemon::new(
+                HincyrayState {
+                    mihomo_path: script.to_string_lossy().into_owned(),
+                    profiles: vec![sample_profile(0, "Active", "active.example")],
+                    active_profile_id: Some(0),
+                    ..Default::default()
+                },
+                dir.path().join("state.json"),
+                dir.path().join("mihomo-config.yaml"),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").expect("controller");
+            daemon.set_mihomo_controller_override(
+                listener.local_addr().expect("address").to_string(),
+            );
+            let worker = thread::spawn(move || {
+                for expected in [
+                    "GET /version ",
+                    "GET /proxies/proxy ",
+                    "PUT /proxies/proxy ",
+                ] {
+                    let (mut socket, _) = listener.accept().expect("request");
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .expect("read timeout");
+                    let mut reader = BufReader::new(&mut socket);
+                    let mut first = String::new();
+                    reader.read_line(&mut first).expect("request line");
+                    assert!(first.starts_with(expected), "unexpected request: {first}");
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        assert!(reader.read_line(&mut line).expect("header") > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                            length = value.trim().parse::<usize>().expect("content length");
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).expect("body");
+                    if expected.starts_with("PUT") {
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&body).expect("selector JSON")["name"],
+                            REJECT_NAME
+                        );
+                    }
+                    drop(reader);
+                    let response = if expected == "GET /proxies/proxy " {
+                        json!({"type":"Selector","all":[PROXY_ACTIVE_NAME,REJECT_NAME],"now":PROXY_ACTIVE_NAME}).to_string()
+                    } else {
+                        "{}".to_owned()
+                    };
+                    write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).expect("response");
+                }
+            });
+            atomic_write_config(&daemon.mihomo_config_path, b"old config\n")
+                .expect("baseline config");
+            let previous_pid = {
+                let mut inner = lock(&daemon.inner);
+                inner.proxy_rejected = true;
+                inner.firewall.active = true;
+                persist_state(&daemon.state_path, &inner.state).expect("baseline state");
+                inner
+                    .core
+                    .start(
+                        script.to_str().expect("script path"),
+                        &daemon.mihomo_config_path,
+                        None,
+                    )
+                    .expect("start core");
+                inner.core.pid().expect("running PID")
+            };
+            let previous_state = fs::read(&daemon.state_path).expect("state bytes");
+            let (status, _, body) = if cleanup {
+                handle_core_cleanup(&daemon)
+            } else {
+                handle_core_restart(&daemon)
+            };
+            assert_eq!(status, 200, "{body}");
+            worker.join().expect("controller worker");
+            let response: Value = serde_json::from_str(&body).expect("reset response");
+            assert_eq!(response["previous_pid"], previous_pid);
+            assert_ne!(response["pid"], previous_pid);
+            assert_eq!(response["process_restarted"], true);
+            assert_eq!(response["connections_reset"], true);
+            assert_eq!(
+                response["operation"],
+                if cleanup { "cleanup" } else { "restart" }
+            );
+            assert!(
+                !Path::new(&format!("/proc/{previous_pid}")).exists(),
+                "old child must be reaped"
+            );
+            assert_eq!(
+                fs::read(&daemon.state_path).expect("state bytes"),
+                previous_state
+            );
+            let mut inner = lock(&daemon.inner);
+            assert!(inner.proxy_rejected);
+            assert!(inner.firewall.active);
+            assert_eq!(inner.core_generation, 1);
+            inner.core.stop().expect("stop core");
+            inner.firewall.active = false;
+        }
+    }
+
+    #[test]
+    fn core_cleanup_rejects_stopped_and_overlapping_operations() {
+        let (_dir, daemon) = test_daemon();
+        assert_eq!(handle_core_cleanup(&daemon).0, 400);
+        let _apply = daemon.apply.lock().expect("apply lock");
+        assert_eq!(handle_core_restart(&daemon).0, 409);
+        assert_eq!(handle_core_cleanup(&daemon).0, 409);
+        assert!(!lock(&daemon.inner).core.is_running());
+        assert!(!daemon.mihomo_config_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_core_restart_validation_failure_does_not_stop_existing_child() {
+        let (_dir, daemon) = test_daemon();
+        atomic_write_config(&daemon.mihomo_config_path, b"old exact config\n")
+            .expect("baseline config");
+        let previous_pid = {
+            let mut inner = lock(&daemon.inner);
+            inner
+                .state
+                .profiles
+                .push(sample_profile(0, "Active", "active.example"));
+            inner.state.active_profile_id = Some(0);
+            inner.state.mihomo_path = "/usr/bin/false".to_owned();
+            inner.core.child = Some(Command::new("sleep").arg("30").spawn().expect("start core"));
+            inner.core.pid().expect("running PID")
+        };
+        assert_eq!(handle_core_restart(&daemon).0, 500);
+        assert_eq!(lock(&daemon.inner).core.pid(), Some(previous_pid));
+        assert_eq!(
+            fs::read(&daemon.mihomo_config_path).expect("config bytes"),
+            b"old exact config\n"
+        );
+        lock(&daemon.inner).core.stop().expect("stop core");
     }
 
     #[test]
@@ -31142,6 +31258,10 @@ mod tests {
             json!({"required_services": "unknown", "fail_fast": false}),
             json!({"required_services": "youtube", "fail_fast": "false"}),
             json!({"required_services": "youtube", "fail_fast": null}),
+            json!({"required_services": "youtube", "fail_fast": false, "reject_no_ping": null}),
+            json!({"required_services": "youtube", "fail_fast": false, "reject_no_ping": "true"}),
+            json!({"required_services": "youtube", "fail_fast": false, "full_ping": null}),
+            json!({"required_services": "youtube", "fail_fast": false, "full_ping": "true"}),
             json!({"required_services": "youtube", "fail_fast": false, "extra": true}),
         ] {
             let body = json!({"method": "availability_full", "service_checks": options});
@@ -31153,6 +31273,16 @@ mod tests {
             );
         }
         let options = json!({"required_services": "all", "fail_fast": false});
+        let enabled = json!({"method":"availability_full", "service_checks":{
+            "required_services":"youtube","fail_fast":false,"reject_no_ping":true,"full_ping":true}});
+        let request: crate::hincyray_api::BenchStartRequest =
+            serde_json::from_value(enabled.clone()).expect("ping policy request");
+        let policy = request.service_checks.expect("policy");
+        assert!(policy.reject_no_ping);
+        assert!(policy.full_ping);
+        let (status, _, response) = handle_bench_start(&enabled.to_string(), &daemon);
+        assert_eq!(status, 400);
+        assert!(response.contains("no profiles to benchmark"), "{response}");
         for method in ["tcp", "head", "get", "quick", "full"] {
             let (status, _, response) = handle_bench_start(
                 &json!({"method": method, "service_checks": options}).to_string(),
@@ -31775,6 +31905,13 @@ mod tests {
 
     #[test]
     fn service_checks_search_schema_matches_typed_request() {
+        assert_eq!(memory_bounded_availability_concurrency(3, 128 * 1024), 3);
+        assert_eq!(memory_bounded_availability_concurrency(3, 127 * 1024), 2);
+        assert_eq!(memory_bounded_availability_concurrency(3, 0), 0);
+        assert_eq!(memory_bounded_availability_concurrency(3, 95 * 1024), 0);
+        assert!(validate_bench_worker_admission(3, 150, 2, true).is_err());
+        assert!(validate_bench_worker_admission(3, 150, 3, true).is_ok());
+        assert_eq!(memory_bounded_bench_concurrency(3, 128 * 1024), 1);
         let schemas = &openapi_document()["components"]["schemas"];
         let search = &schemas["AdaptiveSearchOptions"];
         assert_eq!(search["additionalProperties"], false);
@@ -31803,6 +31940,8 @@ mod tests {
             json!(["fail_fast", "required_services"])
         );
         assert_eq!(policy["properties"]["fail_fast"]["type"], "boolean");
+        assert_eq!(policy["properties"]["reject_no_ping"]["type"], "boolean");
+        assert_eq!(policy["properties"]["full_ping"]["type"], "boolean");
         assert_eq!(
             schemas["ServiceCheckPrefix"]["enum"],
             json!(["all", "youtube", "telegram", "ai"])
@@ -36507,6 +36646,218 @@ ntp:
     }
 
     #[test]
+    fn mihomo_memory_uses_kib_consistently_with_procfs() {
+        assert_eq!(
+            normalize_mihomo_memory(r#"{"inuse":104857600,"oslimit":536870912}"#),
+            json!({"inuse":102400,"oslimit":524288,"unit":"KiB","source":"mihomo"})
+        );
+    }
+
+    #[test]
+    fn stabilization_persistence_retries_and_policy_rollback_preserves_concurrent_state() {
+        let (dir, daemon) = test_daemon();
+        let previous = lock(&daemon.inner).state.clone();
+        {
+            let mut inner = lock(&daemon.inner);
+            inner.state.favorites.push("concurrent.example".to_owned());
+            inner
+                .state
+                .split_routing
+                .auto_vpn_last_checked_unix
+                .insert("fresh.example".to_owned(), 42);
+            inner.state.routing_rules.push(RoutingRule {
+                enabled: true,
+                name: "failed change".to_owned(),
+                ..Default::default()
+            });
+            restore_policy_fields(&mut inner.state, &previous);
+            assert_eq!(inner.state.favorites, ["concurrent.example"]);
+            assert_eq!(
+                inner.state.split_routing.auto_vpn_last_checked_unix["fresh.example"],
+                42
+            );
+            assert_eq!(inner.state.routing_rules, previous.routing_rules);
+            inner.dirty = true;
+            let blocked = dir.path().join("blocked");
+            fs::create_dir(&blocked).expect("blocked destination");
+            flush_if_dirty(&mut inner, &blocked);
+            assert!(inner.dirty, "failure must remain retryable");
+            flush_if_dirty(&mut inner, &daemon.state_path);
+            assert!(!inner.dirty);
+        }
+        assert_eq!(
+            load_state(&daemon.state_path).favorites,
+            ["concurrent.example"]
+        );
+    }
+
+    #[test]
+    fn stabilization_routing_revision_rejects_stale_writes_before_mutation() {
+        let (_dir, daemon) = test_daemon();
+        let revision = routing_rules_revision(&lock(&daemon.inner).state.routing_rules);
+        let request=json!({"expected_revision":revision,"rules":[{"enabled":true,"name":"first","ports":["443"],"target":"direct"}]}).to_string();
+        assert_eq!(handle_routing_rules(&request, &daemon).0, 200);
+        let durable = fs::read(&daemon.state_path).expect("state");
+        assert_eq!(handle_routing_rules(&request, &daemon).0, 409);
+        assert_eq!(fs::read(&daemon.state_path).expect("state"), durable);
+        assert_eq!(
+            handle_routing_rules(r#"{"expected_revision":123,"rules":[]}"#, &daemon).0,
+            400
+        );
+        for invalid in [
+            json!({"proxy_ports":[443]}),
+            json!({"bypass_ports":"443"}),
+            json!({"proxy_ports":["src-port:443"]}),
+            json!({"bypass_ports":["64000-12000"]}),
+        ] {
+            assert_eq!(
+                handle_routing_settings(&invalid.to_string(), &daemon).0,
+                400
+            );
+            assert_eq!(fs::read(&daemon.state_path).expect("state"), durable);
+        }
+        let before = serde_json::to_value(&lock(&daemon.inner).state).expect("state");
+        assert_eq!(
+            handle_auto_settings_set(
+                r#"{"auto_select":true,"auto_refresh_interval_hours":4294967296}"#,
+                &daemon
+            )
+            .0,
+            400
+        );
+        assert_eq!(
+            serde_json::to_value(&lock(&daemon.inner).state).expect("state"),
+            before
+        );
+    }
+
+    #[test]
+    fn stabilization_trace_matches_boundaries_and_preserves_first_match_uncertainty() {
+        let mut rule = RoutingRule {
+            enabled: true,
+            domains: vec!["example.com".to_owned()],
+            target: "direct".to_owned(),
+            ..Default::default()
+        };
+        assert!(!trace_domain_match(&rule, "notexample.com").exact);
+        assert!(!trace_domain_match(&rule, "example.com.attacker.test").exact);
+        assert!(trace_domain_match(&rule, "WWW.EXAMPLE.COM.").exact);
+        rule.domains = vec!["=example.com".to_owned()];
+        assert!(!trace_domain_match(&rule, "www.example.com").exact);
+        assert!(trace_domain_match(&rule, "example.com").exact);
+        rule.domains = vec!["geosite:ru".to_owned(), "example.com".to_owned()];
+        assert!(trace_domain_match(&rule, "example.com").exact);
+        let mut state = HincyrayState::default();
+        state.split_routing.match_target = "direct".to_owned();
+        let request = TraceRequest {
+            host: "example.com".to_owned(),
+            ip: String::new(),
+            source_ip: String::new(),
+            port: Some(443),
+            network: "tcp".to_owned(),
+        };
+        assert_eq!(trace_routing_decision(&state, &request)["target"], "direct");
+        state.routing_rules = vec![
+            RoutingRule {
+                domains: vec!["geosite:unknown".to_owned()],
+                target: "active".to_owned(),
+                ..rule.clone()
+            },
+            rule.clone(),
+        ];
+        assert!(trace_requires_mihomo_runtime(&trace_routing_decision(
+            &state, &request
+        )));
+        state.routing_rules = vec![RoutingRule {
+            domains: vec![],
+            ports: vec!["src-port:443".to_owned()],
+            ..rule.clone()
+        }];
+        assert!(trace_requires_mihomo_runtime(&trace_routing_decision(
+            &state, &request
+        )));
+        state.routing_rules[0].ports = vec!["443".to_owned()];
+        state.routing_rules[0].network = "udp".to_owned();
+        assert!(trace_requires_mihomo_runtime(&trace_routing_decision(
+            &state,
+            &TraceRequest {
+                network: String::new(),
+                ..request
+            }
+        )));
+        assert!(ip_matches_cidr_text("2001:db8::1", "2001:db8::/32"));
+        assert!(!ip_matches_cidr_text("2001:db9::1", "2001:db8::/32"));
+        assert!(validate_trace_metadata(&json!({"port":65536})).is_err());
+        assert!(validate_trace_metadata(&json!({"network":"quic"})).is_err());
+    }
+
+    #[test]
+    fn routing_port_rules_normalize_before_mutation_and_trace_global_matches() {
+        let (_dir, daemon) = test_daemon();
+        let body = json!({"rules":[{"enabled":true,"name":"Global UDP","target":"direct",
+            "ports":["3478/3479", "12000 - 64000"],"network":"UDP","port_mode":"include"}]})
+        .to_string();
+        let (status, _, response) = handle_routing_rules(&body, &daemon);
+        assert_eq!(status, 200, "{response}");
+        let state = lock(&daemon.inner).state.clone();
+        assert_eq!(
+            state.routing_rules[0].ports,
+            ["3478", "3479", "12000-64000"]
+        );
+        assert_eq!(state.routing_rules[0].network, "udp");
+        let request = TraceRequest {
+            host: String::new(),
+            ip: "203.0.113.10".to_owned(),
+            source_ip: "192.0.2.10".to_owned(),
+            port: Some(26626),
+            network: "udp".to_owned(),
+        };
+        assert_eq!(trace_routing_decision(&state, &request)["target"], "direct");
+        assert_eq!(
+            trace_routing_decision(
+                &state,
+                &TraceRequest {
+                    network: "tcp".to_owned(),
+                    ..request.clone()
+                }
+            )["decision"],
+            "default"
+        );
+        assert_eq!(
+            trace_routing_decision(
+                &state,
+                &TraceRequest {
+                    port: Some(443),
+                    ..request
+                }
+            )["decision"],
+            "default"
+        );
+        let history_len = state.undo_stack.len();
+        let durable = fs::read(&daemon.state_path).expect("persisted state");
+        for change in [
+            json!({"ports":["65536"]}),
+            json!({"ports":["64000-12000"]}),
+            json!({"network":"quic"}),
+            json!({"port_mode":"invalid"}),
+        ] {
+            let mut rule = json!({"enabled":true,"name":"Invalid","ports":["443"]});
+            rule.as_object_mut()
+                .expect("rule object")
+                .extend(change.as_object().expect("change object").clone());
+            let (status, _, _) =
+                handle_routing_rules(&json!({"rules":[rule],"apply":true}).to_string(), &daemon);
+            assert_eq!(status, 400);
+            assert_eq!(lock(&daemon.inner).state.routing_rules, state.routing_rules);
+            assert_eq!(lock(&daemon.inner).state.undo_stack.len(), history_len);
+            assert_eq!(
+                fs::read(&daemon.state_path).expect("unchanged state"),
+                durable
+            );
+        }
+    }
+
+    #[test]
     fn connections_page_preserves_total_filtered_order_and_applies_offset() {
         let value = json!({
             "downloadTotal": 123,
@@ -37753,22 +38104,6 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
     }
 
     #[test]
-    fn parovozik_log_parser_accepts_unmatched_direct_dial_failures() {
-        assert_eq!(
-            parovozik_candidate_from_mihomo_log_payload(
-                "[TCP] dial tcp (match Match/) 192.168.2.100:45542 --> New.Example:443 error: i/o timeout"
-            ),
-            Some(auto_candidate("new.example", Some(443)))
-        );
-        assert_eq!(
-            parovozik_candidate_from_mihomo_log_payload(
-                "[TCP] dial proxy-active 192.168.2.100:1 --> ignored.example:443 error: failed"
-            ),
-            None
-        );
-    }
-
-    #[test]
     fn auto_vpn_probe_urls_preserve_observed_port() {
         assert_eq!(
             auto_vpn_probe_urls(&auto_candidate("rutube.ru", Some(8443))),
@@ -37777,80 +38112,6 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
                 "http://rutube.ru:8443/".to_owned()
             ]
         );
-    }
-
-    #[test]
-    fn parovozik_candidates_exclude_known_domains_and_are_disabled_by_default() {
-        let mut state = HincyrayState::default();
-        assert!(!state.split_routing.parovozik_enabled);
-        state
-            .split_routing
-            .parovozik_direct_domains
-            .push("known.example".to_owned());
-        let candidates = parovozik_candidate_domains(
-            &state,
-            AUTO_VPN_RECHECK_INTERVAL_SECS + 1,
-            &[
-                auto_candidate("known.example", Some(443)),
-                auto_candidate("new.example", Some(443)),
-            ],
-        );
-        assert_eq!(candidates, vec![auto_candidate("new.example", Some(443))]);
-    }
-
-    #[test]
-    fn parovozik_metadata_pruning_bounds_live_state() {
-        let mut settings = SplitRoutingSettings::default();
-        let limit = MAX_PAROVOZIK_DOMAINS * 2;
-        for index in 0..limit + 5 {
-            settings
-                .parovozik_last_checked_unix
-                .insert(format!("domain-{index}.example"), index as u64);
-        }
-
-        assert!(prune_parovozik_metadata(&mut settings));
-        assert_eq!(settings.parovozik_last_checked_unix.len(), limit);
-        assert!(
-            !settings
-                .parovozik_last_checked_unix
-                .contains_key("domain-0.example")
-        );
-        assert!(
-            settings
-                .parovozik_last_checked_unix
-                .contains_key(&format!("domain-{}.example", limit + 4))
-        );
-    }
-
-    #[test]
-    fn parovozik_geobase_match_supports_exact_and_suffix_entries() {
-        let bytes = b"exact.example\n+.suffix.example\n";
-        assert!(domain_matches_geobase_artifact("exact.example", bytes));
-        assert!(domain_matches_geobase_artifact("cdn.suffix.example", bytes));
-        assert!(!domain_matches_geobase_artifact("unknown.example", bytes));
-    }
-
-    #[test]
-    fn parovozik_settings_accept_at_most_five_stable_server_refs() {
-        let mut state = HincyrayState::default();
-        for index in 0..6 {
-            state.profiles.push(sample_profile(
-                index,
-                &format!("Server {index}"),
-                &format!("server-{index}.example"),
-            ));
-        }
-        sync_server_route_registry(&mut state);
-        let refs: Vec<String> = state
-            .server_route_registry
-            .iter()
-            .map(|entry| entry.server_ref.clone())
-            .collect();
-        assert_eq!(
-            normalize_parovozik_server_refs(&state, &refs[..5]).expect("five refs"),
-            refs[..5]
-        );
-        assert!(normalize_parovozik_server_refs(&state, &refs).is_err());
     }
 
     #[test]
@@ -37876,20 +38137,18 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         file.flush().expect("flush records");
 
         assert_eq!(
-            cursor.read_new_domains(&path, false).expect("read append"),
+            cursor.read_new_domains(&path).expect("read append"),
             vec![auto_candidate("first.example", Some(443))]
         );
         writeln!(file).expect("complete partial record");
         file.flush().expect("flush completed record");
         assert_eq!(
-            cursor
-                .read_new_domains(&path, false)
-                .expect("read completed line"),
+            cursor.read_new_domains(&path).expect("read completed line"),
             vec![auto_candidate("second.example", Some(443))]
         );
         assert!(
             cursor
-                .read_new_domains(&path, false)
+                .read_new_domains(&path)
                 .expect("read no append")
                 .is_empty()
         );
@@ -37908,9 +38167,7 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         )
         .expect("new log");
         assert_eq!(
-            cursor
-                .read_new_domains(&path, false)
-                .expect("read rotated log"),
+            cursor.read_new_domains(&path).expect("read rotated log"),
             vec![auto_candidate("rotated.example", Some(443))]
         );
     }
@@ -37929,7 +38186,7 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
 
         assert_eq!(
             cursor
-                .read_new_domains(&path, false)
+                .read_new_domains(&path)
                 .expect("read after in-place rotation"),
             vec![auto_candidate("regrown.example", Some(443))]
         );
@@ -37946,9 +38203,7 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
         )
         .expect("created log");
         assert_eq!(
-            cursor
-                .read_new_domains(&path, false)
-                .expect("read created log"),
+            cursor.read_new_domains(&path).expect("read created log"),
             vec![auto_candidate("created.example", Some(8443))]
         );
     }
@@ -38180,6 +38435,115 @@ time="2026-07-10T13:39:05Z" level=warning msg="[TCP] dial proxy-active 192.168.2
             .collect();
         let error = validate_routing_targets(&state, &rules, &[]).expect_err("limit");
         assert!(error.contains("at most 16"), "{error}");
+    }
+
+    #[test]
+    fn best_of_best_full_pool_keeps_fixed_route_budget_and_deduplicates_outbounds() {
+        let mut state = HincyrayState {
+            profiles: (0..=MAX_PINNED_SERVERS + MAX_BEST_OF_BEST_SERVERS)
+                .map(|id| {
+                    sample_profile(id, &format!("Server {id}"), &format!("server-{id}.example"))
+                })
+                .collect(),
+            active_profile_id: Some(0),
+            ..Default::default()
+        };
+        state.split_routing.enabled = true;
+        sync_server_route_registry(&mut state);
+        let refs: Vec<_> = state.profiles[1..]
+            .iter()
+            .map(|profile| server_ref_for_canonical(&canonical_profile_raw(profile)))
+            .collect();
+        state.best_of_best = BestOfBestSettings {
+            enabled: true,
+            server_refs: refs[MAX_PINNED_SERVERS..].to_vec(),
+            selected_ref: None,
+        };
+        for fixed_count in [5, MAX_PINNED_SERVERS] {
+            state.routing_rules = refs[..fixed_count]
+                .iter()
+                .enumerate()
+                .map(|(id, reference)| RoutingRule {
+                    enabled: true,
+                    name: format!("Fixed {id}"),
+                    target: format!("server:{reference}"),
+                    domains: vec![format!("fixed-{id}.example")],
+                    ..Default::default()
+                })
+                .collect();
+            for overlapping in [false, true] {
+                if overlapping {
+                    state.best_of_best.server_refs[0] = refs[0].clone();
+                }
+                validate_routing_targets(&state, &state.routing_rules, &[])
+                    .expect("full pool alongside fixed routes");
+                let yaml = build_daemon_config(&state, &[]).expect("apply config");
+                let config: Value = serde_yaml::from_str(&yaml).expect("yaml");
+                let proxies = config["proxies"].as_array().expect("proxies");
+                let names: HashSet<_> = proxies.iter().map(|proxy| &proxy["name"]).collect();
+                assert_eq!(names.len(), proxies.len(), "no duplicate raw outbounds");
+                assert_eq!(
+                    proxies.len(),
+                    1 + fixed_count + MAX_BEST_OF_BEST_SERVERS - usize::from(overlapping)
+                );
+                let group = config["proxy-groups"]
+                    .as_array()
+                    .expect("groups")
+                    .iter()
+                    .find(|group| group["name"] == BEST_OF_BEST_GROUP)
+                    .expect("pool selector");
+                assert_eq!(group["type"], "select");
+                assert_eq!(group["default-selected"], REJECT_NAME);
+                assert_eq!(group["proxies"][0], REJECT_NAME);
+                assert_eq!(
+                    group["proxies"].as_array().expect("members").len(),
+                    1 + MAX_BEST_OF_BEST_SERVERS
+                );
+                assert!(
+                    !group["proxies"]
+                        .as_array()
+                        .expect("members")
+                        .contains(&json!(DIRECT_NAME))
+                );
+                state.best_of_best.server_refs[0] = refs[MAX_PINNED_SERVERS].clone();
+            }
+        }
+    }
+
+    #[test]
+    fn best_of_best_and_fixed_routes_retain_independent_limits() {
+        let mut state = HincyrayState {
+            profiles: (0..=MAX_PINNED_SERVERS + MAX_BEST_OF_BEST_SERVERS + 1)
+                .map(|id| {
+                    sample_profile(id, &format!("Server {id}"), &format!("server-{id}.example"))
+                })
+                .collect(),
+            active_profile_id: Some(0),
+            ..Default::default()
+        };
+        sync_server_route_registry(&mut state);
+        let refs: Vec<_> = state.profiles[1..]
+            .iter()
+            .map(|profile| server_ref_for_canonical(&canonical_profile_raw(profile)))
+            .collect();
+        state.best_of_best = BestOfBestSettings {
+            enabled: true,
+            server_refs: refs[MAX_PINNED_SERVERS + 1..].to_vec(),
+            selected_ref: None,
+        };
+        let rules: Vec<_> = refs[..=MAX_PINNED_SERVERS]
+            .iter()
+            .map(|reference| RoutingRule {
+                enabled: true,
+                target: format!("server:{reference}"),
+                ..Default::default()
+            })
+            .collect();
+        let error = validate_routing_targets(&state, &rules, &[]).expect_err("fixed budget");
+        assert_eq!(error, "at most 16 pinned servers may be enabled");
+        state.best_of_best.server_refs.push(refs[0].clone());
+        let error = validate_routing_targets(&state, &rules[..1], &[]).expect_err("pool budget");
+        assert_eq!(error, "at most 16 best-of-best servers may be enabled");
     }
 
     #[test]

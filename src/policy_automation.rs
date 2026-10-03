@@ -88,7 +88,7 @@ fn desired_policy(statuses: &[bool; 4]) -> Option<DesiredPolicy> {
 fn policy_command(mac: &str, policy: DesiredPolicy) -> String {
     match policy {
         DesiredPolicy::Xkeen => format!("ip hotspot host {mac} policy Policy0"),
-        DesiredPolicy::Default => format!("no ip hotspot host {mac} policy"),
+        DesiredPolicy::Default => format!("ip hotspot host {mac} no policy"),
     }
 }
 
@@ -458,7 +458,7 @@ mod tests {
         );
         assert_eq!(
             policy_command("02:00:00:00:00:33", DesiredPolicy::Default),
-            "no ip hotspot host 02:00:00:00:00:33 policy"
+            "ip hotspot host 02:00:00:00:00:33 no policy"
         );
     }
     #[test]

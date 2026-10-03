@@ -43,7 +43,45 @@ test('page boots without JavaScript errors', async ({ page }) => {
 
   expect(errors).toEqual([]);
   await expect(page.locator('.sidebar-brand .brand-icon')).toBeVisible();
-  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.30');
+  await expect(page.locator('.sidebar-brand .version')).toHaveText('v1.3.35');
+});
+
+test('core memory cleanup resets the process, reports RSS and blocks overlapping resets', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page,'ov-system');
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let requests = 0;
+  await page.route('**/api/core/cleanup', async route => {
+    requests++;
+    await gate;
+    await route.fulfill({json:{previous_pid:1482,pid:1483,rss_before_kb:118784,rss_after_kb:65536}});
+  });
+  await expect(page.locator('#coreCleanupHint')).toContainText('обрывает все его соединения');
+  await page.locator('#coreCleanupButton').click();
+  await expect(page.locator('#coreCleanupButton')).toBeDisabled();
+  await expect(page.locator('#coreRestartButton')).toBeDisabled();
+  await page.evaluate(() => { runCoreReset(true); runCoreReset(false); });
+  expect(requests).toBe(1);
+  release();
+  await expect(page.locator('#coreResetResult')).toContainText('1482 → 1483');
+  await expect(page.locator('#coreResetResult')).toContainText('RSS:');
+  await expect(page.locator('#coreResetResult')).toContainText('Соединения сброшены');
+  await expect(page.locator('#coreRestartButton')).toBeEnabled();
+  const restart = page.waitForRequest(r => new URL(r.url()).pathname === '/api/core/restart' && r.method() === 'POST');
+  await page.locator('#coreRestartButton').click();
+  await restart;
+  await expect(page.locator('#coreCleanupButton')).toBeEnabled();
+});
+
+test('core cleanup failure is visible and permits retry', async ({ page }) => {
+  await openFixture(page);
+  await navigateTo(page,'ov-system');
+  await page.route('**/api/core/cleanup', route => route.fulfill({status:500,json:{error:'Fixture restart failed'}}));
+  await page.locator('#coreCleanupButton').click();
+  await expect(page.locator('#coreResetResult')).toContainText('Fixture restart failed');
+  await expect(page.locator('#coreCleanupButton')).toBeEnabled();
+  await expect(page.locator('#coreRestartButton')).toBeEnabled();
 });
 
 test('Direct availability card checks each site and shows independent colors', async ({ page }) => {
@@ -97,6 +135,7 @@ test('best-of-best stays opt-in, uses routing refs, and ranks both target picker
   await expect(page.locator('#bestOfBestCandidates')).toContainText('Fixture Profile');
   const checkbox = page.locator('#bestOfBestCandidates input[data-best-ref="srv-v1-fixture"]');
   await checkbox.check();
+  await setBestOfBestOption(page,'HideUntested',false);
   await page.locator('#bestOfBestSearch').fill('#102');
   const manual = page.locator('#bestOfBestCandidates input[data-best-ref="srv-v1-wagon"]');
   await manual.check();
@@ -127,6 +166,251 @@ test('best-of-best stays opt-in, uses routing refs, and ranks both target picker
     return values;
   });
   expect(byPing.slice(0,2)).toEqual(['server:srv-v1-fixture-fast','server:srv-v1-wagon']);
+});
+
+async function installBestOfBestCatalogFixture(page) {
+  const check = state => ({state,tested:!['not-tested','skipped'].includes(state)});
+  const candidate = (id, yt, tg, ai, ping, pingMs) => ({
+    id,ref:`srv-v1-catalog-${id}`,name:`Catalog ${id}`,ping_ms:pingMs,
+    tested:[yt,tg,ai,ping].some(state => !['not-tested','skipped'].includes(state)),
+    checks:{youtube_thumbnails:check(yt),telegram:check(tg),ai:check(ai),ping_proxy:check(ping)},
+  });
+  const data = {settings:{enabled:false,server_refs:['srv-v1-catalog-7','srv-v1-missing-member'],selected_ref:null},max_candidates:16,candidates:[
+    candidate(1,'passed','failed','unknown','passed',10),
+    candidate(2,'failed','passed','passed','passed',40),
+    candidate(3,'passed','passed','failed','passed',60),
+    candidate(4,'stale','stale','stale','stale',null),
+    candidate(5,'not-tested','not-tested','not-tested','not-tested',null),
+    candidate(6,'unknown','skipped','unknown','unknown',null),
+    candidate(7,'not-tested','not-tested','not-tested','not-tested',null),
+    candidate(8,'passed','passed','passed','passed',20),
+  ]};
+  await page.route('**/api/automation/best-of-best', async route => {
+    if (route.request().method() === 'POST') data.settings = {...route.request().postDataJSON(),selected_ref:null};
+    await route.fulfill({json:data});
+  });
+  await openFixture(page);
+  await navigateTo(page,'best-of-best');
+  await expect(page.locator('#bestOfBestCandidates')).toContainText('Catalog 8');
+}
+
+async function visibleBestOfBestIds(page) {
+  return page.locator('#bestOfBestCandidates [data-best-search]').evaluateAll(rows => rows
+    .filter(row => row.style.display !== 'none').map(row => Number(row.querySelector('input').dataset.bestRef.split('-').at(-1))));
+}
+
+async function setBestOfBestOption(page, option, checked) {
+  const input = page.locator(`#bestOfBest${option}`);
+  if (await input.isChecked() !== checked) await input.locator('..').click();
+  await expect(input).toBeChecked({checked});
+}
+
+test('best-of-best independent criteria cover single, combined, ping-only and disabled sorting', async ({ page }) => {
+  await installBestOfBestCatalogFixture(page);
+  await expect(page.locator('#bestOfBestHideUntested')).toBeChecked();
+  await expect(page.locator('#bestOfBestHideFailed')).not.toBeChecked();
+  expect(await visibleBestOfBestIds(page)).toEqual([8,2,3,1,4,6,7]);
+  const row = page.locator('#bestOfBestCandidates label').filter({hasText:'Catalog 1'});
+  await expect(row.locator('.profile-service-test')).toHaveText(['P 10 ms','YT','TG','AI ?']);
+  expect(await row.locator('.profile-service-test').evaluateAll(badges => badges.map(badge => badge.dataset.state))).toEqual(['passed','passed','failed','unknown']);
+  const cases = [
+    [[],1], [['Ping'],1], [['Youtube'],1], [['Telegram'],2], [['Ai'],2],
+    [['Youtube','Telegram'],3], [['Youtube','Ai'],8], [['Telegram','Ai'],2],
+    [['Youtube','Telegram','Ai'],8], [['Ping','Youtube'],1], [['Ping','Telegram'],8],
+    [['Ping','Ai'],8], [['Ping','Youtube','Telegram'],8], [['Ping','Youtube','Ai'],8],
+    [['Ping','Telegram','Ai'],8], [['Ping','Youtube','Telegram','Ai'],8],
+  ];
+  for (const [enabled,first] of cases) {
+    for (const key of ['Ping','Youtube','Telegram','Ai']) {
+      await setBestOfBestOption(page,`Sort${key}`,enabled.includes(key));
+    }
+    expect((await visibleBestOfBestIds(page))[0], enabled.join('+') || 'no criteria').toBe(first);
+  }
+  for (const key of ['Youtube','Telegram','Ai']) await setBestOfBestOption(page,`Sort${key}`,false);
+  expect(await visibleBestOfBestIds(page)).toEqual([1,8,2,3,4,6,7]);
+});
+
+test('best-of-best filters distinguish missing, failed, stale and unknown checks and preserve membership order', async ({ page }) => {
+  await installBestOfBestCatalogFixture(page);
+  await setBestOfBestOption(page,'HideFailed',true);
+  expect(await visibleBestOfBestIds(page)).toEqual([8,4,6,7]);
+  await setBestOfBestOption(page,'HideUntested',false);
+  expect(await visibleBestOfBestIds(page)).toEqual([8,4,5,6,7]);
+  await setBestOfBestOption(page,'SortTelegram',false);
+  expect(await visibleBestOfBestIds(page)).toEqual([8,1,4,5,6,7]);
+  await setBestOfBestOption(page,'SortYoutube',false);
+  await setBestOfBestOption(page,'SortAi',false);
+  await setBestOfBestOption(page,'SortPing',false);
+  expect(await visibleBestOfBestIds(page)).toEqual([1,2,3,4,5,6,7,8]);
+  await setBestOfBestOption(page,'SortYoutube',true);
+  await setBestOfBestOption(page,'SortTelegram',true);
+  await setBestOfBestOption(page,'SortAi',true);
+  await setBestOfBestOption(page,'SortPing',true);
+  await setBestOfBestOption(page,'HideUntested',true);
+  await setBestOfBestOption(page,'HideFailed',false);
+  await page.locator('input[data-best-ref="srv-v1-catalog-1"]').check();
+  await page.locator('input[data-best-ref="srv-v1-catalog-2"]').check();
+  await setBestOfBestOption(page,'HideFailed',true);
+  expect(await visibleBestOfBestIds(page)).toEqual([8,2,1,4,6,7]);
+  await page.locator('#bestOfBestSearch').fill('absent');
+  await expect(page.locator('#bestOfBestEmpty')).toBeVisible();
+  await expect(page.locator('#bestOfBestVisibleCount')).toHaveText('Показано: 0 / 8');
+  // A late refresh must not replace the draft, including invisible/missing refs.
+  await page.evaluate(() => loadBestOfBest());
+  await expect(page.locator('#bestOfBestCount')).toHaveText('В пуле: 4 / 16');
+  const posted = page.waitForRequest(request => request.method() === 'POST' && new URL(request.url()).pathname === '/api/automation/best-of-best');
+  await page.locator('#bestOfBestSave').click();
+  expect((await posted).postDataJSON()).toEqual({enabled:false,server_refs:[
+    'srv-v1-catalog-7','srv-v1-missing-member','srv-v1-catalog-1','srv-v1-catalog-2',
+  ]});
+  await page.locator('#bestOfBestSearch').fill('Catalog 1');
+  await page.locator('input[data-best-ref="srv-v1-catalog-1"]').uncheck();
+  await expect(page.locator('input[data-best-ref="srv-v1-catalog-1"]')).toBeHidden();
+  await expect(page.locator('#bestOfBestCount')).toHaveText('В пуле: 3 / 16');
+});
+
+test('best-of-best catalog preferences survive reload and fit a narrow mobile screen', async ({ page }) => {
+  await installBestOfBestCatalogFixture(page);
+  await setBestOfBestOption(page,'HideUntested',false);
+  await setBestOfBestOption(page,'HideFailed',true);
+  await setBestOfBestOption(page,'SortYoutube',false);
+  await setBestOfBestOption(page,'SortAi',false);
+  await page.reload();
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Profile');
+  await navigateTo(page,'best-of-best');
+  await expect(page.locator('#bestOfBestHideUntested')).not.toBeChecked();
+  await expect(page.locator('#bestOfBestHideFailed')).toBeChecked();
+  await expect(page.locator('#bestOfBestSortYoutube')).not.toBeChecked();
+  await expect(page.locator('#bestOfBestSortAi')).not.toBeChecked();
+  await expect(page.locator('#bestOfBestSortTelegram')).toBeChecked();
+  await expect(page.locator('#bestOfBestSortPing')).toBeChecked();
+  expect(await visibleBestOfBestIds(page)).toEqual([8,2,3,4,5,6,7]);
+  await page.setViewportSize({width:360,height:800});
+  await expect(page.locator('#bestOfBestSort')).toBeVisible();
+  const dimensions = await page.evaluate(() => ({width:innerWidth,scroll:document.documentElement.scrollWidth}));
+  expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
+});
+
+test('best-of-best applies the POST snapshot, ignores old GETs and indicates progress in the sidebar', async ({ page }) => {
+  const data = {settings:{enabled:false,server_refs:['srv-v1-fixture'],selected_ref:null},max_candidates:16,candidates:[
+    {ref:'srv-v1-fixture',id:101,name:'Fixture Profile',tested:true,checks:{}},
+  ]};
+  let releaseOldGet;
+  const oldGet = new Promise(resolve => { releaseOldGet = resolve; });
+  let releasePost;
+  const post = new Promise(resolve => { releasePost = resolve; });
+  let getCount = 0;
+  await page.route('**/api/automation/best-of-best', async route => {
+    if (route.request().method() === 'GET') {
+      const stale = structuredClone(data);
+      if (++getCount === 2) await oldGet;
+      await route.fulfill({json:stale});
+    } else {
+      data.settings = {...route.request().postDataJSON(),selected_ref:null};
+      await post;
+      await route.fulfill({json:data});
+    }
+  });
+  await openFixture(page);
+  await navigateTo(page,'best-of-best');
+  await expect(page.locator('#bestOfBestState')).toHaveText('Пул выключен');
+  await page.evaluate(() => { window.__oldBestLoad = loadBestOfBest(); });
+  await expect.poll(() => getCount).toBe(2);
+  await setBestOfBestOption(page,'Enabled',true);
+  await expect(page.locator('#bestOfBestState')).toContainText('ещё не применены');
+  await page.locator('#bestOfBestSave').click();
+  await expect(page.locator('#longOperationProgress')).toBeVisible();
+  await expect(page.locator('#longOperationLabel')).toContainText('Применение пула');
+  await expect(page.locator('#longOperationKitt')).toHaveClass(/running/);
+  await expect(page.locator('#longOperationProgress')).toHaveAttribute('data-operation-section','best-of-best');
+  await expect(page.locator('#bestOfBestSave')).toHaveAttribute('aria-busy','true');
+  await expect(page.locator('#bestOfBestEnabled')).toBeDisabled();
+  await expect(page.locator('input[data-best-ref]')).toBeDisabled();
+  releasePost();
+  await expect(page.locator('#bestOfBestState')).toHaveText('Пул включён');
+  await expect(page.locator('#bestOfBestEnabled')).toBeChecked();
+  await expect(page.locator('#msgBar')).toHaveText('Пул включён, состав применён');
+  releaseOldGet();
+  await page.evaluate(() => window.__oldBestLoad);
+  await expect(page.locator('#bestOfBestEnabled')).toBeChecked();
+  expect(getCount).toBe(2);
+  await expect(page.locator('#longOperationProgress')).toBeHidden();
+  await page.reload();
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Profile');
+  await navigateTo(page,'best-of-best');
+  await expect(page.locator('#bestOfBestEnabled')).toBeChecked();
+  await setBestOfBestOption(page,'Enabled',false);
+  await page.locator('#bestOfBestSave').click();
+  await expect(page.locator('#bestOfBestState')).toHaveText('Пул выключен');
+  await expect(page.locator('#bestOfBestSelected')).toHaveText('Пул выключен; состав сохранён');
+  await expect(page.locator('#msgBar')).toHaveText('Пул выключен, состав сохранён');
+});
+
+test('best-of-best failed apply retains the draft for retry and clears busy indicators', async ({ page }) => {
+  await installBestOfBestCatalogFixture(page);
+  await page.route('**/api/automation/best-of-best', async route => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    await route.fulfill({status:500,json:{error:'Fixture apply failed'}});
+  });
+  await setBestOfBestOption(page,'Enabled',true);
+  await page.locator('input[data-best-ref="srv-v1-catalog-8"]').check();
+  await page.locator('#bestOfBestSave').click();
+  await expect(page.locator('#msgBar')).toHaveText('Fixture apply failed');
+  await expect(page.locator('#bestOfBestEnabled')).toBeChecked();
+  await expect(page.locator('#bestOfBestState')).toContainText('ещё не применены');
+  await expect(page.locator('input[data-best-ref="srv-v1-catalog-8"]')).toBeChecked();
+  await expect(page.locator('#bestOfBestSave')).toBeEnabled();
+  await expect(page.locator('#bestOfBestSave')).not.toHaveAttribute('aria-busy','true');
+  await expect(page.locator('#longOperationProgress')).toBeHidden();
+});
+
+test('best-of-best excludes dead catalog entries while unavailable members can be explicitly removed', async ({ page }) => {
+  const data = {settings:{enabled:false,server_refs:['srv-v1-dead','srv-v1-missing','srv-v1-live'],selected_ref:null},max_candidates:16,candidates:[
+    {ref:'srv-v1-live',id:1,name:'Living candidate',tested:true,checks:{}},
+    {ref:'srv-v1-dead',id:2,name:'Dead candidate',dead:true,tested:true,checks:{}},
+    {ref:'srv-v1-dead-unselected',id:3,name:'Dead unselected',dead:true,tested:false,checks:{}},
+  ]};
+  await page.route('**/api/automation/best-of-best', async route => {
+    if (route.request().method() === 'POST') data.settings = {...route.request().postDataJSON(),selected_ref:null};
+    await route.fulfill({json:data});
+  });
+  await openFixture(page);
+  await navigateTo(page,'best-of-best');
+  await expect(page.locator('#bestOfBestCandidates')).toContainText('Living candidate');
+  await setBestOfBestOption(page,'HideUntested',false);
+  await expect(page.locator('#bestOfBestCandidates')).not.toContainText('Dead');
+  await expect(page.locator('#bestOfBestCandidates [data-best-search]')).toHaveCount(1);
+  await expect(page.locator('#bestOfBestCount')).toHaveText('В пуле: 3 / 16');
+  await expect(page.locator('#bestOfBestUnavailableCount')).toContainText('2');
+  await page.locator('#bestOfBestUnavailable button').click();
+  await expect(page.locator('#bestOfBestUnavailable')).toBeHidden();
+  const posted = page.waitForRequest(request => request.method() === 'POST' && new URL(request.url()).pathname === '/api/automation/best-of-best');
+  await page.locator('#bestOfBestSave').click();
+  expect((await posted).postDataJSON()).toEqual({enabled:false,server_refs:['srv-v1-live']});
+});
+
+test('best-of-best manual bad marks demote even the best server, persist and preserve pool membership', async ({ page }) => {
+  await installBestOfBestCatalogFixture(page);
+  await page.locator('input[data-best-ref="srv-v1-catalog-8"]').check();
+  const mark = page.locator('button[data-best-bad="srv-v1-catalog-8"]');
+  await mark.click();
+  await expect(mark).toHaveAttribute('aria-pressed','true');
+  expect((await visibleBestOfBestIds(page)).at(-1)).toBe(8);
+  await setBestOfBestOption(page,'SortPing',false);
+  expect((await visibleBestOfBestIds(page)).at(-1)).toBe(8);
+  await setBestOfBestOption(page,'SortPing',true);
+  await page.locator('#bestOfBestSave').click();
+  await expect(page.locator('#bestOfBestState')).toHaveText('Пул выключен');
+  await expect(page.locator('input[data-best-ref="srv-v1-catalog-8"]')).toBeChecked();
+  await page.reload();
+  await expect(page.locator('#profilesBody')).toContainText('Fixture Profile');
+  await navigateTo(page,'best-of-best');
+  await expect(mark).toHaveAttribute('aria-pressed','true');
+  expect((await visibleBestOfBestIds(page)).at(-1)).toBe(8);
+  await mark.click();
+  await expect(mark).toHaveAttribute('aria-pressed','false');
+  expect((await visibleBestOfBestIds(page))[0]).toBe(8);
+  await expect(page.locator('#bestOfBestCount')).toHaveText('В пуле: 3 / 16');
 });
 
 test('Direct bot settings accept a private token and prompt /start pairing', async ({ page }) => {
@@ -300,7 +584,7 @@ test('shared search defaults, failure policy, service prefix, target, and concur
   await page.locator('#benchSearchStopMode').selectOption('find_n');
   await expect(page.locator('#benchSearchServices')).toHaveValue('ai');
   expect(await page.evaluate(() => Object.fromEntries(Object.entries(localStorage).filter(([key]) => key.startsWith('hr_search_'))))).toEqual({
-    hr_search_stop_mode: '"find_n"', hr_search_target_good: '20', hr_search_required_services: '"ai"', hr_search_fail_fast: 'true',
+    hr_search_stop_mode: '"find_n"', hr_search_target_good: '20', hr_search_required_services: '"ai"', hr_search_fail_fast: 'true', hr_search_reject_no_ping: 'false', hr_search_full_ping: 'false',
   });
   await page.locator('#benchSearchServices').selectOption('all');
   await page.reload();
@@ -1056,17 +1340,17 @@ test('normal service UI keeps diagnostics collapsed in Profiles and the sidebar 
   await expect(page.locator('#benchProgress #benchConcurrencyHelp')).toHaveCount(0);
   await page.locator('#benchDetails > summary').click();
   await expect(help).toBeVisible();
-  await expect(help).toContainText('Канал и превью YouTube (контракт 1) проверяются параллельно допущенными работниками');
-  await expect(help).toContainText('У каждого кандидата своё временное ядро и файлы; лимиты декодера прежние');
-  await expect(help).toContainText('Нативный YouTube (контракт 7) и общая сессия Telegram остаются последовательными');
-  await expect(help).toContainText('min(запрошено, кандидаты) работников или HTTP 503');
-  await expect(help).toContainText('оценка для 4 работников: 272 МиБ доступной памяти');
+  await expect(help).toContainText('отдельное экономное ядро на кандидата');
+  await expect(help).toContainText('128 МиБ доступной памяти, включая резерв 80 МиБ');
+  await expect(help).toContainText('Telegram и нативное видео остаются последовательными');
+  await expect(help).toContainText('ядра завершаются и память освобождается');
+  await expect(help).toContainText('HTTP 503');
   await page.evaluate(() => toggleLang());
-  await expect(help).toContainText('YouTube channel and thumbnails (contract 1) run in parallel across admitted workers');
-  await expect(help).toContainText('Each candidate has its own private temporary core and files; decoder limits are unchanged');
-  await expect(help).toContainText('Native YouTube (contract 7) and the shared Telegram session remain serialized');
-  await expect(help).toContainText('min(requested, candidates) workers or HTTP 503');
-  await expect(help).toContainText('4 workers need an estimated 272 MiB available memory');
+  await expect(help).toContainText('private economical core per candidate');
+  await expect(help).toContainText('Three workers need an estimated 128 MiB available');
+  await expect(help).toContainText('Telegram and native video remain serialized');
+  await expect(help).toContainText('reaps cores and releases memory');
+  await expect(help).toContainText('HTTP 503');
   await page.locator('#benchDetails > summary').click();
   await expect(help).toBeHidden();
   await page.request.post('/__fixture/reset');
@@ -1322,6 +1606,56 @@ test('benchmark sidebar renders only the current profile name and progress count
   await expect(page.locator('#benchCounter')).toHaveText('2/6');
 });
 
+test('minimal Ping is default and full Ping persists independently of rejection and fail-fast', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await openFixture(page);
+  await navigateTo(page,'profiles');
+  await page.evaluate(() => { document.getElementById('testPanel').open = true; saveBenchConcurrency(1); });
+  await expect(page.locator('#benchFullPing')).not.toBeChecked();
+  let posted = page.waitForRequest(r => r.method() === 'POST' && new URL(r.url()).pathname === '/api/bench/start');
+  await page.locator('#benchSearchAll').click();
+  expect((await posted).postDataJSON().service_checks).toEqual({required_services:'all',fail_fast:false});
+  await page.locator('label.toggle').filter({has:page.locator('#benchFullPing')}).click();
+  await page.reload();
+  await navigateTo(page,'profiles');
+  await page.evaluate(() => { document.getElementById('testPanel').open = true; });
+  await expect(page.locator('#benchFullPing')).toBeChecked();
+  await expect(page.locator('#benchRejectNoPing')).not.toBeChecked();
+  await expect(page.locator('#benchSearchFailFast')).not.toBeChecked();
+  posted = page.waitForRequest(r => r.method() === 'POST' && new URL(r.url()).pathname === '/api/bench/start');
+  await page.locator('#benchSearchAll').click();
+  expect((await posted).postDataJSON().service_checks).toEqual({required_services:'all',fail_fast:false,full_ping:true});
+  await page.locator('label.toggle').filter({has:page.locator('#benchFullPing')}).click();
+  await page.reload();
+  await navigateTo(page,'profiles');
+  await expect(page.locator('#benchFullPing')).not.toBeChecked();
+  await page.request.post('/__fixture/reset');
+});
+
+test('Ping rejection is optional, persisted and independent of service fail-fast', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await openFixture(page);
+  await navigateTo(page,'profiles');
+  await page.evaluate(() => { document.getElementById('testPanel').open = true; saveBenchConcurrency(1); });
+  await expect(page.locator('#benchRejectNoPing')).not.toBeChecked();
+  await page.locator('label.toggle').filter({has:page.locator('#benchRejectNoPing')}).click();
+  await page.reload();
+  await navigateTo(page,'profiles');
+  await page.evaluate(() => { document.getElementById('testPanel').open = true; });
+  await expect(page.locator('#benchRejectNoPing')).toBeChecked();
+  await expect(page.locator('#benchSearchFailFast')).not.toBeChecked();
+  for (const prefix of ['all','youtube','telegram','ai']) {
+    await page.locator('#benchSearchServices').selectOption(prefix);
+    const posted = page.waitForRequest(r => r.method() === 'POST' && new URL(r.url()).pathname === '/api/bench/start');
+    await page.locator('#benchSearchAll').click();
+    expect((await posted).postDataJSON().service_checks).toEqual({required_services:prefix,fail_fast:false,reject_no_ping:true});
+  }
+  await page.setViewportSize({width:390,height:844});
+  await expect(page.locator('#benchPingGateHelp')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.request.post('/__fixture/reset');
+});
+
 test('one adapter sends shared service policies for every scope and separate global discovery policies', async ({ page }) => {
   test.setTimeout(90_000);
   await page.request.post('/__fixture/reset');
@@ -1355,6 +1689,8 @@ test('one adapter sends shared service policies for every scope and separate glo
     await expect(page.locator('#benchSearchFailFast')).toBeEnabled();
     await page.locator('#benchSearchServices').selectOption(params.services);
     await page.locator('#benchSearchFailFast').evaluate((input, checked) => { input.checked = checked; input.dispatchEvent(new Event('change', { bubbles: true })); }, params.failFast);
+    await page.locator('#benchRejectNoPing').evaluate((input, checked) => { input.checked = checked; input.dispatchEvent(new Event('change', { bubbles: true })); }, params.failFast);
+    await page.locator('#benchFullPing').evaluate((input, checked) => { input.checked = checked; input.dispatchEvent(new Event('change', { bubbles: true })); }, params.failFast);
     if (params.mode === 'find_n') {
       await page.locator('#benchSearchTarget').fill(String(params.target));
       await expect(page.locator('#benchSelectionSearchHelp')).toHaveText('Все выбранные, включая Dead Servers');
@@ -1370,7 +1706,7 @@ test('one adapter sends shared service policies for every scope and separate glo
       expect((await posted).postDataJSON()).toEqual({
         method: scope.advanced && params.mode === 'find_n' ? 'availability_quick' : 'availability_full', concurrency: 4, test_download: false, test_upload: false,
         ...scope.body,
-        ...(params.mode === 'find_n' && scope.advanced ? { search: { target_good: params.target, required_services: params.services, fail_fast:params.failFast } } : {service_checks:{required_services:params.services,fail_fast:params.failFast}}),
+        ...(params.mode === 'find_n' && scope.advanced ? { search: { target_good: params.target, required_services: params.services, fail_fast:params.failFast } } : {service_checks:{required_services:params.services,fail_fast:params.failFast,...(params.failFast ? {reject_no_ping:true,full_ping:true} : {})}}),
       });
       await expect.poll(async () => (await page.request.get('/api/bench/status').then(response => response.json())).concurrency_status.requested).toBe(4);
       if (params.mode === 'find_n' && scope.advanced) {
@@ -1960,6 +2296,149 @@ test('routing rule target uses the same wide searchable server picker', async ({
   await expect(shell.locator('.custom-select-trigger')).toContainText('#');
 });
 
+test('routing save is single-flight and a failed edit remains an edit on retry', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await page.request.post('/api/routing/rules',{data:{rules:[{enabled:true,name:'Original',target:'direct',domains:[],ips:[],ports:['443'],network:'tcp',port_mode:'include'}]}});
+  await openFixture(page);
+  await navigateTo(page,'routing');
+  await page.locator('#routingRulesBody tr').first().getByRole('button',{name:'Редактировать правило',exact:true}).click();
+  await page.locator('#ruleName').fill('Retry draft');
+  let attempts=0, release;
+  const held=new Promise(resolve=>release=resolve);
+  await page.route('**/api/routing/rules',async route=>{
+    if(route.request().method()!=='POST') return route.continue();
+    attempts++;
+    if(attempts===1) { await held; return route.fulfill({status:500,contentType:'application/json',body:JSON.stringify({error:'fixture activation failure'})}); }
+    await route.continue();
+  });
+  await page.locator('#ruleSubmitBtn').click();
+  await expect(page.locator('#ruleSubmitBtn')).toBeDisabled();
+  await page.evaluate(()=>{submitRoutingRule();moveRoutingRule(0,1);toggleRoutingRule(0,false);});
+  expect(attempts).toBe(1);
+  release();
+  await expect(page.locator('#ruleSubmitBtn')).toBeEnabled();
+  await expect(page.locator('#ruleName')).toHaveValue('Retry draft');
+  await expect(page.locator('#ruleFormTitle')).toContainText('Редактировать');
+  const retry=page.waitForRequest(request=>request.method()==='POST'&&new URL(request.url()).pathname==='/api/routing/rules');
+  await page.locator('#ruleSubmitBtn').click();
+  expect((await retry).postDataJSON().rules).toHaveLength(1);
+  await expect(page.locator('#routingRulesBody')).toContainText('Retry draft');
+  expect(attempts).toBe(2);
+  await page.request.post('/__fixture/reset');
+});
+
+test('stale routing save preserves draft and refreshes revision without losing another writer', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await page.request.post('/api/routing/rules',{data:{rules:[{enabled:true,name:'Original',target:'direct',ports:['443'],network:'tcp'}]}});
+  await openFixture(page);
+  await navigateTo(page,'routing');
+  await page.locator('#ruleName').fill('Local draft');
+  await page.locator('#rulePorts').fill('3724');
+  const other=(await (await page.request.get('/api/routing')).json()).rules;
+  other.push({enabled:true,name:'Other window',target:'direct',ports:['1119'],network:'tcp'});
+  await page.request.post('/api/routing/rules',{data:{rules:other}});
+  const rejected=page.waitForResponse(response=>response.request().method()==='POST'&&new URL(response.url()).pathname==='/api/routing/rules'&&response.status()===409);
+  await page.locator('#ruleSubmitBtn').click();
+  await rejected;
+  await expect(page.locator('#ruleSubmitBtn')).toBeEnabled();
+  await expect(page.locator('#ruleName')).toHaveValue('Local draft');
+  await expect(page.locator('#routingRulesBody')).toContainText('Other window');
+  await page.locator('#ruleSubmitBtn').click();
+  await expect(page.locator('#routingRulesBody')).toContainText('Local draft');
+  const saved=(await (await page.request.get('/api/routing')).json()).rules;
+  expect(saved.map(rule=>rule.name)).toEqual(['Original','Other window','Local draft']);
+  await page.request.post('/__fixture/reset');
+});
+
+test('global port rules validate ranges, preserve protocol and reorder above address rules', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await page.request.post('/api/routing/rules', {data:{rules:[{enabled:true,name:'Existing address rule',target:'active',domains:['example.test'],ips:[],ports:[],network:'any',port_mode:'include'}]}});
+  await openFixture(page);
+  await navigateTo(page, 'routing');
+  await page.locator('#ruleName').fill('Global game UDP');
+  await page.locator('#ruleTarget').selectOption('direct');
+  await page.locator('#ruleNetwork').selectOption('udp');
+  await page.locator('#rulePorts').fill('3478-3479, 5060/5062, 6250, 12000 - 64000');
+  await page.locator('#rulePosition').selectOption('first');
+  const post = page.waitForRequest(request => request.method()==='POST' && new URL(request.url()).pathname==='/api/routing/rules');
+  await page.locator('#ruleSubmitBtn').click();
+  const body = (await post).postDataJSON();
+  expect(body.rules[0]).toMatchObject({name:'Global game UDP',target:'direct',network:'udp',port_mode:'include',
+    ports:['3478-3479','5060','5062','6250','12000-64000'],domains:[],ips:[]});
+  expect(body.apply).toBe(true);
+  const row = page.locator('#routingRulesBody tr').filter({hasText:'Global game UDP'});
+  await expect(row).toContainText('Глобально (все адреса)');
+  await expect(row.getByRole('button',{name:'Выше по приоритету'})).toBeDisabled();
+  await expect(page.locator('#routingRulesBody tr').last()).toContainText('MATCH');
+  const reordered = page.waitForRequest(request => request.method()==='POST' && new URL(request.url()).pathname==='/api/routing/rules');
+  await row.getByRole('button',{name:'Ниже по приоритету'}).click();
+  expect((await reordered).postDataJSON().rules[1].name).toBe('Global game UDP');
+  await page.reload();
+  await navigateTo(page, 'routing');
+  await expect(page.locator('#routingRulesBody tr').nth(1)).toContainText('Global game UDP');
+  await row.getByRole('button',{name:'Редактировать правило',exact:true}).click();
+  await expect(page.locator('#rulePorts')).toHaveValue('3478-3479,5060,5062,6250,12000-64000');
+  await expect(page.locator('#ruleNetwork')).toHaveValue('udp');
+  await expect(page.locator('#rulePositionField')).toBeHidden();
+  await page.locator('#rulePortMode').selectOption('exclude');
+  const edited = page.waitForRequest(request => request.method()==='POST' && new URL(request.url()).pathname==='/api/routing/rules');
+  await page.locator('#ruleSubmitBtn').click();
+  expect((await edited).postDataJSON().rules[1]).toMatchObject({name:'Global game UDP',network:'udp',port_mode:'exclude'});
+  await expect(row).toContainText('[кроме]');
+  await row.locator('td').nth(4).locator('.cell-edit').click();
+  const inline = row.locator('td').nth(4).locator('input');
+  await inline.fill('65536');
+  await inline.press('Enter');
+  expect(await inline.evaluate(input=>input.checkValidity())).toBe(false);
+  await inline.fill('12000-54000');
+  const inlinePost = page.waitForRequest(request => request.method()==='POST' && new URL(request.url()).pathname==='/api/routing/rules');
+  await inline.press('Enter');
+  expect((await inlinePost).postDataJSON().rules[1]).toMatchObject({ports:['12000-54000'],network:'udp',port_mode:'exclude'});
+  await page.request.post('/__fixture/reset');
+});
+
+test('invalid destination ports do not post or replace the routing draft', async ({ page }) => {
+  await page.request.post('/__fixture/reset');
+  await openFixture(page);
+  await navigateTo(page, 'routing');
+  let posts = 0;
+  page.on('request', request => { if (request.method()==='POST' && new URL(request.url()).pathname==='/api/routing/rules') posts++; });
+  await page.locator('#ruleName').fill('Invalid draft');
+  for (const invalid of ['0','65536','64000-12000','443,DIRECT','80-81-82','443,///']) {
+    await page.locator('#rulePorts').fill(invalid);
+    await page.locator('#ruleSubmitBtn').click();
+    await expect(page.locator('#rulePorts')).toHaveAttribute('aria-invalid','true');
+    await expect(page.locator('#rulePortsError')).toBeVisible();
+    await expect(page.locator('#ruleName')).toHaveValue('Invalid draft');
+  }
+  expect(posts).toBe(0);
+  await page.locator('#rulePorts').fill('1119,3724,6113');
+  await page.locator('#ruleNetwork').selectOption('tcp');
+  await page.locator('#ruleTarget').selectOption('direct');
+  await expect(page.locator('#rulePortsError')).toBeHidden();
+  const post = page.waitForRequest(request => request.method()==='POST' && new URL(request.url()).pathname==='/api/routing/rules');
+  await page.locator('#ruleSubmitBtn').click();
+  expect((await post).postDataJSON().rules.at(-1)).toMatchObject({network:'tcp',ports:['1119','3724','6113']});
+  await page.request.post('/__fixture/reset');
+});
+
+test('port editor works on mobile and keeps pending ranges across refreshes', async ({ page }) => {
+  await page.setViewportSize({width:390,height:844});
+  await openFixture(page);
+  await navigateTo(page, 'routing');
+  await page.locator('#ruleName').fill('Voice ports');
+  await page.locator('#rulePorts').fill('12000-54000');
+  await page.locator('#ruleNetwork').selectOption('udp');
+  await page.evaluate(() => window.loadRouting());
+  await expect(page.locator('#rulePorts')).toHaveValue('12000-54000');
+  await expect(page.locator('#ruleNetwork')).toHaveValue('udp');
+  const dimensions = await page.evaluate(() => ({width:innerWidth,scroll:document.documentElement.scrollWidth}));
+  expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
+  const box = await page.locator('#rulePorts').boundingBox();
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x+box.width).toBeLessThanOrEqual(390);
+});
+
 test('routing draft and server dialog survive a late dashboard response without losing selection', async ({ page }) => {
   await openFixture(page);
   await navigateTo(page, 'routing');
@@ -2015,10 +2494,10 @@ test('server dialog closes when navigating or its inline editor disappears', asy
   await expect(page.locator('.routing-target-dialog, .routing-target-backdrop')).toHaveCount(0);
 });
 
-test('routing table exposes deletion, undo and hides disabled Parovozik rows', async ({ page }) => {
+test('routing table exposes deletion and undo without removed experimental controls', async ({ page }) => {
   await openFixture(page);
   await navigateTo(page, 'routing');
-  await expect(page.locator('#rParovozikConsist')).not.toHaveAttribute('open');
+  await expect(page.locator('#rParovozikConsist')).toHaveCount(0);
   await expect(page.locator('#routingRulesBody .managed-routing-rule')).toHaveCount(0);
   await page.locator('#ruleName').fill('<unsafe> sample');
   await page.locator('#ruleEntries').fill('delete.example');
@@ -2209,15 +2688,12 @@ test('inline existing-rule target uses the wide picker without blur cancellation
   expect((await posted).postDataJSON().rules[0].target).toBe('server:srv-v1-wagon');
 });
 
-test('unsaved Parovozik selection survives status refresh', async ({ page }) => {
+test('removed experimental routing target is absent after status refresh', async ({ page }) => {
   await openFixture(page);
   await navigateTo(page, 'routing');
-  const wagon = page.locator('[data-parovozik-ref="srv-v1-wagon"]');
-  await page.evaluate(() => window.toggleParovozikWagon('srv-v1-wagon'));
-  await expect(wagon).toBeChecked();
   await page.evaluate(() => window.refreshStatus());
   await page.waitForTimeout(100);
-  await expect(wagon).toBeChecked();
+  await expect(page.locator('option[value="parovozik"]')).toHaveCount(0);
 });
 
 test('DNS save persists settings and applies routing', async ({ page }) => {

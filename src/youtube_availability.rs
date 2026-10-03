@@ -314,6 +314,8 @@ fn probe_with_fetch(
         Ok(urls) => urls,
         Err(category) => return Ok(result(Some(category), true, true)),
     };
+    let ttfb_ms = page.ttfb_ms;
+    drop(page); // Do not retain the HTML capture while decoding previews.
     for url in urls {
         ensure_not_cancelled(cancel)?;
         let preview = fetch(&url, IMAGE_LIMIT, 8);
@@ -331,8 +333,8 @@ fn probe_with_fetch(
     }
     ensure_not_cancelled(cancel)?;
     let mut passed = result(None, true, false);
-    passed.avg_ttfb_ms = page.ttfb_ms;
-    passed.max_ttfb_ms = page.ttfb_ms;
+    passed.avg_ttfb_ms = ttfb_ms;
+    passed.max_ttfb_ms = ttfb_ms;
     Ok(passed)
 }
 

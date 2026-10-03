@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -343,7 +344,7 @@ const responses = new Map([
   ] }] }],
   ['/api/profiles', { profiles: [profile, manualProfile, secondSubscriptionProfile, deadProfile] }],
   ['/api/routing', routing],
-  ['/api/automation/best-of-best', {settings:{enabled:false,server_refs:[],selected_ref:null},candidates:[{ref:'srv-v1-fixture',id:101,name:'Fixture Profile',passed:2,ping_ms:28},{ref:'srv-v1-wagon',id:102,name:'Fixture Manual',passed:0,ping_ms:null,manual:true}],max_candidates:16}],
+  ['/api/automation/best-of-best', {settings:{enabled:false,server_refs:[],selected_ref:null},candidates:[{ref:'srv-v1-fixture',id:101,name:'Fixture Profile',passed:2,ping_ms:28,tested:true,checks:{ping_proxy:{state:'passed',tested:true},youtube_thumbnails:{state:'passed',tested:true},telegram:{state:'failed',tested:true},ai:{state:'passed',tested:true}}},{ref:'srv-v1-wagon',id:102,name:'Fixture Manual',passed:0,ping_ms:null,manual:true,tested:false,checks:{}}],max_candidates:16}],
   ['/api/routing/connection-context', { servers: routing.servers }],
   ['/api/routing/preview', { requires_apply: true, core_restart: true, firewall_reload: true, desired_config_sha256: 'desired', applied_config_sha256: 'applied', changes: ['fixture change'], warnings: [] }],
   ['/api/onboarding/status', { ready: true, checks: [] }],
@@ -452,7 +453,7 @@ const server = http.createServer(async (request, response) => {
   if (request.method === 'POST' && url.pathname === '/__fixture/reset') {
     requests.length = 0;
     routing.rules = [];
-    routing.settings.parovozik_enabled = false;
+    routing.rules_revision = createHash('sha256').update(JSON.stringify(routing.rules)).digest('hex');
     benchMaxWorkers = 3;
     for (const item of [profile, manualProfile]) {
       item.name = initialProfileNames.get(item.id);
@@ -559,7 +560,9 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/automation/best-of-best') {
-      sendJson(response, 200, { settings: { ...body, selected_ref: null }, candidates: responses.get('/api/automation/best-of-best').candidates });
+      const data = {...responses.get(url.pathname),settings:{...body,selected_ref:null}};
+      responses.set(url.pathname,data);
+      sendJson(response,200,data);
       return;
     }
 
@@ -698,8 +701,11 @@ const server = http.createServer(async (request, response) => {
           || !Number.isInteger(body.concurrency) || body.concurrency < 1 || body.concurrency > 6
           || (Object.hasOwn(body, 'profile_ids') && (!Array.isArray(body.profile_ids) || !body.profile_ids.length || body.profile_ids.some(id => !Number.isInteger(id) || id < 0)))
           || (policy !== undefined && (typeof policy !== 'object' || Array.isArray(policy)
-            || Object.keys(policy).sort().join(',') !== 'fail_fast,required_services'
+            || !Object.hasOwn(policy,'required_services') || !Object.hasOwn(policy,'fail_fast')
+            || Object.keys(policy).some(key => !['required_services','fail_fast','reject_no_ping','full_ping'].includes(key))
             || !services.includes(policy.required_services) || typeof policy.fail_fast !== 'boolean'
+            || (Object.hasOwn(policy,'reject_no_ping') && typeof policy.reject_no_ping !== 'boolean')
+            || (Object.hasOwn(policy,'full_ping') && typeof policy.full_ping !== 'boolean')
             || !['availability_quick','availability_full'].includes(body.method) || search !== undefined))
           || (search !== undefined && (typeof search !== 'object' || Array.isArray(search)
             || !['required_services,target_good','fail_fast,required_services,target_good'].includes(Object.keys(search).sort().join(','))
@@ -745,8 +751,14 @@ const server = http.createServer(async (request, response) => {
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/routing/rules') {
+      const revision = createHash('sha256').update(JSON.stringify(routing.rules)).digest('hex');
+      if (body?.expected_revision && body.expected_revision!==revision) {
+        sendJson(response,409,{error:'routing rules changed; reload before saving'});
+        return;
+      }
       routing.rules = Array.isArray(body?.rules) ? body.rules : routing.rules;
-      sendJson(response, 200, { ok: true });
+      routing.rules_revision = createHash('sha256').update(JSON.stringify(routing.rules)).digest('hex');
+      sendJson(response, 200, { ok: true, rules:routing.rules, rules_revision:routing.rules_revision });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/routing/settings') {
@@ -771,6 +783,12 @@ const server = http.createServer(async (request, response) => {
     if (request.method === 'POST' && url.pathname === '/api/routing/reset') {
       routing.settings.torrent_socks = { enabled:false, port:10812, username:'', password_set:false, target:'direct' };
       sendJson(response, 200, { reset:true, applied:body?.apply === true });
+      return;
+    }
+    if (request.method === 'POST' && ['/api/core/restart','/api/core/cleanup'].includes(url.pathname)) {
+      sendJson(response, 200, {core_status:'running',generation:1,
+        operation:url.pathname.endsWith('/cleanup')?'cleanup':'restart',process_restarted:true,
+        connections_reset:true,previous_pid:1482,pid:1483,rss_before_kb:118784,rss_after_kb:65536});
       return;
     }
     if (request.method === 'POST' && url.pathname === '/api/routing/apply') {
@@ -884,6 +902,7 @@ const server = http.createServer(async (request, response) => {
       sendJson(response, 200, { checked: 1, updated: 1, unchanged: 0, dataplane_applied: false, errors: [] });
       return;
     }
+    if (url.pathname === '/api/routing') routing.rules_revision = createHash('sha256').update(JSON.stringify(routing.rules)).digest('hex');
     sendJson(response, 200, responses.get(url.pathname) ?? {});
     return;
   }

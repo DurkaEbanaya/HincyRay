@@ -42,3 +42,5 @@ pub fn run() -> eframe::Result {
         Box::new(|cc| Ok(Box::new(app::XrayVpnTestApp::new(cc)))),
     )
 }
+pub mod hincyray_pool;
+pub mod hincyray_state_transaction;

@@ -212,10 +212,6 @@ pub struct RoutingSettingsUpdateRequest {
     pub ru_direct_exceptions: Option<Vec<String>>,
     pub auto_vpn_learning_enabled: Option<bool>,
     pub auto_vpn_exceptions: Option<Vec<String>>,
-    pub parovozik_enabled: Option<bool>,
-    pub parovozik_direct_domains: Option<Vec<String>>,
-    pub parovozik_vpn_domains: Option<Vec<String>>,
-    pub parovozik_server_refs: Option<Vec<String>>,
     pub match_target: Option<String>,
     pub torrent_socks: Option<TorrentSocksSettingsUpdate>,
 }
@@ -763,6 +759,7 @@ pub struct BenchStatusResponse {
     pub concurrency_status: BenchConcurrencyStatus,
     pub last_updated: u64,
     pub cancel_requested: bool,
+    pub memory_pressure: bool,
     pub results: Vec<BenchStatusResult>,
     pub summary: BenchSummary,
     pub search: Option<SearchProgress>,
@@ -798,6 +795,19 @@ pub struct ProfileTestSettingsResponse {
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct CoreRestartResponse {
+    pub core_status: String,
+    pub generation: u64,
+    pub operation: String,
+    pub process_restarted: bool,
+    pub connections_reset: bool,
+    pub previous_pid: Option<u32>,
+    pub pid: Option<u32>,
+    pub rss_before_kb: Option<u64>,
+    pub rss_after_kb: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct ApiEndpointContract {
     pub method: &'static str,
     pub path: &'static str,
@@ -819,6 +829,22 @@ pub struct ApiContractDescriptor {
 
 pub fn api_endpoint_contracts() -> Vec<ApiEndpointContract> {
     vec![
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/core/restart",
+            request_schema: None,
+            response_schema: "CoreRestartResponse",
+            bounded: true,
+            mutates_state: true,
+        },
+        ApiEndpointContract {
+            method: "POST",
+            path: "/api/core/cleanup",
+            request_schema: None,
+            response_schema: "CoreRestartResponse",
+            bounded: true,
+            mutates_state: true,
+        },
         ApiEndpointContract {
             method: "GET",
             path: "/api/mihomo-features",
@@ -1235,6 +1261,10 @@ pub fn openapi_document() -> Value {
         "RoutingSettingsUpdateResponse": schema_value::<RoutingSettingsUpdateResponse>(),
     });
     let mut schemas = base_schemas.as_object().cloned().unwrap_or_default();
+    schemas.insert(
+        "CoreRestartResponse".to_owned(),
+        schema_value::<CoreRestartResponse>(),
+    );
     schemas.extend(diagnostic_schemas.as_object().cloned().unwrap_or_default());
     schemas.extend(
         routing_settings_schemas

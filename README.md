@@ -1,8 +1,10 @@
-# HincyRay v1.3.30
+# HincyRay v1.3.35
 
-v1.3.30 expands “Best of the best” to a searchable pool of up to 16 servers, including manual profiles, with explicit addition/removal and sticky fail-closed routing. Both routing target pickers rank fresh service checks and proxy ping. See [release evidence](docs/releases/v1.3.30.md). This version does not include Jitsi integration.
+v1.3.35 stabilizes durable saving and rollback, adds fair VPN-pool recovery with bounded diagnostics, protects routing edits against duplicate and stale saves, and makes local route explanations conservative. Parovozik is completely removed; old explicit targets migrate to active VPN. See [stabilization](docs/stabilization.md), [port rules](docs/mihomo-port-rules.md) and [release evidence](docs/releases/v1.3.35.md).
 
-Download the Keenetic/Entware aarch64 binary from [GitHub Release v1.3.30](https://github.com/DurkaEbanaya/HincyRay/releases/tag/v1.3.30). SHA256: `5fd5a6989fb9339414394dddcfdf27ed93e9d5337bf16e6d4d53ad534d4b9bec`. Publication restrictions and pending-release notes below describe historical versions, not this release.
+Subsequent deployed updates add [real core restart and memory cleanup](docs/mihomo-memory-cleanup.md), [minimal/full Ping, optional Ping rejection and three economical availability workers](docs/service-check-parameters.md). The [Beeline whitelist DNS investigation](docs/whitelist-dns.md) records the connection-delay correction and its live verification.
+
+The latest published binary is [GitHub Release v1.3.30](https://github.com/DurkaEbanaya/HincyRay/releases/tag/v1.3.30), SHA256 `5fd5a6989fb9339414394dddcfdf27ed93e9d5337bf16e6d4d53ad534d4b9bec`. v1.3.35 publication is pending; use `HINCYRAY_BIN_PATH` with the local ARM64 artifact for offline installation.
 
 [English](README.md) | [Русский](README.ru.md)
 
@@ -197,7 +199,7 @@ The YouTube probe now carries its visitor cookies and matching client identity t
 
 ### v1.1.0
 
-v1.1.0 adds the disabled-by-default **Паровозик** direct-first classifier. It only considers domains absent from enabled applied GeoBases, keeps learned `Паровозик Direct` and `Паровозик VPN` lists separate from user and GeoBase rules, and can try the current VPN followed by up to five selected live server routes. Its compact subscription-column UI excludes Dead Servers and preserves unsaved selections across status refreshes.
+The experimental Parovozik classifier introduced in v1.1.0 has been removed in v1.3.35. Existing backups migrate explicit targets to active VPN and discard its classifier fields and generated rows.
 
 Quick Test now determines AI Studio availability with the bounded [`vernette/ipregion`](https://github.com/vernette/ipregion) region method. See [`CHANGELOG.md`](CHANGELOG.md) and [`docs/releases/v1.1.0.md`](docs/releases/v1.1.0.md).
 

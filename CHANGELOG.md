@@ -2,6 +2,42 @@
 
 Publication update (2026-09-26): v1.3.30 is the release selected after reverting the unpublished Jitsi integration. Historical publication notes below retain their original context.
 
+### Post-deployment updates · 2026-10-02–03
+
+- Make explicit Mihomo restart replace and reap the tracked child instead of hot-reloading it. Add a separate memory-cleanup action with PID/RSS reporting, connection-reset notice and transactional recovery.
+- Default availability Ping to one proxy HTTPS request; add optional full ICMP/TCP diagnostics and independent rejection after failed Ping. Preserve skipped service evidence and shared policy across ordinary check scopes.
+- Admit up to three economical availability workers with an 80 MiB reserve and measured 16 MiB incremental worker estimate. Bound private Go cores, retain persistent spawn ownership, release temporary resources, and cancel/reap on monitored memory pressure.
+- Document the deployed Beeline whitelist DNS correction: Keenetic local/bootstrap DNS and explicitly proxied remote DoH remove the measured five-second connection-admission delay.
+- Final source verification: 733 Rust tests, 127 browser tests and 140 frontend routes, plus fmt/check, both Clippy configurations, installer contract and diff check. See [service checks](docs/service-check-parameters.md), [memory cleanup](docs/mihomo-memory-cleanup.md) and [DNS evidence](docs/whitelist-dns.md).
+
+## v1.3.35 - 2026-09-29
+
+- Remove Parovozik completely from daemon, routing contracts, generated Mihomo providers/groups and Web UI. Migrate legacy startup/backup settings and explicit targets to active VPN without deleting unrelated routes.
+- Persist private state with unique atomic files, file and directory fsync; retry failed background saves. Report settings save failures and preserve unrelated concurrent state during policy/backup rollback.
+- Add circular best-of-best recovery scheduling, 10-second candidate retry versus 60-second selected-member checks, and bounded categorical probe/transition diagnostics. Preserve raw-leaf HTTPS admission and REJECT until success.
+- Serialize Web UI routing saves, retain failed edit drafts, and reject stale rule snapshots through optional API revisions before undo/persistence mutation.
+- Correct domain boundary/exact matching, IPv6 CIDR and conservative route explanations when transport metadata or earlier runtime rules are unknown. Strictly validate global port lists and trace metadata; explain PortMode as lower-priority fallback.
+- Correct Default Policy command syntax and normalize Mihomo memory bytes to the API's KiB contract.
+
+## v1.3.34 - 2026-09-28
+
+- Improve Mihomo destination-port rules in the routing editor with TCP/UDP, validated lists/ranges, include/exclude, explicit global scope and top/bottom insertion plus priority arrows. Display MATCH last and expose full editing of existing rules.
+- Fix alternative ports being incorrectly ANDed with each other, standalone exclusions and Mihomo NOT syntax. Preserve protocol/address constraints for destination/source/inbound port fields, reject invalid API batches before mutation, and trace global port rules correctly.
+
+## v1.3.33 - 2026-09-28
+
+- Separate the best-of-best pool's 16-member budget from the existing 16-server fixed-route budget (rules, devices, Torrent and Parovozik). Enabling a full pool no longer fails because unrelated fixed routes already exist. Shared outbounds remain deduplicated; both independent caps and REJECT-first pool selection remain enforced.
+
+## v1.3.32 - 2026-09-28
+
+- Synchronize best-of-best enabled state directly from the applied POST response, reject outdated refreshes, protect edits during apply, distinguish saved membership from an enabled pool, and display sidebar application progress.
+- Exclude Dead Servers from the catalog. Previously saved unavailable members remain counted and can be explicitly removed without listing dead candidates. Add reversible browser-local “bad” marks that put servers below normally ranked entries while preserving routing membership/order.
+
+## v1.3.31 - 2026-09-28
+
+- Added independent ping, YouTube, Telegram and AI ranking switches to the best-of-best catalog. Selected service passes rank first, with lower fresh proxy ping as an optional tie-breaker; all four criteria default on. Each row displays separate check states instead of an aggregate score.
+- Added browser-persisted filters for untested servers (on by default) and confirmed failures among selected criteria (off by default). Stale, skipped and inconclusive evidence remain distinct; selected members stay available under these filters. Search and sorting preserve membership, including its routing order and refs absent from the current catalog.
+
 ## v1.3.30 - 2026-09-26
 
 - Expanded best-of-best membership to 16 under the existing shared pinned-route limit. Added the full searchable profile catalog, manual-profile admission without previous Check Services evidence, membership counts, and removal by unchecking; profiles themselves remain intact. Every selected outbound still requires a fresh HTTPS pass before routing.

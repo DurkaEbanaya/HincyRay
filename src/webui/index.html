@@ -795,24 +795,6 @@ textarea.mono{font-family:var(--font-mono);min-height:80px;resize:vertical;font-
 .experimental-card[open]>summary::before{transform:rotate(90deg)}
 .experimental-body{padding:0 16px 16px}
 .experimental-body>.feature-card{border-top:1px solid var(--border);padding:16px 0}
-.parovozik-consist{margin:12px 0;border:1px solid var(--border);background:var(--bg)}
-.parovozik-consist>summary{padding:11px 13px;cursor:pointer;list-style:none;font-weight:600;border-bottom:1px solid transparent}
-.parovozik-consist>summary::-webkit-details-marker{display:none}
-.parovozik-consist[open]>summary{border-bottom-color:var(--border)}
-.parovozik-consist>summary::before{content:'›';display:inline-block;margin-right:7px;transition:transform .15s ease}
-.parovozik-consist[open]>summary::before{transform:rotate(90deg)}
-.parovozik-wagons{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;padding:14px}
-.parovozik-subscription{min-width:0}
-.parovozik-subscription-title{margin:0 0 5px;padding-bottom:5px;border-bottom:1px solid var(--border);font-size:var(--fs-sm);font-weight:700;color:var(--muted);overflow-wrap:anywhere}
-.parovozik-subscription-grid{display:flex;flex-direction:column}
-.parovozik-wagon{display:grid;grid-template-columns:18px minmax(0,1fr);gap:7px;align-items:start;min-width:0;padding:5px 3px;cursor:pointer;line-height:1.3;border-bottom:1px solid color-mix(in srgb,var(--border) 55%,transparent)}
-.parovozik-wagon:hover{background:var(--accent-soft)}
-.parovozik-wagon input{margin:2px 0 0}
-.parovozik-wagon-name{min-width:0;overflow-wrap:anywhere}
-.parovozik-locomotive{cursor:default;color:var(--accent);font-weight:600}
-.parovozik-locomotive:hover{background:transparent}
-.parovozik-consist-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:0 14px 14px}
-@media(max-width:640px){.parovozik-wagons{grid-template-columns:1fr}}
 .geobase-source-fields{display:grid;grid-template-columns:minmax(130px,.7fr) minmax(180px,1fr) minmax(240px,2fr);gap:var(--gap-sm);align-items:end}
 .geobase-runtime{display:none;margin:12px 0;padding:10px 12px;border-left:3px solid var(--accent);background:var(--accent-soft)}
 .geobase-runtime.error{border-left-color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,var(--surface))}
@@ -1012,7 +994,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
   <nav class="sidebar" id="sidebar" data-od-id="sidebar">
     <div class="sidebar-brand" style="border-radius: 0px;">
       <svg class="brand-icon" viewBox="0 0 1024 1024" role="img" aria-label="HincyRay"><defs><radialGradient id="brand-bg" cx="50%" cy="46%" r="62%"><stop stop-color="#172b3d"/><stop offset=".55" stop-color="#0b1018"/><stop offset="1" stop-color="#05070b"/></radialGradient><linearGradient id="brand-phone" x1="250" y1="100" x2="760" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#3b424d"/><stop offset=".45" stop-color="#151a21"/><stop offset="1" stop-color="#050608"/></linearGradient><linearGradient id="brand-screen" x1="310" y1="150" x2="690" y2="850" gradientUnits="userSpaceOnUse"><stop stop-color="#1f3146"/><stop offset="1" stop-color="#070a0f"/></linearGradient></defs><rect width="1024" height="1024" rx="220" fill="url(#brand-bg)"/><path d="M130 740 40 820M190 820 95 930M845 170l115-92M820 790l130 92M93 276l112 52" stroke="#0078d7" stroke-width="18" stroke-linecap="round" opacity=".65"/><g transform="rotate(-8 512 512)"><rect x="290" y="92" width="444" height="840" rx="78" fill="url(#brand-phone)" stroke="#737b87" stroke-width="14"/><rect x="328" y="138" width="368" height="748" rx="48" fill="url(#brand-screen)" stroke="#0e1620" stroke-width="10"/><circle cx="512" cy="176" r="16" fill="#080b10" stroke="#4d5663" stroke-width="5"/><path d="M510 132 455 292l68-30-42 172 106-238-72 34z" fill="#f4d03f" stroke="#fff2a4" stroke-width="8"/><path d="M496 432 365 536l112 8-74 204 214-260-102 14 75-134z" fill="#ff453a" stroke="#ffb2ab" stroke-width="9"/><path d="M520 398 660 496l-92 22 70 188-198-238 92 18z" fill="#60cdff" stroke="#b8efff" stroke-width="8"/><path d="M445 308 340 248M444 309l-96 102M521 264l118-98M514 436l-160 44M514 437l120 152M477 546l-112 188M566 515l104 166" stroke="#d8e6f3" stroke-width="10" stroke-linecap="round" opacity=".8"/><path d="M336 610 238 660l87 36-142 98 238-62-62-42 98-38zM664 300l150-50-72 102 160 10-228 68 38-78z" fill="#1f8fff" opacity=".88"/><text x="512" y="760" text-anchor="middle" font-family="Arial Black,Arial,sans-serif" font-size="76" fill="#f2f6fb" stroke="#05070b" stroke-width="7" paint-order="stroke">POCO</text></g></svg>
-      <div><div class="logo">HincyRay</div><div class="version">v1.3.30</div></div>
+      <div><div class="logo">HincyRay</div><div class="version">v1.3.35</div></div>
     </div>
     <div class="brightness-row">
       <svg class="brightness-icon" onclick="toggleTheme()" title="Переключить тему" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="4"></circle><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.9 4.9l1.1 1.1M14 14l1.1 1.1M15.1 4.9L14 6M5.9 14l-1.1 1.1"></path></svg>
@@ -1198,9 +1180,12 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
           <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
             <button class="btn btn-accent" onclick="apiAction('POST','/api/core/start',null,t('Ядро запущено'),refreshDashboard)">▶ Запустить</button>
             <button class="btn btn-danger" onclick="confirmCmd(t('Остановить ядро?'),'/api/core/stop')">■ Остановить</button>
-            <button class="btn" onclick="apiAction('POST','/api/core/restart',null,t('Ядро перезапущено'),refreshDashboard)">↻ Перезапустить</button>
+            <button class="btn" id="coreRestartButton" onclick="runCoreReset(false)">↻ Перезапустить</button>
+            <button class="btn" id="coreCleanupButton" onclick="runCoreReset(true)">Очистить память</button>
             <button class="btn" onclick="previewAndApplyRouting()">⬆ Применить маршруты</button>
           </div>
+          <div style="font-size:var(--fs-sm);color:var(--muted);margin-top:8px" id="coreCleanupHint">Очистка памяти полностью перезапускает Mihomo и обрывает все его соединения. Новый процесс снова выделит память под правила и трафик.</div>
+          <div id="coreResetResult" role="status" style="font-size:var(--fs-sm);margin-top:8px"></div>
           <div class="feature-grid" style="margin-top:16px">
             <div class="feature-card"><h4>Готовность</h4><div id="onboardingSummary" class="routing-visual-subtitle">Проверка…</div><button class="btn btn-sm" onclick="showOnboardingStatus()">Показать проверки</button></div>
             <div class="feature-card"><h4>Безопасный режим</h4><div id="safeModeSummary" class="routing-visual-subtitle">Загрузка…</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-sm" onclick="toggleSafeMode()">Переключить</button><button class="btn btn-sm" onclick="showMemoryEstimate()">Память правил</button></div></div>
@@ -1264,7 +1249,10 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
               <div id="benchSearchParameters" class="form-row" style="align-items:flex-end;flex-wrap:wrap;gap:12px;margin-bottom:12px">
                 <div class="form-group" style="margin:0;min-width:160px;flex:1"><label for="benchSearchServices">Нужные сервисы</label><select id="benchSearchServices" data-native-select="1" onchange="syncServerSearchParameters('required_services')"><option value="all">Все: Ping+YT+TG+AI</option><option value="youtube">YT</option><option value="telegram">YT+TG</option><option value="ai">YT+TG+AI</option></select></div>
                 <div class="field"><label for="benchSearchFailFast">Стоп после сбоя YT/TG</label><label class="toggle"><input type="checkbox" id="benchSearchFailFast" onchange="syncServerSearchParameters('fail_fast')"><span class="slider"></span></label></div>
+                <div class="field"><label for="benchRejectNoPing">Считать нерабочим без Ping</label><label class="toggle"><input type="checkbox" id="benchRejectNoPing" onchange="syncServerSearchParameters('reject_no_ping')"><span class="slider"></span></label></div>
+                <div class="field"><label for="benchFullPing">Полная проверка Ping</label><label class="toggle"><input type="checkbox" id="benchFullPing" onchange="syncServerSearchParameters('full_ping')"><span class="slider"></span></label></div>
               </div>
+              <p id="benchPingGateHelp" style="font-size:var(--fs-xs);color:var(--muted)">По умолчанию Ping — один HTTPS-запрос через VPN. Полная проверка добавляет ICMP и TCP и занимает больше времени. «Без Ping» пропускает YT/TG/AI, если выбранная проверка не дала ни одного ответа. В расширенном «Найти N» всегда используется отдельный минимальный HTTPS-отсев.</p>
               <p id="benchDeadDiagnosticsHelp" style="font-size:var(--fs-xs);color:var(--muted)">Dead Servers проверяются явно, без автоматического восстановления.</p>
               <details id="benchAdvancedParameters" style="margin-bottom:12px">
                 <summary style="cursor:pointer">Расширенный поиск (все серверы)</summary>
@@ -1320,7 +1308,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px soli
           <p id="benchSearchStatus" style="display:none;font-size:var(--fs-xs);color:var(--muted);overflow-wrap:anywhere"></p>
           <p id="benchConcurrencyStatus" style="display:none;font-size:var(--fs-xs);color:var(--muted);overflow-wrap:anywhere"></p>
           <p id="benchSearchPartialHelp" style="display:none;font-size:var(--fs-xs);color:var(--muted)"></p>
-          <p id="benchConcurrencyHelp" style="font-size:var(--fs-xs);color:var(--muted)">Канал и превью YouTube (контракт 1) проверяются параллельно допущенными работниками. У каждого кандидата своё временное ядро и файлы; лимиты декодера прежние. Нативный YouTube (контракт 7) и общая сессия Telegram остаются последовательными. Обычная проверка с явной политикой: min(запрошено, кандидаты) работников или HTTP 503; оценка для 4 работников: 272 МиБ доступной памяти. В поиске N допуск также ограничен оставшимися местами цели.</p>
+          <p id="benchConcurrencyHelp" style="font-size:var(--fs-xs);color:var(--muted)">Канал и превью YouTube проверяются параллельно: отдельное экономное ядро на кандидата. Три работника требуют оценочно 128 МиБ доступной памяти, включая резерв 80 МиБ. При падении ниже резерва проверка прерывается, ядра завершаются и память освобождается. Telegram и нативное видео остаются последовательными. Запрошенное число работников допускается целиком или возвращается HTTP 503; в поиске N также учитываются оставшиеся места цели.</p>
           <span id="benchSelectionSearchHelp" style="font-size:var(--fs-xs);color:var(--muted)"></span>
           <div id="benchSummary" style="margin-top:12px;display:none" class="cards">
             <div class="card"><div class="card-label">Прошло</div><div class="card-value success" id="benchPassed">0</div></div>
@@ -1466,7 +1454,7 @@ https://sub.example.com/…"></textarea>
               <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Порт SOCKS5</label><input id="rTorrentSocksPort" type="number" min="1" max="65535" value="10812" class="mono"></div>
               <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Имя пользователя</label><input id="rTorrentSocksUsername" maxlength="128" autocomplete="off"></div>
               <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Новый пароль</label><input id="rTorrentSocksPassword" type="password" maxlength="512" autocomplete="new-password" placeholder="Не менять" oninput="updateTorrentSocksPasswordHint()"></div>
-              <div class="field routing-target-field"><label style="font-size:var(--fs-sm);color:var(--muted)">Маршрут торрент-трафика</label><select id="rTorrentSocksTarget" data-routing-target-select="1" data-searchable-select="1"><option value="direct">DIRECT</option><option value="active">Текущий активный VPN</option><option value="reject">REJECT</option><option value="parovozik">Паровозик VPN</option></select></div>
+              <div class="field routing-target-field"><label style="font-size:var(--fs-sm);color:var(--muted)">Маршрут торрент-трафика</label><select id="rTorrentSocksTarget" data-routing-target-select="1" data-searchable-select="1"><option value="direct">DIRECT</option><option value="active">Текущий активный VPN</option><option value="reject">REJECT</option></select></div>
               <div class="hint" id="rTorrentSocksPasswordStatus">Пароль не настроен</div>
               <div class="hint" id="rTorrentSocksPasswordLength"></div>
               <div class="hint">Для включения задайте отдельный пароль SOCKS5 длиной от 12 до 512 байт. Пустое поле «Новый пароль» сохраняет только уже настроенный пароль.</div>
@@ -1510,21 +1498,6 @@ https://sub.example.com/…"></textarea>
                   <div class="form-group" style="flex:1"><label>Авто-исключения VPN (по одному на строку)</label><textarea id="rAutoVpnExceptions" class="mono" rows="4" placeholder="auto-learned.example"></textarea></div>
                 </div>
                 <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить</button>
-              </div>
-              <div class="feature-card">
-                <h4>🚂 Паровозик</h4>
-                <div class="field"><label style="font-size:var(--fs-sm);color:var(--muted)">Включить экспериментальную direct-first классификацию</label><label class="toggle"><input type="checkbox" id="rParovozikEnabled"><span class="slider"></span></label></div>
-                <div style="font-size:var(--fs-sm);color:var(--muted);margin:8px 0">Только для сайтов, отсутствующих во включённых GeoBase: сначала DIRECT, после подтверждённой ошибки — текущее VPN и выбранные резервные серверы. GeoBase всегда имеет приоритет.</div>
-                <details class="parovozik-consist" id="rParovozikConsist">
-                  <summary>Состав вагонов · <span id="rParovozikCount">0 / 5</span></summary>
-                  <div class="parovozik-wagons" id="rParovozikWagons"></div>
-                  <div class="parovozik-consist-actions"><button class="btn btn-accent" type="button" onclick="saveParovozikConsist()">Сохранить состав вагонов</button><span class="hint">Текущее VPN — локомотив и добавляется автоматически.</span></div>
-                </details>
-                <div class="form-row">
-                  <div class="form-group" style="flex:1"><label>Паровозик Direct</label><textarea id="rParovozikDirect" class="mono" rows="4" readonly></textarea></div>
-                  <div class="form-group" style="flex:1"><label>Паровозик VPN</label><textarea id="rParovozikVpn" class="mono" rows="4" readonly></textarea></div>
-                </div>
-                <button class="btn btn-accent" onclick="saveRoutingSettings()">Сохранить и применить</button>
               </div>
               <div class="feature-card" id="geobaseConstructor">
                 <h4>GeoBase Constructor</h4>
@@ -1581,15 +1554,19 @@ https://sub.example.com/…"></textarea>
             <div class="server-target-detail">если выбранный сервер недоступен — текущий активный VPN; DIRECT не используется</div>
             <div style="margin-top:10px"><button class="btn btn-sm" onclick="navTo('connections-table')">Открыть таблицу соединений</button></div>
           </div>
-          <div class="feature-card" style="margin-bottom:16px">
+          <div class="feature-card" id="routingRuleEditor" style="margin-bottom:16px">
             <h4 id="ruleFormTitle">Добавить правило</h4>
             <div class="form-row">
               <div class="form-group"><label>Имя</label><input id="ruleName" placeholder="YouTube via proxy"></div>
               <div class="form-group routing-target-field"><label>Цель</label><select id="ruleTarget" data-routing-target-select="1" data-searchable-select="1"><option value="active">active</option><option value="direct">direct</option><option value="reject">reject</option></select></div>
-              <div class="form-group"><label>Протокол</label><select id="ruleNetwork"><option value="any">any</option><option value="tcp">tcp</option><option value="udp">udp</option></select></div>
-              <div class="form-group"><label>Порты</label><input id="rulePorts" class="mono" placeholder="80,443"></div>
-              <div class="form-group"><label>Режим портов</label><select id="rulePortMode"><option value="include">только эти</option><option value="exclude">кроме этих</option></select></div>
+              <div class="form-group"><label for="ruleNetwork">Протокол</label><select id="ruleNetwork"><option value="any">TCP + UDP</option><option value="tcp">TCP</option><option value="udp">UDP</option></select></div>
+              <div class="form-group"><label for="rulePorts">Порты назначения</label><input id="rulePorts" class="mono" placeholder="1119, 3724, 12000-64000" maxlength="4096" aria-describedby="rulePortsHelp rulePortsError" oninput="validateRulePorts(this)"></div>
+              <div class="form-group"><label for="rulePortMode">Режим портов</label><select id="rulePortMode"><option value="include">только эти</option><option value="exclude">кроме этих</option></select></div>
+              <div class="form-group" id="rulePositionField"><label for="rulePosition">Приоритет нового правила</label><select id="rulePosition"><option value="last">В конец списка</option><option value="first">В начало списка</option></select></div>
             </div>
+            <div class="hint" id="rulePortsHelp">Порты 1–65535 через запятую, диапазоны через дефис. Совпадает любой порт из списка; протокол и домены/IP — дополнительные условия. Пустые домены/IP: глобальное правило для трафика Mihomo. Пустые порты: все порты.</div>
+            <div id="rulePortsError" role="alert" style="display:none;color:var(--danger);margin-top:8px"></div>
+            <div class="hint" style="margin:8px 0">DIRECT отправляет трафик напрямую через Mihomo, а не исключает его из перехвата. Правила проверяются сверху вниз до первого совпадения; маршруты устройств имеют приоритет. Сохранение применяет правила и переподключает текущие соединения.</div>
             <div class="form-row">
               <div class="form-group" style="flex:1"><label>Домены, доменные зоны и IP <span style="font-size:var(--fs-sm);color:var(--muted)">(по одному на строку)</span></label><textarea id="ruleEntries" class="mono" rows="5" placeholder="geosite:youtube&#10;googlevideo.com&#10;geoip:us&#10;ip-asn:15169&#10;ru&#10;xn--p1ai"></textarea></div>
             </div>
@@ -1600,6 +1577,7 @@ https://sub.example.com/…"></textarea>
             </div>
           </div>
           <div class="routing-rules">
+            <div class="hint" style="margin-bottom:8px">Приоритет правил: сверху вниз. Используйте ↑ и ↓ для изменения порядка.</div>
             <div id="routingUndo" style="display:none;margin:0 0 10px;padding:10px;border:1px solid var(--warning);border-radius:8px;background:var(--warning-soft)"></div>
             <table class="tbl" id="routingRulesTable">
               <thead><tr><th>Вкл</th><th>Имя</th><th>Домены / IP</th><th>Цель</th><th>Порты</th><th>Протокол</th><th>Действие</th></tr></thead>
@@ -1967,12 +1945,31 @@ https://sub.example.com/…"></textarea>
         <div class="section-header" onclick="toggleSection(this)"><h2>Лучшие из лучших</h2><svg class="chevron" viewBox="0 0 16 16" fill="currentColor"><path d="M6 4l4 4-4 4"></path></svg></div>
         <div class="section-body">
           <p>До 16 серверов, включая свои ручные профили для теста. Число загруженных серверов также ограничено общим лимитом маршрутов. Добавьте серверы галочками, удалите из пула снятием галочки и сохраните. Перед использованием каждого выхода обязательна HTTPS-проверка; при отказе нет перехода на DIRECT.</p>
-          <label class="toggle"><input type="checkbox" id="bestOfBestEnabled"><span class="slider"></span></label> Включить пул
+          <label class="toggle"><input type="checkbox" id="bestOfBestEnabled" disabled><span class="slider"></span></label> Включить пул
+          <div id="bestOfBestState" role="status" style="margin-top:8px">Загрузка состояния пула…</div>
           <div id="bestOfBestSelected" style="margin:12px 0">—</div>
+          <div id="bestOfBestRuntime" role="status" class="hint" style="margin:8px 0"></div>
+          <details><summary>История переключений пула</summary><div id="bestOfBestTransitions" class="hint"></div></details>
           <input id="bestOfBestSearch" type="search" placeholder="Поиск сервера по имени или #ID" oninput="filterBestOfBestCatalog()" style="width:100%;margin-bottom:10px">
+          <div id="bestOfBestSort" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px" role="group" aria-label="Сортировка серверов">
+            <span>Сортировать по:</span>
+            <label style="display:flex;align-items:center;gap:6px"><span class="toggle"><input id="bestOfBestSortPing" type="checkbox" data-best-option="ping" checked><span class="slider"></span></span>Пингу</label>
+            <label style="display:flex;align-items:center;gap:6px"><span class="toggle"><input id="bestOfBestSortYoutube" type="checkbox" data-best-option="youtube" checked><span class="slider"></span></span>Доступности YouTube</label>
+            <label style="display:flex;align-items:center;gap:6px"><span class="toggle"><input id="bestOfBestSortTelegram" type="checkbox" data-best-option="telegram" checked><span class="slider"></span></span>Доступности Telegram</label>
+            <label style="display:flex;align-items:center;gap:6px"><span class="toggle"><input id="bestOfBestSortAi" type="checkbox" data-best-option="ai" checked><span class="slider"></span></span>Доступности AI</label>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:10px">
+            <label style="display:flex;align-items:center;gap:6px"><span class="toggle"><input id="bestOfBestHideUntested" type="checkbox" data-best-option="hideUntested" checked><span class="slider"></span></span>Скрыть непротестированные серверы</label>
+            <label style="display:flex;align-items:center;gap:6px"><span class="toggle"><input id="bestOfBestHideFailed" type="checkbox" data-best-option="hideFailed"><span class="slider"></span></span>Скрыть серверы, не прошедшие проверку</label>
+          </div>
+          <p style="font-size:var(--fs-sm);color:var(--muted)">Сначала успешные проверки выбранных сервисов, при равенстве — меньший пинг, если он включён. Рейтинг учитывает результаты за последние 6 часов. Отрицательные результаты скрываются только по включённым критериям; пропущенные и неподтверждённые не считаются провалом. Серверы в пуле остаются видимыми при фильтрации.</p>
           <div id="bestOfBestCount" style="margin-bottom:8px">В пуле: 0</div>
+          <div id="bestOfBestUnavailable" hidden style="margin-bottom:8px"><span id="bestOfBestUnavailableCount"></span> <button type="button" class="btn btn-sm" onclick="removeUnavailableBestOfBestMembers()">Убрать из состава</button></div>
+          <div id="bestOfBestVisibleCount" style="font-size:var(--fs-sm);color:var(--muted);margin-bottom:8px"></div>
           <div id="bestOfBestCandidates" style="max-height:380px;overflow:auto"></div>
-          <button class="btn btn-accent btn-sm" id="bestOfBestSave" onclick="saveBestOfBest()">Сохранить и применить</button>
+          <div id="bestOfBestEmpty" hidden style="margin-bottom:10px">Нет серверов, соответствующих поиску и фильтрам</div>
+          <div style="font-size:var(--fs-sm);color:var(--muted);margin-bottom:10px">Отметка «Плохой» ставит сервер в конец списка и сохраняется в этом браузере.</div>
+          <button class="btn btn-accent btn-sm" id="bestOfBestSave" onclick="saveBestOfBest()" disabled>Сохранить и применить</button>
         </div>
       </section>
       <section class="section-panel" data-section="maintenance" data-od-id="sec-maintenance">
@@ -2623,7 +2620,9 @@ const LONG_OPERATIONS = [
   [/^\/api\/geobases\/(?:analyze|sync)$/, 'Обработка GeoBase…'],
   [/^\/api\/routing\/(?:apply|reset)$/, 'Применение маршрутизации…'],
   [/^\/api\/routing-presets\/apply$/, 'Применение пресета…'],
+  [/^\/api\/automation\/best-of-best$/, 'Применение пула «Лучшие из лучших»…'],
   [/^\/api\/core\/(?:start|restart)$/, 'Запуск ядра…'],
+  [/^\/api\/core\/cleanup$/, 'Очистка памяти Mihomo…'],
   [/^\/api\/update\/(?:check|apply)$/, 'Обновление Mihomo…'],
   [/^\/api\/profiles\/import$/, 'Импорт профилей…'],
   [/^\/api\/backups\/(?:create|restore|webdav-upload|webdav-download)$/, 'Операция с резервной копией…'],
@@ -2633,6 +2632,7 @@ const LONG_OPERATIONS = [
   [/^\/api\/substore-lite\/apply$/, 'Применение Sub-Store…'],
 ];
 function operationSection(path) {
+  if (path === '/api/automation/best-of-best') return 'best-of-best';
   if (/^\/api\/(subscriptions|profiles)/.test(path)) return 'profiles';
   if (/^\/api\/(routing|routing-presets|geobases|geo)/.test(path)) return 'routing';
   if (/^\/api\/(dns|diagnostics\/dns|unlock-check)/.test(path)) return path.includes('unlock') ? 'unlock' : 'diag-network';
@@ -2722,6 +2722,30 @@ function apiAction(method, path, body, successMsg, reloadFn) {
     if (reloadFn) reloadFn();
     return r;
   }).catch(() => {});
+}
+
+let coreResetPending = false;
+async function runCoreReset(cleanup) {
+  if (coreResetPending) return;
+  coreResetPending = true;
+  const buttons = ['coreRestartButton','coreCleanupButton'].map(id => document.getElementById(id));
+  buttons.forEach(button => setButtonPending(button,true));
+  const result = document.getElementById('coreResetResult');
+  result.textContent = t('Перезапуск процесса Mihomo…');
+  try {
+    const response = cleanup
+      ? await api('POST','/api/core/cleanup',null)
+      : await api('POST','/api/core/restart',null);
+    const memory = value => Number.isFinite(value) ? fmtBytes(value * 1024) : '—';
+    result.textContent = `${t('Процесс Mihomo перезапущен')}. PID: ${response.previous_pid ?? '—'} → ${response.pid ?? '—'}. RSS: ${memory(response.rss_before_kb)} → ${memory(response.rss_after_kb)}. ${t('Соединения сброшены')}.`;
+    showToast('success',t(cleanup ? 'Очистка выполнена' : 'Ядро перезапущено'));
+    refreshDashboard();
+  } catch (error) {
+    result.textContent = error.message || t('Перезапуск не выполнен');
+  } finally {
+    coreResetPending = false;
+    buttons.forEach(button => setButtonPending(button,false));
+  }
 }
 
 let activeProfileSelection = null;
@@ -3437,6 +3461,16 @@ function t(ru) {
   return ru;
 }
 const I18N = {
+  'Порты назначения':'Destination ports',
+  'Приоритет нового правила':'New rule priority',
+  'В конец списка':'End of list','В начало списка':'Start of list',
+  'Порты 1–65535 через запятую, диапазоны через дефис. Совпадает любой порт из списка; протокол и домены/IP — дополнительные условия. Пустые домены/IP: глобальное правило для трафика Mihomo. Пустые порты: все порты.':'Comma-separated ports 1–65535, hyphenated ranges. Any listed port matches; protocol and domains/IPs are additional conditions. Empty domains/IPs: global rule for Mihomo traffic. Empty ports: all ports.',
+  'DIRECT отправляет трафик напрямую через Mihomo, а не исключает его из перехвата. Правила проверяются сверху вниз до первого совпадения; маршруты устройств имеют приоритет. Сохранение применяет правила и переподключает текущие соединения.':'DIRECT sends traffic directly through Mihomo; it does not bypass interception. Rules are checked top to bottom until the first match; device routes take precedence. Saving applies rules and reconnects current connections.',
+  'Приоритет правил: сверху вниз. Используйте ↑ и ↓ для изменения порядка.':'Rule priority: top to bottom. Use ↑ and ↓ to change the order.',
+  'Выше по приоритету':'Move up in priority','Ниже по приоритету':'Move down in priority',
+  'Глобально (все адреса)':'Global (all addresses)',
+  'Укажите порты 1–65535 или возрастающий диапазон, например 12000-64000':'Enter ports 1–65535 or an ascending range, e.g. 12000-64000',
+  'Не более 256 портов/диапазонов и 4096 символов':'At most 256 ports/ranges and 4096 characters',
   // Nav group labels
   'Обзор':'Overview','Профили и подписки':'Profiles & Subscriptions','Маршрутизация':'Routing',
   'Mihomo':'Mihomo','Автоматизация':'Automation','Диагностика':'Diagnostics','Администрирование':'Administration',
@@ -3519,6 +3553,11 @@ const I18N = {
   'пустой ответ':'empty response','недоступно':'unavailable',
   'Результат':'Result','Закрыть':'Close',
   'Ядро запущено':'Core started','Ядро перезапущено':'Core restarted','Маршруты применены':'Routes applied',
+  'Очистить память':'Clear memory','Перезапуск процесса Mihomo…':'Restarting Mihomo process…',
+  'Очистка памяти Mihomo…':'Cleaning Mihomo memory…',
+  'Процесс Mihomo перезапущен':'Mihomo process restarted','Соединения сброшены':'Connections reset',
+  'Очистка выполнена':'Cleanup completed','Перезапуск не выполнен':'Restart failed',
+  'Очистка памяти полностью перезапускает Mihomo и обрывает все его соединения. Новый процесс снова выделит память под правила и трафик.':'Memory cleanup fully restarts Mihomo and disconnects all its connections. The new process allocates memory for rules and traffic again.',
   'Подписки обновляются':'Subscriptions refreshing','Бенчмарк остановлен':'Benchmark stopped','Бенчмарк уже завершён':'Benchmark already completed',
   'Каталог обновляется':'Catalog refreshing','Файрвол запущен':'Firewall started',
   'Fake-IP кэш сброшен':'Fake-IP cache flushed','DNS кэш сброшен':'DNS cache flushed',
@@ -3731,6 +3770,10 @@ const I18N = {
   'Параметры поиска серверов':'Server search parameters','Когда остановиться':'When to stop',
   'Проверить всю область':'Check complete scope','Найти N подходящих':'Find N good servers','Все: Ping+YT+TG+AI':'All: Ping+YT+TG+AI',
   'Стоп после сбоя YT/TG':'Stop after YT/TG failure',
+  'Считать нерабочим без Ping':'Reject servers without Ping',
+  'Полная проверка Ping':'Full Ping check',
+  'Проверка остановлена: резерв памяти':'Check stopped: memory reserve',
+  'По умолчанию Ping — один HTTPS-запрос через VPN. Полная проверка добавляет ICMP и TCP и занимает больше времени. «Без Ping» пропускает YT/TG/AI, если выбранная проверка не дала ни одного ответа. В расширенном «Найти N» всегда используется отдельный минимальный HTTPS-отсев.':'By default, Ping is one HTTPS request through the VPN. Full checking adds ICMP and TCP and takes longer. Reject without Ping skips YT/TG/AI when no selected Ping check responds. Advanced Find N always uses its separate minimal HTTPS preflight.',
   'Запустить поиск':'Start search','Поиск выбранных':'Search selection','Поиск подписки':'Search subscription','Поиск группы':'Search group','Поиск этого сервера':'Search this server','Поиск Dead Servers':'Search Dead Servers',
   'Проверить сервисы':'Check services','Параметры проверки сервисов':'Service check parameters','Подробности проверки':'Check details',
   'Расширенный поиск (все серверы)':'Advanced search (all servers)','Запустить расширенный поиск':'Start advanced search','Совместимость нативных тестов':'Native test compatibility',
@@ -3743,7 +3786,7 @@ const I18N = {
   'Все кнопки поиска используют эти параметры; область задаётся кнопкой: сервер, подписка, группа, выбранные или все серверы.':'All search buttons share these parameters; the button sets the scope: one server, subscription, group, selection, or all servers.',
   'Вся область: ping, страница канала YouTube @MrBeast и 3 превью, медиа Telegram и регион AI Studio; ограничить сервисы нельзя. Опция прекращает дальнейшие проверки сервисов этого сервера после сбоя YouTube или Telegram, а не поиск всей области; без неё выполняются все проверки. Даже если все ping провалились, проверка YouTube продолжается. Сбой ping сам по себе не доказывает недоступность сервера. Найти N: только последовательные YT, YT+TG или YT+TG+AI; остановка цепочки после сбоя YouTube/Telegram обязательна, независимый выбор сервисов недоступен. Поиск N частичный: остановка по цели или исчерпанию кандидатов; непроверенные и отсеянные предпроверкой не считаются провалами сервисов. Дубликаты объединяются; история задаёт только приоритет, найденные серверы всегда проверяются заново.':'Complete scope: ping, the YouTube @MrBeast channel page and 3 thumbnails, Telegram media, and the AI Studio region; limiting services is unavailable. This option stops subsequent service checks for that server after a YouTube or Telegram failure, not the whole scope search; without it all checks run. Even if all ping checks fail, YouTube is still tested. Ping failure alone does not prove unreachability. Find N: only sequential YT, YT+TG, or YT+TG+AI; stopping the pipeline after a YouTube/Telegram failure is mandatory, independent service selection is unavailable. Find N is partial: it stops at the target or candidate exhaustion; untested and preflight-rejected candidates are not service failures. Duplicates are merged; history only sets priority, and found servers are always retested.',
   'Найти N исключает Dead Servers из выбранной области. Отдельный поиск Dead Servers всегда проверяет всю область и все сервисы с выбранной политикой сбоя; автоматического восстановления нет. Параметры общие, в том числе для диагностики Dead Servers.':'Find N excludes Dead Servers from the selection. Explicit Dead Servers search always checks the complete scope and all services using the selected failure policy; it never restores automatically. Parameters are shared, including for Dead Servers diagnostics.',
-  'Канал и превью YouTube (контракт 1) проверяются параллельно допущенными работниками. У каждого кандидата своё временное ядро и файлы; лимиты декодера прежние. Нативный YouTube (контракт 7) и общая сессия Telegram остаются последовательными. Обычная проверка с явной политикой: min(запрошено, кандидаты) работников или HTTP 503; оценка для 4 работников: 272 МиБ доступной памяти. В поиске N допуск также ограничен оставшимися местами цели.':'YouTube channel and thumbnails (contract 1) run in parallel across admitted workers. Each candidate has its own private temporary core and files; decoder limits are unchanged. Native YouTube (contract 7) and the shared Telegram session remain serialized. Ordinary explicit-policy checks require min(requested, candidates) workers or HTTP 503; 4 workers need an estimated 272 MiB available memory. Find N admission is also bounded by remaining target slots.',
+  'Канал и превью YouTube проверяются параллельно: отдельное экономное ядро на кандидата. Три работника требуют оценочно 128 МиБ доступной памяти, включая резерв 80 МиБ. При падении ниже резерва проверка прерывается, ядра завершаются и память освобождается. Telegram и нативное видео остаются последовательными. Запрошенное число работников допускается целиком или возвращается HTTP 503; в поиске N также учитываются оставшиеся места цели.':'YouTube channel and thumbnails run in parallel using a private economical core per candidate. Three workers need an estimated 128 MiB available, including an 80 MiB reserve. Falling below the reserve cancels the check, reaps cores and releases memory. Telegram and native video remain serialized. Ordinary checks admit the requested worker count or return HTTP 503; Find N also respects remaining target slots.',
   'Нативные пост-действия (совместимость)':'Native post-actions (compatibility)',
   'Настройки автоматических действий относятся к прежним нативным тестам; проверка превью их не запускает. Поиск доступности, как всей области, так и N серверов, не запускает поднятие серверов, перенос в Dead Servers или AutoSelect.':'Automatic-action settings apply to legacy native tests; thumbnail checks do not trigger them. Availability search, for both complete scope and N servers, never triggers server promotion, movement to Dead Servers, or AutoSelect.',
   'Исключено Dead Servers':'Excluded Dead Servers','Все выбранные, включая Dead Servers':'All selected, including Dead Servers','Нет кандидатов: Dead Servers исключены':'No candidates: Dead Servers excluded',
@@ -4153,13 +4196,13 @@ function trackRoutingDraft(event) {
 }
 function routingEditActive() {
   const active = document.activeElement;
-  return routingRuleDraftDirty || routingSettingsDraftDirty || editingCell !== null || editingRuleIndex !== null || parovozikConsistDirty
+  return routingRuleDraftDirty || routingSettingsDraftDirty || editingCell !== null || editingRuleIndex !== null
     || document.querySelector('.routing-target-select.open') !== null
     || (active?.matches('input,select,textarea') && active.closest('.section-panel[data-section="routing"]'));
 }
 function routingSettingsEditActive() {
   const active = document.activeElement;
-  return routingSettingsDraftDirty || parovozikConsistDirty
+  return routingSettingsDraftDirty
     || document.querySelector('#rTorrentSocksTarget')?.closest('.custom-select.open') !== null
     || (active?.matches('input,select,textarea') && active.closest('#splitRoutingSection, #experimentalFeatures'));
 }
@@ -5032,10 +5075,48 @@ function collectRuleFromForm() {
     domains,
     ips,
     services: [],
-    ports: (document.getElementById('rulePorts')?.value || '').split(',').map(s=>s.trim()).filter(Boolean),
+    ports: parseRoutingPorts(document.getElementById('rulePorts')?.value || ''),
     network: document.getElementById('ruleNetwork')?.value || 'any',
     port_mode: document.getElementById('rulePortMode')?.value || 'include'
   };
+}
+
+function parseRoutingPorts(value) {
+  const text = String(value || '');
+  if (new TextEncoder().encode(text).length > 4096) throw new Error(t('Не более 256 портов/диапазонов и 4096 символов'));
+  const ports = [];
+  let count = 0;
+  // Keep legacy source/inbound specifications round-trippable; ordinary input
+  // without prefixes is always the remote destination port.
+  for (const item of text.split(/[,;\n]/).map(s=>s.trim()).filter(Boolean)) {
+    const prefixed = item.match(/^(src-port:|in-port:)(.*)$/);
+    const prefix = prefixed?.[1] || '';
+    const body = prefixed ? prefixed[2] : item;
+    if (prefix && !body.trim()) throw new Error(t('Укажите порты 1–65535 или возрастающий диапазон, например 12000-64000'));
+    const previousCount = count;
+    for (const spec of body.split('/').map(s=>s.trim()).filter(Boolean)) {
+      if (++count > 256) throw new Error(t('Не более 256 портов/диапазонов и 4096 символов'));
+      const match = spec.match(/^(\d+)\s*(?:-\s*(\d+))?$/);
+      const start = Number(match?.[1]), end = Number(match?.[2] || match?.[1]);
+      if (!match || start < 1 || end > 65535 || start > end) throw new Error(t('Укажите порты 1–65535 или возрастающий диапазон, например 12000-64000'));
+      const canonical = prefix + (start === end ? String(start) : `${start}-${end}`);
+      if (!ports.includes(canonical)) ports.push(canonical);
+    }
+    if (count === previousCount) throw new Error(t('Укажите порты 1–65535 или возрастающий диапазон, например 12000-64000'));
+  }
+  if (text.trim() && !ports.length) throw new Error(t('Укажите порты 1–65535 или возрастающий диапазон, например 12000-64000'));
+  return ports;
+}
+
+function validateRulePorts(input = document.getElementById('rulePorts')) {
+  if (!input) return false;
+  let error = '';
+  try { parseRoutingPorts(input.value); } catch (err) { error = err.message; }
+  input.setCustomValidity(error);
+  input.setAttribute('aria-invalid', String(!!error));
+  const box = document.getElementById('rulePortsError');
+  if (box) { box.textContent = error; box.style.display = error ? '' : 'none'; }
+  return !error;
 }
 
 function routingServerByTarget(target) {
@@ -5107,8 +5188,6 @@ function refreshTorrentSocksTargetSelect(selectedTarget) {
   if (!select) return;
   const selected = selectedTarget || select.value || 'direct';
   const base = [['direct','DIRECT'],['active',t('Текущий активный VPN')],['reject','REJECT']];
-  if (MOCK.split_routing?.parovozik_enabled === true) base.push(['parovozik',t('Паровозик VPN')]);
-  else if (selected === 'parovozik') base.push(['parovozik',t('Паровозик VPN')]);
   select.innerHTML = base.map(([value,label]) => `<option value="${attrEscape(value)}" ${selected===value?'selected':''}>${htmlEscape(label)}</option>`).join('') + routingTargetServerOptions(selected);
   select.value = selected;
   if (select.dataset.customSelectEnhanced) refreshCustomSelects();
@@ -5132,16 +5211,29 @@ function populateFormFromRule(rule) {
   safeValue('ruleNetwork', rule.network || 'any');
   safeValue('rulePorts', (rule.ports || []).join(','));
   safeValue('rulePortMode', rule.port_mode || 'include');
-  const entries = (rule.domains || []).concat(rule.ips || []);
+  const entries = (rule.domains || []).concat(rule.ips || []).concat((rule.services || []).map(s=>'geosite:'+s));
+  if (!entries.length && rule.pattern) entries.push(rule.pattern);
   safeValue('ruleEntries', entries.join('\n'));
+  validateRulePorts();
 }
 
+let routingRulesSaving = false;
+let routingRulesRevision = null;
+let routingRulesCommitted = null;
+let routingEditingCommitted = null;
+let routingRevisionConflict = false;
+
 function submitRoutingRule() {
+  if (routingRevisionConflict) { showToast('warning',t('Правило изменено в другом окне. Выберите правило заново или отмените редактирование.')); return; }
+  if (routingRulesSaving) return;
+  routingEditingCommitted = editingRuleIndex;
+  if (!validateRulePorts()) { document.getElementById('rulePorts')?.focus(); return; }
   const rule = collectRuleFromForm();
   if (editingRuleIndex !== null) {
     rule.enabled = MOCK.routing_rules[editingRuleIndex].enabled;
-    MOCK.routing_rules[editingRuleIndex] = rule;
-    editingRuleIndex = null;
+    MOCK.routing_rules[editingRuleIndex] = {...MOCK.routing_rules[editingRuleIndex], ...rule};
+  } else if (document.getElementById('rulePosition')?.value === 'first') {
+    MOCK.routing_rules.unshift(rule);
   } else {
     MOCK.routing_rules.push(rule);
   }
@@ -5153,10 +5245,13 @@ function submitRoutingRule() {
 }
 
 function editRoutingRule(idx) {
+  if (routingRulesSaving) return;
+  routingRevisionConflict = false;
   if (idx < 0 || idx >= MOCK.routing_rules.length) return;
   editingRuleIndex = idx;
   const rule = MOCK.routing_rules[idx];
   populateFormFromRule(rule);
+  document.getElementById('rulePositionField').style.display = 'none';
   document.getElementById('ruleFormTitle').textContent = t('Редактировать правило');
   document.getElementById('ruleSubmitBtn').textContent = '💾 ' + t('Сохранить');
   document.getElementById('ruleCancelEditBtn').style.display = '';
@@ -5166,6 +5261,8 @@ function editRoutingRule(idx) {
 }
 
 function cancelEditRule() {
+  if (routingRulesSaving) return;
+  routingRevisionConflict = false;
   editingRuleIndex = null;
   resetRuleForm();
   routingRuleDraftDirty = false;
@@ -5179,6 +5276,9 @@ function resetRuleForm() {
   safeValue('ruleNetwork', 'any');
   safeValue('rulePorts', '');
   safeValue('rulePortMode', 'include');
+  safeValue('rulePosition', 'last');
+  document.getElementById('rulePositionField').style.display = '';
+  validateRulePorts();
   safeValue('ruleEntries', '');
   document.getElementById('ruleFormTitle').textContent = t('Добавить правило');
   document.getElementById('ruleSubmitBtn').textContent = '+ ' + t('Добавить правило');
@@ -5186,12 +5286,26 @@ function resetRuleForm() {
 }
 
 function toggleRoutingRule(idx, enabled) {
+  if (routingRulesSaving) return;
   if (idx < 0 || idx >= MOCK.routing_rules.length) return;
   MOCK.routing_rules[idx].enabled = enabled;
   saveRoutingRulesToBackend(() => loadRouting({force:true}));
 }
 
+function moveRoutingRule(idx, direction) {
+  if (routingRulesSaving) return;
+  const next = idx + direction;
+  if (![1,-1].includes(direction) || next < 0 || next >= MOCK.routing_rules.length) return;
+  const rule = MOCK.routing_rules[idx], other = MOCK.routing_rules[next];
+  if (!rule || !other) return;
+  [MOCK.routing_rules[idx], MOCK.routing_rules[next]] = [other, rule];
+  if (editingRuleIndex === idx) editingRuleIndex = next;
+  else if (editingRuleIndex === next) editingRuleIndex = idx;
+  saveRoutingRulesToBackend(() => loadRouting({force:true}));
+}
+
 function deleteRoutingRule(idx) {
+  if (routingRulesSaving) return;
   if (idx < 0 || idx >= MOCK.routing_rules.length) return;
   closeCustomSelects();
   const removed = MOCK.routing_rules.splice(idx, 1)[0];
@@ -5211,6 +5325,7 @@ function showUndoRoutingRule(idx, rule) {
   routingUndoTimer = setTimeout(() => { box.style.display = 'none'; box._rule = null; }, 15000);
 }
 function restoreRoutingRule(idx) {
+  if (routingRulesSaving) return;
   const box = document.getElementById('routingUndo');
   const rule = box && box._rule;
   if (!rule) return;
@@ -5221,7 +5336,16 @@ function restoreRoutingRule(idx) {
 }
 
 function saveRoutingRulesToBackend(afterFn) {
-  api('POST','/api/routing/rules',{rules:MOCK.routing_rules, apply:true}).then(result=>{
+  if (routingRulesSaving) return;
+  routingRulesSaving = true;
+  const table = document.getElementById('routingRulesBody');
+  if (table) table.inert = true;
+  const submit = document.getElementById('ruleSubmitBtn');
+  if (submit) submit.disabled = true;
+  return api('POST','/api/routing/rules',{rules:MOCK.routing_rules, expected_revision:routingRulesRevision, apply:true}).then(result=>{
+    routingRulesRevision = result.rules_revision ?? routingRulesRevision;
+    if (Array.isArray(result.rules)) MOCK.routing_rules = result.rules;
+    routingRulesCommitted = structuredClone(MOCK.routing_rules);
     if (result.applied === false) {
       showToast('warning', `${t('Правила сохранены, но не применены')}: ${result.activation_error || t('требуется повторное применение')}`);
     } else {
@@ -5230,8 +5354,32 @@ function saveRoutingRulesToBackend(afterFn) {
     }
     if (afterFn) afterFn();
   }).catch(error => {
+    if (routingRulesCommitted) MOCK.routing_rules = structuredClone(routingRulesCommitted);
+    editingRuleIndex = routingEditingCommitted ?? editingRuleIndex;
+    renderRoutingRules(MOCK.routing_rules);
     showToast('error', error.message || t('Ошибка'));
-    loadRouting({force:true});
+    // Refresh the revision without replacing the user's form draft. A subsequent
+    // save must be based on the newly committed list, not the rejected snapshot.
+    if (error.status === 409 || /routing rules changed/.test(error.message || '')) {
+      return api('GET','/api/routing').then(data => {
+        const oldRule = editingRuleIndex === null ? null : routingRulesCommitted?.[editingRuleIndex];
+        MOCK.routing_rules = data.rules || [];
+        routingRulesRevision = data.rules_revision ?? null;
+        routingRulesCommitted = structuredClone(MOCK.routing_rules);
+        if (oldRule) {
+          const matches = MOCK.routing_rules.map((rule,index)=>JSON.stringify(rule)===JSON.stringify(oldRule)?index:-1).filter(index=>index>=0);
+          if (matches.length===1) editingRuleIndex = matches[0];
+          else routingRevisionConflict = true;
+          if (matches.length!==1) showToast('warning', t('Правило изменено в другом окне. Черновик сохранён; выберите правило для редактирования заново.'));
+        }
+        renderRoutingRules(MOCK.routing_rules);
+      }).catch(refreshError=>showToast('error',refreshError.message || t('Ошибка')));
+    }
+  }).finally(() => {
+    routingRulesSaving = false;
+    routingEditingCommitted = null;
+    if (submit) submit.disabled = false;
+    if (table) table.inert = false;
   });
 }
 
@@ -5277,9 +5425,9 @@ function renderRoutingRules(data) {
   const matchTarget = (MOCK.split_routing && MOCK.split_routing.match_target) || 'proxy';
   const matchLabel = matchTarget === 'direct' ? 'Всё напрямую' : 'Всё через VPN';
   const matchBadge = matchTarget === 'direct' ? 'success' : 'info';
-  const rulesCount = (data||[]).filter(r => r.kind !== 'managed-parovozik').length;
-  // MATCH row: immutable first row, target dropdown locked when 0 rules
-  let html = `<tr style="opacity:0.6;background:var(--surface2)">
+  const rulesCount = (data||[]).length;
+  // MATCH is the final rule, also shown last in the priority table.
+  const matchRow = `<tr style="opacity:0.6;background:var(--surface2)">
     <td>—</td>
     <td><strong>${t(matchLabel)}</strong></td>
     <td class="mono" style="font-size:11px;color:var(--muted)">MATCH (финальное правило)</td>
@@ -5291,22 +5439,18 @@ function renderRoutingRules(data) {
     <td>—</td>
     <td></td>
   </tr>`;
+  let html = '';
   const ed = editingCell; // shorthand
   html += (data||[]).map((r,i) => {
     const entries = (r.domains||[]).concat(r.ips||[]).concat((r.services||[]).map(s=>'geosite:'+s));
     const entriesStr = entries.join(', ') || '—';
-    const entriesShort = entries.slice(0,3).join(', ') + (entries.length>3?'…':'');
+    const entriesShort = entries.slice(0,3).join(', ') + (entries.length>3?'…':'') || t('Глобально (все адреса)');
     const ports = (r.ports||[]);
     const portMode = r.port_mode || 'include';
     const portLabel = ports.length ? `${ports.join(',')} ${portMode==='exclude'?'[кроме]':'[только]'}` : '—';
     const net = r.network || 'any';
     const target = routingTargetPresentation(r.target);
     const targetBadge = r.target==='reject' || target.stale?'danger':r.target==='direct'?'success':'info';
-    if (r.kind === 'managed-parovozik') {
-      if (MOCK.split_routing?.parovozik_enabled !== true) return '';
-      const managedTarget = r.target === 'direct' ? 'DIRECT' : 'parovozik-vpn';
-      return `<tr class="managed-routing-rule"><td><span class="badge">🚂 managed</span></td><td><strong>${htmlEscape(r.name)}</strong></td><td class="mono" style="font-size:12px">${htmlEscape(entriesShort)}</td><td><span class="badge badge-${targetBadge}">${managedTarget}</span></td><td>—</td><td>any</td><td>—</td></tr>`;
-    }
 
     // Target cell: <select> if editing, otherwise clickable span
     let targetCell;
@@ -5335,13 +5479,17 @@ function renderRoutingRules(data) {
     <td><span class="cell-edit" onclick="inlineEditName(${i},this)" title="${attrEscape(t('Нажми для редактирования'))}">${htmlEscape(r.name||'—')}</span></td>
     <td class="mono" style="font-size:12px"><span class="cell-edit" onclick="inlineEditEntries(${i},this)" title="${attrEscape(entriesStr)}">${htmlEscape(entriesShort)}</span></td>
     <td>${targetCell}</td>
-    <td class="mono" style="font-size:12px"><span class="cell-edit" onclick="inlineEditPorts(${i},this)">${portLabel}</span></td>
+    <td class="mono" style="font-size:12px"><span class="cell-edit" onclick="inlineEditPorts(${i},this)">${htmlEscape(portLabel)}</span></td>
     <td style="font-size:12px">${protoCell}</td>
     <td style="white-space:nowrap">
+      <button class="btn btn-sm" type="button" onclick="editRoutingRule(${i})" title="${t('Редактировать правило')}" aria-label="${t('Редактировать правило')}">✎</button>
+      <button class="btn btn-sm" type="button" onclick="moveRoutingRule(${i},-1)" ${i===0?'disabled':''} title="${t('Выше по приоритету')}" aria-label="${t('Выше по приоритету')}">↑</button>
+      <button class="btn btn-sm" type="button" onclick="moveRoutingRule(${i},1)" ${i===data.length-1?'disabled':''} title="${t('Ниже по приоритету')}" aria-label="${t('Ниже по приоритету')}">↓</button>
       <button class="btn btn-sm btn-danger" type="button" onclick="deleteRoutingRule(${i})" title="${t('Удалить правило')}">${t('Удалить')}</button>
     </td>
   </tr>`}).join('');
   html += renderManagedRoutingRules(MOCK.managed_routing_rules, MOCK.geobase_requires_apply === true);
+  html += matchRow;
   body.innerHTML = html;
   enhanceCustomSelects(body);
 }
@@ -5352,6 +5500,7 @@ function renderRoutingRules(data) {
 var editingCell = null;
 
 function inlineStartEdit(row, col) {
+  if (routingRulesSaving) return;
   editingCell = { row, col };
   renderRoutingRules(MOCK.routing_rules);
   const body = document.getElementById('routingRulesBody');
@@ -5379,6 +5528,7 @@ function inlineCancelEdit() {
 }
 
 function inlineSaveSelect(idx, field, value) {
+  if (routingRulesSaving) return;
   editingCell = null;
   const r = MOCK.routing_rules[idx]; if (!r) return;
   if (field === 'target') r.target = value;
@@ -5391,12 +5541,14 @@ function inlineSaveAndReload(idx) {
 }
 
 function inlineEditName(idx, el) {
+  if (routingRulesSaving) return;
   const r = MOCK.routing_rules[idx]; if (!r) return;
   const td = el.closest('td');
-  td.innerHTML = `<input type="text" value="${r.name||''}" style="width:100%;padding:2px 6px;border:1px solid var(--accent);border-radius:4px;background:var(--surface1);color:var(--text);font-size:13px">`;
+  td.innerHTML = `<input type="text" value="${attrEscape(r.name||'')}" style="width:100%;padding:2px 6px;border:1px solid var(--accent);border-radius:4px;background:var(--surface1);color:var(--text);font-size:13px">`;
   const inp = td.querySelector('input');
   inp.focus(); inp.select();
   const save = () => {
+    if (routingRulesSaving) return;
     r.name = inp.value.trim() || 'Custom rule';
     inlineSaveAndReload(idx);
   };
@@ -5405,13 +5557,15 @@ function inlineEditName(idx, el) {
 }
 
 function inlineEditEntries(idx, el) {
+  if (routingRulesSaving) return;
   const r = MOCK.routing_rules[idx]; if (!r) return;
   const td = el.closest('td');
   const entries = (r.domains||[]).concat(r.ips||[]).concat((r.services||[]).map(s=>'geosite:'+s));
-  td.innerHTML = `<textarea style="width:100%;min-width:200px;padding:4px 6px;border:1px solid var(--accent);border-radius:4px;background:var(--surface1);color:var(--text);font-size:12px;font-family:monospace" rows="3">${entries.join('\n')}</textarea>`;
+  td.innerHTML = `<textarea style="width:100%;min-width:200px;padding:4px 6px;border:1px solid var(--accent);border-radius:4px;background:var(--surface1);color:var(--text);font-size:12px;font-family:monospace" rows="3">${htmlEscape(entries.join('\n'))}</textarea>`;
   const ta = td.querySelector('textarea');
   ta.focus();
   const save = () => {
+    if (routingRulesSaving) return;
     const lines = ta.value.split(/\n|,/).map(s=>s.trim()).filter(Boolean);
     r.domains = lines.filter(e => classifyEntry(e) === 'domain');
     r.ips = lines.filter(e => classifyEntry(e) === 'ip');
@@ -5426,12 +5580,13 @@ function inlineEditEntries(idx, el) {
 }
 
 function inlineEditPorts(idx, el) {
+  if (routingRulesSaving) return;
   const r = MOCK.routing_rules[idx]; if (!r) return;
   const td = el.closest('td');
   const ports = (r.ports||[]).join(',');
   const mode = r.port_mode || 'include';
   td.innerHTML = `<div style="display:flex;gap:4px;align-items:center">
-    <input type="text" value="${ports}" placeholder="80,443" style="width:80px;padding:2px 4px;border:1px solid var(--accent);border-radius:4px;background:var(--surface1);color:var(--text);font-size:12px;font-family:monospace">
+    <input type="text" value="${attrEscape(ports)}" placeholder="80,443,12000-64000" maxlength="4096" style="width:160px;padding:2px 4px;border:1px solid var(--accent);border-radius:4px;background:var(--surface1);color:var(--text);font-size:12px;font-family:monospace">
     <select style="padding:2px 4px;border:1px solid var(--accent);border-radius:4px;background:var(--surface1);color:var(--text);font-size:11px">
       <option value="include" ${mode==='include'?'selected':''}>только</option>
       <option value="exclude" ${mode==='exclude'?'selected':''}>кроме</option>
@@ -5442,16 +5597,20 @@ function inlineEditPorts(idx, el) {
   inp.focus();
   let saved = false;
   const save = () => {
-    if (saved) return;
+    if (saved || routingRulesSaving) return;
+    let ports;
+    try { ports = parseRoutingPorts(inp.value); }
+    catch (error) { inp.setCustomValidity(error.message); inp.reportValidity(); return; }
     saved = true;
-    r.ports = inp.value.split(',').map(s=>s.trim()).filter(Boolean);
+    r.ports = ports;
     r.port_mode = sel.value;
     inlineSaveAndReload(idx);
   };
   inp.onblur = () => { if (!saved) setTimeout(save, 150); };
   sel.onchange = save;
   sel.onblur = () => { if (!saved) setTimeout(save, 150); };
-  inp.onkeydown = (e) => { if (e.key==='Enter') save(); if (e.key==='Escape') loadRouting({force:true}); };
+  inp.oninput = () => inp.setCustomValidity('');
+  inp.onkeydown = (e) => { if (e.key==='Enter') save(); if (e.key==='Escape') { saved = true; loadRouting({force:true}); } };
 }
 
 function changeMatchTarget(target) {
@@ -6429,7 +6588,7 @@ function updateBenchStatus(data) {
   if (counterEl) counterEl.textContent = done + '/' + total;
   const currentEl = document.getElementById('benchCurrent');
   if (currentEl) {
-    currentEl.textContent = !running && total ? t('Проверка завершена') : current;
+    currentEl.textContent = data?.memory_pressure ? t('Проверка остановлена: резерв памяти') : !running && total ? t('Проверка завершена') : current;
     currentEl.style.whiteSpace = 'nowrap';
   }
   const results = data && Array.isArray(data.results) ? data.results : [];
@@ -6589,9 +6748,9 @@ function saveProfileTestSettings() {
   return apiAction('POST','/api/bench/settings',settings,t('Настройки сохранены'),loadProfileTestSettings);
 }
 
-let serverSearchParameters = {stop_mode:'complete_scope',target_good:5,required_services:'all',fail_fast:false};
+let serverSearchParameters = {stop_mode:'complete_scope',target_good:5,required_services:'all',fail_fast:false,reject_no_ping:false,full_ping:false};
 function syncServerSearchParameters(changed) {
-  const controls = {stop_mode:'benchSearchStopMode',target_good:'benchSearchTarget',required_services:'benchSearchServices',fail_fast:'benchSearchFailFast'};
+  const controls = {stop_mode:'benchSearchStopMode',target_good:'benchSearchTarget',required_services:'benchSearchServices',fail_fast:'benchSearchFailFast',reject_no_ping:'benchRejectNoPing',full_ping:'benchFullPing'};
   const valid = (key, value) => key === 'stop_mode' ? ['complete_scope','find_n'].includes(value)
     : key === 'target_good' ? Number.isInteger(value) && value >= 1 && value <= 20
     : key === 'required_services' ? ['all','youtube','telegram','ai'].includes(value) : typeof value === 'boolean';
@@ -6604,10 +6763,10 @@ function syncServerSearchParameters(changed) {
         const stored = raw && raw.length <= 32 ? JSON.parse(raw) : null;
         if (valid(key, stored)) serverSearchParameters[key] = stored;
       } catch (_) {}
-      if (key === 'fail_fast') control.checked = serverSearchParameters[key];
+      if (['fail_fast','reject_no_ping','full_ping'].includes(key)) control.checked = serverSearchParameters[key];
       else control.value = String(serverSearchParameters[key]);
     } else if (changed === key) {
-      const value = key === 'fail_fast' ? control.checked : key === 'target_good' ? Number(control.value) : control.value;
+      const value = ['fail_fast','reject_no_ping','full_ping'].includes(key) ? control.checked : key === 'target_good' ? Number(control.value) : control.value;
       if (valid(key, value)) serverSearchParameters[key] = value;
     }
     try { localStorage.setItem('hr_search_'+key, JSON.stringify(serverSearchParameters[key])); } catch (_) {}
@@ -6652,6 +6811,8 @@ function startServerSearch(scope) {
   const findN = advanced && stopMode === 'find_n';
   const required_services = document.getElementById('benchSearchServices')?.value;
   const fail_fast = document.getElementById('benchSearchFailFast')?.checked === true;
+  const reject_no_ping = document.getElementById('benchRejectNoPing')?.checked === true;
+  const full_ping = document.getElementById('benchFullPing')?.checked === true;
   if (!['all','youtube','telegram','ai'].includes(required_services)) {
     showToast('error',t('Выберите нужные сервисы'));
     return;
@@ -6674,7 +6835,7 @@ function startServerSearch(scope) {
       return;
     }
     body.search = {target_good,required_services,fail_fast};
-  } else body.service_checks = {required_services,fail_fast};
+  } else body.service_checks = {required_services,fail_fast,...(reject_no_ping ? {reject_no_ping:true} : {}),...(full_ping ? {full_ping:true} : {})};
   api('POST','/api/bench/start', body).then(result => {
     window.benchIsGroup = !body.profile_ids || body.profile_ids.length > 1;
     if (hasSubscription) sortProfiles('results');
@@ -7069,47 +7230,181 @@ document.getElementById('directPolicyDevices')?.addEventListener('change', () =>
 document.getElementById('directPolicyOfflineDevices')?.addEventListener('change', () => { directPolicyEditing = true; });
 
 async function loadBestOfBest() {
+  if (bestOfBestSaving || bestOfBestDraftDirty) return;
+  const generation = ++bestOfBestGeneration;
   try {
     const data = await api('GET','/api/automation/best-of-best',undefined,true);
-    if (bestOfBestDraftDirty) return;
-    bestOfBestLimit = Number(data.max_candidates) || 16;
-    document.getElementById('bestOfBestEnabled').checked = data.settings?.enabled === true;
-    const selected = new Set(data.settings?.server_refs || []);
-    const selectedName = (data.candidates || []).find(server => server.ref === data.settings?.selected_ref);
-    document.getElementById('bestOfBestSelected').textContent = selectedName ? `Текущий выход: #${selectedName.id} · ${selectedName.name}` : 'Текущий выход: REJECT до успешной HTTPS-проверки';
-    document.getElementById('bestOfBestCandidates').innerHTML = (data.candidates || []).map(server =>
-      `<label data-best-search="${attrEscape(`#${server.id} ${server.name}`.toLowerCase())}" style="display:block;padding:6px"><input type="checkbox" data-best-ref="${attrEscape(server.ref)}" ${selected.has(server.ref)?'checked':''} ${server.dead && !selected.has(server.ref)?'disabled':''}> #${server.id} · ${htmlEscape(server.name)} · ${server.manual?'Ручной · ':''}${server.dead?'Dead · ':''}${server.passed}/3 · ${server.ping_ms == null ? '—' : `${server.ping_ms} ms`}</label>`
-    ).join('') || 'Проверенных серверов подписок пока нет';
-    filterBestOfBestCatalog();
-    updateBestOfBestCount();
-  } catch (_) { document.getElementById('bestOfBestSelected').textContent = 'Не удалось загрузить пул'; }
+    if (generation !== bestOfBestGeneration || bestOfBestSaving || bestOfBestDraftDirty) return;
+    renderBestOfBest(data);
+  } catch (_) {
+    if (generation === bestOfBestGeneration && !bestOfBestSaving && !bestOfBestDraftDirty) document.getElementById('bestOfBestState').textContent = 'Не удалось загрузить состояние пула';
+  }
+}
+function renderBestOfBest(data) {
+  const probe = data.runtime?.last_probe;
+  const labels = {https_passed:'HTTPS-проверка пройдена',upstream_unreachable:'HTTPS-проверка не прошла',no_eligible_member:'Нет доступного участника',selector_unavailable:'Селектор недоступен',selector_error:'Ошибка применения селектора',selector_rejected:'Селектор REJECT'};
+  const next = data.runtime?.next_attempt_unix;
+  safeSet('bestOfBestRuntime',probe ? `${labels[probe.outcome] || probe.outcome} · ${new Date(probe.timestamp*1000).toLocaleTimeString()}${next ? ` · следующая проверка: ${new Date(next*1000).toLocaleTimeString()}` : ''}` : 'Ожидание первой проверки после запуска');
+  const history = document.getElementById('bestOfBestTransitions');
+  if (history) history.innerHTML = (data.runtime?.transitions || []).slice(-20).map(event=>{
+    const server = (data.candidates || []).find(server=>server.ref===event.server_ref);
+    return `<div>${htmlEscape(new Date(event.timestamp*1000).toLocaleTimeString())} · ${htmlEscape(labels[event.outcome] || event.outcome)}${server ? ` · #${server.id} ${htmlEscape(server.name)}` : ''}</div>`;
+  }).join('') || 'История пока пуста';
+  bestOfBestLimit = Number(data.max_candidates) || 16;
+  bestOfBestAppliedEnabled = data.settings?.enabled === true;
+  document.getElementById('bestOfBestEnabled').checked = bestOfBestAppliedEnabled;
+  bestOfBestMembership = new Set(data.settings?.server_refs || []);
+  bestOfBestCatalog = (Array.isArray(data.candidates) ? data.candidates : []).filter(server => !server.dead);
+  const selectedName = bestOfBestCatalog.find(server => server.ref === data.settings?.selected_ref);
+  document.getElementById('bestOfBestSelected').textContent = !bestOfBestAppliedEnabled ? 'Пул выключен; состав сохранён'
+    : selectedName ? `Текущий выход: #${selectedName.id} · ${selectedName.name}` : 'Текущий выход: REJECT до успешной HTTPS-проверки';
+  document.getElementById('bestOfBestCandidates').innerHTML = bestOfBestCatalog.map(server =>
+    `<div data-best-search="${attrEscape(`#${server.id} ${server.name}`.toLowerCase())}" style="display:flex;align-items:flex-start;gap:8px;padding:6px;overflow-wrap:anywhere"><label style="display:flex;align-items:flex-start;gap:8px;flex:1;min-width:0"><input type="checkbox" data-best-ref="${attrEscape(server.ref)}" ${bestOfBestMembership.has(server.ref)?'checked':''}><span style="min-width:0">#${server.id} · ${htmlEscape(server.name)}${server.manual?' · Ручной':''}${bestOfBestChecksHtml(server)}</span></label><button type="button" class="btn btn-sm" data-best-bad="${attrEscape(server.ref)}"></button></div>`
+  ).join('');
+  setBestOfBestSaving(false);
+  filterBestOfBestCatalog();
+  updateBestOfBestCount();
+  updateBestOfBestState();
+}
+function updateBestOfBestState() {
+  const desired = document.getElementById('bestOfBestEnabled').checked;
+  document.getElementById('bestOfBestState').textContent = bestOfBestSaving ? 'Применение пула…'
+    : bestOfBestDraftDirty ? `Черновик: пул ${desired ? 'включён' : 'выключен'}; изменения ещё не применены — нажмите «Сохранить и применить»`
+    : bestOfBestAppliedEnabled ? 'Пул включён' : 'Пул выключен';
+}
+function setBestOfBestSaving(saving) {
+  bestOfBestSaving = saving;
+  setButtonPending(document.getElementById('bestOfBestSave'),saving,'Применение пула');
+  document.getElementById('bestOfBestEnabled').disabled = saving;
+  document.querySelectorAll('#bestOfBestCandidates input, #bestOfBestUnavailable button').forEach(input => { input.disabled = saving; });
+}
+function markBestOfBestDraft() {
+  bestOfBestDraftDirty = true;
+  ++bestOfBestGeneration;
+  updateBestOfBestState();
+}
+function removeUnavailableBestOfBestMembers() {
+  if (bestOfBestSaving) return;
+  const available = new Set(bestOfBestCatalog.map(server => server.ref));
+  bestOfBestMembership = new Set([...bestOfBestMembership].filter(ref => available.has(ref)));
+  markBestOfBestDraft();
+  updateBestOfBestCount();
 }
 async function saveBestOfBest() {
-  const server_refs = [...document.querySelectorAll('#bestOfBestCandidates input[data-best-ref]:checked')].map(input => input.dataset.bestRef);
+  if (bestOfBestSaving || document.getElementById('bestOfBestSave').disabled) return;
+  const server_refs = [...bestOfBestMembership];
   if (server_refs.length > bestOfBestLimit) return showToast('error',`Не более ${bestOfBestLimit} серверов; общий лимит маршрутов также учитывается`);
-  const button = document.getElementById('bestOfBestSave');
-  button.disabled = true;
+  const enabled = document.getElementById('bestOfBestEnabled').checked;
+  ++bestOfBestGeneration;
+  setBestOfBestSaving(true);
+  updateBestOfBestState();
   try {
-    await api('POST','/api/automation/best-of-best',{enabled:document.getElementById('bestOfBestEnabled').checked,server_refs});
+    const data = await api('POST','/api/automation/best-of-best',{enabled,server_refs});
     bestOfBestDraftDirty = false;
-    await loadBestOfBest();
-    showToast('success','Пул сохранён');
+    renderBestOfBest(data);
+    showToast('success',data.settings?.enabled === true ? 'Пул включён, состав применён' : 'Пул выключен, состав сохранён');
   } catch (_) { /* api reports failure */ }
-  finally { button.disabled = false; }
+  finally { setBestOfBestSaving(false); updateBestOfBestState(); }
 }
 let bestOfBestDraftDirty = false;
+let bestOfBestSaving = false;
+let bestOfBestGeneration = 0;
+let bestOfBestAppliedEnabled = false;
 let bestOfBestLimit = 16;
+let bestOfBestCatalog = [];
+let bestOfBestMembership = new Set();
+const bestOfBestBadServers = (() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem('hr_best_of_best_bad_servers') || '[]');
+    return new Set(Array.isArray(saved) ? saved.filter(ref => typeof ref === 'string' && /^srv-v1-[a-z0-9-]+$/.test(ref)).slice(0,4096) : []);
+  } catch (_) { return new Set(); }
+})();
+const bestOfBestOptions = (() => {
+  const defaults = {ping:true,youtube:true,telegram:true,ai:true,hideUntested:true,hideFailed:false};
+  try {
+    const saved = JSON.parse(localStorage.getItem('hr_best_of_best_catalog') || 'null');
+    Object.keys(defaults).forEach(key => { if (typeof saved?.[key] === 'boolean') defaults[key] = saved[key]; });
+  } catch (_) {}
+  return defaults;
+})();
+const BEST_OF_BEST_CHECKS = [['ping_proxy','P'],['youtube_thumbnails','YT'],['telegram','TG'],['ai','AI']];
+function bestOfBestChecksHtml(server) {
+  const states = {'passed':['ok','Проверка пройдена'],'failed':['bad','Проверка не пройдена'],'unknown':['unknown','Результат не подтверждён'],'skipped':['skipped','Проверка пропущена'],'stale':['stale','Устаревший результат; требуется новая проверка'],'not-tested':['skipped','Не проверено']};
+  return `<span class="profile-service-tests">${BEST_OF_BEST_CHECKS.map(([id,label]) => {
+    const state = server.checks?.[id]?.state || 'not-tested';
+    const [css,title] = states[state] || states['not-tested'];
+    const text = id === 'ping_proxy' && state === 'passed' && server.ping_ms > 0 ? `P ${server.ping_ms} ms` : label + (state === 'unknown' ? ' ?' : '');
+    return `<span class="profile-service-test ${css}" data-state="${attrEscape(state)}" title="${attrEscape(label+': '+title)}">${htmlEscape(text)}</span>`;
+  }).join('')}</span>`;
+}
+function bestOfBestSelectedChecks() {
+  return [['ping','ping_proxy'],['youtube','youtube_thumbnails'],['telegram','telegram'],['ai','ai']]
+    .filter(([option]) => bestOfBestOptions[option]).map(([,id]) => id);
+}
 function filterBestOfBestCatalog() {
   const query = (document.getElementById('bestOfBestSearch')?.value || '').trim().toLowerCase();
-  document.querySelectorAll('#bestOfBestCandidates label[data-best-search]').forEach(row => {
-    row.style.display = row.dataset.bestSearch.includes(query) ? 'block' : 'none';
+  const selectedChecks = bestOfBestSelectedChecks();
+  const services = selectedChecks.filter(id => id !== 'ping_proxy');
+  const passed = server => services.filter(id => server.checks?.[id]?.state === 'passed').length;
+  const pingRank = server => server.checks?.ping_proxy?.state === 'passed' ? 0 : server.checks?.ping_proxy?.state === 'failed' ? 2 : 1;
+  const ping = server => server.checks?.ping_proxy?.state === 'passed' && server.ping_ms > 0 ? Number(server.ping_ms) : Infinity;
+  const container = document.getElementById('bestOfBestCandidates');
+  const rows = new Map([...container.querySelectorAll('[data-best-search]')].map(row => [row.querySelector('input[data-best-ref]').dataset.bestRef,row]));
+  const ordered = [...bestOfBestCatalog].sort((a,b) => Number(bestOfBestBadServers.has(a.ref)) - Number(bestOfBestBadServers.has(b.ref)) || passed(b) - passed(a)
+    || (bestOfBestOptions.ping ? pingRank(a) - pingRank(b) || ping(a) - ping(b) : 0) || a.id - b.id);
+  let visible = 0;
+  ordered.forEach(server => {
+    const row = rows.get(server.ref);
+    if (!row) return;
+    const selected = row.querySelector('input[data-best-ref]').checked;
+    const bad = bestOfBestBadServers.has(server.ref);
+    const badButton = row.querySelector('[data-best-bad]');
+    badButton.textContent = bad ? 'Плохой ✓' : 'Плохой';
+    badButton.setAttribute('aria-pressed',String(bad));
+    badButton.setAttribute('aria-label',`${bad ? 'Снять отметку «плохой»' : 'Пометить плохим'}: #${server.id} · ${server.name}`);
+    badButton.title = bad ? 'Убрать ручную отметку и вернуть обычный рейтинг' : 'Поставить в конец списка';
+    const failed = selectedChecks.some(id => server.checks?.[id]?.state === 'failed');
+    const matches = row.dataset.bestSearch.includes(query) && (selected
+      || ((!bestOfBestOptions.hideUntested || server.tested === true) && (!bestOfBestOptions.hideFailed || !failed)));
+    row.style.display = matches ? 'flex' : 'none';
+    if (matches) visible++;
+    container.appendChild(row);
   });
+  document.getElementById('bestOfBestVisibleCount').textContent = `Показано: ${visible} / ${bestOfBestCatalog.length}`;
+  document.getElementById('bestOfBestEmpty').hidden = visible > 0;
 }
 function updateBestOfBestCount() {
-  document.getElementById('bestOfBestCount').textContent = `В пуле: ${document.querySelectorAll('#bestOfBestCandidates input:checked').length} / ${bestOfBestLimit}`;
+  document.getElementById('bestOfBestCount').textContent = `В пуле: ${bestOfBestMembership.size} / ${bestOfBestLimit}`;
+  const available = new Set(bestOfBestCatalog.map(server => server.ref));
+  const unavailable = [...bestOfBestMembership].filter(ref => !available.has(ref)).length;
+  document.getElementById('bestOfBestUnavailable').hidden = unavailable === 0;
+  document.getElementById('bestOfBestUnavailableCount').textContent = `Недоступных участников вне каталога: ${unavailable}.`;
 }
-document.getElementById('bestOfBestEnabled')?.addEventListener('change', () => { bestOfBestDraftDirty = true; });
-document.getElementById('bestOfBestCandidates')?.addEventListener('change', () => { bestOfBestDraftDirty = true; updateBestOfBestCount(); });
+document.getElementById('bestOfBestEnabled')?.addEventListener('change', markBestOfBestDraft);
+document.getElementById('bestOfBestCandidates')?.addEventListener('change', event => {
+  const input = event.target.closest('input[data-best-ref]');
+  if (!input) return;
+  if (input.checked) bestOfBestMembership.add(input.dataset.bestRef); else bestOfBestMembership.delete(input.dataset.bestRef);
+  markBestOfBestDraft();
+  filterBestOfBestCatalog();
+  updateBestOfBestCount();
+});
+document.getElementById('bestOfBestCandidates')?.addEventListener('click', event => {
+  const button = event.target.closest('button[data-best-bad]');
+  if (!button) return;
+  const ref = button.dataset.bestBad;
+  if (bestOfBestBadServers.has(ref)) bestOfBestBadServers.delete(ref); else bestOfBestBadServers.add(ref);
+  try { localStorage.setItem('hr_best_of_best_bad_servers',JSON.stringify([...bestOfBestBadServers])); } catch (_) {}
+  filterBestOfBestCatalog();
+});
+document.querySelectorAll('input[data-best-option]').forEach(input => {
+  input.checked = bestOfBestOptions[input.dataset.bestOption];
+  input.addEventListener('change', () => {
+    bestOfBestOptions[input.dataset.bestOption] = input.checked;
+    try { localStorage.setItem('hr_best_of_best_catalog',JSON.stringify(bestOfBestOptions)); } catch (_) {}
+    filterBestOfBestCatalog();
+  });
+});
 
 // ─── AUTO SETTINGS ───────────────────────────────────────────────────
 function saveAutoSettings() {
@@ -7343,6 +7638,12 @@ function updateTorrentSocksPasswordHint() {
 }
 function saveRoutingSettings() {
   const sr = MOCK.split_routing || {};
+  let proxyPorts, bypassPorts;
+  try {
+    proxyPorts = parseRoutingPorts(document.getElementById('rProxyPorts')?.value || '');
+    bypassPorts = parseRoutingPorts(document.getElementById('rBypassPorts')?.value || '');
+    if ([...proxyPorts,...bypassPorts].some(port => port.includes(':'))) throw new Error('Нужны порты назначения');
+  } catch (error) { return showToast('error',error.message); }
   const body = {
     enabled: document.getElementById('splitEnabled')?.checked ?? false,
     auto_switch: document.getElementById('rAutoSwitch')?.checked ?? false,
@@ -7352,14 +7653,12 @@ function saveRoutingSettings() {
     policy_name: document.getElementById('rPolicy')?.value || 'HincyRay',
     geo_asset_path: document.getElementById('rGeoAssetPath')?.value || '',
     port_mode: document.getElementById('rPortMode')?.value || 'all',
-    proxy_ports: (document.getElementById('rProxyPorts')?.value || '').split(/[,\n]/).map(s=>s.trim()).filter(Boolean),
-    bypass_ports: (document.getElementById('rBypassPorts')?.value || '').split(/[,\n]/).map(s=>s.trim()).filter(Boolean),
+    proxy_ports: proxyPorts,
+    bypass_ports: bypassPorts,
     ru_direct_mode: document.getElementById('rRuDirectMode')?.value || 'off',
     ru_direct_exceptions: (document.getElementById('rRuDirectExceptions')?.value || '').split('\n').map(s=>s.trim()).filter(Boolean),
     auto_vpn_learning_enabled: document.getElementById('rAutoVpnLearning')?.checked === true,
     auto_vpn_exceptions: (document.getElementById('rAutoVpnExceptions')?.value || '').split('\n').map(s=>s.trim()).filter(Boolean),
-    parovozik_enabled: document.getElementById('rParovozikEnabled')?.checked === true,
-    parovozik_server_refs: [...parovozikSelectedRefs],
     match_target: sr.match_target || 'proxy',
   };
   const torrentSettings = {
@@ -7382,7 +7681,6 @@ function saveRoutingSettings() {
   body.torrent_socks = torrentSettings;
   api('POST','/api/routing/settings',body).then(result => {
     routingSettingsDraftDirty = false;
-    parovozikConsistDirty = false;
     safeValue('rTorrentSocksPassword','');
     updateTorrentSocksPasswordHint();
     applySavedRoutingSettings(result.settings);
@@ -7412,61 +7710,6 @@ function clearTorrentSocksCredentials() {
     applySavedRoutingSettings(result.settings);
     showToast('success',t('Учётные данные Torrent SOCKS5 очищены'));
     refreshDashboard();
-  }).catch(()=>{});
-}
-
-const parovozikSelectedRefs = new Set();
-let parovozikConsistDirty = false;
-
-function toggleParovozikWagon(serverRef) {
-  if (!serverRef) return;
-  if (parovozikSelectedRefs.has(serverRef)) parovozikSelectedRefs.delete(serverRef);
-  else if (parovozikSelectedRefs.size < 5) parovozikSelectedRefs.add(serverRef);
-  else return showToast('warning','Можно выбрать не более 5 вагонов');
-  parovozikConsistDirty = true;
-  renderParovozikServers([...parovozikSelectedRefs]);
-}
-
-function renderParovozikServers(selectedRefs) {
-  const selected = new Set(Array.isArray(selectedRefs) ? selectedRefs : []);
-  const servers = (MOCK.routing_servers || []).filter(server => !server.active && !server.dead && server.ref);
-  const availableRefs = new Set(servers.map(server => server.ref));
-  parovozikSelectedRefs.clear();
-  [...selected].filter(serverRef => availableRefs.has(serverRef)).slice(0,5).forEach(serverRef => parovozikSelectedRefs.add(serverRef));
-  const container = document.getElementById('rParovozikWagons');
-  if (!container) return;
-  const active = (MOCK.routing_servers || []).find(server => server.active);
-  const locomotive = active ? `<div class="parovozik-subscription"><div class="parovozik-subscription-title">Локомотив</div><div class="parovozik-subscription-grid"><div class="parovozik-wagon parovozik-locomotive"><span>🚂</span><span class="parovozik-wagon-name">${htmlEscape(active.name || t('Текущий активный VPN'))}</span></div></div></div>` : '';
-  const groups = new Map();
-  servers.forEach(server => {
-    const key = server.group || '';
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(server);
-  });
-  const grouped = [...groups.entries()].map(([group, items]) => {
-    const subscription = subscriptionForGroup(group);
-    const title = subscription?.title || shortGroupName(group || t('Без группы'));
-    const cards = items.map(server => {
-      const checked = parovozikSelectedRefs.has(server.ref);
-      const disabled = !checked && parovozikSelectedRefs.size >= 5;
-      return `<label class="parovozik-wagon">
-        <input type="checkbox" data-parovozik-ref="${attrEscape(server.ref)}" ${checked?'checked':''} ${disabled?'disabled':''} onchange="toggleParovozikWagon(this.dataset.parovozikRef)">
-        <span class="parovozik-wagon-name">${htmlEscape(server.name || `#${server.id}`)}</span>
-      </label>`;
-    }).join('');
-    return `<div class="parovozik-subscription"><div class="parovozik-subscription-title">${htmlEscape(title)}</div><div class="parovozik-subscription-grid">${cards}</div></div>`;
-  }).join('');
-  container.innerHTML = locomotive + grouped;
-  if (!active && !servers.length) container.innerHTML = '<div class="hint">Серверов нет.</div>';
-  safeSet('rParovozikCount', `${parovozikSelectedRefs.size} / 5`);
-}
-
-function saveParovozikConsist() {
-  api('POST','/api/routing/settings',{parovozik_server_refs:[...parovozikSelectedRefs],apply:true}).then(result => {
-    parovozikConsistDirty = false;
-    applySavedRoutingSettings(result.settings);
-    showToast('success','Состав вагонов сохранён');
-    showRoutingReconnectStatus(result);
   }).catch(()=>{});
 }
 
@@ -7584,7 +7827,7 @@ const TOOLTIPS = {
   'rTorrentSocksPort': 'LAN-порт отдельного SOCKS5. TCP и UDP проверяются readiness-контрактом Mihomo',
   'rTorrentSocksUsername': 'Обязательное имя пользователя SOCKS5. Credentials скрыты из generated config preview',
   'rTorrentSocksPassword': 'Оставьте пустым, чтобы сохранить текущий пароль. Пароль никогда не возвращается API',
-  'rTorrentSocksTarget': 'DIRECT, текущее VPN, конкретный сервер, Паровозик или REJECT. Цель применяется только к этому listener',
+  'rTorrentSocksTarget': 'DIRECT, текущее VPN, конкретный сервер, Лучшие из лучших или REJECT. Цель применяется только к этому listener',
   'rRuDirectMode': 'Выключено — RU Direct не действует. .ru и .рф — DOMAIN-SUFFIX для российских TLD. GEOSITE — category-ru из geosite.dat (включает vk.com, yandex.com и др.)',
   'rRuDirectExceptions': 'Домены, которые пойдут через VPN несмотря на RU Direct. Один на строку. Например: 2ip.ru',
   'ruleEntries': 'Домены, доменные зоны и IP-адреса. Примеры: geosite:youtube, googlevideo.com, geoip:us, ip-asn:15169, ru (DOMAIN-SUFFIX .ru), xn--p1ai (.рф)',
@@ -7592,7 +7835,7 @@ const TOOLTIPS = {
   'ruleTarget': 'active — через активный профиль, direct — напрямую, reject — блокировать, best — через лучший',
   'ruleNetwork': 'any — TCP и UDP, tcp — только TCP, udp — только UDP',
   'rulePortMode': 'только эти — правило применяется к указанным портам, кроме этих — ко всем портам кроме указанных',
-  'rulePorts': 'Порты через запятую (например: 80,443 или 1000-2000). Оставьте пустым для всех портов',
+  'rulePorts': 'Удалённые порты назначения, а не динамические порты клиента. Список через запятую: 80,443,12000-64000. Пустое поле — все порты',
   // DNS
   'dnsEnabled': 'Включить DNS anti-leak. В режиме split routing всегда включён (firewall DNATит DNS на 127.0.0.1:1053)',
   'dnsStrategy': 'UseIPv4 — только A-записи. UseIPv6 — только AAAA. UseIP — и A, и AAAA',
@@ -7820,10 +8063,6 @@ function updateRoutingForm(sr) {
   updateTorrentSocksPasswordHint();
   refreshTorrentSocksTargetSelect(torrent.target || 'direct');
   safeSet('rTorrentSocksPasswordStatus', torrent.password_set ? t('Пароль настроен') : t('Пароль не настроен'));
-  safeChecked('rParovozikEnabled', sr.parovozik_enabled === true);
-  safeValue('rParovozikDirect', Array.isArray(sr.parovozik_direct_domains) ? sr.parovozik_direct_domains.join('\n') : '');
-  safeValue('rParovozikVpn', Array.isArray(sr.parovozik_vpn_domains) ? sr.parovozik_vpn_domains.join('\n') : '');
-  if (!parovozikConsistDirty) renderParovozikServers(sr.parovozik_server_refs);
   updatePortModeFields();
   // Sync all custom selects with the freshly-loaded values.
   refreshCustomSelects();
@@ -7998,19 +8237,20 @@ function loadRouting(options = {}) {
   const serial = ++routingReloadSerial;
   return api('GET','/api/routing').then(d => {
   if (serial !== routingReloadSerial) return;
-  if (!options.force && routingEditActive()) {
+  if (routingRulesSaving || (!options.force && routingEditActive())) {
     routingReloadDeferred = true;
     return;
   }
   routingReloadDeferred = false;
   MOCK.routing_rules = d.rules || d.routing_rules || [];
+  routingRulesRevision = d.rules_revision ?? null;
+  routingRulesCommitted = structuredClone(MOCK.routing_rules);
   MOCK.routing_servers = Array.isArray(d.servers) ? d.servers : [];
   MOCK.managed_routing_rules = d.managed_rules || [];
   MOCK.geobase_requires_apply = d.geobase_requires_apply === true;
   const settings = d.settings || d.split_routing;
   const preserveSettings = routingSettingsEditActive();
   if (settings && !preserveSettings) MOCK.split_routing = settings;
-  renderParovozikServers(parovozikConsistDirty ? [...parovozikSelectedRefs] : MOCK.split_routing?.parovozik_server_refs);
   if (!routingRuleDraftDirty && editingRuleIndex === null) refreshRoutingTargetSelect('active');
   renderRoutingRules(MOCK.routing_rules);
   renderRuleChips(d.catalog || []);

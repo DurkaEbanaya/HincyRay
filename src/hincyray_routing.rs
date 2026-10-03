@@ -6,6 +6,67 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
+/// Canonical port alternatives, preserving the legacy source/inbound prefixes.
+/// Separators inside an item have the same OR meaning as separate array items.
+pub fn normalize_port_items(items: &[String]) -> Result<Vec<String>, String> {
+    if items.iter().map(String::len).sum::<usize>() > 4096 {
+        return Err("port list exceeds 4096 bytes".to_owned());
+    }
+    let mut result = Vec::new();
+    let mut count = 0;
+    for item in items.iter().flat_map(|item| item.split([',', ';', '\n'])) {
+        let item = item.trim();
+        let (prefix, body) = if let Some(body) = item.strip_prefix("src-port:") {
+            ("src-port:", body)
+        } else if let Some(body) = item.strip_prefix("in-port:") {
+            ("in-port:", body)
+        } else {
+            ("", item)
+        };
+        let previous_count = count;
+        for spec in body.split('/').map(str::trim).filter(|s| !s.is_empty()) {
+            count += 1;
+            if count > 256 {
+                return Err("port list exceeds 256 entries".to_owned());
+            }
+            let parse = |value: &str| -> Result<u16, String> {
+                let value = value.trim();
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(
+                        "expected ports 1–65535 or ascending ranges, e.g. 12000-64000".to_owned(),
+                    );
+                }
+                value
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port > 0)
+                    .ok_or_else(|| "ports must be between 1 and 65535".to_owned())
+            };
+            let canonical = if let Some((start, end)) = spec.split_once('-') {
+                let (start, end) = (parse(start)?, parse(end)?);
+                if start > end {
+                    return Err("port range start must not exceed its end".to_owned());
+                }
+                if start == end {
+                    start.to_string()
+                } else {
+                    format!("{start}-{end}")
+                }
+            } else {
+                parse(spec)?.to_string()
+            };
+            let canonical = format!("{prefix}{canonical}");
+            if !result.contains(&canonical) {
+                result.push(canonical);
+            }
+        }
+        if !item.is_empty() && previous_count == count {
+            return Err("port item requires at least one port".to_owned());
+        }
+    }
+    Ok(result)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoutingResourceKind {
     Domain,
@@ -120,6 +181,51 @@ pub fn normalize_routing_resource(raw: &str) -> Option<RoutingResource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_lists_accept_alternatives_ranges_and_legacy_prefixes() {
+        let items = vec![
+            "01119/3724,6113".to_owned(),
+            "12000 - 64000; 443\n443".to_owned(),
+            "src-port:80/81".to_owned(),
+            "in-port:10809".to_owned(),
+        ];
+        assert_eq!(
+            normalize_port_items(&items).expect("valid port list"),
+            [
+                "1119",
+                "3724",
+                "6113",
+                "12000-64000",
+                "443",
+                "src-port:80",
+                "src-port:81",
+                "in-port:10809"
+            ]
+        );
+        for invalid in [
+            "0",
+            "65536",
+            "64000-12000",
+            "443,DIRECT",
+            "80-81-82",
+            "src-port:",
+            "///",
+            "80 443",
+            "-1",
+        ] {
+            assert!(
+                normalize_port_items(&[invalid.to_owned()]).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(normalize_port_items(&["1,".repeat(257)]).is_err());
+        assert!(normalize_port_items(&["1".repeat(4097)]).is_err());
+        assert_eq!(
+            normalize_port_items(&["src-port:80/81,443".to_owned()]).expect("mixed port list"),
+            ["src-port:80", "src-port:81", "443"]
+        );
+    }
 
     #[test]
     fn normalize_routing_resource_classifies_urls_hosts_and_ips() {

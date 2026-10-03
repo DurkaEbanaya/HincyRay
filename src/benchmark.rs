@@ -223,6 +223,14 @@ impl AdaptiveSearchOptions {
 pub struct ServiceCheckOptions {
     pub required_services: ServiceCheckPrefix,
     pub fail_fast: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reject_no_ping: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub full_ping: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -287,6 +295,8 @@ pub struct BenchJob {
     pub(crate) requested_concurrency: usize,
     pub(crate) memory_limited: bool,
     pub(crate) worker_count: usize,
+    pub(crate) memory_reserve_kb: Option<u64>,
+    pub memory_pressure: bool,
 }
 
 #[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
@@ -432,144 +442,186 @@ fn run_bench_with_probe(
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .worker_count;
+            let reserve = job
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .memory_reserve_kb;
+            let monitor_done = AtomicBool::new(false);
 
             thread::scope(|scope| {
-                for _ in 0..worker_count {
-                    let queue = Arc::clone(&queue);
-                    let job = Arc::clone(&job);
-                    let cancel = Arc::clone(&cancel);
-                    let on_result = Arc::clone(&on_result);
-                    let probe = &probe;
-                    let idle_wait = &idle_wait;
+                struct MonitorExit<'a>(&'a AtomicBool);
+                impl Drop for MonitorExit<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::Relaxed);
+                    }
+                }
+                let monitor_exit = MonitorExit(&monitor_done);
+                if let Some(reserve) = reserve {
+                    let monitor_done = &monitor_done;
+                    let cancel = &cancel;
+                    let job = &job;
                     scope.spawn(move || {
-                        loop {
-                            if cancel.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            let (profile, required) = {
+                        while !monitor_done.load(Ordering::Relaxed)
+                            && !cancel.load(Ordering::Relaxed)
+                        {
+                            let available = available_memory_kb();
+                            if available.is_none_or(|available| available < reserve) {
+                                cancel.store(true, Ordering::Relaxed);
                                 let mut state =
                                     job.lock().unwrap_or_else(|poison| poison.into_inner());
+                                state.memory_pressure = true;
+                                state.cancel_requested = true;
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                    });
+                }
+                // Join workers before signaling the scoped monitor to exit.
+                thread::scope(|scope| {
+                    for _ in 0..worker_count {
+                        let queue = Arc::clone(&queue);
+                        let job = Arc::clone(&job);
+                        let cancel = Arc::clone(&cancel);
+                        let on_result = Arc::clone(&on_result);
+                        let probe = &probe;
+                        let idle_wait = &idle_wait;
+                        scope.spawn(move || {
+                            loop {
                                 if cancel.load(Ordering::Relaxed) {
                                     break;
                                 }
-                                if let Some(search) = &state.search {
-                                    if search.found_good >= search.target_good {
+                                let (profile, required) = {
+                                    let mut state =
+                                        job.lock().unwrap_or_else(|poison| poison.into_inner());
+                                    if cancel.load(Ordering::Relaxed) {
                                         break;
                                     }
-                                    if search.found_good + state.active_profiles.len()
-                                        >= search.target_good
-                                    {
-                                        drop(state);
-                                        idle_wait();
-                                        continue;
+                                    if let Some(search) = &state.search {
+                                        if search.found_good >= search.target_good {
+                                            break;
+                                        }
+                                        if search.found_good + state.active_profiles.len()
+                                            >= search.target_good
+                                        {
+                                            drop(state);
+                                            idle_wait();
+                                            continue;
+                                        }
                                     }
-                                }
-                                // Admission and reservation are atomic; always lock job before queue.
-                                let Some(profile) = queue
-                                    .lock()
-                                    .unwrap_or_else(|poison| poison.into_inner())
-                                    .pop_front()
-                                else {
-                                    break;
+                                    // Admission and reservation are atomic; always lock job before queue.
+                                    let Some(profile) = queue
+                                        .lock()
+                                        .unwrap_or_else(|poison| poison.into_inner())
+                                        .pop_front()
+                                    else {
+                                        break;
+                                    };
+                                    state.current_profile_id = Some(profile.id);
+                                    state.current_profile_name = Some(profile.name.clone());
+                                    if state.active_profiles.len() < 6 {
+                                        state.active_profiles.push(ActiveBenchProfile {
+                                            id: profile.id,
+                                            name: profile.name.clone(),
+                                        });
+                                    }
+                                    state.last_updated = unix_now();
+                                    let required = state
+                                        .search
+                                        .as_ref()
+                                        .map(|search| search.required_services.clone());
+                                    (profile, required)
                                 };
-                                state.current_profile_id = Some(profile.id);
-                                state.current_profile_name = Some(profile.name.clone());
-                                if state.active_profiles.len() < 6 {
-                                    state.active_profiles.push(ActiveBenchProfile {
-                                        id: profile.id,
-                                        name: profile.name.clone(),
-                                    });
-                                }
-                                state.last_updated = unix_now();
-                                let required = state
-                                    .search
-                                    .as_ref()
-                                    .map(|search| search.required_services.clone());
-                                (profile, required)
-                            };
 
-                            let on_preflight = |passed: bool| {
-                                let mut state =
-                                    job.lock().unwrap_or_else(|poison| poison.into_inner());
-                                if let Some(search) = &mut state.search {
-                                    search.preflight_completed += 1;
-                                    search.preflight_rejected += usize::from(!passed);
-                                    state.last_updated = unix_now();
-                                }
-                            };
-                            let on_preflight_failure = |phase: &str, error: &str| {
-                                let mut state =
-                                    job.lock().unwrap_or_else(|poison| poison.into_inner());
-                                if state.search.is_some() {
-                                    if state.preflight_failures.len() == PREFLIGHT_FAILURE_LIMIT {
-                                        state.preflight_failures.remove(0);
+                                let on_preflight = |passed: bool| {
+                                    let mut state =
+                                        job.lock().unwrap_or_else(|poison| poison.into_inner());
+                                    if let Some(search) = &mut state.search {
+                                        search.preflight_completed += 1;
+                                        search.preflight_rejected += usize::from(!passed);
+                                        state.last_updated = unix_now();
                                     }
-                                    state.preflight_failures.push(PreflightFailure {
-                                        profile_id: profile.id,
-                                        phase: phase.chars().take(32).collect(),
-                                        error: bounded_preflight_error(error),
-                                    });
-                                    state.last_updated = unix_now();
-                                }
-                            };
-                            let result = probe(
-                                &profile,
-                                required.as_deref(),
-                                &cancel,
-                                &on_preflight,
-                                &on_preflight_failure,
-                            );
+                                };
+                                let on_preflight_failure = |phase: &str, error: &str| {
+                                    let mut state =
+                                        job.lock().unwrap_or_else(|poison| poison.into_inner());
+                                    if state.search.is_some() {
+                                        if state.preflight_failures.len() == PREFLIGHT_FAILURE_LIMIT
+                                        {
+                                            state.preflight_failures.remove(0);
+                                        }
+                                        state.preflight_failures.push(PreflightFailure {
+                                            profile_id: profile.id,
+                                            phase: phase.chars().take(32).collect(),
+                                            error: bounded_preflight_error(error),
+                                        });
+                                        state.last_updated = unix_now();
+                                    }
+                                };
+                                let result = probe(
+                                    &profile,
+                                    required.as_deref(),
+                                    &cancel,
+                                    &on_preflight,
+                                    &on_preflight_failure,
+                                );
+                                // Private cores/captures and decoder buffers have been dropped.
+                                // Return freed glibc pages now rather than waiting for watchdog.
+                                crate::hincyray::trim_process_allocator();
 
-                            if cancel.load(Ordering::Relaxed) {
+                                if cancel.load(Ordering::Relaxed) {
+                                    let mut state =
+                                        job.lock().unwrap_or_else(|poison| poison.into_inner());
+                                    state
+                                        .active_profiles
+                                        .retain(|active| active.id != profile.id);
+                                    continue;
+                                }
+
+                                if let Some(result) = &result {
+                                    on_result(result.clone());
+                                }
                                 let mut state =
                                     job.lock().unwrap_or_else(|poison| poison.into_inner());
                                 state
                                     .active_profiles
                                     .retain(|active| active.id != profile.id);
-                                continue;
+                                if let Some((id, name)) = state
+                                    .active_profiles
+                                    .last()
+                                    .map(|active| (active.id, active.name.clone()))
+                                {
+                                    state.current_profile_id = Some(id);
+                                    state.current_profile_name = Some(name);
+                                } else {
+                                    state.current_profile_id = None;
+                                    state.current_profile_name = None;
+                                }
+                                let unique_good = result.as_ref().is_some_and(|result| {
+                                    required.as_deref().is_some_and(|required| {
+                                        adaptive_result_is_good(result, required)
+                                            && !state.results.iter().any(|previous| {
+                                                previous.profile_raw == result.profile_raw
+                                                    && adaptive_result_is_good(previous, required)
+                                            })
+                                    })
+                                });
+                                if let Some(search) = &mut state.search
+                                    && result.is_some()
+                                {
+                                    search.quick_completed += 1;
+                                    search.found_good += usize::from(unique_good);
+                                }
+                                if let Some(result) = result {
+                                    state.results.push(result);
+                                }
+                                state.completed += 1;
+                                state.last_updated = unix_now();
                             }
-
-                            if let Some(result) = &result {
-                                on_result(result.clone());
-                            }
-                            let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
-                            state
-                                .active_profiles
-                                .retain(|active| active.id != profile.id);
-                            if let Some((id, name)) = state
-                                .active_profiles
-                                .last()
-                                .map(|active| (active.id, active.name.clone()))
-                            {
-                                state.current_profile_id = Some(id);
-                                state.current_profile_name = Some(name);
-                            } else {
-                                state.current_profile_id = None;
-                                state.current_profile_name = None;
-                            }
-                            let unique_good = result.as_ref().is_some_and(|result| {
-                                required.as_deref().is_some_and(|required| {
-                                    adaptive_result_is_good(result, required)
-                                        && !state.results.iter().any(|previous| {
-                                            previous.profile_raw == result.profile_raw
-                                                && adaptive_result_is_good(previous, required)
-                                        })
-                                })
-                            });
-                            if let Some(search) = &mut state.search
-                                && result.is_some()
-                            {
-                                search.quick_completed += 1;
-                                search.found_good += usize::from(unique_good);
-                            }
-                            if let Some(result) = result {
-                                state.results.push(result);
-                            }
-                            state.completed += 1;
-                            state.last_updated = unix_now();
-                        }
-                    });
-                }
+                        });
+                    }
+                });
+                drop(monitor_exit);
             });
 
             let completed_results = {
@@ -585,6 +637,8 @@ fn run_bench_with_probe(
                     .unwrap_or_else(|poison| poison.into_inner())
                     .results = results;
             }
+            drop(queue);
+            crate::hincyray::trim_process_allocator();
 
             {
                 let mut state = job.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -608,6 +662,22 @@ fn run_bench_with_probe(
             }
         })
         .map_err(|error| format!("spawn benchmark worker: {error}"))
+}
+
+fn available_memory_kb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        meminfo.lines().find_map(|line| {
+            line.strip_prefix("MemAvailable:")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
 }
 
 fn benchmark_worker_count(concurrency: usize, profile_count: usize) -> usize {
@@ -850,10 +920,14 @@ fn run_service_resources(
     cancel: &AtomicBool,
 ) -> Result<(Metrics, Vec<ResourceTestResult>), String> {
     ensure_not_cancelled(cancel)?;
-    let mut tests = vec![
-        run_icmp_ping_probe(profile, cancel)?,
-        run_tcp_ping_probe(profile, cancel)?,
-    ];
+    let options = quick_probe.and_then(|probe| probe.service_checks.as_ref());
+    let full_ping = options.map_or(!method.is_availability(), |options| options.full_ping);
+    let mut tests = run_direct_ping_diagnostics(
+        full_ping,
+        cancel,
+        || run_icmp_ping_probe(profile, cancel),
+        || run_tcp_ping_probe(profile, cancel),
+    )?;
     let runtime = spawn_bench_mihomo_with_path(profile, mihomo_path, Some(cancel));
     match runtime.as_ref() {
         Ok((port, _guard)) => tests.push(run_proxy_ping_probe(*port, probe_url, cancel)?),
@@ -863,10 +937,19 @@ fn run_service_resources(
             error,
         )),
     };
-    if let Ok((port, _guard)) = runtime.as_ref() {
-        tests.extend(run_complete_service_probes(
+    if reject_services_after_ping(options, &tests) {
+        tests.extend(run_service_probes_after_ping(
             method,
-            quick_probe.and_then(|probe| probe.service_checks.as_ref()),
+            options,
+            &tests,
+            cancel,
+            |_| unreachable!("services must not run after failed ping"),
+        )?);
+    } else if let Ok((port, _guard)) = runtime.as_ref() {
+        tests.extend(run_service_probes_after_ping(
+            method,
+            options,
+            &tests,
             cancel,
             |id| match id {
                 "youtube" if method.is_availability() => youtube_availability::probe(*port, cancel),
@@ -918,6 +1001,81 @@ fn run_service_resources(
     }
 
     Ok((ping_metrics(&tests), tests))
+}
+
+fn run_direct_ping_diagnostics(
+    full_ping: bool,
+    cancel: &AtomicBool,
+    icmp: impl FnOnce() -> Result<ResourceTestResult, String>,
+    tcp: impl FnOnce() -> Result<ResourceTestResult, String>,
+) -> Result<Vec<ResourceTestResult>, String> {
+    ensure_not_cancelled(cancel)?;
+    if full_ping {
+        let icmp = icmp()?;
+        ensure_not_cancelled(cancel)?;
+        Ok(vec![icmp, tcp()?])
+    } else {
+        Ok(vec![
+            skipped_resource_result("ping_icmp", "ICMP ping", "minimal Ping: proxy HTTPS only"),
+            skipped_resource_result("ping_tcp", "TCP ping", "minimal Ping: proxy HTTPS only"),
+        ])
+    }
+}
+
+fn reject_services_after_ping(
+    options: Option<&ServiceCheckOptions>,
+    tests: &[ResourceTestResult],
+) -> bool {
+    options.is_some_and(|options| options.reject_no_ping)
+        && !tests.iter().any(|test| {
+            matches!(test.id.as_str(), "ping_icmp" | "ping_tcp" | "ping_proxy")
+                && test.attempts > 0
+                && test.reachable
+        })
+}
+
+fn run_service_probes_after_ping(
+    method: BenchMethod,
+    options: Option<&ServiceCheckOptions>,
+    ping_tests: &[ResourceTestResult],
+    cancel: &AtomicBool,
+    service: impl FnMut(&str) -> Result<ResourceTestResult, String>,
+) -> Result<Vec<ResourceTestResult>, String> {
+    if !reject_services_after_ping(options, ping_tests) {
+        return run_complete_service_probes(method, options, cancel, service);
+    }
+    ensure_not_cancelled(cancel)?;
+    let required = options
+        .expect("explicit ping policy")
+        .required_services
+        .last_service();
+    let mut requested = true;
+    Ok([
+        ("youtube", "YouTube"),
+        ("telegram", "Telegram"),
+        ("ai", "AI Studio"),
+    ]
+    .into_iter()
+    .map(|(id, name)| {
+        let mut test = skipped_resource_result(
+            id,
+            name,
+            if requested {
+                "skipped after all ping checks failed (reject_no_ping)"
+            } else {
+                "not requested by service_checks"
+            },
+        );
+        if id == "youtube" && method.is_availability() {
+            test.id = "youtube_thumbnails".to_owned();
+            test.contract_version = YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+        }
+        if id == required {
+            requested = false;
+        }
+        test
+    })
+    .collect())
 }
 
 fn run_complete_service_probes(
@@ -2436,6 +2594,8 @@ fn spawn_mihomo_with_combined_log(
         .arg(config_path)
         .arg("-d")
         .arg(benchmark_mihomo_home(config_path))
+        .env("GOMEMLIMIT", "16MiB")
+        .env("GOGC", "20")
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     #[cfg(target_os = "linux")]
@@ -2459,6 +2619,9 @@ fn spawn_mihomo_with_combined_log(
             });
         }
     }
+    #[cfg(target_os = "linux")]
+    return crate::hincyray::spawn_core_on_persistent_thread(command);
+    #[cfg(not(target_os = "linux"))]
     command.spawn()
 }
 
@@ -3570,6 +3733,59 @@ mod tests {
         }
         assert!(!home.exists() && !config.exists() && !log.exists());
         assert!(second._config_file.path().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn benchmark_spawn_uses_economical_env_and_survives_caller_thread_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().expect("home");
+        let config = NamedTempFile::new_in(home.path()).expect("config");
+        let log = NamedTempFile::new_in(home.path()).expect("log");
+        let executable = home.path().join("fake-core");
+        std::fs::write(&executable, "#!/bin/sh\n[ \"$GOMEMLIMIT\" = 16MiB ] && [ \"$GOGC\" = 20 ] || exit 9\nexec sleep 30\n").expect("fake core");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("permissions");
+        let path = config.path().to_owned();
+        let mut child = thread::spawn(move || {
+            spawn_mihomo_with_combined_log(executable.to_str().expect("path"), &path, &log)
+                .expect("spawn")
+        })
+        .join()
+        .expect("short caller exits");
+        thread::sleep(Duration::from_millis(100));
+        assert!(child.try_wait().expect("alive").is_none());
+        child.kill().expect("kill owned core");
+        child.wait().expect("reap");
+    }
+
+    #[test]
+    fn memory_pressure_cancels_and_joins_workers_without_false_completion() {
+        let job = new_bench_job(BenchMethod::AvailabilityFull, 3, 3);
+        job.lock().expect("job").memory_reserve_kb = Some(u64::MAX);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = run_bench_with_probe(
+            search_profiles(3),
+            Arc::clone(&job),
+            Arc::clone(&cancel),
+            Box::new(|_| panic!("no result from aborted probe")),
+            Some(Box::new(|_| {
+                panic!("no complete actions under memory pressure")
+            })),
+            |_, _, cancel, _, _| {
+                while !cancel.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                None
+            },
+            || thread::sleep(Duration::from_millis(10)),
+        )
+        .expect("workers");
+        handle.join().expect("monitor and workers join");
+        let state = job.lock().expect("final job");
+        assert!(state.memory_pressure && state.cancel_requested);
+        assert!(!state.running);
+        assert!(state.active_profiles.is_empty() && state.results.is_empty());
     }
 
     #[test]
@@ -4764,6 +4980,8 @@ mod tests {
                         let options = ServiceCheckOptions {
                             required_services,
                             fail_fast,
+                            reject_no_ping: false,
+                            full_ping: false,
                         };
                         let mut calls = Vec::new();
                         let tests = run_complete_service_probes(
@@ -4830,6 +5048,8 @@ mod tests {
         let options = ServiceCheckOptions {
             required_services: ServiceCheckPrefix::All,
             fail_fast: true,
+            reject_no_ping: false,
+            full_ping: false,
         };
         let mut tests = vec![successful_resource_result(
             "ping_proxy",
@@ -4872,6 +5092,8 @@ mod tests {
         let youtube_only = ServiceCheckOptions {
             required_services: ServiceCheckPrefix::Youtube,
             fail_fast: true,
+            reject_no_ping: false,
+            full_ping: false,
         };
         assert_eq!(
             service_resource_outcome(&tests, Some(&youtube_only)),
@@ -4902,6 +5124,301 @@ mod tests {
     }
 
     #[test]
+    fn ping_gate_skips_services_for_every_prefix_independently_of_fail_fast() {
+        for required_services in [
+            ServiceCheckPrefix::All,
+            ServiceCheckPrefix::Youtube,
+            ServiceCheckPrefix::Telegram,
+            ServiceCheckPrefix::Ai,
+        ] {
+            for fail_fast in [false, true] {
+                for reject_no_ping in [false, true] {
+                    let options = ServiceCheckOptions {
+                        required_services,
+                        fail_fast,
+                        reject_no_ping,
+                        full_ping: false,
+                    };
+                    let pings = ["ping_icmp", "ping_tcp", "ping_proxy"]
+                        .map(|id| failed_resource_result(id, id, "no response"));
+                    let mut calls = Vec::new();
+                    let tests = run_service_probes_after_ping(
+                        BenchMethod::AvailabilityFull,
+                        Some(&options),
+                        &pings,
+                        &AtomicBool::new(false),
+                        |id| {
+                            calls.push(id.to_owned());
+                            let mut test =
+                                successful_resource_result(id, id, Duration::from_millis(1));
+                            if id == "youtube" {
+                                test.id = "youtube_thumbnails".to_owned();
+                                test.contract_version = YOUTUBE_AVAILABILITY_CONTRACT_VERSION;
+                            }
+                            Ok(test)
+                        },
+                    )
+                    .expect("service checks");
+                    if reject_no_ping {
+                        assert!(
+                            calls.is_empty(),
+                            "no service/network call after failed ping"
+                        );
+                        assert!(tests.iter().all(|test| test.attempts == 0
+                            && test.successes == 0
+                            && !test.reachable));
+                        assert!(
+                            tests[0]
+                                .error
+                                .as_deref()
+                                .is_some_and(|error| error.contains("reject_no_ping"))
+                        );
+                        assert_eq!(tests[0].id, "youtube_thumbnails");
+                        assert_eq!(
+                            tests[0].contract_version,
+                            YOUTUBE_AVAILABILITY_CONTRACT_VERSION
+                        );
+                    } else {
+                        assert!(!calls.is_empty(), "legacy continued checks retained");
+                    }
+                    let mut resources = pings.to_vec();
+                    resources.extend(tests);
+                    let (passed, error) = service_resource_outcome(&resources, Some(&options));
+                    assert!(!passed);
+                    assert!(error.contains("Ping failed"));
+                    assert!(!error.contains("0/0"));
+                    if reject_no_ping {
+                        assert!(!error.contains("YouTube"));
+                        assert!(!error.contains("Telegram"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ping_gate_accepts_any_successful_ping_and_preserves_cancellation() {
+        let options = ServiceCheckOptions {
+            required_services: ServiceCheckPrefix::All,
+            fail_fast: false,
+            reject_no_ping: true,
+            full_ping: false,
+        };
+        for success in 0..3 {
+            let mut pings = ["ping_icmp", "ping_tcp", "ping_proxy"]
+                .map(|id| failed_resource_result(id, id, "no response"));
+            let id = pings[success].id.clone();
+            pings[success] = successful_resource_result(&id, &id, Duration::from_millis(1));
+            let mut calls = 0;
+            run_service_probes_after_ping(
+                BenchMethod::AvailabilityFull,
+                Some(&options),
+                &pings,
+                &AtomicBool::new(false),
+                |id| {
+                    calls += 1;
+                    Ok(successful_resource_result(id, id, Duration::from_millis(1)))
+                },
+            )
+            .expect("reachable server services");
+            assert_eq!(calls, 3);
+        }
+        let error = run_service_probes_after_ping(
+            BenchMethod::AvailabilityFull,
+            Some(&options),
+            &[],
+            &AtomicBool::new(true),
+            |_| panic!("cancelled services"),
+        )
+        .expect_err("cancelled gate");
+        assert_eq!(error, "benchmark cancelled");
+    }
+
+    #[test]
+    fn ping_gate_policy_is_optional_strict_and_roundtrips() {
+        for reject_no_ping in [false, true] {
+            let policy: ServiceCheckOptions = serde_json::from_value(serde_json::json!({
+                "required_services":"youtube","fail_fast":false,"reject_no_ping":reject_no_ping
+            }))
+            .expect("boolean policy");
+            assert_eq!(policy.reject_no_ping, reject_no_ping);
+        }
+        let legacy: ServiceCheckOptions =
+            serde_json::from_str(r#"{"required_services":"youtube","fail_fast":false}"#)
+                .expect("legacy policy");
+        assert!(!legacy.reject_no_ping);
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!("true"),
+            serde_json::json!(1),
+        ] {
+            assert!(
+                serde_json::from_value::<ServiceCheckOptions>(serde_json::json!({
+                    "required_services":"youtube","fail_fast":false,"reject_no_ping":invalid
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn minimal_ping_avoids_direct_probes_and_full_ping_restores_them() {
+        let cancel = AtomicBool::new(false);
+        let skipped = run_direct_ping_diagnostics(
+            false,
+            &cancel,
+            || panic!("minimal Ping must not spawn ICMP"),
+            || panic!("minimal Ping must not resolve/connect TCP"),
+        )
+        .expect("minimal ping");
+        assert_eq!(skipped.len(), 2);
+        assert!(
+            skipped
+                .iter()
+                .all(|test| test.attempts == 0 && !test.reachable)
+        );
+        let proxy = successful_resource_result("ping_proxy", "HTTPS", Duration::from_millis(42));
+        assert_eq!(
+            ping_metrics(&[skipped[0].clone(), skipped[1].clone(), proxy]).latency_ms,
+            42
+        );
+        let full = run_direct_ping_diagnostics(
+            true,
+            &cancel,
+            || {
+                Ok(successful_resource_result(
+                    "ping_icmp",
+                    "ICMP",
+                    Duration::from_millis(1),
+                ))
+            },
+            || Ok(failed_resource_result("ping_tcp", "TCP", "no response")),
+        )
+        .expect("full ping");
+        assert!(full.iter().all(|test| test.attempts == 1));
+        assert!(full[0].reachable);
+        assert!(!full[1].reachable);
+        let cancelled = run_direct_ping_diagnostics(
+            true,
+            &cancel,
+            || {
+                cancel.store(true, Ordering::Relaxed);
+                Ok(full[0].clone())
+            },
+            || panic!("cancelled TCP must not start"),
+        );
+        assert_eq!(cancelled.expect_err("cancelled"), "benchmark cancelled");
+        assert!(
+            run_direct_ping_diagnostics(
+                false,
+                &cancel,
+                || panic!("cancelled ICMP"),
+                || panic!("cancelled TCP"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn full_ping_policy_is_optional_strict_and_roundtrips() {
+        for full_ping in [false, true] {
+            let policy: ServiceCheckOptions = serde_json::from_value(serde_json::json!({
+                "required_services":"all", "fail_fast":false, "full_ping":full_ping
+            }))
+            .expect("boolean ping mode");
+            assert_eq!(policy.full_ping, full_ping);
+            let roundtrip: ServiceCheckOptions =
+                serde_json::from_value(serde_json::to_value(&policy).expect("serialize"))
+                    .expect("roundtrip");
+            assert_eq!(roundtrip, policy);
+        }
+        let legacy: ServiceCheckOptions =
+            serde_json::from_str(r#"{"required_services":"all","fail_fast":false}"#)
+                .expect("omitted means minimal");
+        assert!(!legacy.full_ping);
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!("true"),
+            serde_json::json!(1),
+        ] {
+            assert!(
+                serde_json::from_value::<ServiceCheckOptions>(serde_json::json!({
+                    "required_services":"all", "fail_fast":false, "full_ping":invalid
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn ping_gate_worker_reports_failed_candidate_without_attempting_services() {
+        let mut profile = search_profiles(1).remove(0);
+        profile.address.clear();
+        let policy = QuickProbeConfig {
+            telegram_session_path: String::new(),
+            telegram: None,
+            service_checks: Some(ServiceCheckOptions {
+                required_services: ServiceCheckPrefix::All,
+                fail_fast: false,
+                reject_no_ping: true,
+                full_ping: false,
+            }),
+        };
+        let result = benchmark_profile(
+            &profile,
+            BenchMethod::AvailabilityFull,
+            DEFAULT_PROBE_URL,
+            DEFAULT_DOWNLOAD_URL,
+            DEFAULT_UPLOAD_URL,
+            "/definitely/missing/ping-gate-mihomo",
+            Some(&policy),
+            false,
+            false,
+            &AtomicBool::new(false),
+        );
+        assert!(!result.success);
+        assert_eq!(result.resource_tests.len(), 6);
+        assert!(
+            result.resource_tests[..2]
+                .iter()
+                .all(|test| test.attempts == 0)
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Ping failed"))
+        );
+        for test in result.resource_tests.iter().skip(3) {
+            assert_eq!(test.attempts, 0);
+            assert!(
+                test.error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("reject_no_ping"))
+            );
+        }
+    }
+
+    #[test]
+    fn availability_without_policy_defaults_to_minimal_ping() {
+        let mut profile = search_profiles(1).remove(0);
+        profile.address.clear();
+        let (_, tests) = run_service_resources(
+            &profile,
+            BenchMethod::AvailabilityFull,
+            DEFAULT_PROBE_URL,
+            "/definitely/missing/minimal-ping-mihomo",
+            None,
+            &AtomicBool::new(false),
+        )
+        .expect("unavailable core diagnostic");
+        assert_eq!(tests.len(), 6);
+        assert!(tests[..2].iter().all(|test| test.attempts == 0));
+        assert_eq!(tests[2].id, "ping_proxy");
+        assert_eq!(tests[2].attempts, 1);
+    }
+
+    #[test]
     fn service_checks_worker_captures_job_policy_without_adaptive_preflight() {
         let method = BenchMethod::AvailabilityFull;
         let mut profile = search_profiles(1).remove(0);
@@ -4910,6 +5427,8 @@ mod tests {
         job.lock().expect("job policy").service_checks = Some(ServiceCheckOptions {
             required_services: ServiceCheckPrefix::Youtube,
             fail_fast: false,
+            reject_no_ping: false,
+            full_ping: false,
         });
         run_bench(
             vec![profile],
@@ -4956,6 +5475,8 @@ mod tests {
             let options = ServiceCheckOptions {
                 required_services: ServiceCheckPrefix::All,
                 fail_fast,
+                reject_no_ping: false,
+                full_ping: false,
             };
             let mut calls = Vec::new();
             let tests = run_complete_service_probes(

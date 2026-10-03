@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::hincyray_routing::normalize_domain_rule;
+use crate::hincyray_routing::{normalize_domain_rule, normalize_port_items};
 use crate::profiles::{Profile, Protocol, decode_vmess_json};
 use crate::xray_config::{
     DNS_INBOUND_PORT, GeoBaseRuleBehavior, GeoBaseRuleProvider, GeoBaseRuleTarget, PortMode,
@@ -218,7 +218,6 @@ pub const PROXY_ACTIVE_NAME: &str = "proxy-active";
 pub const PROXY_HEALTH_NAME: &str = "proxy-health";
 pub const DIRECT_NAME: &str = "DIRECT";
 pub const REJECT_NAME: &str = "REJECT";
-pub const PAROVOZIK_PROXY_GROUP: &str = "parovozik-vpn";
 pub const BEST_OF_BEST_GROUP: &str = "best-of-best";
 pub const REDIR_LISTENER: &str = "redir-in";
 pub const TPROXY_LISTENER: &str = "tproxy-in";
@@ -671,7 +670,7 @@ pub fn build_mihomo_router_config(
 
     let mut rules = Vec::new();
     for rule in route_rules {
-        rules.extend(rule_to_strings(rule));
+        rules.extend(rule_to_strings(rule)?);
     }
 
     // System-level QUIC block: block when TPROXY is unavailable (UDP
@@ -697,13 +696,7 @@ pub fn build_mihomo_router_config(
         rules.push(format!("DOMAIN-SUFFIX,{domain},{}", PROXY_NAME));
     }
 
-    // GeoBase providers keep precedence over hot-updated Parovozik providers.
-    for target in [
-        GeoBaseRuleTarget::Active,
-        GeoBaseRuleTarget::Direct,
-        GeoBaseRuleTarget::ParovozikVpn,
-        GeoBaseRuleTarget::ParovozikDirect,
-    ] {
+    for target in [GeoBaseRuleTarget::Active, GeoBaseRuleTarget::Direct] {
         for provider in extra
             .geobase_rule_providers
             .iter()
@@ -719,8 +712,6 @@ pub fn build_mihomo_router_config(
                 // flaps or dies.
                 GeoBaseRuleTarget::Active => PROXY_NAME,
                 GeoBaseRuleTarget::Direct => DIRECT_NAME,
-                GeoBaseRuleTarget::ParovozikDirect => DIRECT_NAME,
-                GeoBaseRuleTarget::ParovozikVpn => PAROVOZIK_PROXY_GROUP,
             };
             rules.push(format!("RULE-SET,{},{}", provider.name, target_name));
         }
@@ -882,21 +873,6 @@ pub fn build_mihomo_router_config(
             .is_some_and(|socks| socks.proxy == BEST_OF_BEST_GROUP)
     {
         groups.push(json!({"name":BEST_OF_BEST_GROUP,"type":"select","proxies":[REJECT_NAME],"default-selected":REJECT_NAME}));
-    }
-    if !extra.parovozik_vpn_target.is_empty() {
-        let proxies: Vec<String> = [REJECT_NAME.to_owned(), PROXY_ACTIVE_NAME.to_owned()]
-            .into_iter()
-            .chain(extra.parovozik_vpn_outbounds.iter().cloned())
-            .collect();
-        groups.push(json!({
-            "name": PAROVOZIK_PROXY_GROUP,
-            "type": "fallback",
-            "proxies": proxies,
-            "url": fallback_health_url("parovozik"),
-            "interval": AUXILIARY_HEALTH_INTERVAL_SECS,
-            "timeout": FALLBACK_HEALTH_TIMEOUT_MS,
-            "empty-fallback": REJECT_NAME,
-        }));
     }
 
     // Rule providers are validated local managed GeoBase sets only.
@@ -2949,36 +2925,42 @@ fn build_tailscale_proxy(profile: &Profile, name: &str) -> Result<Value, String>
 
 /// Convert a daemon-level route rule into Mihomo rule strings.
 ///
-/// When a rule combines multiple condition types (domains/IPs + ports,
-/// or ports + network), they are ANDed together so the rule matches
-/// only when ALL conditions are satisfied. When only one condition type
-/// is present, separate rules are emitted (current behaviour).
-fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
+/// Alternatives within each port field are ORed; distinct condition types
+/// are ANDed. Exclusion negates the whole port set, including port-only rules.
+fn rule_to_strings(rule: &XrayRouteRule) -> Result<Vec<String>, String> {
     let target = outbound_tag_to_name(&rule.outbound_tag);
     let mut result = Vec::new();
 
     let exclude_ports = rule.port_mode.trim().eq_ignore_ascii_case("exclude");
     let network = rule.network.as_deref().and_then(normalize_mihomo_network);
 
-    // Collect DST-PORT conditions (exclude src-port:/in-port: which are
-    // emitted as separate rule types).
-    let dst_ports: Vec<&String> = rule
-        .ports
-        .iter()
-        .filter(|p| !p.starts_with("src-port:") && !p.starts_with("in-port:"))
-        .collect();
-
-    let port_conditions: Vec<String> = if exclude_ports {
-        dst_ports
+    // Invalid legacy input must reject activation rather than lose a rule.
+    let ports = normalize_port_items(&rule.ports)?;
+    let mut port_conditions = Vec::new();
+    for (prefix, kind) in [
+        ("", "DST-PORT"),
+        ("src-port:", "SRC-PORT"),
+        ("in-port:", "IN-PORT"),
+    ] {
+        let values: Vec<_> = ports
             .iter()
-            .map(|p| format!("(NOT,(DST-PORT,{p}))"))
-            .collect()
-    } else {
-        dst_ports
-            .iter()
-            .map(|p| format!("(DST-PORT,{p})"))
-            .collect()
-    };
+            .filter_map(|port| {
+                if prefix.is_empty() {
+                    (!port.contains(':')).then_some(port.as_str())
+                } else {
+                    port.strip_prefix(prefix)
+                }
+            })
+            .collect();
+        if !values.is_empty() {
+            let body = format!("{kind},{}", values.join("/"));
+            port_conditions.push(if exclude_ports {
+                format!("(NOT,(({body})))")
+            } else {
+                format!("({body})")
+            });
+        }
+    }
 
     let net_condition = network.map(|n| format!("(NETWORK,{n})"));
 
@@ -3006,7 +2988,7 @@ fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
             };
             result.push(format!("AND,(({ir}),{extra_joined}),{target}"));
         }
-    } else if !has_domains_or_ips && !port_conditions.is_empty() && net_condition.is_some() {
+    } else if !has_domains_or_ips && !port_conditions.is_empty() {
         // Ports + network without domains/IPs: AND them together.
         // Example: AND,((NETWORK,udp),(DST-PORT,443)),REJECT
         let mut conditions: Vec<String> = Vec::new();
@@ -3014,8 +2996,16 @@ fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
             conditions.push(nc.clone());
         }
         conditions.extend(port_conditions.iter().cloned());
-        let conditions_joined = conditions.join(",");
-        result.push(format!("AND,({conditions_joined}),{target}"));
+        if conditions.len() == 1 {
+            let body = conditions[0]
+                .strip_prefix('(')
+                .expect("generated condition starts with parentheses")
+                .strip_suffix(')')
+                .expect("generated condition ends with parentheses");
+            result.push(format!("{body},{target}"));
+        } else {
+            result.push(format!("AND,({}),{target}", conditions.join(",")));
+        }
     } else {
         // Simple mode: emit separate rules for each condition.
         for domain in &rule.domains {
@@ -3024,21 +3014,12 @@ fn rule_to_strings(rule: &XrayRouteRule) -> Vec<String> {
         for ip in &rule.ips {
             result.push(ip_rule(ip, &target));
         }
-        for port in &rule.ports {
-            if let Some(rest) = port.strip_prefix("src-port:") {
-                result.push(format!("SRC-PORT,{rest},{target}"));
-            } else if let Some(rest) = port.strip_prefix("in-port:") {
-                result.push(format!("IN-PORT,{rest},{target}"));
-            } else {
-                result.push(format!("DST-PORT,{port},{target}"));
-            }
-        }
         if let Some(net) = network {
             result.push(format!("NETWORK,{net},{target}"));
         }
     }
 
-    result
+    Ok(result)
 }
 
 fn normalize_mihomo_network(network: &str) -> Option<&'static str> {
@@ -3374,16 +3355,16 @@ fn apply_grpc_advanced(grpc_opts: &mut Value, url: &Url) {
 mod tests {
     use super::{
         AUXILIARY_HEALTH_INTERVAL_SECS, DIRECT_NAME, ExternalControllerConfig,
-        FALLBACK_HEALTH_TIMEOUT_MS, MihomoFeatures, PAROVOZIK_PROXY_GROUP, PROXY_ACTIVE_NAME,
-        PROXY_HEALTH_NAME, PROXY_NAME, PerProxyDefaults, PinnedServerRoute, REDIR_LISTENER,
-        REJECT_NAME, TORRENT_SOCKS_LISTENER, TPROXY_LISTENER, TunnelConfig, build_anytls_proxy,
+        FALLBACK_HEALTH_TIMEOUT_MS, MihomoFeatures, PROXY_ACTIVE_NAME, PROXY_HEALTH_NAME,
+        PROXY_NAME, PerProxyDefaults, PinnedServerRoute, REDIR_LISTENER, REJECT_NAME,
+        TORRENT_SOCKS_LISTENER, TPROXY_LISTENER, TunnelConfig, build_anytls_proxy,
         build_http_proxy, build_hysteria_proxy, build_hysteria2_proxy, build_masque_proxy,
         build_mihomo_bench_config, build_mihomo_config, build_mihomo_router_config,
         build_openvpn_proxy, build_shadowsocks_proxy, build_shadowsocksr_proxy, build_snell_proxy,
         build_socks_proxy, build_ssh_proxy, build_tailscale_proxy, build_trojan_proxy,
         build_tuic_proxy, build_vless_proxy, build_vmess_proxy, build_wireguard_proxy,
         domain_rule_body, fallback_health_url, ip_rule_body, main_fallback_health_url,
-        parse_xhttp_extra, read_xhttp_tuning, update_xhttp_tuning,
+        parse_xhttp_extra, read_xhttp_tuning, rule_to_strings, update_xhttp_tuning,
     };
     use crate::profiles::parse_profiles;
     use crate::xray_config::{
@@ -6549,64 +6530,6 @@ mod tests {
     }
 
     #[test]
-    fn parovozik_provider_rules_follow_geobase_and_use_fallback_group() {
-        let extra = RouterExtra {
-            geobase_rule_providers: vec![
-                managed_provider(
-                    "managed-direct",
-                    "/opt/etc/hincyray/geobase/direct.txt",
-                    GeoBaseRuleBehavior::Domain,
-                    GeoBaseRuleTarget::Direct,
-                ),
-                managed_provider(
-                    "parovozik-vpn-rules",
-                    "/opt/etc/hincyray/parovozik-vpn.txt",
-                    GeoBaseRuleBehavior::Domain,
-                    GeoBaseRuleTarget::ParovozikVpn,
-                ),
-                managed_provider(
-                    "parovozik-direct",
-                    "/opt/etc/hincyray/parovozik-direct.txt",
-                    GeoBaseRuleBehavior::Domain,
-                    GeoBaseRuleTarget::ParovozikDirect,
-                ),
-            ],
-            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
-            parovozik_vpn_target: PAROVOZIK_PROXY_GROUP.to_owned(),
-            parovozik_vpn_outbounds: vec!["srv-route-test".to_owned()],
-            ..RouterExtra::default()
-        };
-        let yaml = build_router_with_extra(&extra, &[], false, &MihomoFeatures::default())
-            .expect("router config");
-        let config: Value = serde_yaml::from_str(&yaml).expect("config");
-        let rules = config["rules"].as_array().expect("rules");
-        let geobase = rules
-            .iter()
-            .position(|rule| rule == "RULE-SET,managed-direct,DIRECT")
-            .expect("GeoBase rule");
-        let vpn = rules
-            .iter()
-            .position(|rule| rule == "RULE-SET,parovozik-vpn-rules,parovozik-vpn")
-            .expect("Parovozik VPN rule");
-        let direct = rules
-            .iter()
-            .position(|rule| rule == "RULE-SET,parovozik-direct,DIRECT")
-            .expect("Parovozik Direct rule");
-        assert!(geobase < vpn && vpn < direct);
-        let group = config["proxy-groups"]
-            .as_array()
-            .expect("groups")
-            .iter()
-            .find(|group| group["name"] == PAROVOZIK_PROXY_GROUP)
-            .expect("Parovozik group");
-        assert_eq!(group["type"], "fallback");
-        assert_eq!(
-            group["proxies"],
-            json!(["REJECT", PROXY_ACTIVE_NAME, "srv-route-test"])
-        );
-    }
-
-    #[test]
     fn invalid_geobase_descriptors_are_rejected() {
         for provider in [
             managed_provider(
@@ -6951,14 +6874,120 @@ mod tests {
         )
         .expect("config");
         let rules = router_rules(&yaml);
-        // Exclude mode: AND,((DOMAIN-SUFFIX,example.com),(NOT,(DST-PORT,22))),DIRECT
+        // NOT requires its own outer list plus the nested condition.
         let has_exclude = rules
             .iter()
-            .any(|r| r == "AND,((DOMAIN-SUFFIX,example.com),(NOT,(DST-PORT,22))),DIRECT");
+            .any(|r| r == "AND,((DOMAIN-SUFFIX,example.com),(NOT,((DST-PORT,22)))),DIRECT");
         assert!(
             has_exclude,
             "expected AND with NOT,DST-PORT, got: {rules:?}"
         );
+    }
+
+    #[test]
+    fn port_rule_alternatives_and_exclusions_keep_protocol_and_address_constraints() {
+        let mut rule = XrayRouteRule {
+            domains: vec![],
+            ips: vec![],
+            outbound_tag: "direct".to_owned(),
+            block_quic: false,
+            ports: vec!["1119".to_owned(), "3724/6113".to_owned()],
+            network: Some("tcp".to_owned()),
+            port_mode: "include".to_owned(),
+        };
+        assert_eq!(
+            rule_to_strings(&rule).expect("valid port rule"),
+            ["AND,((NETWORK,tcp),(DST-PORT,1119/3724/6113)),DIRECT"]
+        );
+        rule.ports = vec![
+            "3478-3479".to_owned(),
+            "5060".to_owned(),
+            "12000-64000".to_owned(),
+        ];
+        rule.network = Some("udp".to_owned());
+        assert_eq!(
+            rule_to_strings(&rule).expect("valid port rule"),
+            ["AND,((NETWORK,udp),(DST-PORT,3478-3479/5060/12000-64000)),DIRECT"]
+        );
+        rule.domains = vec!["example.test".to_owned()];
+        rule.ips = vec!["203.0.113.0/24".to_owned()];
+        assert_eq!(
+            rule_to_strings(&rule).expect("valid port rule"),
+            [
+                "AND,((DOMAIN-SUFFIX,example.test),(DST-PORT,3478-3479/5060/12000-64000),(NETWORK,udp)),DIRECT",
+                "AND,((IP-CIDR,203.0.113.0/24),(DST-PORT,3478-3479/5060/12000-64000),(NETWORK,udp)),DIRECT"
+            ]
+        );
+        rule.domains.clear();
+        rule.ips.clear();
+        rule.network = None;
+        rule.port_mode = "exclude".to_owned();
+        assert_eq!(
+            rule_to_strings(&rule).expect("valid port rule"),
+            ["NOT,((DST-PORT,3478-3479/5060/12000-64000)),DIRECT"]
+        );
+        rule.network = Some("udp".to_owned());
+        assert_eq!(
+            rule_to_strings(&rule).expect("valid port rule"),
+            ["AND,((NETWORK,udp),(NOT,((DST-PORT,3478-3479/5060/12000-64000)))),DIRECT"]
+        );
+        rule.ports = vec!["src-port:80/81".to_owned(), "in-port:10809".to_owned()];
+        rule.port_mode = "include".to_owned();
+        assert_eq!(
+            rule_to_strings(&rule).expect("valid port rule"),
+            ["AND,((NETWORK,udp),(SRC-PORT,80/81),(IN-PORT,10809)),DIRECT"]
+        );
+    }
+
+    #[test]
+    fn global_port_rules_keep_user_priority_before_quic_and_geobase() {
+        let routes = [
+            XrayRouteRule {
+                domains: vec![],
+                ips: vec![],
+                outbound_tag: "direct".to_owned(),
+                block_quic: false,
+                ports: vec!["443".to_owned(), "12000-64000".to_owned()],
+                network: Some("udp".to_owned()),
+                port_mode: "include".to_owned(),
+            },
+            XrayRouteRule {
+                domains: vec!["example.test".to_owned()],
+                ips: vec![],
+                outbound_tag: "active".to_owned(),
+                block_quic: false,
+                ports: vec![],
+                network: None,
+                port_mode: "include".to_owned(),
+            },
+        ];
+        let extra = RouterExtra {
+            mihomo_home: Some("/opt/etc/hincyray".to_owned()),
+            geobase_rule_providers: vec![managed_provider(
+                "test-geobase",
+                "/opt/etc/hincyray/geobase/test.txt",
+                GeoBaseRuleBehavior::Domain,
+                GeoBaseRuleTarget::Active,
+            )],
+            ..RouterExtra::default()
+        };
+        let yaml = build_router_with_extra(&extra, &routes, false, &MihomoFeatures::default())
+            .expect("router config");
+        let rules = router_rules(&yaml);
+        assert_eq!(
+            &rules[..3],
+            [
+                "AND,((NETWORK,udp),(DST-PORT,443/12000-64000)),DIRECT",
+                "DOMAIN-SUFFIX,example.test,proxy",
+                "AND,((NETWORK,udp),(DST-PORT,443)),REJECT"
+            ]
+        );
+        assert!(
+            rules[3..]
+                .iter()
+                .any(|rule| rule == "RULE-SET,test-geobase,proxy")
+        );
+        assert!(rules.last().expect("MATCH rule").starts_with("MATCH,"));
     }
 
     #[test]
